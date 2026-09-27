@@ -1,0 +1,222 @@
+(module agent_tools.sys)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.time" :as time)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; libc entry points this library needs that the standard library does not
+;;; declare. Every extern lives here, once, so two importers never collide.
+
+(extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern readlink :cc c [(ptr i8) (ptr i8) i64] (-> i64))
+(extern access :cc c [(ptr i8) i32] (-> i32))
+(extern strerror :cc c [i32] (-> (ptr i8)))
+(extern waitid :cc c [i32 u32 (ptr u8) i32] (-> i32))
+
+(const ENOENT 2)
+(const EINTR 4)
+(const EEXIST 17)
+(const ENOTDIR 20)
+(const X_OK 1)
+
+;;; Large enough for `realpath`'s output buffer on every supported platform
+;;; (PATH_MAX is 1024 on macOS and 4096 on Linux).
+(const PATH_BUFFER_BYTES 4096)
+
+(defn wnowait-code [] (-> Code)
+  (if (= (primitive/target-os) `linux) `16777216 `32))
+
+(defn siginfo-pid-offset-code [] (-> Code)
+  (if (= (primitive/target-os) `linux) `16 `12))
+
+;;; waitid flags and the siginfo_t layout differ between Linux and macOS.
+(const P_PID 1)
+(const WNOHANG 1)
+(const WEXITED 4)
+(const WNOWAIT (wnowait-code))
+(const SIGINFO_PID_OFFSET (siginfo-pid-offset-code))
+;;; siginfo_t is 128 bytes on both platforms.
+(const SIGINFO_BYTES 128)
+
+;;; Report an unrecoverable condition on stderr and abort the process.
+(defn fatal [(message (slice u8))] (-> i64)
+  (let [prefix "agent-tools: fatal: "]
+    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data prefix)) (primitive/cast isize (len prefix)))
+    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data message)) (primitive/cast isize (len message)))
+    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data "\n")) (primitive/cast isize 1))
+    (abort)
+    0))
+
+;;; Monotonic milliseconds. The clock cannot fail on a supported system; if it
+;;; does, the process stops with a clear message rather than inventing a time.
+(defn monotonic-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [_] (fatal "the monotonic clock is unavailable"))))
+
+;;; A duration of `ms` (non-negative) milliseconds.
+(defn millis [(ms i64)] (-> time/Duration)
+  (match (time/duration-millis ms)
+    (Ok [d] d)
+    (Err [_] (do (fatal "a negative duration was requested") (time/Duration :sec 0 :nsec 0)))))
+
+(defn sleep-ms [(ms i64)] (-> i64)
+  (match (time/sleep (millis ms))
+    (Ok [_] 0)
+    (Err [_] (fatal "sleep failed"))))
+
+;;; The system's description of an errno value, such as "No such file or
+;;; directory". Borrowed from libc; copy it before the next call.
+(defn errno-text [(code i64)] (-> (slice u8))
+  (cstr->str (strerror (primitive/cast i32 code))))
+
+;;; A NUL-terminated copy of `s`, or null when allocation fails.
+(defn c-string [(a (dyn Allocator)) (s (slice u8))] (-> (ptr i8))
+  (str->cstr a s))
+
+(defn c-string-free [(a (dyn Allocator)) (s (slice u8)) (c (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 c) 0)
+      0
+      (free-bytes a (slice-new (primitive/cast (ptr u8) c) (+ (len s) 1)) 1)))
+
+(defn copy-bytes [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (sb-push-str! (mut b) s)
+    (sb-finish! (mut b))))
+
+;;; The outcome of a path query that can fail with an errno.
+(defsum PathQuery
+  (PathOk [(value (slice u8))])
+  (PathErrno [(code i64)]))
+
+;;; `realpath(3)` into allocator-owned storage.
+(defn real-path [(a (dyn Allocator)) (path (slice u8))] (-> PathQuery)
+  (let [c (c-string a path)]
+    (if (= (primitive/cast i64 c) 0)
+        (PathErrno 12)
+        (match (alloc [i8] a PATH_BUFFER_BYTES)
+          (None [] (do (c-string-free a path c) (PathErrno 12)))
+          (Some [buffer]
+                (let [r (realpath c (slice-data buffer))
+                      code (if (= (primitive/cast i64 r) 0) (os/os-errno) 0)]
+                  (c-string-free a path c)
+                  (if (= (primitive/cast i64 r) 0)
+                      (do (free [i8] a buffer) (PathErrno code))
+                      (let [result (copy-bytes a (cstr->str r))]
+                        (free [i8] a buffer)
+                        (PathOk result)))))))))
+
+;;; Whether `path` itself (not what it points to) is a symbolic link.
+(defn symlink? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (let [c (c-string a path)
+        buffer (primitive/alloc-stack (array i8 8))]
+    (if (= (primitive/cast i64 c) 0)
+        false
+        (let [n (readlink c (primitive/cast (ptr i8) buffer) 8)]
+          (c-string-free a path c)
+          (>= n 0)))))
+
+;;; Whether `path` names a directory (following symbolic links).
+(defn directory? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (let [c (c-string a path)]
+    (if (= (primitive/cast i64 c) 0)
+        false
+        (let [d (fs/opendir c)]
+          (c-string-free a path c)
+          (if (= (primitive/cast i64 d) 0)
+              false
+              (do (fs/closedir d) true))))))
+
+;;; Whether `path` names an executable file.
+(defn executable? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (let [c (c-string a path)]
+    (if (= (primitive/cast i64 c) 0)
+        false
+        (let [r (access c (primitive/cast i32 X_OK))]
+          (c-string-free a path c)
+          (and (= r (primitive/cast i32 0)) (not (directory? a path)))))))
+
+;;; Create one directory. Ok when it was created or already exists as a directory.
+(defn make-directory [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64 i64))
+  (let [c (c-string a path)]
+    (if (= (primitive/cast i64 c) 0)
+        (Err 12)
+        (let [r (fs/make-dir c 493)
+              code (if (< r (primitive/cast i32 0)) (os/os-errno) 0)]
+          (c-string-free a path c)
+          (cond (= code 0) (Ok 0)
+                (and (= code EEXIST) (directory? a path)) (Ok 0)
+                :else (Err code))))))
+
+;;; Whether `path` exists and is not a directory (following symbolic links).
+(defn existing-file? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (match (real-path a path)
+    (PathErrno [_] false)
+    (PathOk [real] (let [result (not (directory? a real))]
+                     (free-bytes a real 1)
+                     result))))
+
+;;; Read a whole file that must be at most `limit` bytes.
+(defn read-small-file [(a (dyn Allocator)) (path (slice u8)) (limit i64)] (-> (Result (slice u8) (slice u8)))
+  (match (fs/read-file a path)
+    (Err [error] (Err (match error
+                        (io/Errno [code] (copy-bytes a (errno-text code)))
+                        (_ "read failed"))))
+    (Ok [bytes] (if (> (len bytes) limit)
+                    (do (free-bytes a bytes 1) (Err "file is larger than expected"))
+                    (Ok bytes)))))
+
+;;; The first executable named `name` on PATH, allocated in `a`.
+(defn find-on-path [(a (dyn Allocator)) (name (slice u8))] (-> (Option (slice u8)))
+  (match (os/env-get a "PATH")
+    (Err [_] (do (fatal "cannot read the PATH environment variable") (None)))
+    (Ok [maybe]
+        (match maybe
+          (None [] (None))
+          (Some [owned]
+                (let [path (os/owned-string-slice owned)
+                      n (len path)
+                      (mut start) 0
+                      (mut i) 0
+                      (mut found) (: (None) (Option (slice u8)))]
+                  (loop (if (or (> (load i) n) (match (load found) (Some [_] true) (None [] false)))
+                            (break)
+                            (do (when (or (= (load i) n) (= (get path (load i)) (primitive/cast u8 #\:)))
+                                  (let [dir (subslice path (load start) (load i))]
+                                    (when (> (len dir) 0)
+                                      (let [(mut b) (sb-new a)]
+                                        (sb-push-str! (mut b) dir)
+                                        (sb-push-str! (mut b) "/")
+                                        (sb-push-str! (mut b) name)
+                                        (let [candidate (sb-finish! (mut b))]
+                                          (if (executable? a candidate)
+                                              (set! found (Some candidate))
+                                              (free-bytes a candidate 1))))
+                                      0)
+                                    (set! start (+ (load i) 1))
+                                    0)
+                                  0)
+                                (set! i (+ (load i) 1)))))
+                  (let [(mut o) owned]
+                    (os/owned-string-free a (mut o)))
+                  (load found)))))))
+
+;;; The target of the symbolic link at `path`, or None when it is not a link.
+(defn read-link [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
+  (let [c (c-string a path)]
+    (if (= (primitive/cast i64 c) 0)
+        (None)
+        (match (alloc [i8] a PATH_BUFFER_BYTES)
+          (None [] (do (c-string-free a path c) (None)))
+          (Some [buffer]
+                (let [n (readlink c (slice-data buffer) PATH_BUFFER_BYTES)]
+                  (c-string-free a path c)
+                  (if (< n 0)
+                      (do (free [i8] a buffer) (None))
+                      (let [target (copy-bytes a (slice-new (primitive/cast (ptr u8) (slice-data buffer)) n))]
+                        (free [i8] a buffer)
+                        (Some target)))))))))

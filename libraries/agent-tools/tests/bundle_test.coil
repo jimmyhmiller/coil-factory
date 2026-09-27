@@ -1,0 +1,126 @@
+(module agent_tools.bundle-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.json" :as json)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.bundle" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.workspace" :use *)
+(import "agent_tools.test-support" :use *)
+(import "json_schema.validate" :as schema)
+
+(defn open-ws [(a (dyn Allocator)) (root (slice u8))] (-> Workspace)
+  (match (workspace-open a root)
+    (Ok [ws] ws)
+    (Err [message] (do (println "{}" message) (assert false) (Workspace :root "")))))
+
+(defn tools-for [(a (dyn Allocator)) (ws Workspace) (groups (slice (slice u8)))] (-> StandardTools)
+  (match (standard-tools a ws (NoSandbox) groups)
+    (Ok [tools] tools)
+    (Err [m] (do (println "{}" m) (assert false) (primitive/zeroed StandardTools)))))
+
+(defn group-error [(a (dyn Allocator)) (ws Workspace) (groups (slice (slice u8)))] (-> (slice u8))
+  (match (standard-tools a ws (NoSandbox) groups)
+    (Ok [_] (do (assert false) ""))
+    (Err [m] m)))
+
+(defn names [(a (dyn Allocator)) (registry (ptr ToolRegistry))] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) (registry-count registry))
+              (break)
+              (let [spec (tool-spec (registry-at registry (load i)))]
+                (sb-push-str! (mut b) (.name spec))
+                (sb-push-str! (mut b) " ")
+                (set! i (+ (load i) 1)))))
+    (sb-finish! (mut b))))
+
+(deftest selects-tool-groups-by-exact-name
+  (let [a (malloc-allocator)
+        dir (temp-dir a "bundle")
+        ws (open-ws a dir)]
+    (let [(mut all) (tools-for a ws ["files" "shell"])]
+      (assert (= (names a (mut (.registry all))) "read_file write_file edit_file list_dir search shell "))
+      (standard-tools-free! (mut all)))
+    (let [(mut files) (tools-for a ws ["files"])]
+      (assert (= (names a (mut (.registry files))) "read_file write_file edit_file list_dir search "))
+      (standard-tools-free! (mut files)))
+    (let [(mut shell) (tools-for a ws ["shell"])]
+      (assert (= (names a (mut (.registry shell))) "shell "))
+      (standard-tools-free! (mut shell)))
+    (assert (= (group-error a ws ["file"]) "unknown tool group \"file\"; the groups are \"files\" and \"shell\""))
+    (assert (= (group-error a ws ["files" "shel"]) "unknown tool group \"shel\"; the groups are \"files\" and \"shell\""))
+    (assert (= (group-error a ws ["filesx"]) "unknown tool group \"filesx\"; the groups are \"files\" and \"shell\""))
+    (assert (= (group-error a ws ["shell" "shell"]) "tool group \"shell\" is listed more than once"))
+    (remove-tree a dir)))
+
+(deftest registered-tools-run-through-the-registry
+  (let [a (malloc-allocator)
+        dir (temp-dir a "bundle-run")
+        ws (open-ws a dir)
+        (mut tools) (tools-for a ws ["files" "shell"])
+        never (box! a NeverCancelled (NeverCancelled :unused 0))]
+    (match (registry-find (mut (.registry tools)) "shell")
+      (None [] (assert false))
+      (Some [shell]
+            (match (from-json [JVal] a "{\"command\":\"echo hello > greeting.txt && echo written\"}")
+              (Err [_] (assert false))
+              (Ok [args] (match (tool-run shell a (tool-call "c1" "shell" args "") never)
+                           (ToolOk [text] (assert (= text "written\nexit 0")))
+                           (ToolFailed [m] (assert false)))))))
+    (match (registry-find (mut (.registry tools)) "read_file")
+      (None [] (assert false))
+      (Some [read]
+            (match (from-json [JVal] a "{\"path\":\"greeting.txt\"}")
+              (Err [_] (assert false))
+              (Ok [args] (match (tool-run read a (tool-call "c2" "read_file" args "") never)
+                           (ToolOk [text] (assert (= text "    1\x2502; hello\n")))
+                           (ToolFailed [m] (assert false)))))))
+    (standard-tools-free! (mut tools))
+    (remove-tree a dir)))
+
+;;; Every schema must be accepted by the validator the agent loop runs, and a
+;;; representative argument object must validate against it.
+(defn check-schema [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (name (slice u8)) (valid-args (slice u8)) (invalid-args (slice u8))] (-> i64)
+  (match (registry-find registry name)
+    (None [] (do (println "no tool {}" name) (assert false) 0))
+    (Some [tool]
+          (let [spec (tool-spec tool)]
+            (match (json/parse a (.parameters spec))
+              (Err [_] (do (println "{}: schema is not JSON" name) (assert false) 0))
+              (Ok [schema-doc]
+                  (match (json/parse a valid-args)
+                    (Err [_] (do (assert false) 0))
+                    (Ok [good]
+                        (let [result (schema/validate a schema-doc good)]
+                          (when (not (.ok result))
+                            (println "{}: {} at {}" name (.message result) (.path result))
+                            0)
+                          (assert (.ok result))
+                          (match (json/parse a invalid-args)
+                            (Err [_] (do (assert false) 0))
+                            (Ok [bad]
+                                (let [rejected (schema/validate a schema-doc bad)]
+                                  (when (.ok rejected)
+                                    (println "{}: accepted invalid {}" name invalid-args)
+                                    0)
+                                  (assert (not (.ok rejected)))
+                                  0))))))))))))
+
+(deftest every-schema-uses-the-supported-subset
+  (let [a (malloc-allocator)
+        dir (temp-dir a "bundle-schema")
+        ws (open-ws a dir)
+        (mut tools) (tools-for a ws ["files" "shell"])]
+    (check-schema a (mut (.registry tools)) "read_file" "{\"path\":\"a\",\"offset\":2,\"limit\":10}" "{\"path\":\"a\",\"extra\":1}")
+    (check-schema a (mut (.registry tools)) "write_file" "{\"path\":\"a\",\"content\":\"\"}" "{\"path\":\"a\"}")
+    (check-schema a (mut (.registry tools)) "edit_file" "{\"path\":\"a\",\"old_text\":\"x\",\"new_text\":\"y\",\"replace_all\":true}" "{\"path\":\"a\",\"old_text\":\"x\",\"new_text\":1}")
+    (check-schema a (mut (.registry tools)) "list_dir" "{}" "{\"path\":3}")
+    (check-schema a (mut (.registry tools)) "search" "{\"pattern\":\"x\",\"path\":\"src\",\"glob\":\"*.coil\"}" "{\"path\":\"src\"}")
+    (check-schema a (mut (.registry tools)) "shell" "{\"command\":\"ls\",\"timeout_seconds\":30}" "{\"command\":\"ls\",\"timeout_seconds\":\"30\"}")
+    (standard-tools-free! (mut tools))
+    (remove-tree a dir)))

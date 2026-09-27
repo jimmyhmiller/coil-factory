@@ -1,0 +1,7 @@
+[package]
+name = "cli"
+source-roots = ["src", "tests"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

@@ -1,0 +1,186 @@
+(module tui.app)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.time" :as time)
+(import "tui.fatal" :use [fatal])
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.term" :use *)
+
+;;; What the event loop hands to `app-event`.
+(defsum Event
+  (KeyEvent [(key Key)])
+  (TickEvent [(tick i64)])
+  (ResizeEvent [(width i64) (height i64)]))
+
+;;; An event handler's verdict.
+(defsum AppFlow
+  (Continue)
+  (Quit))
+
+;;; Everything a draw callback needs. `canvas` is cleared before each draw.
+;;; `scratch` is an arena reset before every frame: allocate per-frame strings,
+;;; wrapped lines and tables from it freely, but keep nothing across frames.
+;;; `tick` counts timer ticks (drive spinners with it).
+(defstruct Frame
+  [(canvas (ptr Canvas))
+   (scratch (dyn Allocator))
+   (tick i64)
+   (color-mode ColorMode)])
+
+;;; An interactive program. `app-draw` renders the whole UI from the app state
+;;; into `(.canvas frame)`; `app-event` updates the state and says whether to
+;;; keep running. Implement both for a struct and pass a pointer to `app-run`.
+(deftrait App [Self]
+  (app-draw [(self (ptr Self)) (frame (ptr Frame))] (-> i64))
+  (app-event [(self (ptr Self)) (event Event)] (-> AppFlow)))
+
+;;; Event loop configuration. `tick-ms` is the timer interval (animations,
+;;; polling). With `suspend-on-ctrl-z`, Ctrl-Z stops the program like a shell job
+;;; and restores the screen on resume; otherwise it is delivered as a key.
+(defstruct AppOptions
+  [(tick-ms i64)
+   (term TermOptions)
+   (color-mode ColorMode)
+   (suspend-on-ctrl-z bool)])
+
+;;; 100 ms ticks, full-screen terminal setup, detected colors, Ctrl-Z suspends.
+(defn app-options-default [] (-> AppOptions)
+  (AppOptions
+    :tick-ms 100
+    :term (term-options-default)
+    :color-mode (detect-color-mode)
+    :suspend-on-ctrl-z true))
+
+(defn app--now [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [e] (fatal "monotonic clock unavailable"))))
+
+(defn app--ctrl-z? [(key Key)] (-> bool)
+  (match key (Ctrl [l] (= l #\z)) (_ false)))
+
+;;; Draw a frame and write only what changed since the last one.
+(defn app--present! [(app (dyn App))
+                     (frame (ptr Frame))
+                     (prev (ptr Canvas))
+                     (out (ptr (ArrayList u8)))
+                     (arena (ptr scratch/ScratchArena))] (-> i64)
+  (scratch/scratch-recycle! arena)
+  (canvas-clear! (.canvas frame))
+  (app-draw app frame)
+  (al-clear! out)
+  (render-diff! out prev (.canvas frame) (.color-mode frame))
+  (when (> (len (load out)) 0)
+    (match (term-write! (al-slice (load out)))
+      (Ok [n] 0)
+      (Err [e] (fatal "writing the frame to the terminal failed"))))
+  (canvas-commit! prev (.canvas frame))
+  0)
+
+;;; Run `app` full-screen until its event handler returns `Quit` (or input
+;;; ends). Every event is followed by a redraw; unchanged cells are never
+;;; re-sent. Resizes resize the canvas and repaint fully. The terminal is always
+;;; restored on return, on a `tui.fatal` abort and on fatal signals. Returns an
+;;; error, without touching the screen, when stdin/stdout is not a terminal.
+(defn app-run [(app (dyn App)) (options AppOptions) (a (dyn Allocator))] (-> (Result i64
+                                                                                     TermError))
+  (when (<= (.tick-ms options) 0)
+    (fatal "app-run: tick-ms must be positive"))
+  (match (term-enter! (.term options))
+    (Err [e] (Err e))
+    (Ok [_]
+        (let [size (term-size)
+              next (primitive/alloc-stack Canvas)
+              prev (primitive/alloc-stack Canvas)
+              (mut out) (al-new [u8] a)
+              (mut reader) (key-reader-new a)
+              (mut arena) (zeroed scratch/ScratchArena)
+              (mut frame) (zeroed Frame)
+              (mut next-tick) (+ (app--now) (.tick-ms options))]
+          (set! next (canvas-new a (.width size) (.height size)))
+          (set! prev (canvas-new a (.width size) (.height size)))
+          (scratch/scratch-init (mut arena) a)
+          (set! (.canvas frame) next)
+          (set! (.scratch frame) (scratch/scratch-allocator (mut arena)))
+          (set! (.tick frame) 0)
+          (set! (.color-mode frame) (.color-mode options))
+          (app--present! app (mut frame) prev (mut out) (mut arena))
+          (loop (let [wait
+                        (let [left (- (load next-tick) (app--now))]
+                          (if (< left 0) 0 left))
+                      key (read-key! (mut reader) wait)
+                      flow
+                        (match key
+                          (NoKey [] (Continue))
+                          (Eof [] (Quit))
+                          (Resize [w h]
+                                  (do
+                                    (canvas-resize! next w h)
+                                    (canvas-resize! prev w h)
+                                    (app-event app (ResizeEvent w h))))
+                          (_ (if (and (.suspend-on-ctrl-z options)
+                                      (app--ctrl-z? key))
+                                 (match (term-suspend!)
+                                   (Ok [_]
+                                       (let [now-size (term-size)]
+                                         (canvas-resize! next
+                                                         (.width now-size)
+                                                         (.height now-size))
+                                         (canvas-resize! prev
+                                                         (.width now-size)
+                                                         (.height now-size))
+                                         (Continue)))
+                                   (Err [e] (Quit)))
+                                 (app-event app (KeyEvent key)))))
+                      quit (match flow (Quit [] true) (Continue [] false))]
+                  (when quit (break))
+                  (let [now (app--now)
+                        ticked (>= now (load next-tick))
+                        tick-flow
+                          (if ticked
+                              (do
+                                (set! (.tick frame) (+ (.tick frame) 1))
+                                (set! next-tick
+                                      (let [due
+                                              (+ (load next-tick)
+                                                 (.tick-ms options))]
+                                        (if (< due now)
+                                            (+ now (.tick-ms options))
+                                            due)))
+                                (app-event app (TickEvent (.tick frame))))
+                              (Continue))]
+                    (when (match tick-flow (Quit [] true) (Continue [] false))
+                      (break))
+                    (app--present! app (mut frame) prev (mut out) (mut arena)))))
+          (term-leave!)
+          (scratch/scratch-close! (mut arena))
+          (key-reader-free! (mut reader))
+          (al-free! (mut out))
+          (canvas-free! next)
+          (canvas-free! prev)
+          (Ok 0)))))
+
+;;; Draw one frame of `app` into a fresh `width` x `height` canvas and return it
+;;; as plain text (see `render-plain`). No terminal is involved: use it for
+;;; snapshot tests of a whole screen. `a` also serves as the frame's scratch
+;;; allocator, so pass an arena you release afterwards.
+(defn app-snapshot [(app (dyn App))
+                    (width i64)
+                    (height i64)
+                    (tick i64)
+                    (a (dyn Allocator))] (-> (slice u8))
+  (let [canvas (primitive/alloc-stack Canvas)
+        (mut frame) (zeroed Frame)]
+    (set! canvas (canvas-new a width height))
+    (set! (.canvas frame) canvas)
+    (set! (.scratch frame) a)
+    (set! (.tick frame) tick)
+    (set! (.color-mode frame) (NoColor))
+    (app-draw app (mut frame))
+    (let [text (render-plain a canvas)]
+      (canvas-free! canvas)
+      text)))

@@ -1,0 +1,42 @@
+(module agent_tools.readme-test)
+(import "coil.alloc" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.bundle" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.shell" :use *)
+(import "agent_tools.workspace" :use *)
+(import "agent_tools.test-support" :use *)
+
+;;; The README's quick start, verbatim.
+(defn tools-for-run [(a (dyn Allocator)) (root (slice u8))] (-> (Result StandardTools (slice u8)))
+  (match (workspace-open a root)
+    (Err [message] (Err message))
+    (Ok [workspace]
+        (match (workspace-sandbox-options a workspace false)
+          (Err [message] (Err message))
+          (Ok [options]
+              (let [policy (sandbox-detect a options)]
+                (match policy
+                  (NoSandbox [] (Err "isolation = sandbox, but neither sandbox-exec nor bwrap is available"))
+                  (_ (standard-tools a workspace policy ["files" "shell"])))))))))
+
+(deftest readme-quick-start-and-gate
+  (let [a (malloc-allocator)
+        dir (temp-dir a "readme")]
+    (match (tools-for-run a dir)
+      (Err [m] (do (println "{}" m) (assert false)))
+      (Ok [built]
+          (let [(mut tools) built]
+            (assert-eq (registry-count (mut (.registry tools))) 6)
+            (standard-tools-free! (mut tools)))))
+    (match (workspace-open a dir)
+      (Err [m] (assert false))
+      (Ok [workspace]
+          (match (run-command a workspace (sandbox-detect a (sandbox-options false)) "exit 4" 600000
+                              (box! a NeverCancelled (NeverCancelled :unused 0)))
+            (Err [message] (assert false))
+            (Ok [finished]
+                (let [result finished]
+                  (assert (not (and (= (.exit-code result) 0) (not (.timed-out result)))))
+                  (assert-eq (.exit-code result) 4))))))
+    (remove-tree a dir)))

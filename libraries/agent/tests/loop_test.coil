@@ -1,0 +1,217 @@
+(module agent.loop-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.chat" :as chat)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+
+;; A model that plays back canned responses and records what it was sent.
+(defstruct Script
+  [(replies (ArrayList (slice u8)))
+   (next i64)
+   (seen (ArrayList (slice u8)))
+   (failures-first i64)])
+
+(impl chat/ChatProvider Script
+  (complete [(self (ptr Script)) (a (dyn Allocator)) (request chat/ChatRequest)]
+            (-> chat/ChatResult)
+            (if (> (.failures-first self) 0)
+                (do (set! (.failures-first self) (- (.failures-first self) 1))
+                    (chat/ChatFailed (chat/chat-error "provider" 503 "overloaded")))
+                (let [body (get (.replies self) (.next self))
+                      root (match (jv-parse a body)
+                             (Some [v] v)
+                             (None [] (JNull)))
+                      message (jv-get (jv-nth (jv-get root "choices") 0) "message")
+                      (mut response) (primitive/zeroed chat/ChatResponse)]
+                  (push! [(slice u8)] (mut (.seen self)) (jv-encode (malloc-allocator) (.messages request)))
+                  (set! (.next self) (+ (.next self) 1))
+                  (set! (.text response) (jv-string-or (jv-get message "content") ""))
+                  (set! (.tool-calls response) (jv-get message "tool_calls"))
+                  (set! (.input-tokens response) 10)
+                  (set! (.output-tokens response) 5)
+                  (set! (.raw response) root)
+                  (chat/ChatOk (load response))))))
+
+(defstruct Echo [(runs i64)])
+
+(impl Tool Echo
+  (tool-spec [(self (ptr Echo))] (-> ToolSpec)
+    (ToolSpec :name "echo"
+              :description "Echo text back"
+              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"))
+  (tool-summary [(self (ptr Echo)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (call-string call "text"))
+  (tool-run [(self (ptr Echo)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (do (set! (.runs self) (+ (.runs self) 1))
+        (ToolOk (call-string call "text")))))
+
+(defstruct Finish [(unused u8)])
+
+(impl Tool Finish
+  (tool-spec [(self (ptr Finish))] (-> ToolSpec)
+    (ToolSpec :name "finish"
+              :description "Finish"
+              :parameters "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"]}"))
+  (tool-summary [(self (ptr Finish)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "finish")
+  (tool-run [(self (ptr Finish)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (ToolOk "recorded")))
+
+;; Records event kinds as a compact trace, e.g. "turn,tool:echo,ended:ok,".
+(defstruct Trace [(text StrBuf) (retries i64)])
+
+(impl AgentObserver Trace
+  (observe [(self (ptr Trace)) (event AgentEvent)] (-> i64)
+    (match event
+      (TurnStarted [turn] (sb-push-str! (mut (.text self)) "turn,"))
+      (MessageDelivered [delivered]
+                        (let [message delivered]
+                            (sb-push-str! (mut (.text self)) "msg:")
+                            (sb-push-str! (mut (.text self)) (.text message))
+                            (sb-push-str! (mut (.text self)) ",")))
+      (Thought [text] (sb-push-str! (mut (.text self)) "thought,"))
+      (Said [text] (do (sb-push-str! (mut (.text self)) "said:")
+                       (sb-push-str! (mut (.text self)) text)
+                       (sb-push-str! (mut (.text self)) ",")))
+      (UsageReported [i o] 0)
+      (ToolStarted [call summary]
+                   (do (sb-push-str! (mut (.text self)) "tool:")
+                       (sb-push-str! (mut (.text self)) summary)
+                       (sb-push-str! (mut (.text self)) ",")))
+      (ToolEnded [call summary ok output ms]
+                 (sb-push-str! (mut (.text self)) (if ok "ok," "err,")))
+      (ModelRetrying [attempt error delay] (do (set! (.retries self) (+ (.retries self) 1)) 0))
+      (PausedEvent [] (sb-push-str! (mut (.text self)) "paused,"))
+      (ResumedEvent [] (sb-push-str! (mut (.text self)) "resumed,"))
+      (Compacted [n bytes] (sb-push-str! (mut (.text self)) "compacted,")))))
+
+;; Delivers one queued message on the first inbox check.
+(defstruct Desk [(pending (slice u8)) (checks i64) (cancel-after i64)])
+
+(impl AgentControl Desk
+  (control-check [(self (ptr Desk))] (-> Control)
+    (do (set! (.checks self) (+ (.checks self) 1))
+        (if (and (> (.cancel-after self) 0) (> (.checks self) (.cancel-after self)))
+            (Cancel)
+            (Proceed))))
+  (control-inbox [(self (ptr Desk)) (a (dyn Allocator))] (-> (ArrayList Inbound))
+    (let [(mut out) (al-new [Inbound] a)]
+      (when (> (len (.pending self)) 0)
+        (push! [Inbound] (mut out) (Inbound :from "operator" :text (.pending self) :ref 7))
+        (set! (.pending self) "")
+        0)
+      (load out)))
+  (control-idle [(self (ptr Desk))] (-> i64) 0))
+
+(defn script [(a (dyn Allocator)) (replies (slice (slice u8)))] (-> (ptr Script))
+  (let [s (box! a Script (primitive/zeroed Script))]
+    (set! (.replies s) (al-new [(slice u8)] a))
+    (set! (.seen s) (al-new [(slice u8)] a))
+    (for r (iter replies) (push! [(slice u8)] (mut (.replies s)) r))
+    s))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(deftest runs-tools-delivers-messages-and-stops-at-the-stop-tool
+  (let [a (malloc-allocator)
+        model (script a ["{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Looking.\",\"reasoning_content\":\"hmm\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}}]}"
+                         "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"wrong\\\":1}\"}},{\"id\":\"c3\",\"type\":\"function\",\"function\":{\"name\":\"finish\",\"arguments\":\"{\\\"summary\\\":\\\"done it\\\"}\"}}]}}]}"])
+        echo (box! a Echo (Echo :runs 0))
+        finish (box! a Finish (Finish :unused 0))
+        (mut tools) (registry-new a)
+        trace (box! a Trace (Trace :text (sb-new a) :retries 0))
+        desk (box! a Desk (Desk :pending "" :checks 0 :cancel-after 0))]
+    (registry-add! (mut tools) echo)
+    (registry-add! (mut tools) finish)
+    (let [(mut agent) (agent-new a model (agent-config "test-model" "finish") (mut tools) trace desk)]
+      (agent-add-system! (mut agent) "You are a test.")
+      (agent-add-user! (mut agent) "Say hi.")
+      (set! (.pending desk) "use lowercase")
+      (match (agent-run! (mut agent))
+        (Finished [call result]
+                  (do (assert (= (call-string call "summary") "done it"))
+                      (assert (= result "recorded"))))
+        (_ (assert false)))
+      (assert-eq (.runs echo) 1)
+      (assert-eq (.input-tokens agent) 20)
+      (let [trace-text (sb-str (.text trace))]
+        (assert (= trace-text
+                   "msg:use lowercase,turn,thought,said:Looking.,tool:hi,ok,turn,tool:,err,tool:finish,ok,")))
+      ;; The second request carried the reasoning, the tool result, and the operator message.
+      (let [second (get (.seen model) 1)]
+        (assert (contains? second "reasoning_content"))
+        (assert (contains? second "[operator] use lowercase"))
+        (assert (contains? second "\"tool_call_id\":\"c1\"")))
+      ;; Invalid arguments were reported to the model rather than executed.
+      (let [transcript (agent-transcript-json (mut agent) a)]
+        (assert (contains? transcript "invalid arguments at $"))))))
+
+(deftest replies-without-tools-and-restores-a-transcript
+  (let [a (malloc-allocator)
+        model (script a ["{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Just an answer.\"}}]}"])
+        (mut tools) (registry-new a)
+        trace (box! a Trace (Trace :text (sb-new a) :retries 0))
+        desk (box! a Desk (Desk :pending "" :checks 0 :cancel-after 0))
+        (mut agent) (agent-new a model (agent-config "m" "") (mut tools) trace desk)]
+    (assert (agent-restore! (mut agent) "[{\"role\":\"user\",\"content\":\"earlier\"}]"))
+    (assert (not (agent-restore! (mut agent) "{\"not\":\"an array\"}")))
+    (agent-add-user! (mut agent) "now")
+    (match (agent-run! (mut agent))
+      (Replied [text] (assert (= text "Just an answer.")))
+      (_ (assert false)))
+    (assert-eq (agent-message-count (mut agent)) 3)))
+
+(deftest retries-transient-failures-then-cancels
+  (let [a (malloc-allocator)
+        model (script a ["{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"])
+        (mut tools) (registry-new a)
+        trace (box! a Trace (Trace :text (sb-new a) :retries 0))
+        desk (box! a Desk (Desk :pending "" :checks 0 :cancel-after 0))
+        (mut agent) (agent-new a model (agent-config "m" "") (mut tools) trace desk)]
+    (set! (.failures-first model) 1)
+    (agent-add-user! (mut agent) "hello")
+    (match (agent-run! (mut agent))
+      (Replied [text] (assert (= text "ok")))
+      (_ (assert false)))
+    (assert-eq (.retries trace) 1)
+    ;; A cancel during the retry wait ends the run.
+    (set! (.failures-first model) 5)
+    (set! (.cancel-after desk) (+ (.checks desk) 2))
+    (match (agent-run! (mut agent))
+      (Cancelled [] 0)
+      (_ (assert false)))))
+
+(deftest compaction-elides-old-tool-output-but-keeps-recent-and-user-text
+  (let [a (malloc-allocator)
+        model (script a ["{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"])
+        (mut tools) (registry-new a)
+        trace (box! a Trace (Trace :text (sb-new a) :retries 0))
+        desk (box! a Desk (Desk :pending "" :checks 0 :cancel-after 0))
+        (mut config) (agent-config "m" "")
+        (mut big) (sb-new a)]
+    (for i (range 0 3000) (sb-push-str! (mut big) "0123456789"))
+    (set! (.context-budget-bytes config) 50000)
+    (set! (.keep-recent config) 2)
+    (let [(mut agent) (agent-new a model (load config) (mut tools) trace desk)
+          output (sb-finish! (mut big))]
+      (agent-add-system! (mut agent) "system prompt")
+      (agent-add-user! (mut agent) output)
+      (for i (range 0 4)
+        (jv-push! (.messages agent) (tool-result-message a "c" output)))
+      (assert (> (compact-transcript! (mut agent)) 0))
+      ;; The user's text is never touched; the newest tool output survives whole.
+      (assert-eq (len (jv-string-or (jv-get (jv-nth (.messages agent) 1) "content") "")) 30000)
+      (assert-eq (len (jv-string-or (jv-get (jv-nth (.messages agent) 5) "content") "")) 30000)
+      (let [old (jv-string-or (jv-get (jv-nth (.messages agent) 2) "content") "")]
+        (assert (< (len old) 1000))
+        (assert (contains? old "elided")))
+      ;; Protected: the system prompt, the user text, and the two newest messages.
+      (assert (< (len (jv-string-or (jv-get (jv-nth (.messages agent) 3) "content") "")) 1000))
+      (assert-eq (len (jv-string-or (jv-get (jv-nth (.messages agent) 4) "content") "")) 30000)
+      (assert (<= (text-bytes (.messages agent)) 92000)))))

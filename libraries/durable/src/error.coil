@@ -1,0 +1,71 @@
+(module durable.error)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.os" :as os)
+(import "coil.str" :use *)
+(import "durable.sys" :use *)
+
+;;; Every fallible `durable` operation returns `(Result T DurableError)`.
+;;;
+;;; - `Os`: a system call failed. `op` names the call (a static string such as
+;;;   "open" or "flock") and `code` is the positive errno captured right after it.
+;;; - `Invalid`: the caller passed an argument the operation refuses, such as a
+;;;   journal line containing a newline or a path containing a NUL byte.
+;;; - `BadCursor`: a journal read offset is negative, past the end of the file, or
+;;;   not on a record boundary.
+;;; - `Corrupt`: on-disk content does not have the expected shape (for example a
+;;;   pid file that does not hold a decimal pid).
+;;; - `OutOfMemory`: the supplied allocator failed.
+;;;
+;;; All `(slice u8)` payloads are static strings; an error never owns memory.
+(defsum DurableError
+  (Os [(op (slice u8)) (code i64)])
+  (Invalid [(reason (slice u8))])
+  (BadCursor [(offset i64) (reason (slice u8))])
+  (Corrupt [(reason (slice u8))])
+  (OutOfMemory))
+
+;;; An `Os` error for `op`, reading errno immediately. Call it directly after the
+;;; failing system call, before anything else can overwrite errno.
+(defn os-error [(op (slice u8))] (-> DurableError)
+  (Os op (os/os-errno)))
+
+;;; The errno carried by an `Os` error, or `None` for every other variant.
+(defn error-os-code [(err DurableError)] (-> (Option i64))
+  (match err
+    (Os [op code] (Some code))
+    (_ (None))))
+
+;;; The C library's description of an errno value, borrowed from static storage.
+(defn errno-text [(code i64)] (-> (slice u8))
+  (cstr->str (strerror (cast i32 code))))
+
+;;; Render a one-line description of `err` into bytes owned by `a` (release them with
+;;; `(free-bytes a text 1)`, or allocate from an arena).
+(defn error-describe [(a (dyn Allocator)) (err DurableError)] (-> (slice u8))
+  (let [(mut sb) (sb-new a)]
+    (match err
+      (Os [op code]
+          (do
+            (sb-push-str! (mut sb) op)
+            (sb-push-str! (mut sb) " failed: ")
+            (sb-push-str! (mut sb) (errno-text code))
+            (sb-push-str! (mut sb) " (errno ")
+            (sb-push-i64! (mut sb) code)
+            (sb-push-str! (mut sb) ")")))
+      (Invalid [reason]
+               (do
+                 (sb-push-str! (mut sb) "invalid argument: ")
+                 (sb-push-str! (mut sb) reason)))
+      (BadCursor [offset reason]
+                 (do
+                   (sb-push-str! (mut sb) "bad journal cursor ")
+                   (sb-push-i64! (mut sb) offset)
+                   (sb-push-str! (mut sb) ": ")
+                   (sb-push-str! (mut sb) reason)))
+      (Corrupt [reason]
+               (do
+                 (sb-push-str! (mut sb) "corrupt data: ")
+                 (sb-push-str! (mut sb) reason)))
+      (OutOfMemory [] (sb-push-str! (mut sb) "out of memory")))
+    (sb-finish! (mut sb))))

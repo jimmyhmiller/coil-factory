@@ -1,0 +1,110 @@
+(module durable.sys)
+(import "coil.primitive" :as primitive)
+
+;; The single home of every libc declaration the durable package adds. Coil does not
+;; deduplicate `extern` declarations across modules, so each symbol is declared here
+;; exactly once and the other modules `:use` it. Symbols the bundled library already
+;; declares (`open`/`close`/`kill`/`getpid` in coil.os, `read`/`write` in coil.io,
+;; `readdir`/`closedir`/`rename`/`ftruncate` in coil.fs) are used from there.
+(extern flock :cc c [i32 i32] (-> i32))
+
+(extern pread :cc c [i32 (ptr i8) i64 i64] (-> i64))
+
+(extern lseek :cc c [i32 i64 i32] (-> i64))
+
+(extern fsync :cc c [i32] (-> i32))
+
+
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+(extern openat :cc c [i32 (ptr i8) i32 ...] (-> i32))
+
+(extern unlinkat :cc c [i32 (ptr i8) i32] (-> i32))
+
+(extern fdopendir :cc c [i32] (-> (ptr i8)))
+
+(extern dup :cc c [i32] (-> i32))
+
+(extern getentropy :cc c [(ptr i8) i64] (-> i32))
+
+(extern strerror :cc c [i32] (-> (ptr i8)))
+
+;; Used by the test suites to build symbolic-link fixtures.
+(extern symlink :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+;;; Choose a platform spelling at compile time. The generic Linux column covers
+;;; x86_64 and the asm-generic architectures; 32- and 64-bit ARM Linux use their own
+;;; values for a few open(2) flags. Any other target OS is a compile error rather than
+;;; a guess.
+(defn sys-pick [(linux Code) (linux-arm Code) (darwin Code)] (-> Code)
+  (cond (= (primitive/target-os) `darwin) darwin
+        (= (primitive/target-os) `linux)
+          (if (or (= (primitive/target-arch) `aarch64)
+                  (= (primitive/target-arch) `arm))
+              linux-arm
+              linux)
+        :else
+          (primitive/error "durable: unsupported target OS (only linux and darwin are implemented)")))
+
+;;; hygiene: these constants are referenced by hand in the other durable modules, so
+;;; the generator publishes their bare names.
+(defn sys--public [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
+
+(defn sys-constants [] (-> Code)
+  `(do
+     ;; open(2)
+     (const ~(sys--public `SYS-O-RDONLY) 0)
+     (const ~(sys--public `SYS-O-WRONLY) 1)
+     (const ~(sys--public `SYS-O-RDWR) 2)
+     (const ~(sys--public `SYS-O-APPEND) ~(sys-pick `1024 `1024 `8))
+     (const ~(sys--public `SYS-O-CREAT) ~(sys-pick `64 `64 `512))
+     (const ~(sys--public `SYS-O-EXCL) ~(sys-pick `128 `128 `2048))
+     (const ~(sys--public `SYS-O-CLOEXEC) ~(sys-pick `524288 `524288 `16777216))
+     (const ~(sys--public `SYS-O-DIRECTORY) ~(sys-pick `65536 `16384 `1048576))
+     (const ~(sys--public `SYS-O-NOFOLLOW) ~(sys-pick `131072 `32768 `256))
+     ;; *at(2)
+     (const ~(sys--public `SYS-AT-FDCWD) ~(sys-pick `-100 `-100 `-2))
+     (const ~(sys--public `SYS-AT-REMOVEDIR) ~(sys-pick `512 `512 `128))
+     ;; errno
+     (const ~(sys--public `SYS-EPERM) 1)
+     (const ~(sys--public `SYS-ENOENT) 2)
+     (const ~(sys--public `SYS-ESRCH) 3)
+     (const ~(sys--public `SYS-EINTR) 4)
+     (const ~(sys--public `SYS-EACCES) 13)
+     (const ~(sys--public `SYS-EEXIST) 17)
+     (const ~(sys--public `SYS-ENOTDIR) 20)
+     (const ~(sys--public `SYS-EISDIR) 21)
+     (const ~(sys--public `SYS-EWOULDBLOCK) ~(sys-pick `11 `11 `35))
+     (const ~(sys--public `SYS-ELOOP) ~(sys-pick `40 `40 `62))))
+
+(meta (sys-constants))
+
+;; flock(2) and lseek(2) values are identical on every supported platform.
+(const SYS-LOCK-SH 1)
+
+(const SYS-LOCK-EX 2)
+
+(const SYS-LOCK-NB 4)
+
+(const SYS-LOCK-UN 8)
+
+(const SYS-SEEK-SET 0)
+
+(const SYS-SEEK-END 2)
+
+(extern rewinddir :cc c [(ptr i8)] (-> void))
+
+;;; The thread's errno cell, needed to tell readdir(3)'s end-of-directory from its
+;;; failure (both return NULL). The accessor's symbol differs by platform, so the
+;;; declaration is generated for the target being compiled for.
+(defn sys-errno-extern [] (-> Code)
+  `(extern ~(sys--public `sys-errno-location)
+           :as
+           ~(sys-pick `"__errno_location" `"__errno_location" `"__error")
+           :cc
+           c
+           []
+           (-> (ptr i32))))
+
+(meta (sys-errno-extern))

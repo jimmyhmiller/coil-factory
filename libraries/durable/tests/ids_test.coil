@@ -1,0 +1,63 @@
+(module durable.ids-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.error" :use *)
+(import "durable.ids" :use *)
+(import "durable.test-support" :use *)
+
+(defn all-hex? [(s (slice u8))] (-> bool)
+  (let [(mut ok) true
+        (mut i) 0]
+    (loop (if (>= (load i) (len s))
+              (break)
+              (let [c (cast i64 (get s (load i)))]
+                (when (not (or (and (>= c 48) (<= c 57))
+                               (and (>= c 97) (<= c 102))))
+                  (set! ok false)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load ok)))
+
+(deftest random-hex-has-the-requested-length-and-varies
+         (let [a (malloc-allocator)
+               x (expect-ok a "random-hex" (random-hex a 16))
+               y (expect-ok a "random-hex" (random-hex a 16))
+               big (expect-ok a "random-hex" (random-hex a 1000))]
+           (assert-eq (len x) 32)
+           (assert (all-hex? x))
+           (assert (not (= x y)))
+           (assert-eq (len big) 2000)
+           (assert (all-hex? big))
+           (assert (match (random-hex a 0)
+                     (Err [e] true)
+                     (Ok [v] false)))))
+
+(deftest time-ids-encode-the-timestamp-and-sort
+         (let [a (malloc-allocator)
+               zero (expect-ok a "time-id-at" (time-id-at a 0))
+               one (expect-ok a "time-id-at" (time-id-at a 1))
+               radix (expect-ok a "time-id-at" (time-id-at a 36))
+               known (expect-ok a "time-id-at" (time-id-at a 1700000000000))
+               later (expect-ok a "time-id-at" (time-id-at a 1700000000001))]
+           (assert-eq (len zero) 18)
+           (assert (= (subslice [u8] zero 0 10) "000000000-"))
+           (assert (all-hex? (subslice [u8] zero 10 18)))
+           (assert (= (subslice [u8] one 0 9) "000000001"))
+           (assert (= (subslice [u8] radix 0 9) "000000010"))
+           ;; 1700000000000 is loyw3v28 in base 36 (digits 21 24 34 32 3 31 2 8)
+           (assert (= (subslice [u8] known 0 9) "0loyw3v28"))
+           (assert (< (str-cmp known later) 0))
+           (assert (< (str-cmp zero one) 0))
+           (assert (match (time-id-at a -5)
+                     (Err [e] true)
+                     (Ok [v] false)))))
+
+(deftest now-ms-is-the-current-epoch-time
+         (let [a (malloc-allocator)
+               t (now-ms)
+               id (expect-ok a "time-id" (time-id a))]
+           (assert (> t 1700000000000))
+           (assert (< t 4102444800000))
+           (assert-eq (len id) 18)))

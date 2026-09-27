@@ -1,0 +1,97 @@
+(module factory.models)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.chat" :as chat)
+(import "ai.openai" :as openai)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+
+;;; Models are named `provider/model` and resolved on the site that runs the
+;;; agent, with that site's keys. Built-in providers:
+;;;
+;;;     deepseek/…     https://api.deepseek.com          DEEPSEEK_API_KEY
+;;;     openrouter/…   https://openrouter.ai/api/v1      OPENROUTER_API_KEY
+;;;     openai/…       https://api.openai.com/v1         OPENAI_API_KEY
+;;;     vercel/…       https://ai-gateway.vercel.sh/v1   VERCEL_AI_GATEWAY_KEY
+;;;     zen/…          https://opencode.ai/zen/v1       OPENCODE_KEY
+;;;
+;;; plus any OpenAI-compatible server declared in site.json `providers`.
+
+(defstruct ResolvedModel
+  [(provider (dyn chat/ChatProvider))
+   (model (slice u8))
+   (label (slice u8))])
+
+(defsum ModelResult
+  (ModelOk [(resolved ResolvedModel)])
+  (ModelBad [(message (slice u8))]))
+
+(defstruct Endpoint [(url (slice u8)) (key-env (slice u8)) (found bool)])
+
+(defn builtin-endpoint [(provider (slice u8))] (-> Endpoint)
+  (cond (= provider "deepseek")
+          (Endpoint :url "https://api.deepseek.com/chat/completions" :key-env "DEEPSEEK_API_KEY" :found true)
+        (= provider "openrouter")
+          (Endpoint :url "https://openrouter.ai/api/v1/chat/completions" :key-env "OPENROUTER_API_KEY,OPEN_ROUTER_KEY" :found true)
+        (= provider "openai")
+          (Endpoint :url "https://api.openai.com/v1/chat/completions" :key-env "OPENAI_API_KEY" :found true)
+        (= provider "vercel")
+          (Endpoint :url "https://ai-gateway.vercel.sh/v1/chat/completions" :key-env "VERCEL_AI_GATEWAY_KEY" :found true)
+        (= provider "zen")
+          (Endpoint :url "https://opencode.ai/zen/v1/chat/completions" :key-env "OPENCODE_KEY" :found true)
+        :else (Endpoint :url "" :key-env "" :found false)))
+
+(defn declared-endpoint [(config (ptr SiteConfig)) (provider (slice u8))] (-> Endpoint)
+  (let [(mut result) (Endpoint :url "" :key-env "" :found false)]
+    (for decl (iter (.providers config))
+      (let [d decl]
+        (when (= (.name d) provider)
+          (set! result (Endpoint :url (.base-url d) :key-env (.key-env d) :found true))
+          0)))
+    (load result)))
+
+(defn message [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn resolve-model [(a (dyn Allocator)) (config (ptr SiteConfig)) (name (slice u8))] (-> ModelResult)
+  (match (str-find name "/")
+    (None [] (ModelBad (message a ["model \"" name "\" must be written provider/model, for example deepseek/deepseek-v4-flash"])))
+    (Some [slash]
+          (let [provider (subslice [u8] name 0 slash)
+                model (subslice [u8] name (+ slash 1) (len name))
+                declared (declared-endpoint config provider)
+                builtin (builtin-endpoint provider)
+                endpoint (if (.found declared) (load declared) (load builtin))]
+            (cond (not (.found endpoint))
+                    (ModelBad (message a ["unknown model provider \"" provider "\"; built in: deepseek, openrouter, openai, vercel, zen; or declare it in site.json providers"]))
+                  (= (len model) 0)
+                    (ModelBad (message a ["model \"" name "\" has no model name after the provider"]))
+                  :else
+                    (let [key (if (> (len (.key-env endpoint)) 0)
+                                  (first-secret a (.home config) (.key-env endpoint))
+                                  "none")]
+                      (if (= (len key) 0)
+                          (ModelBad (message a [(.key-env endpoint) " is not set on this site (environment or secrets.env)"]))
+                          (let [transport (box! a openai/NativeChatHttp (primitive/zeroed openai/NativeChatHttp))
+                                chat-provider (box! a openai/OpenAiChat (primitive/zeroed openai/OpenAiChat))]
+                            (set! (.url chat-provider) (copy-bytes a (.url endpoint)))
+                            (set! (.api-key chat-provider) key)
+                            (set! (.transport chat-provider) transport)
+                            (ModelOk (ResolvedModel :provider chat-provider
+                                                    :model (copy-bytes a model)
+                                                    :label (copy-bytes a name)))))))))))
+
+;;; The first of several comma-separated secret names that is set, so a
+;;; provider can accept the conventional name and common alternatives.
+(defn first-secret [(a (dyn Allocator)) (home (slice u8)) (names (slice u8))] (-> (slice u8))
+  (let [(mut found) ""]
+    (for name (iter (str-split a names ","))
+      (when (= (len (load found)) 0)
+        (set! found (secret a home (str-trim name)))
+        0))
+    (load found)))

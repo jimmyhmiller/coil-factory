@@ -1,0 +1,13 @@
+[package]
+name = "agent-tools"
+source-roots = ["src", "tests"]
+
+[dependencies]
+agent = { path = "../agent" }
+# Used only by the tests, to prove every tool schema is accepted by the
+# validator the agent loop runs.
+json_schema = { path = "../json-schema" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

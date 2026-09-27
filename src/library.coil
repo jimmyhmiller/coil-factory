@@ -1,0 +1,120 @@
+(module factory.library)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+
+;;; Where factories come from. A name resolves, in order, to a factory in the
+;;; site's library (`~/.factory/factories/NAME.md`) and then to one bundled in
+;;; this executable. Anything containing a `/` or ending in `.md` is a path.
+
+(const BUNDLED-FEATURE (include-str "../factories/feature.md"))
+(const BUNDLED-FIX (include-str "../factories/fix.md"))
+(const BUNDLED-BUILD-COIL (include-str "../factories/build-coil-program.md"))
+(const BUNDLED-HAIKU (include-str "../factories/haiku.md"))
+
+(defstruct Bundled [(name (slice u8)) (text (slice u8))])
+
+(defn bundled-factories [] (-> (array Bundled 4))
+  [(Bundled :name "feature" :text BUNDLED-FEATURE)
+   (Bundled :name "fix" :text BUNDLED-FIX)
+   (Bundled :name "build-coil-program" :text BUNDLED-BUILD-COIL)
+   (Bundled :name "haiku" :text BUNDLED-HAIKU)])
+
+(defstruct CatalogEntry
+  [(name (slice u8))
+   ;;; "library" or "bundled"
+   (origin (slice u8))
+   (path (slice u8))
+   (text (slice u8))])
+
+(defn path-like? [(reference (slice u8))] (-> bool)
+  (or (match (str-find reference "/") (Some [at] true) (None [] false))
+      (and (> (len reference) 3)
+           (= (subslice [u8] reference (- (len reference) 3) (len reference)) ".md"))))
+
+(defn library-file [(a (dyn Allocator)) (home (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut file) (sb-new a)]
+    (sb-push-str! (mut file) name)
+    (sb-push-str! (mut file) ".md")
+    (path-join a (factories-dir a home) (sb-finish! (mut file)))))
+
+(defsum Resolved
+  (Found [(entry CatalogEntry)])
+  (NotFound [(message (slice u8))]))
+
+(defn resolve-factory [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
+  (if (path-like? reference)
+      (match (atomic/read-file-if-exists a reference)
+        (Ok [found] (match found
+                      (Some [text] (Found (CatalogEntry :name reference :origin "file" :path reference :text text)))
+                      (None [] (NotFound (join a ["no factory file at " reference])))))
+        (Err [failure] (NotFound (join a ["cannot read " reference]))))
+      (let [path (library-file a home reference)]
+        (match (atomic/read-file-if-exists a path)
+          (Ok [found]
+              (match found
+                (Some [text] (Found (CatalogEntry :name reference :origin "library" :path path :text text)))
+                (None []
+                      (let [(mut result) (NotFound (join a ["no factory named \"" reference "\"; `factory factories` lists them"]))]
+                        (for bundled (iter (bundled-factories))
+                          (let [b bundled]
+                            (when (= (.name b) reference)
+                              (set! result (Found (CatalogEntry :name reference :origin "bundled" :path "" :text (.text b))))
+                              0)))
+                        (load result)))))
+          (Err [failure] (NotFound (join a ["cannot read " path])))))))
+
+;;; Every factory available by name: the library, then bundled ones it does
+;;; not shadow.
+(defn list-factories [(a (dyn Allocator)) (home (slice u8))] (-> (ArrayList CatalogEntry))
+  (let [(mut out) (al-new [CatalogEntry] a)
+        dir (factories-dir a home)]
+    (match (atomic/list-dir a dir)
+      (Err [failure] 0)
+      (Ok [names]
+          (do (for file (iter names)
+                (when (and (> (len file) 3)
+                           (= (subslice [u8] file (- (len file) 3) (len file)) ".md"))
+                  (let [name (subslice [u8] file 0 (- (len file) 3))
+                        path (path-join a dir file)]
+                    (match (atomic/read-file-if-exists a path)
+                      (Ok [found] (match found
+                                    (Some [text] (push! [CatalogEntry] (mut out)
+                                                        (CatalogEntry :name name :origin "library" :path path :text text)))
+                                    (None [] 0)))
+                      (Err [failure] 0))
+                    0)
+                  0))
+              0)))
+    (for bundled (iter (bundled-factories))
+      (let [b bundled
+            (mut shadowed) false]
+        (for existing (iter out)
+          (let [e existing]
+            (when (= (.name e) (.name b)) (set! shadowed true) 0)))
+        (when (not (load shadowed))
+          (push! [CatalogEntry] (mut out) (CatalogEntry :name (.name b) :origin "bundled" :path "" :text (.text b)))
+          0)))
+    (load out)))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+;; ---------------------------------------------------------------------------
+;; Skills for Claude Code, bundled so `factory skills install` needs no checkout.
+
+(const SKILL-DESIGN (include-str "../skills/factory-design/SKILL.md"))
+(const SKILL-OPERATE (include-str "../skills/factory-operate/SKILL.md"))
+(const SKILL-SITES (include-str "../skills/factory-sites/SKILL.md"))
+
+(defn bundled-skills [] (-> (array Bundled 3))
+  [(Bundled :name "factory-design" :text SKILL-DESIGN)
+   (Bundled :name "factory-operate" :text SKILL-OPERATE)
+   (Bundled :name "factory-sites" :text SKILL-SITES)])

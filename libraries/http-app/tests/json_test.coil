@@ -1,0 +1,37 @@
+(module http-app-json-test)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "http_app.json" :use *)
+(import "http_app.router" :use *)
+
+(deftest json-error-has-the-documented-shape
+         (let [a (malloc-allocator)
+               reply (json-error a 404 "not_found" "no such run")]
+           (assert-eq (.status reply) 404)
+           (assert (= (.content-type reply) "application/json"))
+           (assert (= (.body reply)
+                      "{\"error\":{\"code\":\"not_found\",\"message\":\"no such run\"}}"))))
+
+(deftest json-strings-escape-quotes-controls-and-invalid-utf8
+         (let [a (malloc-allocator)]
+           (assert (= (json-quote a "say \"hi\"\\ok")
+                      "\"say \\\"hi\\\"\\\\ok\""))
+           (assert (= (json-quote a "a\nb\r\tc\x1;\x7f;")
+                      "\"a\\nb\\r\\tc\\u0001\x7f;\""))
+           (assert (= (json-quote a "wörld ✓ 😀") "\"wörld ✓ 😀\""))
+           (assert (= (json-error-body a "bad\"code" "line1\nline2")
+                      "{\"error\":{\"code\":\"bad\\\"code\",\"message\":\"line1\\nline2\"}}"))))
+
+(deftest json-strings-replace-malformed-utf8
+         (let [a (malloc-allocator)
+               bytes (primitive/alloc-stack (array u8 6))]
+           ;; "a", lone continuation 0x80, overlong 0xC0 0xAF, truncated 0xE2 0x82
+           (set! (index bytes 0) (cast u8 97))
+           (set! (index bytes 1) (cast u8 128))
+           (set! (index bytes 2) (cast u8 192))
+           (set! (index bytes 3) (cast u8 175))
+           (set! (index bytes 4) (cast u8 226))
+           (set! (index bytes 5) (cast u8 130))
+           (assert (= (json-quote a (slice-new [u8] (cast (ptr u8) bytes) 6))
+                      "\"a\\ufffd\\ufffd\\ufffd\\ufffd\\ufffd\""))))

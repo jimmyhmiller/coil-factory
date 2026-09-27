@@ -1,0 +1,397 @@
+(module factory.ui-views-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator malloc-allocator box!])
+(import "coil.slice" :use *)
+(import "coil.str" :use [sb-new sb-push-byte! sb-finish! str-find])
+(import "coil.arraylist" :use *)
+(import "tui.keys" :use *)
+(import "tui.app" :use [Quit Continue])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [jv-parse jv-encode jv-put!])
+(import "tui.app" :use [app-snapshot])
+(import "factory.client" :use [Hub])
+(import "factory.ui.store" :use *)
+(import "factory.ui.feed" :use *)
+(import "factory.ui.chat" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.dashboard" :use *)
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern tzset :cc c [] (-> void))
+
+;; Fixtures are written with ' for " to stay readable.
+(defn q [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break)
+              (let [b (get text (load i))]
+                (sb-push-byte! (mut out)
+                               (if (= (cast i64 b) #\') (cast u8 #\") b))
+                (set! i (+ (load i) 1)))))
+    (sb-finish! (mut out))))
+
+(defn doc [(a (dyn Allocator)) (text (slice u8))] (-> JVal)
+  (match (jv-parse a (q a text))
+    (Some [v] v)
+    (None [] (do (assert false) (JNull)))))
+
+(const NOW 1790476500000)
+
+(const OVERVIEW
+       "{'now': 1790476500000,
+    'sites': [{'name': 'ui', 'kind': 'local', 'status': 'up', 'max_runs': 4, 'running': 1, 'runs': 3}],
+    'runs': [
+      {'id': 'haiku-4695', 'factory': 'haiku', 'site': 'ui', 'status': 'running', 'current': 'critique',
+       'model': 'deepseek/deepseek-v4-flash', 'branch': 'factory/haiku-4695', 'brief': 'autumn rain on a tin roof', 'cursor': 9000,
+       'created': 1790476449080, 'started': 1790476449169, 'finished': 0, 'input_tokens': 18012, 'output_tokens': 2735,
+       'reason': '', 'verdict': 'on_track', 'verdict_reason': 'fine', 'verdict_t': 1790476464971,
+       'stations': [{'name': 'write', 'status': 'passed', 'attempts': 1, 'gate_failures': 0, 'summary': 'Wrote poem.md'},
+                    {'name': 'critique', 'status': 'running', 'attempts': 1, 'gate_failures': 0, 'summary': ''}],
+       'agents': [{'name': 'write', 'phase': 'done', 'activity': 'Wrote poem.md', 'activity_t': 1790476456072,
+                   'turns': 4, 'tool_calls': 4, 'tool_errors': 0, 'input_tokens': 7982, 'output_tokens': 852},
+                  {'name': 'critique', 'phase': 'tool', 'activity': '$ coil test', 'activity_t': 1790476497000,
+                   'turns': 5, 'tool_calls': 5, 'tool_errors': 1, 'input_tokens': 10030, 'output_tokens': 1883}],
+       'findings': [], 'pending_messages': []},
+      {'id': 'blocker-73c0', 'factory': 'blocker', 'site': 'ui', 'status': 'blocked', 'current': 'attempt',
+       'created': 1790476476302, 'started': 1790476476400, 'finished': 0, 'input_tokens': 5000, 'output_tokens': 700,
+       'reason': 'attempt is waiting for you: the gate keeps failing', 'verdict': 'stuck',
+       'verdict_reason': 'the gate cannot pass', 'verdict_t': 1790476490000,
+       'stations': [{'name': 'attempt', 'status': 'blocked', 'attempts': 1, 'gate_failures': 1, 'summary': 'Wrote note.md'}],
+       'agents': [{'name': 'attempt', 'phase': 'waiting', 'activity': 'gate failed', 'activity_t': 1790476480000,
+                   'turns': 3, 'tool_calls': 2, 'tool_errors': 0, 'input_tokens': 5000, 'output_tokens': 700}],
+       'findings': [{'t': 1790476485000, 'severity': 'warn', 'code': 'flailing', 'agent': 'attempt',
+                     'message': 'the gate failed on every attempt'}],
+       'pending_messages': []},
+      {'id': 'fix-11aa', 'factory': 'fix', 'site': 'ui', 'status': 'succeeded', 'current': '',
+       'created': 1790470000000, 'started': 1790470001000, 'finished': 1790471000000, 'input_tokens': 900000,
+       'output_tokens': 40000, 'reason': '', 'verdict': '', 'stations': [], 'agents': [], 'findings': [],
+       'pending_messages': []}]}")
+
+(defn dash-for-test [(a (dyn Allocator))] (-> (ptr Dash))
+  (let [d (box! a Dash (zeroed Dash))]
+    (setenv c"TZ" c"UTC" 1)
+    (tzset)
+    (dash-init! d a (Hub :base-url "http://127.0.0.1:1" :token ""))
+    (set! (.now d) NOW)
+    d))
+
+(deftest overview-shows-sites-runs-and-the-overseer
+         (let [a (malloc-allocator)
+               d (dash-for-test a)]
+           (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
+           (sync-selection! d)
+           (let [screen (app-snapshot d 120 16 0 a)]
+             (assert (= screen
+
+                        " ◆ factory  ·  1 site  ·  1 running  ·   1 NEEDS YOU                                                              02:35
+ ● ui local 1/4 running
+╭─ Runs ───────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  STATUS       RUN               FACTORY   SITE      STATION         ACTIVITY                            TOKENS   AGE │
+│▎ ⠋ running    haiku-4695        haiku     ui        critique 2/2    critique: $ coil test                20.7k   50s │
+│  ▲ blocked    blocker-73c0      blocker   ui        attempt 1/1     attempt is waiting for you: the g…    5.7k   23s │
+│  ✓ succeeded  fix-11aa          fix       ui        —               done in 16m39s                        940k    1h │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1/3 ─╯
+╭─ Overseer ───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ◉ 02:34 blocker-73c0  stuck — the gate cannot pass                                                                   │
+│ ⚠ 02:34 blocker-73c0/attempt  the gate failed on every attempt  [flailing]                                           │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────── 2 notices ─╯
+ ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
+"))))
+         0)
+
+(const EVENTS
+       "{'cursor': 9000, 'records': [
+    {'t': 1790476449169, 'kind': 'run.started'},
+    {'t': 1790476449170, 'kind': 'station.started', 'agent': 'write', 'model': 'deepseek/deepseek-v4-flash'},
+    {'t': 1790476450000, 'kind': 'agent.turn', 'agent': 'write', 'turn': 1},
+    {'t': 1790476450100, 'kind': 'agent.thought', 'agent': 'write', 'text': 'A haiku about rain.\\nFive syllables first.'},
+    {'t': 1790476450208, 'kind': 'tool.started', 'agent': 'write', 'call': 'c1', 'tool': 'write_file', 'summary': 'write poem.md'},
+    {'t': 1790476450210, 'kind': 'tool.finished', 'agent': 'write', 'call': 'c1', 'tool': 'write_file', 'summary': 'write poem.md', 'ok': true, 'ms': 2, 'output': 'created poem.md'},
+    {'t': 1790476455857, 'kind': 'gate.started', 'agent': 'write', 'command': 'test -s poem.md'},
+    {'t': 1790476455965, 'kind': 'gate.finished', 'agent': 'write', 'ok': true, 'exit': 0, 'output': ''},
+    {'t': 1790476456072, 'kind': 'station.finished', 'agent': 'write', 'outcome': 'passed', 'summary': 'Wrote poem.md'},
+    {'t': 1790476460000, 'kind': 'message.sent', 'agent': 'critique', 'from': 'operator', 'text': 'count carefully'},
+    {'t': 1790476464971, 'kind': 'oversight', 'agent': 'critique', 'verdict': 'on_track', 'reason': 'fine'},
+    {'t': 1790476470000, 'kind': 'tool.started', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test'},
+    {'t': 1790476472000, 'kind': 'tool.finished', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test', 'ok': false, 'ms': 2300, 'output': 'error: 2 tests failed\\nmore'},
+    {'t': 1790476480000, 'kind': 'finding', 'agent': 'critique', 'severity': 'warn', 'code': 'flailing', 'message': 'tests keep failing'},
+    {'t': 1790476497000, 'kind': 'tool.started', 'agent': 'critique', 'call': 'c10', 'tool': 'shell', 'summary': '$ coil test'}]}")
+
+(defn load-run! [(d (ptr Dash)) (a (dyn Allocator))] (-> i64)
+  (let [ov (doc a OVERVIEW)
+        run (jv-nth (jv-get ov "runs") 0)]
+    (own! d (field d run-id) "haiku-4695")
+    (assert (snap-load-text! (field d run) (jv-encode a run) NOW))
+    (run-loaded! d true)
+    (feed-ingest-page! (field d feed) (doc a EVENTS))
+    0))
+
+(deftest run-view-shows-pipeline-agents-and-feed
+         (let [a (malloc-allocator)
+               d (dash-for-test a)]
+           (load-run! d a)
+           (set! (.view d) (ViewRun))
+           (let [screen (app-snapshot d 110 30 0 a)]
+             (assert (= screen
+                        " ◆ factory › haiku › haiku-4695   running                                                               02:35
+   50s  ·  deepseek/deepseek-v4-flash  ·  20.7k tokens (↑18.0k ↓2.7k)  ·  factory/haiku-4695  ·  on ui
+   brief  autumn rain on a tin roof
+   overseer  ◉ on_track  fine
+╭─ Stations ─────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ✓ write ──── ⠙ critique                                                                                    │
+│ critique · attempt 1                                                                                       │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Agents ───────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  AGENT         PHASE       DOING                                              TURNS    TOOLS  TOKENS  SEEN │
+│  write         · done      Wrote poem.md                                          4        4    8.8k   43s │
+│▎ critique      ⠙ tool      $ coil test                                            5     5 ✗1   11.9k   now │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Activity ─────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ 02:34:09            ◆  run started                                                                         │
+│ 02:34:09  write     ▶  station started                                                                     │
+│ 02:34:10  write     ⟳  turn 1                                                                              │
+│ 02:34:10  write     💭 A haiku about rain.                                                                 │
+│ 02:34:10  write     ✎  write poem.md  ✓ 2ms                                                                │
+│ 02:34:15  write     ◈  gate: test -s poem.md                                                               │
+│ 02:34:15  write     ◈  gate passed                                                                         │
+│ 02:34:16  write     ✓  station passed — Wrote poem.md                                                      │
+│ 02:34:20  critique  ✉  operator → count carefully                                                          │
+│ 02:34:24  critique  ◉  overseer: on_track — fine                                                           │
+│ 02:34:30  critique  $  coil test  ✗ 2.3s · error: 2 tests failed                                           │
+│ 02:34:40  critique  ⚠  [flailing] tests keep failing                                                       │
+│ 02:34:57  critique  $  coil test                                                                           │
+│                                                                                                            │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────── ● live ─╯
+ ↑↓ agent · enter chat · tab feed · pgup/pgdn scroll · p pause/resume · x stop · esc back
+"))))
+         0)
+
+(const AGENT
+       "{'run': 'haiku-4695', 'name': 'critique', 'transcript': [
+    {'role': 'system', 'content': 'You are the critique station.'},
+    {'role': 'user', 'content': 'Begin the critique station.\\nLook at the workspace.\\nCount syllables.\\nWrite review.md.\\nThen finish.'},
+    {'role': 'assistant', 'content': 'I will look at the workspace first.', 'reasoning_content': 'Start by listing files.',
+     'tool_calls': [{'id': 'c1', 'type': 'function', 'function': {'name': 'list_dir', 'arguments': '{}'}},
+                    {'id': 'c2', 'type': 'function', 'function': {'name': 'read_file', 'arguments': '{\\'path\\': \\'poem.md\\'}'}}]},
+    {'role': 'tool', 'tool_call_id': 'c1', 'content': 'poem.md\\n'},
+    {'role': 'tool', 'tool_call_id': 'c2', 'content': '1│ Cold autumn rainfall\\n2│ drumming on the old tin roof'},
+    {'role': 'user', 'content': '[operator] count carefully'},
+    {'role': 'assistant', 'content': 'Counting now: the lines are 5, 7 and 5 syllables, which is exactly what a haiku needs.'}]}")
+
+(const CHAT-TAIL
+       "{'cursor': 9500, 'records': [
+    {'t': 1790476490000, 'kind': 'agent.turn', 'agent': 'critique', 'turn': 6},
+    {'t': 1790476491000, 'kind': 'agent.thought', 'agent': 'critique', 'text': 'Run the tests.'},
+    {'t': 1790476492000, 'kind': 'tool.started', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test'},
+    {'t': 1790476493000, 'kind': 'tool.finished', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test', 'ok': true, 'ms': 1500, 'output': 'ok'},
+    {'t': 1790476494000, 'kind': 'agent.text', 'agent': 'write', 'text': 'not this agent'}]}")
+
+(const PENDING-RUN
+       "{'id': 'haiku-4695', 'status': 'running', 'cursor': 9600,
+    'pending_messages': [{'ref': 9550, 'agent': 'critique', 'from': 'operator', 'text': 'also check the title', 't': 1790476495000}],
+    'agents': [{'name': 'critique', 'phase': 'tool', 'activity': '$ coil test', 'turns': 6, 'input_tokens': 10030, 'output_tokens': 1883}]}")
+
+(deftest chat-view-merges-transcript-journal-and-pending
+         (let [a (malloc-allocator)
+               d (dash-for-test a)
+               chat (field d chat)]
+           (own! d (field d run-id) "haiku-4695")
+           (assert (snap-load-text! (field d run) (q a PENDING-RUN) NOW))
+           (chat-open! chat "haiku-4695" "critique")
+           (chat-start-from-tail! chat (doc a CHAT-TAIL))
+           (assert (snap-load-text! (field chat transcript) (q a AGENT) NOW))
+           (set! (.needs-transcript chat) false)
+           (chat-bump! chat)
+           (chat-sync-pending! chat (.value (field d run)))
+           (chat-add-local! chat 9700 "and the rhythm" NOW)
+           (set! (.view d) (ViewChat))
+           (let [screen (app-snapshot d 90 34 0 a)]
+             (assert (= screen
+                        " ◆ factory › haiku-4695 › critique   running                                        02:35
+╭─ critique · conversation ──────────────────────────────────────────────────────────────╮
+│ factory                                                                                │
+│ │ Begin the critique station.                                                          │
+│ │ Look at the workspace.                                                               │
+│ │ Count syllables.                                                                     │
+│ │ … 2 more lines · ctrl-t shows all                                                    │
+│                                                                                        │
+│ critique                                                                               │
+│ ┊ Start by listing files.                                                              │
+│ │ I will look at the workspace first.                                                  │
+│ │ ▤ .  → poem.md                                                                       │
+│ │ ▤ poem.md  → 1│ Cold autumn rainfall                                                 │
+│                                                                                        │
+│ you                                                                                    │
+│ │ count carefully                                                                      │
+│                                                                                        │
+│ critique                                                                               │
+│ │ Counting now: the lines are 5, 7 and 5 syllables, which is exactly what a haiku      │
+│ │ needs.                                                                               │
+│ ┊ Run the tests.                                                                       │
+│ │ $ coil test  ✓ 1.5s                                                                  │
+│                                                                                        │
+│ you · waiting for the agent                                                            │
+│ │ also check the title                                                                 │
+│                                                                                        │
+│ you · sending                                                                          │
+│ │ and the rhythm                                                                       │
+│                                                                                        │
+│ ⠋ tool  $ coil test                                                                    │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ ❯ Steer the agent — it reads this at its next turn                                     │
+╰─────────────────────────────────────────────────────────────── 6 turns · 11.9k tokens ─╯
+ enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
+")))
+           (set! (.details chat) true)
+           (let [screen (app-snapshot d 90 40 0 a)]
+             (assert (= screen
+                        " ◆ factory › haiku-4695 › critique   running                                        02:35
+╭─ critique · conversation ──────────────────────────────────────────────────────────────╮
+│ factory                                                                                │
+│ │ Begin the critique station.                                                          │
+│ │ Look at the workspace.                                                               │
+│ │ Count syllables.                                                                     │
+│ │ Write review.md.                                                                     │
+│ │ Then finish.                                                                         │
+│                                                                                        │
+│ critique                                                                               │
+│ ┊ Start by listing files.                                                              │
+│ │ I will look at the workspace first.                                                  │
+│ │ ▤ .  → poem.md                                                                       │
+│ │   poem.md                                                                            │
+│ │ ▤ poem.md  → 1│ Cold autumn rainfall                                                 │
+│ │   1│ Cold autumn rainfall                                                            │
+│ │   2│ drumming on the old tin roof                                                    │
+│                                                                                        │
+│ you                                                                                    │
+│ │ count carefully                                                                      │
+│                                                                                        │
+│ critique                                                                               │
+│ │ Counting now: the lines are 5, 7 and 5 syllables, which is exactly what a haiku      │
+│ │ needs.                                                                               │
+│ ┊ Run the tests.                                                                       │
+│ │ $ coil test  ✓ 1.5s                                                                  │
+│ │   ok                                                                                 │
+│                                                                                        │
+│ you · waiting for the agent                                                            │
+│ │ also check the title                                                                 │
+│                                                                                        │
+│ you · sending                                                                          │
+│ │ and the rhythm                                                                       │
+│                                                                                        │
+│                                                                                        │
+│ ⠋ tool  $ coil test                                                                    │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ ❯ Steer the agent — it reads this at its next turn                                     │
+╰────────────────────────────────────────────────── 6 turns · 11.9k tokens · details on ─╯
+ enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
+"))))
+         0)
+
+(deftest keys-drive-selection-overlays-and-actions-without-a-hub
+         (let [a (malloc-allocator)
+               d (dash-for-test a)]
+           (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
+           (sync-selection! d)
+           (dashboard-key! d (Char #\?))
+           (assert (.help d))
+           (assert (str-contains? (app-snapshot d 100 24 0 a)
+                                  "show tool output and full reasoning"))
+           (dashboard-key! d (Escape))
+           (assert (not (.help d)))
+           (dashboard-key! d (Char #\x))
+           (assert (.confirm-stop d))
+           (assert (str-contains? (app-snapshot d 100 24 0 a)
+                                  "Stop haiku-4695? Its agents are cancelled."))
+           (dashboard-key! d (Char #\n))
+           (assert (not (.confirm-stop d)))
+           (dashboard-key! d (Down))
+           (assert (= (.selected-id d) "blocker-73c0"))
+           (dashboard-key! d (Char #\p))
+           (assert (str-contains? (.toast d) "is blocked"))
+           ;; Nothing listens on port 1: opening the run reports the hub as down.
+           (dashboard-key! d (Enter))
+           (assert (match (.view d) (ViewRun [] true) (_ false)))
+           (assert (hub-down? d))
+           (assert (str-contains? (app-snapshot d 100 24 0 a) "HUB DOWN"))
+           (dashboard-key! d (Escape))
+           (assert (match (.view d) (ViewOverview [] true) (_ false)))
+           (assert (match (dashboard-key! d (Char #\q))
+                     (Quit [] true)
+                     (_ false))))
+         0)
+
+(deftest chat-refetches-at-checkpoints
+         (let [a (malloc-allocator)
+               d (dash-for-test a)
+               chat (field d chat)]
+           (chat-open! chat "haiku-4695" "critique")
+           (chat-start-from-tail! chat (doc a CHAT-TAIL))
+           (assert-eq (len (.overlay chat)) 2)
+           (assert-eq (.cursor chat) 9500)
+           (set! (.needs-transcript chat) false)
+           (chat-ingest-page! chat
+                              (doc a
+                                   "{'cursor': 9900, 'records': [
+      {'t': 1, 'kind': 'agent.text', 'agent': 'critique', 'text': 'done counting'},
+      {'t': 2, 'kind': 'agent.turn', 'agent': 'critique', 'turn': 7},
+      {'t': 3, 'kind': 'agent.thought', 'agent': 'critique', 'text': 'next'}]}"))
+           (assert-eq (len (.overlay chat)) 1)
+           (assert (.needs-transcript chat))
+           (assert-eq (.cursor chat) 9900))
+         0)
+
+(defn str-contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [i] true) (None [] false)))
+
+(defn agent-doc-at [(a (dyn Allocator)) (cursor i64)] (-> JVal)
+  (let [v (doc a AGENT)]
+    (jv-put! v "transcript_cursor" (JInt cursor))
+    v))
+
+(deftest chat-merges-exactly-at-the-transcript-cursor
+         (let [a (malloc-allocator)
+               d (dash-for-test a)
+               chat (field d chat)]
+           (chat-open! chat "haiku-4695" "critique")
+           ;; A transcript with its cursor: the overlay is read from exactly there.
+           (assert (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW))
+           (assert (.exact chat))
+           (assert (.loaded chat))
+           (assert-eq (.cursor chat) 9000)
+           (chat-ingest-page! chat
+                              (doc a
+                                   "{'cursor': 9900, 'records': [
+      {'t': 1, 'kind': 'agent.text', 'agent': 'critique', 'text': 'done counting'},
+      {'t': 2, 'kind': 'agent.turn', 'agent': 'critique', 'turn': 7},
+      {'t': 3, 'kind': 'agent.thought', 'agent': 'critique', 'text': 'next'}]}"))
+           ;; A checkpoint record keeps the overlay and asks for a newer transcript.
+           (assert-eq (len (.overlay chat)) 2)
+           (assert (.needs-transcript chat))
+           (assert-eq (.cursor chat) 9900)
+           ;; No newer checkpoint yet: nothing changes.
+           (assert (not (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW)))
+           (assert (not (.needs-transcript chat)))
+           (assert-eq (len (.overlay chat)) 2)
+           ;; A newer one replaces the overlay; events are reread from its cursor.
+           (assert (chat-adopt-transcript! chat (agent-doc-at a 9800) NOW))
+           (assert-eq (len (.overlay chat)) 0)
+           (assert-eq (.cursor chat) 9800)
+           (assert-eq (.transcript-cursor chat) 9800))
+         0)
+
+(deftest chat-falls-back-to-checkpoint-records-without-a-cursor
+         (let [a (malloc-allocator)
+               d (dash-for-test a)
+               chat (field d chat)]
+           (chat-open! chat "haiku-4695" "critique")
+           (assert (not (chat-adopt-transcript! chat (doc a AGENT) NOW)))
+           (assert (not (.exact chat)))
+           (assert (not (.loaded chat)))
+           (assert (.has (field chat transcript))))
+         0)

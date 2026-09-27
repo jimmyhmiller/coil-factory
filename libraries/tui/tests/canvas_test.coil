@@ -1,0 +1,297 @@
+(module tui.canvas-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "tui.canvas" :use *)
+
+(defn plain [(c (ptr Canvas))] (-> (slice u8))
+  (render-plain (malloc-allocator) c))
+
+(deftest put-text-basic
+         (let [(mut c) (canvas-new (malloc-allocator) 10 2)]
+           (assert-eq (put-text! (mut c)
+                                 (canvas-rect (mut c))
+                                 1
+                                 0
+                                 "hello"
+                                 (style-default))
+                      5)
+           (assert (= (plain (mut c)) " hello\n\n"))))
+
+(deftest put-text-clips-wide-graphemes-at-the-right-edge
+         (let [(mut c) (canvas-new (malloc-allocator) 6 1)]
+           (assert-eq (put-text! (mut c)
+                                 (rect 0 0 5 1)
+                                 0
+                                 0
+                                 "中文字"
+                                 (style-default))
+                      4)
+           (assert (= (plain (mut c)) "中文\n"))
+           (assert-eq (.width (canvas-cell (mut c) 1 0)) 0)
+           (assert-eq (.rune (canvas-cell (mut c) 4 0)) 32)))
+
+(deftest put-text-clips-on-the-left-and-repairs-split-wide-cells
+         (let [(mut c) (canvas-new (malloc-allocator) 6 1)]
+           (assert-eq (put-text! (mut c)
+                                 (canvas-rect (mut c))
+                                 -1
+                                 0
+                                 "中文"
+                                 (style-default))
+                      3)
+           (assert (= (plain (mut c)) " 文\n"))
+           (put-text! (mut c) (canvas-rect (mut c)) 2 0 "x" (style-default))
+           (assert (= (plain (mut c)) "  x\n"))
+           (put-text! (mut c) (canvas-rect (mut c)) 3 0 "漢" (style-default))
+           (put-text! (mut c) (canvas-rect (mut c)) 4 0 "y" (style-default))
+           (assert (= (plain (mut c)) "  x y\n"))))
+
+(deftest put-text-keeps-combining-marks-in-the-cell
+         (let [(mut c) (canvas-new (malloc-allocator) 4 1)]
+           (assert-eq (put-text! (mut c)
+                                 (canvas-rect (mut c))
+                                 0
+                                 0
+                                 "e\x301;x"
+                                 (style-default))
+                      2)
+           (assert (= (plain (mut c)) "e\x301;x\n"))
+           (assert (> (.ext-len (canvas-cell (mut c) 0 0)) 0))))
+
+(deftest put-text-ellipsis-marks-cut-text
+         (let [(mut c) (canvas-new (malloc-allocator) 8 1)]
+           (assert-eq (put-text-ellipsis! (mut c)
+                                          (rect 0 0 5 1)
+                                          0
+                                          0
+                                          "hello world"
+                                          (style-default))
+                      5)
+           (assert (= (plain (mut c)) "hell…\n"))
+           (canvas-clear! (mut c))
+           (assert-eq (put-text-ellipsis! (mut c)
+                                          (rect 0 0 5 1)
+                                          0
+                                          0
+                                          "hi"
+                                          (style-default))
+                      2)
+           (assert (= (plain (mut c)) "hi\n"))))
+
+(deftest draws-boxes-with-title-and-footer
+         (let [(mut c) (canvas-new (malloc-allocator) 12 4)
+               inner
+                 (draw-box! (mut c)
+                            (rect 0 0 12 4)
+                            (BoxOpts
+                              :border (Rounded)
+                              :style (style-default)
+                              :title "Runs"
+                              :title-style (style-default)
+                              :footer "3"
+                              :footer-style (style-default)))]
+           (assert-eq (.x inner) 1)
+           (assert-eq (.w inner) 10)
+           (assert-eq (.h inner) 2)
+           (assert (= (plain (mut c))
+                      "╭─ Runs ───╮\n│          │\n│          │\n╰────── 3 ─╯\n"))))
+
+(deftest draws-other-border-kinds-and-truncates-titles
+         (let [(mut c) (canvas-new (malloc-allocator) 9 3)]
+           (draw-box! (mut c)
+                      (rect 0 0 9 3)
+                      (box-titled (Heavy)
+                                  (style-default)
+                                  "Machines"
+                                  (style-default)))
+           (assert (= (plain (mut c))
+                      "┏━ Ma… ━┓\n┃       ┃\n┗━━━━━━━┛\n"))
+           (canvas-clear! (mut c))
+           (draw-box! (mut c)
+                      (rect 0 0 4 3)
+                      (box-opts (Double) (style-default)))
+           (draw-box! (mut c) (rect 4 0 5 3) (box-opts (Plain) (style-default)))
+           (assert (= (plain (mut c))
+                      "╔══╗┌───┐\n║  ║│   │\n╚══╝└───┘\n"))))
+
+(deftest splits-rects-by-constraints
+         (let [(mut parts) (zeroed (array Rect 3))]
+           (split-vertical (rect 0 0 20 10)
+                           [(Fixed 1) (Fill 1) (Fixed 3)]
+                           0
+                           parts)
+           (assert-eq (.h (index parts 0)) 1)
+           (assert-eq (.y (index parts 1)) 1)
+           (assert-eq (.h (index parts 1)) 6)
+           (assert-eq (.y (index parts 2)) 7)
+           (assert-eq (.h (index parts 2)) 3)
+           (split-horizontal (rect 2 0 21 5)
+                             [(Ratio 1 3) (Fill 1) (Fill 2)]
+                             1
+                             parts)
+           (assert-eq (.w (index parts 0)) 7)
+           (assert-eq (.x (index parts 1)) 10)
+           (assert-eq (.w (index parts 1)) 4)
+           (assert-eq (.w (index parts 2)) 8)
+           (assert-eq (+ (.x (index parts 2)) (.w (index parts 2))) 23)))
+
+(defn bytes-eq [(out (ptr (ArrayList u8))) (expected (slice u8))] (-> bool)
+  (= (al-slice (load out)) expected))
+
+(deftest render-diff-emits-only-the-changed-cell
+         (let [a (malloc-allocator)
+               (mut prev) (canvas-new a 5 2)
+               (mut next) (canvas-new a 5 2)
+               (mut out) (al-new [u8] a)]
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      0
+                      0
+                      "ab"
+                      (style-default))
+           (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[0m\x1b;[H\x1b;[2J\x1b;[1;1Hab\x1b;[?2026l"))
+           (canvas-commit! (mut prev) (mut next))
+           (al-clear! (mut out))
+           (assert-eq (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+                      0)
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      1
+                      0
+                      "X"
+                      (bold (fg (indexed 1))))
+           (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[1;2H\x1b;[1;31mX\x1b;[0m\x1b;[?2026l"))))
+
+(deftest full-render-addresses-each-run-once
+         (let [a (malloc-allocator)
+               (mut prev) (canvas-new a 4 1)
+               (mut next) (canvas-new a 4 1)
+               (mut out) (al-new [u8] a)]
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      0
+                      0
+                      "ab"
+                      (style-default))
+           (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[0m\x1b;[H\x1b;[2J\x1b;[1;1Hab\x1b;[?2026l"))))
+
+(deftest render-diff-downgrades-truecolor-and-places-the-cursor
+         (let [a (malloc-allocator)
+               (mut prev) (canvas-new a 3 1)
+               (mut next) (canvas-new a 3 1)
+               (mut out) (al-new [u8] a)]
+           (canvas-commit! (mut prev) (mut next))
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      2
+                      0
+                      "z"
+                      (fg (rgb 255 0 0)))
+           (canvas-set-cursor! (mut next) 1 0)
+           (render-diff! (mut out) (mut prev) (mut next) (Ansi256))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[1;3H\x1b;[38;5;196mz\x1b;[0m\x1b;[1;2H\x1b;[?25h\x1b;[?2026l"))
+           (al-clear! (mut out))
+           (render-diff! (mut out) (mut prev) (mut next) (NoColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[1;3Hz\x1b;[1;2H\x1b;[?25h\x1b;[?2026l"))))
+
+(deftest render-diff-reprints-a-wide-grapheme-when-its-right-half-changes
+         (let [a (malloc-allocator)
+               (mut prev) (canvas-new a 4 1)
+               (mut next) (canvas-new a 4 1)
+               (mut out) (al-new [u8] a)]
+           (put-text! (mut prev)
+                      (canvas-rect (mut prev))
+                      0
+                      0
+                      "abcd"
+                      (style-default))
+           (set! (.valid prev) true)
+           (canvas-copy! (mut next) (mut prev))
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      1
+                      0
+                      "中"
+                      (style-default))
+           (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[1;2H中\x1b;[?2026l"))))
+
+(deftest sgr-transitions-are-minimal
+         (let [(mut out) (al-new [u8] (malloc-allocator))]
+           (out-sgr-transition! (mut out)
+                                (bold (fg (indexed 9)))
+                                (dim (style-default)))
+           (assert (bytes-eq (mut out) "\x1b;[22;2;39m"))
+           (al-clear! (mut out))
+           (out-sgr-transition! (mut out)
+                                (style-default)
+                                (with-bg (fg (hex 0x7aa2f7)) (indexed 236)))
+           (assert (bytes-eq (mut out) "\x1b;[38;2;122;162;247;48;5;236m"))
+           (al-clear! (mut out))
+           (out-sgr-transition! (mut out)
+                                (bold (style-default))
+                                (bold (style-default)))
+           (assert-eq (len out) 0)))
+
+(deftest color-downgrades
+         (assert-eq (rgb-to-256 255 0 0) 196)
+         (assert-eq (rgb-to-256 128 128 128) 244)
+         (assert-eq (rgb-to-16 250 10 10) 9)
+         (assert (= (color-for-mode (indexed 196) (Ansi16)) (indexed 9)))
+         (assert (= (color-for-mode (rgb 1 2 3) (NoColor)) (Default))))
+
+(deftest no-color-mode-turns-tints-into-reverse-video
+         (let [s
+                 (style-for-mode (with-bg (bold (fg (hex 0x112233)))
+                                          (hex 0x445566))
+                                 (NoColor))]
+           (assert (= (.fg s) (Default)))
+           (assert (= (.bg s) (Default)))
+           (assert-eq (.attrs s) (+ ATTR-BOLD ATTR-REVERSE))))
+
+(deftest render-diff-bridges-short-gaps-instead-of-jumping
+         (let [a (malloc-allocator)
+               (mut prev) (canvas-new a 12 1)
+               (mut next) (canvas-new a 12 1)
+               (mut out) (al-new [u8] a)]
+           (put-text! (mut prev)
+                      (canvas-rect (mut prev))
+                      0
+                      0
+                      "abcdefghijkl"
+                      (style-default))
+           (set! (.valid prev) true)
+           (canvas-copy! (mut next) (mut prev))
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      0
+                      0
+                      "X"
+                      (style-default))
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      5
+                      0
+                      "Y"
+                      (style-default))
+           (put-text! (mut next)
+                      (canvas-rect (mut next))
+                      11
+                      0
+                      "Z"
+                      (style-default))
+           (render-diff! (mut out) (mut prev) (mut next) (TrueColor))
+           (assert (bytes-eq (mut out)
+                             "\x1b;[?2026h\x1b;[?25l\x1b;[1;1HXbcdeY\x1b;[1;12HZ\x1b;[?2026l"))))

@@ -1,0 +1,260 @@
+(module agent_tools.files-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.files" :use *)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(import "agent_tools.test-support" :use *)
+
+(defn open-ws [(a (dyn Allocator)) (root (slice u8))] (-> Workspace)
+  (match (workspace-open a root)
+    (Ok [ws] ws)
+    (Err [message] (do (println "{}" message) (assert false) (Workspace :root "")))))
+
+(defn args [(a (dyn Allocator)) (json (slice u8))] (-> JVal)
+  (match (from-json [JVal] a json)
+    (Ok [v] v)
+    (Err [_] (do (println "bad test json: {}" json) (assert false) (JNull)))))
+
+(defn run-tool [(a (dyn Allocator)) (tool (dyn Tool)) (json (slice u8))] (-> ToolOutcome)
+  (let [spec (tool-spec tool)]
+    (tool-run tool a (tool-call "c1" (.name spec) (args a json) json)
+              (box! a NeverCancelled (NeverCancelled :unused 0)))))
+
+(defn ok-text [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [text] text)
+    (ToolFailed [m] (do (println "tool failed: {}" m) (assert false) ""))))
+
+(defn failed-text [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [text] (do (println "tool unexpectedly succeeded: {}" text) (assert false) ""))
+    (ToolFailed [m] m)))
+
+(defn summary [(a (dyn Allocator)) (tool (dyn Tool)) (json (slice u8))] (-> (slice u8))
+  (tool-summary tool a (tool-call "c1" "t" (args a json) json)))
+
+;;; "1\n2\n...\nn\n" as "line 1".."line n".
+(defn numbered-file [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        (mut i) 1]
+    (loop (if (> (load i) n)
+              (break)
+              (do (sb-push-str! (mut b) "line ")
+                  (sb-push-i64! (mut b) (load i))
+                  (sb-push-str! (mut b) "\n")
+                  (set! i (+ (load i) 1)))))
+    (sb-finish! (mut b))))
+
+(deftest read-file-numbers-lines-and-windows
+  (let [a (malloc-allocator)
+        dir (temp-dir a "read")
+        ws (open-ws a dir)
+        tool (box! a ReadFileTool (read-file-tool ws))]
+    (write-text! a (path-join a dir "small.txt") "alpha\nbeta\ngamma")
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"small.txt\"}"))
+               "    1\x2502; alpha\n    2\x2502; beta\n    3\x2502; gamma\n"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"small.txt\",\"offset\":2,\"limit\":1}"))
+               "    2\x2502; beta\n(showing lines 2-2; the file continues. Read more with offset=3)\n"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"small.txt\",\"offset\":3}")) "    3\x2502; gamma\n"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"small.txt\",\"offset\":9}"))
+                       "offset 9 is past the end of \"small.txt\", which has 3 lines"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"small.txt\",\"offset\":0}")) "\"offset\" must be at least 1"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"small.txt\",\"limit\":\"x\"}")) "\"limit\" must be an integer"))
+    (assert (contains? (failed-text (run-tool a tool "{}")) "missing required argument \"path\""))
+    (write-text! a (path-join a dir "big.txt") (numbered-file a 1000))
+    (let [text (ok-text (run-tool a tool "{\"path\":\"big.txt\"}"))]
+      (assert (starts-with text "    1\x2502; line 1\n"))
+      (assert (contains? text "  400\x2502; line 400\n"))
+      (assert (not (contains? text "line 401")))
+      (assert (contains? text "(showing lines 1-400; the file continues. Read more with offset=401)")))
+    (let [text (ok-text (run-tool a tool "{\"path\":\"big.txt\",\"offset\":990}"))]
+      (assert (starts-with text "  990\x2502; line 990\n"))
+      (assert (contains? text " 1000\x2502; line 1000\n"))
+      (assert (not (contains? text "showing"))))
+    (write-text! a (path-join a dir "empty.txt") "")
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"empty.txt\"}")) "\"empty.txt\" is empty"))
+    (assert (= (summary a tool "{\"path\":\"src/x.coil\"}") "read src/x.coil"))
+    (remove-tree a dir)))
+
+(deftest read-file-caps-bytes-and-long-lines
+  (let [a (malloc-allocator)
+        dir (temp-dir a "readcap")
+        ws (open-ws a dir)
+        tool (box! a ReadFileTool (read-file-tool ws))
+        (mut b) (sb-new a)
+        (mut i) 0]
+    ;; 200 lines of 1000 bytes: the 50 KB output limit stops before the 400-line limit.
+    (loop (if (>= (load i) 200)
+              (break)
+              (do (let [(mut j) 0]
+                    (loop (if (>= (load j) 1000) (break) (do (sb-push-str! (mut b) "x") (set! j (+ (load j) 1))))))
+                  (sb-push-str! (mut b) "\n")
+                  (set! i (+ (load i) 1)))))
+    (write-text! a (path-join a dir "wide.txt") (sb-finish! (mut b)))
+    (let [text (ok-text (run-tool a tool "{\"path\":\"wide.txt\"}"))]
+      (assert (<= (len text) 50200))
+      (assert (contains? text ", the 50 KB output limit; the file continues. Read more with offset=")))
+    (let [(mut long) (sb-new a)
+          (mut k) 0]
+      (loop (if (>= (load k) 5000) (break) (do (sb-push-str! (mut long) "y") (set! k (+ (load k) 1)))))
+      (sb-push-str! (mut long) "\nshort\n")
+      (write-text! a (path-join a dir "long.txt") (sb-finish! (mut long))))
+    (let [text (ok-text (run-tool a tool "{\"path\":\"long.txt\"}"))]
+      (assert (contains? text " \x2026; [line cut at 2000 of 5000 bytes]\n    2\x2502; short\n"))
+      (assert (< (len text) 2200)))
+    (remove-tree a dir)))
+
+(deftest read-file-refuses-binary-directories-and-escapes
+  (let [a (malloc-allocator)
+        dir (temp-dir a "readbin")
+        ws (open-ws a dir)
+        tool (box! a ReadFileTool (read-file-tool ws))]
+    (write-text! a (path-join a dir "blob.bin") "ELF\x0;\x1;binary")
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"blob.bin\"}")) "is not a text file"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\".\"}")) "is a directory; use list_dir"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"missing.txt\"}"))
+                       "cannot read \"missing.txt\": No such file or directory"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"/etc/passwd\"}")) "is absolute"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"../../etc/passwd\"}")) "leave the workspace"))
+    (symlink! a "/etc" (path-join a dir "etc"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"etc/passwd\"}")) "outside the workspace"))
+    (remove-tree a dir)))
+
+(deftest write-file-creates-parents-and-reports
+  (let [a (malloc-allocator)
+        dir (temp-dir a "write")
+        ws (open-ws a dir)
+        tool (box! a WriteFileTool (write-file-tool ws))]
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"src/deep/new.coil\",\"content\":\"(a)\\n(b)\\n\"}"))
+               "created src/deep/new.coil (8 bytes, 2 lines)"))
+    (assert (= (read-text a (path-join a dir "src/deep/new.coil")) "(a)\n(b)\n"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"./src/deep/new.coil\",\"content\":\"x\"}"))
+               "overwrote src/deep/new.coil (1 byte, 1 line)"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"empty\",\"content\":\"\"}")) "created empty (0 bytes, 0 lines)"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"src\",\"content\":\"x\"}")) "is a directory"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"empty/child\",\"content\":\"x\"}"))
+                       "cannot create directory \"empty\""))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"a.txt\"}")) "missing required argument \"content\""))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"../x.txt\",\"content\":\"x\"}")) "leave the workspace"))
+    (assert (= (summary a tool "{\"path\":\"src/x.coil\",\"content\":\"\"}") "write src/x.coil"))
+    (remove-tree a dir)))
+
+(deftest edit-file-replaces-exact-text
+  (let [a (malloc-allocator)
+        dir (temp-dir a "edit")
+        ws (open-ws a dir)
+        tool (box! a EditFileTool (edit-file-tool ws))
+        file (path-join a dir "main.coil")]
+    (write-text! a file "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n")
+    (let [text (ok-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"five\",\"new_text\":\"FIVE\\nFIVE-B\"}"))]
+      (assert (= text (join2 a "edited main.coil: replaced 1 occurrence\n"
+                             "    2\x2502; two\n    3\x2502; three\n    4\x2502; four\n    5\x2502; FIVE\n    6\x2502; FIVE-B\n    7\x2502; six\n    8\x2502; seven\n    9\x2502; eight\n"))))
+    (assert (= (read-text a file) "one\ntwo\nthree\nfour\nFIVE\nFIVE-B\nsix\nseven\neight\nnine\n"))
+    (let [missing (failed-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"absent\",\"new_text\":\"x\"}"))]
+      (assert (contains? missing "old_text was not found in \"main.coil\". Nothing was changed.")))
+    (write-text! a file "x = 1\ny = 1\nz = 1\n")
+    (let [multiple (failed-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"= 1\",\"new_text\":\"= 2\"}"))]
+      (assert (contains? multiple "old_text appears 3 times in \"main.coil\""))
+      (assert (contains? multiple "replace_all")))
+    (assert (= (read-text a file) "x = 1\ny = 1\nz = 1\n"))
+    (let [text (ok-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"= 1\",\"new_text\":\"= 2\",\"replace_all\":true}"))]
+      (assert (starts-with text "edited main.coil: replaced 3 occurrences; the first is shown\n")))
+    (assert (= (read-text a file) "x = 2\ny = 2\nz = 2\n"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"\",\"new_text\":\"x\"}")) "old_text is empty"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"x\",\"new_text\":\"x\"}")) "identical"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"nope.coil\",\"old_text\":\"x\",\"new_text\":\"y\"}"))
+                       "cannot read \"nope.coil\": No such file or directory"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"main.coil\",\"old_text\":\"x\",\"new_text\":\"y\",\"replace_all\":\"yes\"}"))
+                       "\"replace_all\" must be true or false"))
+    (assert (= (summary a tool "{\"path\":\"src/x.coil\"}") "edit src/x.coil"))
+    (remove-tree a dir)))
+
+(deftest list-dir-sorts-and-marks-entries
+  (let [a (malloc-allocator)
+        dir (temp-dir a "list")
+        ws (open-ws a dir)
+        tool (box! a ListDirTool (list-dir-tool ws))]
+    (write-text! a (path-join a dir "b.txt") "b")
+    (write-text! a (path-join a dir "a.txt") "a")
+    (run-argv a ["/bin/mkdir" "-p" (path-join a dir "src/inner") (path-join a dir ".git/objects")])
+    (write-text! a (path-join a dir ".env") "x")
+    (symlink! a "a.txt" (path-join a dir "link"))
+    (assert (= (ok-text (run-tool a tool "{}")) ".env\na.txt\nb.txt\nlink -> a.txt\nsrc/\n"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"src\"}")) "inner/\n"))
+    (assert (= (ok-text (run-tool a tool "{\"path\":\"src/inner\"}")) "\"src/inner\" is empty"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"a.txt\"}")) "is a file, not a directory"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"nothing\"}")) "\"nothing\" does not exist"))
+    (assert (contains? (failed-text (run-tool a tool "{\"path\":\"/\"}")) "is absolute"))
+    (assert (= (summary a tool "{}") "ls ."))
+    (assert (= (summary a tool "{\"path\":\"src\"}") "ls src"))
+    (remove-tree a dir)))
+
+(deftest list-dir-caps-entries
+  (let [a (malloc-allocator)
+        dir (temp-dir a "listcap")
+        ws (open-ws a dir)
+        tool (box! a ListDirTool (list-dir-tool ws))
+        (mut i) 0]
+    (loop (if (>= (load i) 510)
+              (break)
+              (let [(mut b) (sb-new a)]
+                (sb-push-str! (mut b) "f")
+                (sb-push-i64! (mut b) (+ 1000 (load i)))
+                (write-text! a (path-join a dir (sb-finish! (mut b))) "")
+                (set! i (+ (load i) 1)))))
+    (let [text (ok-text (run-tool a tool "{}"))]
+      (assert (starts-with text "f1000\nf1001\n"))
+      (assert (contains? text "f1499\n\x2026; 10 more entries not shown\n"))
+      (assert (not (contains? text "f1500"))))
+    (remove-tree a dir)))
+
+(defn search-fixture [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
+  (let [dir (temp-dir a label)]
+    (run-argv a ["/bin/mkdir" "-p" (path-join a dir "src") (path-join a dir ".git")])
+    (write-text! a (path-join a dir "src/main.coil") "(defn main [] 0)\n(defn helper [] 1)\n")
+    (write-text! a (path-join a dir "src/notes.md") "main idea\n")
+    (write-text! a (path-join a dir ".git/config") "defn inside git\n")
+    (write-text! a (path-join a dir "blob.bin") "defn\x0;binary")
+    dir))
+
+(defn check-search [(a (dyn Allocator)) (backend SearchBackend) (label (slice u8))] (-> i64)
+  (let [dir (search-fixture a label)
+        ws (open-ws a dir)
+        tool (box! a SearchTool (search-tool ws backend))]
+    (assert (= (ok-text (run-tool a tool "{\"pattern\":\"defn (main|helper)\"}"))
+               "src/main.coil:1:(defn main [] 0)\nsrc/main.coil:2:(defn helper [] 1)\n"))
+    (assert (= (ok-text (run-tool a tool "{\"pattern\":\"main\",\"glob\":\"*.md\"}")) "src/notes.md:1:main idea\n"))
+    (assert (= (ok-text (run-tool a tool "{\"pattern\":\"helper\",\"path\":\"src/main.coil\"}"))
+               "src/main.coil:2:(defn helper [] 1)\n"))
+    (assert (= (ok-text (run-tool a tool "{\"pattern\":\"zzz\"}")) "no matches for \"zzz\" in \".\""))
+    (assert (contains? (failed-text (run-tool a tool "{\"pattern\":\"(\"}")) "search failed (exit 2)"))
+    (assert (contains? (failed-text (run-tool a tool "{\"pattern\":\"x\",\"path\":\"../\"}")) "leave the workspace"))
+    (assert (contains? (failed-text (run-tool a tool "{\"pattern\":\"x\",\"path\":\"nope\"}")) "does not exist"))
+    (assert (contains? (failed-text (run-tool a tool "{\"pattern\":\"\"}")) "pattern is empty"))
+    (assert (= (summary a tool "{\"pattern\":\"defn main\"}") "search \"defn main\""))
+    ;; Many matches are capped with a note.
+    (let [(mut b) (sb-new a)
+          (mut i) 0]
+      (loop (if (>= (load i) 400) (break) (do (sb-push-str! (mut b) "hit\n") (set! i (+ (load i) 1)))))
+      (write-text! a (path-join a dir "src/many.txt") (sb-finish! (mut b))))
+    (let [text (ok-text (run-tool a tool "{\"pattern\":\"hit\"}"))]
+      (assert (starts-with text "src/many.txt:1:hit\n"))
+      (assert (contains? text "src/many.txt:250:hit\n(showing 250 of 400 matching lines; narrow the pattern, path, or glob to see the rest)\n"))
+      (assert (not (contains? text ":251:"))))
+    (remove-tree a dir)))
+
+(deftest search-with-grep
+  (let [a (malloc-allocator)]
+    (check-search a (Grep "/usr/bin/grep") "grep")))
+
+(deftest search-with-detected-backend
+  (let [a (malloc-allocator)]
+    (match (search-backend-detect a)
+      (Ok [backend] (check-search a backend "detected"))
+      (Err [m] (do (println "{}" m) (assert false) 0)))))

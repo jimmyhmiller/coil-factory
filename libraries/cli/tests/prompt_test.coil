@@ -1,0 +1,182 @@
+(module cli.prompt-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.prompt" :use *)
+(import "cli.style" :use [term-plain])
+
+(defstruct Pipe [(read i32) (write i32)])
+
+(defn pipe-new [] (-> Pipe)
+  (let [fds (primitive/alloc-stack (array i32 2))]
+    (assert-eq (os/pipe (cast (ptr i32) fds)) 0)
+    (Pipe :read (load (index fds 0)) :write (load (index fds 1)))))
+
+;; A readable descriptor that yields `text` and then end of input.
+(defn input-fd [(text (slice u8))] (-> i32)
+  (let [p (pipe-new)]
+    (when (> (len text) 0)
+      (assert-eq (cast i64
+                       (io/write (.write p)
+                                 (cast (ptr i8) (slice-data text))
+                                 (cast isize (len text))))
+                 (len text))
+      0)
+    (os/close (.write p))
+    (.read p)))
+
+(defn captured [(a (dyn Allocator)) (output Pipe)] (-> (slice u8))
+  (os/close (.write output))
+  (try (let [bytes
+               (try-or! (read-fd-all a (.read output)) (do (assert false) ""))]
+         bytes)))
+
+(defn text-of [(result (Result (slice u8) PromptError))] (-> (slice u8))
+  (try (let [text (try-or! result "<error>")] text)))
+
+(defn eof? [(result (Result (slice u8) PromptError))] (-> bool)
+  (match result
+    (Err [failure]
+         (match failure
+           (PromptEof [] true)
+           (_ false)))
+    (Ok [_] false)))
+
+(defn index-of [(result (Result i64 PromptError))] (-> i64)
+  (match result
+    (Ok [value] value)
+    (Err [failure]
+         (match failure
+           (InvalidAnswer [_] -2)
+           (_ -3)))))
+
+(defn yes? [(result (Result bool PromptError))] (-> i64)
+  (match result
+    (Ok [value] (if value 1 0))
+    (Err [failure]
+         (match failure
+           (InvalidAnswer [_] -2)
+           (_ -3)))))
+
+(deftest piped-answers-are-read-line-by-line
+         (let [a (malloc-allocator)
+               (mut p)
+                 (prompter-with a
+                                (input-fd "hello\n\r\n  \nlast")
+                                2
+                                (term-plain)
+                                false)]
+           (assert-eq (text-of (ask (mut p) "Name" "")) "hello")
+           (assert-eq (text-of (ask (mut p) "Name" "fallback")) "fallback")
+           (assert-eq (text-of (ask (mut p) "Name" "blank")) "blank")
+           (assert-eq (text-of (ask (mut p) "Name" "")) "last")
+           (assert (eof? (ask (mut p) "Name" "default")))
+           (prompter-free! (mut p))))
+
+(deftest confirm-accepts-yes-no-and-default
+         (let [a (malloc-allocator)
+               (mut p)
+                 (prompter-with a
+                                (input-fd "y\nNO\n\nYes\nmaybe\n")
+                                2
+                                (term-plain)
+                                false)]
+           (assert-eq (yes? (confirm (mut p) "Deploy?" false)) 1)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" true)) 0)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" true)) 1)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" false)) 1)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" false)) -2)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" false)) -3)
+           (prompter-free! (mut p))))
+
+(deftest choose-by-number-name-or-default
+         (let [a (malloc-allocator)
+               options ["local" "metaphysics" "sandbox"]
+               (mut p)
+                 (prompter-with a
+                                (input-fd "2\nSANDBOX\n\n7\n")
+                                2
+                                (term-plain)
+                                false)]
+           (assert-eq (index-of (choose (mut p) "Site" options 0)) 1)
+           (assert-eq (index-of (choose (mut p) "Site" options 0)) 2)
+           (assert-eq (index-of (choose (mut p) "Site" options 0)) 0)
+           (assert-eq (index-of (choose (mut p) "Site" options 0)) -2)
+           (assert-eq (index-of (choose (mut p) "Site" options 0)) -3)
+           (prompter-free! (mut p))))
+
+(deftest choose-without-default-rejects-empty
+         (let [a (malloc-allocator)
+               (mut p) (prompter-with a (input-fd "\n") 2 (term-plain) false)]
+           (assert-eq (index-of (choose (mut p) "Site" ["a" "b"] -1)) -2)
+           (prompter-free! (mut p))))
+
+(deftest multiline-ends-at-dot-or-eof
+         (let [a (malloc-allocator)
+               (mut p)
+                 (prompter-with a
+                                (input-fd "line one\nline two\n.\nafter\nx\ny")
+                                2
+                                (term-plain)
+                                false)]
+           (assert-eq (text-of (ask-multiline (mut p) "Brief"))
+                      "line one\nline two")
+           (assert-eq (text-of (ask (mut p) "Next" "")) "after")
+           (assert-eq (text-of (ask-multiline (mut p) "More")) "x\ny")
+           (assert-eq (text-of (ask-multiline (mut p) "Empty")) "")
+           (prompter-free! (mut p))))
+
+(deftest interactive-prompts-are-shown-and-reasked
+         (let [a (malloc-allocator)
+               output (pipe-new)
+               (mut p)
+                 (prompter-with a
+                                (input-fd "\n9\nmetaphysics\nmaybe\nYES\n")
+                                (.write output)
+                                (term-plain)
+                                true)]
+           (assert-eq (text-of (ask (mut p) "Name" "demo")) "demo")
+           (assert-eq (index-of (choose (mut p)
+                                        "Pick a site"
+                                        ["local" "metaphysics"]
+                                        0))
+                      1)
+           (assert-eq (yes? (confirm (mut p) "Deploy?" false)) 1)
+           (assert (eof? (ask (mut p) "Again" "")))
+           (prompter-free! (mut p))
+           (assert-eq (captured a output)
+                      "? Name (demo): ? Pick a site
+  1) local
+  2) metaphysics
+  Choose 1-2 (local):   \x2717; enter a number from 1 to 2 or an option's name
+  Choose 1-2 (local): ? Deploy? [y/N]:   \x2717; answer y or n
+? Deploy? [y/N]: ? Again: \n")))
+
+(deftest interactive-multiline-shows-instructions
+         (let [a (malloc-allocator)
+               output (pipe-new)
+               (mut p)
+                 (prompter-with a
+                                (input-fd "a\n.\n")
+                                (.write output)
+                                (term-plain)
+                                true)]
+           (assert-eq (text-of (ask-multiline (mut p) "Brief")) "a")
+           (prompter-free! (mut p))
+           (assert-eq (captured a output)
+                      "? Brief
+  (end with a line containing only '.', or Ctrl-D)
+")))
+
+(deftest reads-a-whole-stream
+         (let [a (malloc-allocator)]
+           (try (let [bytes
+                        (try-or! (read-fd-all a (input-fd "abc\ndef"))
+                                 (assert false))]
+                  (assert-eq bytes "abc\ndef")))
+           (try (let [bytes
+                        (try-or! (read-fd-all a (input-fd "")) (assert false))]
+                  (assert-eq (len bytes) 0)))))

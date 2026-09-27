@@ -1,0 +1,478 @@
+(module tui.keys)
+(import "coil.selectors" :as selectors)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.os" :use [os-errno])
+(import "coil.time" :as time)
+(import "tui.fatal" :use [fatal])
+(import "tui.width"
+        :use
+        [utf8-decode utf8-sequence-length REPLACEMENT-RUNE rune-control?])
+(import "tui.term" :use [term-size term-wake-fd term-drain-wake! TermSize])
+
+(extern read :cc c [i32 (ptr i8) isize] (-> isize))
+
+
+
+;;; One input event. `Char` is a printable Unicode scalar. `Ctrl` carries a
+;;; lowercase ASCII letter, or one of `@ [ \ ] ^ _` / space for the other C0
+;;; bytes. `Alt` is Escape-prefixed input (Alt-b arrives as `(Alt #\b)`).
+;;; `WordLeft`/`WordRight` are Alt- or Ctrl-modified Left/Right. `Paste` is a
+;;; bracketed paste; its text borrows the reader's (or decoded buffer's) storage
+;;; and is valid until the next read. `Resize` reports the new size. `NoKey`
+;;; means the timeout elapsed. `Eof` means standard input closed. `Unknown` is a
+;;; complete escape sequence this decoder does not map (focus, mouse, …).
+(defsum Key
+  (Char [(rune i64)])
+  (Enter)
+  (Tab)
+  (BackTab)
+  (Backspace)
+  (Delete)
+  (Insert)
+  (Escape)
+  (Up)
+  (Down)
+  (Left)
+  (Right)
+  (Home)
+  (End)
+  (PageUp)
+  (PageDown)
+  (Function [(n i64)])
+  (Ctrl [(letter i64)])
+  (Alt [(rune i64)])
+  (AltEnter)
+  (ShiftEnter)
+  (AltBackspace)
+  (WordLeft)
+  (WordRight)
+  (Paste [(text (slice u8))])
+  (Resize [(width i64) (height i64)])
+  (NoKey)
+  (Eof)
+  (Unknown))
+
+;;; Result of decoding the front of an input buffer: a key and the number of
+;;; bytes it used, or `Incomplete` when more bytes are needed to decide.
+(defsum KeyDecode
+  (Decoded [(key Key) (consumed i64)])
+  (Incomplete))
+
+(const ESC 27)
+
+(const PASTE-START "\x1b;[200~")
+
+(const PASTE-END "\x1b;[201~")
+
+(defn keys--byte [(bytes (slice u8)) (i i64)] (-> i64)
+  (cast i64 (get bytes i)))
+
+(defn keys--starts-with? [(bytes (slice u8)) (at i64) (prefix (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut ok) (<= (+ at (len prefix)) (len bytes))]
+    (loop (if (or (not (load ok)) (>= (load i) (len prefix)))
+              (break)
+              (do
+                (when (!= (get bytes (+ at (load i))) (get prefix (load i)))
+                  (set! ok false))
+                (set! i (+ (load i) 1)))))
+    (load ok)))
+
+;;; True when `bytes` is a proper prefix of `whole` (all bytes present match).
+(defn keys--partial-of? [(bytes (slice u8)) (whole (slice u8))] (-> bool)
+  (and (< (len bytes) (len whole))
+       (keys--starts-with? whole 0 bytes)))
+
+(defn keys--find [(bytes (slice u8)) (from i64) (needle (slice u8))] (-> i64)
+  (let [(mut i) from
+        (mut found) -1]
+    (loop (if (> (+ (load i) (len needle)) (len bytes))
+              (break)
+              (if (keys--starts-with? bytes (load i) needle)
+                  (do (set! found (load i)) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn keys--control [(b i64)] (-> Key)
+  (cond (= b 0) (Ctrl 32)
+        (= b 8) (Backspace)
+        (= b 9) (Tab)
+        (= b 13) (Enter)
+        (<= b 26) (Ctrl (+ b 96))
+        (= b 28) (Ctrl #\\)
+        (= b 29) (Ctrl #\])
+        (= b 30) (Ctrl #\^)
+        (= b 31) (Ctrl #\_)
+        (= b 127) (Backspace)
+        :else (Unknown)))
+
+;;; Decode a UTF-8 scalar (or control byte) at `at`. Returns Incomplete when the
+;;; sequence is cut short and more input may follow.
+(defn keys--scalar [(bytes (slice u8)) (at i64) (final bool)] (-> KeyDecode)
+  (let [b (keys--byte bytes at)]
+    (cond (or (< b 32) (= b 127)) (Decoded (keys--control b) 1)
+          (< b 128) (Decoded (Char b) 1)
+          :else
+            (let [need (utf8-sequence-length (get bytes at))
+                  have (- (len bytes) at)]
+              (if (and (> need have)
+                       (not final)
+                       ;; Only wait if what is there so far is a valid prefix.
+                       (let [(mut i) 1
+                             (mut ok) true]
+                         (loop (if (>= (load i) have)
+                                   (break)
+                                   (do
+                                     (when (!= (primitive/iand (keys--byte bytes
+                                                                           (+ at
+                                                                              (load i)))
+                                                               0xC0)
+                                               0x80)
+                                       (set! ok false))
+                                     (set! i (+ (load i) 1)))))
+                         (load ok)))
+                  (Incomplete)
+                  (let [d (utf8-decode bytes at)]
+                    (if (rune-control? (.rune d))
+                        (Decoded (Unknown) (.len d))
+                        (Decoded (Char (.rune d)) (.len d)))))))))
+
+;;; Parsed CSI: numeric parameters (missing ones are -1), the final byte and the
+;;; total sequence length. `private` is a leading `<`, `=`, `>` or `?` byte.
+(defstruct Csi
+  [(p0 i64)
+   (p1 i64)
+   (p2 i64)
+   (count i64)
+   (private i64)
+   (final i64)
+   (length i64)])
+
+;;; Parse `ESC [ …` at offset 0. Returns length 0 when the sequence is not yet
+;;; complete and -1 when it is malformed (a byte that cannot occur in a CSI).
+(defn keys--parse-csi [(bytes (slice u8))] (-> Csi)
+  (let [(mut params) (zeroed (array i64 3))
+        (mut count) 0
+        (mut current) -1
+        (mut private) 0
+        (mut i) 2
+        (mut final) 0
+        (mut length) 0]
+    (set! (index params 0) -1)
+    (set! (index params 1) -1)
+    (set! (index params 2) -1)
+    (when (and (> (len bytes) 2)
+               (let [b (keys--byte bytes 2)] (and (>= b 0x3C) (<= b 0x3F))))
+      (set! private (keys--byte bytes 2))
+      (set! i 3))
+    (loop (if (>= (load i) (len bytes))
+              (break)
+              (let [b (keys--byte bytes (load i))]
+                (cond (and (>= b 48) (<= b 57))
+                        (do
+                          (set! current
+                                (+ (* (if (< (load current) 0) 0 (load current))
+                                      10)
+                                   (- b 48)))
+                          (when (> (load current) 1000000)
+                            (set! current 1000000))
+                          (set! i (+ (load i) 1)))
+                      (or (= b 59) (= b 58))
+                        (do
+                          (when (< (load count) 3)
+                            (set! (index params (load count)) (load current)))
+                          (set! count (+ (load count) 1))
+                          (set! current -1)
+                          (set! i (+ (load i) 1)))
+                      (and (>= b 0x20) (<= b 0x2F)) (set! i (+ (load i) 1))
+                      (and (>= b 0x40) (<= b 0x7E))
+                        (do
+                          (when (< (load count) 3)
+                            (set! (index params (load count)) (load current)))
+                          (set! count (+ (load count) 1))
+                          (set! final b)
+                          (set! length (+ (load i) 1))
+                          (break))
+                      :else (do (set! length -1) (break))))))
+    (Csi
+      :p0 (load (index params 0))
+      :p1 (load (index params 1))
+      :p2 (load (index params 2))
+      :count (load count)
+      :private (load private)
+      :final (load final)
+      :length (load length))))
+
+;;; xterm modifier parameter: 1 + (shift 1 | alt 2 | ctrl 4 | meta 8).
+(defn keys--word-modifier? [(modifier i64)] (-> bool)
+  (and (> modifier 1)
+       (!= (primitive/iand (- modifier 1) 6) 0)))
+
+(defn keys--csi-key [(csi Csi)] (-> Key)
+  (let [f (.final csi)
+        p0 (.p0 csi)
+        p1 (.p1 csi)]
+    (cond (!= (.private csi) 0) (Unknown)
+          (= f #\A) (Up)
+          (= f #\B) (Down)
+          (= f #\C) (if (keys--word-modifier? p1) (WordRight) (Right))
+          (= f #\D) (if (keys--word-modifier? p1) (WordLeft) (Left))
+          (= f #\H) (Home)
+          (= f #\F) (End)
+          (= f #\Z) (BackTab)
+          (and (= f #\P) (= p0 1)) (Function 1)
+          (and (= f #\Q) (= p0 1)) (Function 2)
+          (and (= f #\R) (= p0 1)) (Function 3)
+          (and (= f #\S) (= p0 1)) (Function 4)
+          (= f #\~)
+            (cond (or (= p0 1) (= p0 7)) (Home)
+                  (or (= p0 4) (= p0 8)) (End)
+                  (= p0 2) (Insert)
+                  (= p0 3) (Delete)
+                  (= p0 5) (PageUp)
+                  (= p0 6) (PageDown)
+                  (and (>= p0 11) (<= p0 15)) (Function (- p0 10))
+                  (and (>= p0 17) (<= p0 21)) (Function (- p0 11))
+                  (and (>= p0 23) (<= p0 24)) (Function (- p0 12))
+                  ;; xterm modifyOtherKeys: CSI 27 ; modifier ; code ~
+                  (and (= p0 27) (= (.p2 csi) 13) (= p1 2)) (ShiftEnter)
+                  (and (= p0 27) (= (.p2 csi) 13) (= p1 3)) (AltEnter)
+                  :else (Unknown))
+          ;; kitty / fixterms: CSI code ; modifier u
+          (= f #\u)
+            (cond (and (= p0 13) (= p1 2)) (ShiftEnter)
+                  (and (= p0 13) (= p1 3)) (AltEnter)
+                  (and (= p0 13) (< p1 2)) (Enter)
+                  (and (= p0 27) (< p1 2)) (Escape)
+                  (and (= p0 127) (< p1 2)) (Backspace)
+                  (and (= p0 9) (< p1 2)) (Tab)
+                  (and (>= p0 97) (<= p0 122) (= p1 5)) (Ctrl p0)
+                  (and (>= p0 32) (< p0 127) (= p1 3)) (Alt p0)
+                  :else (Unknown))
+          :else (Unknown))))
+
+(defn keys--ss3-key [(b i64)] (-> Key)
+  (cond (= b #\A) (Up)
+        (= b #\B) (Down)
+        (= b #\C) (Right)
+        (= b #\D) (Left)
+        (= b #\H) (Home)
+        (= b #\F) (End)
+        (= b #\P) (Function 1)
+        (= b #\Q) (Function 2)
+        (= b #\R) (Function 3)
+        (= b #\S) (Function 4)
+        (= b #\M) (Enter)
+        :else (Unknown)))
+
+(defn keys--escape [(bytes (slice u8)) (final bool)] (-> KeyDecode)
+  (let [n (len bytes)]
+    (cond (= n 1) (if final (Decoded (Escape) 1) (Incomplete))
+          ;; Bracketed paste: everything up to the end marker is literal text.
+          (keys--starts-with? bytes 0 PASTE-START)
+            (let [end (keys--find bytes (len PASTE-START) PASTE-END)]
+              (if (< end 0)
+                  (Incomplete)
+                  (Decoded (Paste (subslice bytes (len PASTE-START) end))
+                           (+ end (len PASTE-END)))))
+          (and (not final) (keys--partial-of? bytes PASTE-START)) (Incomplete)
+          (= (keys--byte bytes 1) #\[)
+            (let [csi (keys--parse-csi bytes)]
+              (cond (> (.length csi) 0)
+                      (Decoded (keys--csi-key csi) (.length csi))
+                    (< (.length csi) 0) (Decoded (Unknown) 2)
+                    (not final) (Incomplete)
+                    (= n 2) (Decoded (Alt #\[) 2)
+                    :else (Decoded (Unknown) n)))
+          (= (keys--byte bytes 1) #\O)
+            (cond (>= n 3) (Decoded (keys--ss3-key (keys--byte bytes 2)) 3)
+                  (not final) (Incomplete)
+                  :else (Decoded (Alt #\O) 2))
+          (= (keys--byte bytes 1) 13) (Decoded (AltEnter) 2)
+          (or (= (keys--byte bytes 1) 127) (= (keys--byte bytes 1) 8))
+            (Decoded (AltBackspace) 2)
+          (= (keys--byte bytes 1) ESC) (Decoded (Escape) 1)
+          (< (keys--byte bytes 1) 32) (Decoded (Escape) 1)
+          :else
+            (match (keys--scalar bytes 1 final)
+              (Incomplete [] (Incomplete))
+              (Decoded [key used]
+                       (match key
+                         (Char [rune] (Decoded (Alt rune) (+ used 1)))
+                         (_ (Decoded (Escape) 1))))))))
+
+;;; Decode the first key in `bytes`. Pure: it reads nothing and keeps no state.
+;;; With `final` false, a sequence that might still be growing (a lone ESC, a
+;;; partial CSI or UTF-8 sequence) yields `Incomplete`; with `final` true (the
+;;; reader's short escape timeout expired) it is resolved as typed: a lone ESC is
+;;; `Escape`. An unterminated bracketed paste is always `Incomplete`. Empty input
+;;; is `Incomplete`.
+(defn decode-key [(bytes (slice u8)) (final bool)] (-> KeyDecode)
+  (cond (= (len bytes) 0) (Incomplete)
+        (= (keys--byte bytes 0) ESC) (keys--escape bytes final)
+        :else (keys--scalar bytes 0 final)))
+
+;; ---------------------------------------------------------------------------
+;; Reading from the terminal
+
+;;; Buffered, timeout-aware key reader over standard input.
+(defstruct KeyReader
+  [(fd i64)
+   (buffer (ArrayList u8))
+   (paste (ArrayList u8))
+   (width i64)
+   (height i64)
+   (escape-timeout-ms i64)])
+
+;;; A reader over fd 0. The escape timeout (how long a lone ESC waits to become
+;;; part of a sequence) defaults to 30 ms.
+(defn key-reader-new [(a (dyn Allocator))] (-> KeyReader)
+  (let [size (term-size)]
+    (KeyReader
+      :fd 0
+      :buffer (al-new [u8] a)
+      :paste (al-new [u8] a)
+      :width (.width size)
+      :height (.height size)
+      :escape-timeout-ms 30)))
+
+(defn key-reader-free! [(r (ptr KeyReader))] (-> i64)
+  (al-free! (mut (.buffer r)))
+  (al-free! (mut (.paste r)))
+  0)
+
+(defn keys--now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [e] (fatal "monotonic clock unavailable"))))
+
+(defn keys--consume! [(r (ptr KeyReader)) (n i64)] (-> i64)
+  (let [total (len (.buffer r))
+        data (.data (.buffer r))
+        (mut i) n]
+    (loop (if (>= (load i) total)
+              (break)
+              (do
+                (set! (index data (- (load i) n)) (load (index data (load i))))
+                (set! i (+ (load i) 1)))))
+    (set! (.len (.buffer r)) (- total n))
+    0))
+
+;;; Poll input (and the resize wake pipe). Returns 1 when input is readable,
+;;; 2 when a resize was signalled, 0 on timeout. EINTR counts as a wake-up.
+(defn keys--wait [(r (ptr KeyReader)) (timeout-ms i64)] (-> i64)
+  (let [fds (primitive/alloc-stack (array selectors/PollFd 2))
+        wake (term-wake-fd)
+        count (if (>= wake 0) 2 1)]
+    (set! (index fds 0)
+          (selectors/PollFd
+            :fd (cast i32 (.fd r))
+            :events (cast i16 1)
+            :revents (cast i16 0)))
+    (set! (index fds 1)
+          (selectors/PollFd
+            :fd (cast i32 wake)
+            :events (cast i16 1)
+            :revents (cast i16 0)))
+    (let [ready
+            (cast i64
+                  (selectors/poll-fds (index fds 0)
+                        count
+                        (cast i32 (if (< timeout-ms 0) -1 timeout-ms))))]
+      (cond (> ready 0)
+              (if (and (= count 2) (!= (cast i64 (.revents (index fds 1))) 0))
+                  (do (term-drain-wake!) 2)
+                  1)
+            (= ready 0) 0
+            (= (os-errno) 4) 2
+            :else (fatal "poll on standard input failed")))))
+
+;;; Read available bytes into the buffer. Returns false at end of input.
+(defn keys--fill! [(r (ptr KeyReader))] (-> bool)
+  (let [chunk (primitive/alloc-stack (array u8 4096))
+        got
+          (cast i64
+                (read (cast i32 (.fd r))
+                      (cast (ptr i8) (index chunk 0))
+                      (cast isize 4096)))]
+    (cond (> got 0) (do (al-extend! (mut (.buffer r)) (index chunk 0) got) true)
+          (= got 0) false
+          (or (= (os-errno) 4) (= (os-errno) 35) (= (os-errno) 11)) true
+          :else (do (fatal "read from standard input failed") false))))
+
+(defn keys--take! [(r (ptr KeyReader)) (key Key) (used i64)] (-> Key)
+  (match key
+    (Paste [text]
+           (do
+             ;; Copy out of the input buffer before it is compacted.
+             (al-clear! (mut (.paste r)))
+             (al-extend! (mut (.paste r)) (slice-data text) (len text))
+             (keys--consume! r used)
+             (Paste (al-slice (.paste r)))))
+    (_ (do (keys--consume! r used) key))))
+
+(defn keys--resized? [(r (ptr KeyReader))] (-> bool)
+  (let [size (term-size)]
+    (if (and (= (.width size) (.width r)) (= (.height size) (.height r)))
+        false
+        (do
+          (set! (.width r) (.width size))
+          (set! (.height r) (.height size))
+          true))))
+
+;;; Wait up to `timeout-ms` (negative = forever) for the next key. Returns
+;;; `Resize` as soon as the window size changes, `NoKey` on timeout and `Eof`
+;;; when input ends. Multi-byte sequences split across reads are reassembled; a
+;;; lone ESC is reported after the escape timeout.
+(defn read-key! [(r (ptr KeyReader)) (timeout-ms i64)] (-> Key)
+  (let [deadline (if (< timeout-ms 0) -1 (+ (keys--now-ms) timeout-ms))
+        (mut result) (NoKey)]
+    (loop (if (keys--resized? r)
+              (do (set! result (Resize (.width r) (.height r))) (break))
+              (let [pending (> (len (.buffer r)) 0)
+                    decoded
+                      (if pending
+                          (decode-key (al-slice (.buffer r)) false)
+                          (Incomplete))]
+                (match decoded
+                  (Decoded [key used]
+                           (do (set! result (keys--take! r key used)) (break)))
+                  (Incomplete []
+                              (let [remaining
+                                      (if (< deadline 0)
+                                          -1
+                                          (let [left (- deadline (keys--now-ms))]
+                                            (if (< left 0) 0 left)))
+                                    wait
+                                      (if (and pending
+                                               (or (< remaining 0)
+                                                   (> remaining
+                                                      (.escape-timeout-ms r))))
+                                          (.escape-timeout-ms r)
+                                          remaining)
+                                    woke (keys--wait r wait)]
+                                (cond (= woke 1)
+                                        (when (not (keys--fill! r))
+                                          (set! result (Eof))
+                                          (break))
+                                      (= woke 2) 0
+                                      ;; Timed out with bytes pending: resolve them as typed.
+                                      pending
+                                        (match (decode-key (al-slice (.buffer r))
+                                                           true)
+                                          (Decoded [key used]
+                                                   (do
+                                                     (set! result
+                                                           (keys--take! r
+                                                                        key
+                                                                        used))
+                                                     (break)))
+                                          (Incomplete []
+                                                      (when (= remaining 0)
+                                                        (set! result (NoKey))
+                                                        (break))))
+                                      :else (do (set! result (NoKey)) (break)))))))))
+    (load result)))

@@ -1,0 +1,143 @@
+;; A tiny program exercising the cli package: subcommands, flags, help, errors,
+;; styled status output, a table, and prompts.
+(module greet.main)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.io" :as io)
+(import "coil.result" :use [ok?])
+(import "coil.str" :use *)
+(import "cli.args" :use *)
+(import "cli.prompt" :use *)
+(import "cli.style" :use *)
+
+(defn out [(text (slice u8))] (-> i64)
+  (io/print-str (io/stdout) text)
+  0)
+
+(defn hello [(a (dyn Allocator)) (t Term) (inv Invocation)] (-> i64)
+  (let [name
+          (match (positional inv 0)
+            (Some [value] value)
+            (None [] "world"))
+        times
+          (match (str-parse-int (flag-value-or inv "times" "1"))
+            (Some [n] n)
+            (None [] -1))]
+    (if (< times 1)
+        (do
+          (io/print-str (io/stderr) (err a (term-stderr) "error:"))
+          (io/print-str (io/stderr)
+                        " --times must be a positive whole number\n")
+          2)
+        (let [(mut k) 0]
+          (loop (if (>= (load k) times)
+                    (break)
+                    (do
+                      (out (ok a t (glyph-check t)))
+                      (out " Hello, ")
+                      (out (if (flag? inv "shout")
+                               (strong a t name)
+                               (accent a t name)))
+                      (out (if (flag? inv "shout") "!\n" ".\n"))
+                      (set! k (+ (load k) 1)))))
+          0))))
+
+(defn status [(a (dyn Allocator)) (t Term)] (-> i64)
+  (let [(mut table) (table-new a ["" "RUN" "FACTORY" "SITE" "AGE" "TOKENS"])]
+    (table-align! (mut table) 5 (AlignRight))
+    (table-row! (mut table)
+                [(ok a t (glyph-dot t))
+                 "7f3a"
+                 "implement-review"
+                 "local"
+                 (relative-time a 12000)
+                 (human-count a 48213)])
+    (table-row! (mut table)
+                [(warn a t (glyph-warning t))
+                 "b21c"
+                 "\x65e5;\x672c;-docs"
+                 "metaphysics"
+                 (relative-time a 4000000)
+                 (human-count a 1200)])
+    (table-row! (mut table)
+                [(muted a t (glyph-circle t))
+                 "c9d0"
+                 "triage"
+                 "local"
+                 (relative-time a 200000000)
+                 (human-count a 7)])
+    (out (table-render a t table))
+    (out (muted a t (count-noun a (table-row-count table) "run" "runs")))
+    (out (muted a t " \x00b7; "))
+    (out (muted a t (human-bytes a 3650722202)))
+    (out "\n")
+    (table-free! (mut table))
+    0))
+
+(defn interview-answers [(a (dyn Allocator)) (t Term) (p (mut Prompter))] (-> (Result i64
+                                                                                      PromptError))
+  (try (let [name (try! (ask (mut p) "Project name" "demo"))
+             site
+               (try! (choose (mut p)
+                             "Where should it run?"
+                             ["local" "metaphysics"]
+                             0))
+             go (try! (confirm (mut p) "Start now?" true))]
+         (out (if go (ok a t (glyph-check t)) (muted a t (glyph-circle t))))
+         (out " ")
+         (out (strong a t name))
+         (out " on site #")
+         (out (human-count a (+ site 1)))
+         (out (if go " starting\n" " saved for later\n"))
+         (Ok 0))))
+
+(defn interview [(a (dyn Allocator)) (t Term)] (-> i64)
+  (let [(mut p) (prompter-new a)
+        result (interview-answers a t (mut p))]
+    (prompter-free! (mut p))
+    (if (ok? result)
+        0
+        (do
+          (io/print-str (io/stderr) (err a (term-stderr) "cancelled"))
+          (io/print-str (io/stderr) "\n")
+          1))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [a (malloc-allocator)
+        prog
+          (Program
+            :name "greet"
+            :summary "Say hello, beautifully."
+            :version "1.0.0"
+            :commands
+              [(Command
+                 :name "hello"
+                 :group "Greetings"
+                 :summary "Greet someone"
+                 :usage ""
+                 :args ["[NAME]"]
+                 :flags
+                   [(switch "shout" #\s "Greet loudly")
+                    (flag "times" #\n "N" "Repeat the greeting N times")])
+               (Command
+                 :name "status"
+                 :group "Showcase"
+                 :summary "Print a status table"
+                 :usage ""
+                 :args (no-args)
+                 :flags (no-flags))
+               (Command
+                 :name "interview"
+                 :group "Showcase"
+                 :summary "Ask a few questions"
+                 :usage ""
+                 :args (no-args)
+                 :flags (no-flags))]
+            :flags (no-flags))
+        t (term-stdout)]
+    (match (parse-standard a prog (argv-from-main a argc argv))
+      (Err [code] code)
+      (Ok [inv]
+          (cond (command-is? inv "hello") (hello a t inv)
+                (command-is? inv "status") (status a t)
+                :else (interview a t))))))

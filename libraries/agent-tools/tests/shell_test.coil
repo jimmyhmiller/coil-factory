@@ -1,0 +1,224 @@
+(module agent_tools.shell-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.os" :as os)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.shell" :use *)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(import "agent_tools.test-support" :use *)
+
+;;; A context that reports cancellation once a monotonic deadline passes.
+(defstruct CancelAt [(at-ms i64) (polls i64)])
+
+(impl ToolContext CancelAt
+  (tool-cancelled? [(self (ptr CancelAt))] (-> bool)
+    (do (set! (.polls self) (+ (.polls self) 1))
+        (>= (sys/monotonic-ms) (.at-ms self)))))
+
+(defn open-ws [(a (dyn Allocator)) (root (slice u8))] (-> Workspace)
+  (match (workspace-open a root)
+    (Ok [ws] ws)
+    (Err [message] (do (println "{}" message) (assert false) (Workspace :root "")))))
+
+(defn never [(a (dyn Allocator))] (-> (ptr NeverCancelled))
+  (box! a NeverCancelled (NeverCancelled :unused 0)))
+
+(defn run! [(a (dyn Allocator)) (ws Workspace) (policy SandboxPolicy) (command (slice u8)) (timeout-ms i64)] (-> CommandResult)
+  (match (run-command a ws policy command timeout-ms (never a))
+    (Ok [r] r)
+    (Err [m] (do (println "run-command failed: {}" m) (assert false) (primitive/zeroed CommandResult)))))
+
+(defn args [(a (dyn Allocator)) (json (slice u8))] (-> JVal)
+  (match (from-json [JVal] a json)
+    (Ok [v] v)
+    (Err [_] (do (assert false) (JNull)))))
+
+(defn run-tool [(a (dyn Allocator)) (tool (ptr ShellTool)) (json (slice u8)) (context (dyn ToolContext))] (-> ToolOutcome)
+  (tool-run tool a (tool-call "c1" "shell" (args a json) json) context))
+
+(defn ok-text [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [text] text)
+    (ToolFailed [m] (do (println "tool failed: {}" m) (assert false) ""))))
+
+(defn failed-text [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [text] (do (println "tool unexpectedly succeeded: {}" text) (assert false) ""))
+    (ToolFailed [m] m)))
+
+;;; Whether `pid` is still a live process, waiting up to a second for a killed
+;;; process to be reaped by its new parent.
+(defn process-alive? [(pid i64)] (-> bool)
+  (let [(mut alive) true
+        (mut tries) 0]
+    (loop (if (or (not (load alive)) (>= (load tries) 20))
+              (break)
+              (do (when (!= (os/kill (primitive/cast i32 pid) (primitive/cast i32 0)) (primitive/cast i32 0))
+                    (set! alive false)
+                    0)
+                  (when (load alive)
+                    (run-argv (malloc-allocator) ["/bin/sleep" "0.05"])
+                    0)
+                  (set! tries (+ (load tries) 1)))))
+    (load alive)))
+
+(defn pid-in [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (match (str-parse-int (str-trim (read-text a path)))
+    (Some [n] n)
+    (None [] (do (assert false) 0))))
+
+(deftest reports-exit-codes-and-merges-streams
+  (let [a (malloc-allocator)
+        dir (temp-dir a "exit")
+        ws (open-ws a dir)
+        tool (box! a ShellTool (shell-tool ws (NoSandbox)))]
+    (assert (= (ok-text (run-tool a tool "{\"command\":\"echo hi\"}" (never a))) "hi\nexit 0"))
+    (assert (= (ok-text (run-tool a tool "{\"command\":\"echo out; echo err >&2; exit 3\"}" (never a)))
+               "out\nerr\nexit 3"))
+    (assert (= (ok-text (run-tool a tool "{\"command\":\"true\"}" (never a))) "(no output)\nexit 0"))
+    (assert (= (ok-text (run-tool a tool "{\"command\":\"pwd\"}" (never a)))
+               (join2 a (workspace-root ws) "\nexit 0")))
+    (assert (contains? (ok-text (run-tool a tool "{\"command\":\"kill -9 $$\"}" (never a)))
+                       "exit 137 (killed by signal 9)"))
+    (let [r (run! a ws (NoSandbox) "cat; echo done" 10000)]
+      (assert (= (.output r) "done\n"))
+      (assert-eq (.exit-code r) 0))
+    (remove-tree a dir)))
+
+(deftest caps-long-output-to-head-and-tail
+  (let [a (malloc-allocator)
+        dir (temp-dir a "cap")
+        ws (open-ws a dir)
+        r (run! a ws (NoSandbox) "i=0; while [ $i -lt 5000 ]; do echo \"line $i\"; i=$((i+1)); done" 30000)]
+    (assert-eq (.exit-code r) 0)
+    (assert (> (.omitted-bytes r) 0))
+    (assert-eq (+ (.omitted-bytes r) 16384) (.output-bytes r))
+    (assert (starts-with (.output r) "line 0\nline 1\n"))
+    (assert (contains? (.output r) " bytes omitted "))
+    (assert (contains? (.output r) "line 4999\n"))
+    (assert (not (contains? (.output r) "line 2500\n")))
+    (assert (< (len (.output r)) 16500))
+    (remove-tree a dir)))
+
+(deftest timeout-kills-the-whole-process-group
+  (let [a (malloc-allocator)
+        dir (temp-dir a "timeout")
+        ws (open-ws a dir)
+        started (sys/monotonic-ms)
+        r (run! a ws (NoSandbox) "sleep 30 & echo $! > child.pid; echo started; sleep 30" 1000)
+        elapsed (- (sys/monotonic-ms) started)]
+    (assert (.timed-out r))
+    (assert (not (.cancelled r)))
+    (assert (< elapsed 5000))
+    (assert (= (.output r) "started\n"))
+    (assert (not (process-alive? (pid-in a (path-join a dir "child.pid")))))
+    (remove-tree a dir)))
+
+(deftest timeout-message-names-the-limit
+  (let [a (malloc-allocator)
+        dir (temp-dir a "timeout-msg")
+        ws (open-ws a dir)
+        tool (box! a ShellTool (shell-tool ws (NoSandbox)))
+        text (ok-text (run-tool a tool "{\"command\":\"echo begin; sleep 30\",\"timeout_seconds\":1}" (never a)))]
+    (assert (= text "begin\ntimed out after 1s; the command and its child processes were stopped"))
+    (remove-tree a dir)))
+
+(deftest background-processes-do-not-outlive-the-command
+  (let [a (malloc-allocator)
+        dir (temp-dir a "background")
+        ws (open-ws a dir)
+        started (sys/monotonic-ms)
+        r (run! a ws (NoSandbox) "sleep 30 & echo $! > bg.pid; (sleep 30 > /dev/null 2>&1 &) ; echo done" 20000)
+        elapsed (- (sys/monotonic-ms) started)]
+    (assert (not (.timed-out r)))
+    (assert-eq (.exit-code r) 0)
+    (assert (= (.output r) "done\n"))
+    (assert (< elapsed 5000))
+    (assert (not (process-alive? (pid-in a (path-join a dir "bg.pid")))))
+    (remove-tree a dir)))
+
+(deftest cancellation-stops-the-command
+  (let [a (malloc-allocator)
+        dir (temp-dir a "cancel")
+        ws (open-ws a dir)
+        tool (box! a ShellTool (shell-tool ws (NoSandbox)))
+        context (box! a CancelAt (CancelAt :at-ms (+ (sys/monotonic-ms) 500) :polls 0))
+        started (sys/monotonic-ms)
+        text (ok-text (run-tool a tool "{\"command\":\"sleep 30 & echo $! > child.pid; sleep 30\"}" context))
+        elapsed (- (sys/monotonic-ms) started)]
+    (assert (= text "(no output)\ncancelled; the command and its child processes were stopped"))
+    (assert (> (.polls context) 1))
+    (assert (< elapsed 5000))
+    (assert (not (process-alive? (pid-in a (path-join a dir "child.pid")))))
+    (remove-tree a dir)))
+
+(deftest rejects-bad-arguments-and-reports-spawn-failures
+  (let [a (malloc-allocator)
+        dir (temp-dir a "badargs")
+        ws (open-ws a dir)
+        tool (box! a ShellTool (shell-tool ws (NoSandbox)))]
+    (assert (contains? (failed-text (run-tool a tool "{\"command\":\"  \"}" (never a))) "command is required"))
+    (assert (contains? (failed-text (run-tool a tool "{\"command\":\"ls\",\"timeout_seconds\":0}" (never a)))
+                       "between 1 and 3600"))
+    (assert (contains? (failed-text (run-tool a tool "{\"command\":\"ls\",\"timeout_seconds\":3601}" (never a)))
+                       "between 1 and 3600"))
+    (assert (contains? (failed-text (run-tool a tool "{\"command\":\"ls\",\"timeout_seconds\":\"5\"}" (never a)))
+                       "must be an integer"))
+    (remove-tree a dir)
+    (let [message (failed-text (run-tool a tool "{\"command\":\"ls\"}" (never a)))]
+      (assert (contains? message "could not start \"/bin/sh\""))
+      (assert (contains? message "No such file or directory")))
+    (match (run-command a ws (NoSandbox) "ls" 0 (never a))
+      (Ok [_] (assert false))
+      (Err [m] (assert (contains? m "timeout must be positive"))))))
+
+(deftest summary-is-the-first-command-line
+  (let [a (malloc-allocator)
+        tool (box! a ShellTool (shell-tool (Workspace :root "/") (NoSandbox)))]
+    (assert (= (tool-summary tool a (tool-call "c" "shell" (args a "{\"command\":\"coil test\"}") "")) "$ coil test"))
+    (assert (= (tool-summary tool a (tool-call "c" "shell" (args a "{\"command\":\"cd src\\nmake\"}") ""))
+               "$ cd src \x2026;"))
+    (let [long (tool-summary tool a (tool-call "c" "shell"
+                                               (args a "{\"command\":\"echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
+                                               ""))]
+      (assert (starts-with long "$ echo aaaa"))
+      (assert (< (len long) 90)))))
+
+(deftest sandbox-confines-writes-to-the-workspace
+  (let [a (malloc-allocator)]
+    (let [base (fresh-dir a (cache-dir a) "sandbox")
+          ws-dir (path-join a base "ws")
+          outside (path-join a base "outside")]
+      (sys/make-directory a ws-dir)
+      (let [ws (open-ws a ws-dir)
+            policy (sandbox-detect a (sandbox-options false))]
+        (match policy
+          (NoSandbox [] (do (println "no sandbox (sandbox-exec or bwrap) on this machine") (assert false)))
+          (_ 0))
+        (let [blocked (run! a ws policy (join2 a "touch " outside) 20000)]
+          (assert (!= (.exit-code blocked) 0))
+          (assert (or (contains? (.output blocked) "Operation not permitted")
+                      (contains? (.output blocked) "Read-only file system")))
+          (assert (not (exists? a outside))))
+        (let [inside (run! a ws policy "touch inside.txt && mkdir -p .coil/build && echo x > .coil/build/o && echo ok" 20000)]
+          (assert-eq (.exit-code inside) 0)
+          (assert (= (.output inside) "ok\n"))
+          (assert (exists? a (path-join a ws-dir "inside.txt"))))
+        (let [tmp (run! a ws policy "f=$(mktemp) && echo data > \"$f\" && cat \"$f\" && rm \"$f\"" 20000)]
+          (assert-eq (.exit-code tmp) 0)
+          (assert (= (.output tmp) "data\n")))
+        (let [git (run! a ws policy "git init -q && git -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m first && git log --format=%s" 30000)]
+          (when (!= (.exit-code git) 0) (println "{}" (.output git)) 0)
+          (assert-eq (.exit-code git) 0)
+          (assert (= (.output git) "first\n")))
+        (let [unsandboxed (run! a ws (NoSandbox) (join2 a "touch " outside) 20000)]
+          (assert-eq (.exit-code unsandboxed) 0)
+          (assert (exists? a outside))))
+      (remove-tree a base))))

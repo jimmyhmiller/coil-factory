@@ -1,0 +1,334 @@
+(module durable.fdio)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.mem" :use *)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.try" :use *)
+(import "durable.error" :use *)
+(import "durable.sys" :use *)
+
+;; Descriptor-level helpers shared by the durable modules: C path conversion, and
+;; system-call loops that retry EINTR and finish partial transfers.
+
+;;; A NUL-terminated copy of `path` owned by `a`; release it with `path-cstr-free`.
+;;; An empty path or one containing a NUL byte is rejected: libc would otherwise
+;;; silently operate on a truncated name.
+(defn path-cstr [(a (dyn Allocator)) (path (slice u8))] (-> (Result (ptr i8)
+                                                                    DurableError))
+  (try (ensure! (> (len path) 0) (Err (Invalid "empty path")))
+       (let [(mut i) 0]
+         (loop (if (>= (load i) (len path))
+                   (break)
+                   (do
+                     (ensure! (!= (cast i64 (get path (load i))) 0)
+                              (Err (Invalid "path contains a NUL byte")))
+                     (set! i (+ (load i) 1))))))
+       (let [cp (str->cstr a path)]
+         (ensure! (!= (cast i64 cp) 0) (Err (OutOfMemory)))
+         (Ok cp))))
+
+(defn path-cstr-free [(a (dyn Allocator)) (path (slice u8)) (cp (ptr i8))] (-> i64)
+  (free-bytes a (slice-new [u8] (cast (ptr u8) cp) (+ (len path) 1)) 1))
+
+(defn eintr? [] (-> bool)
+  (= (os/os-errno) SYS-EINTR))
+
+;;; open(2) `path` relative to the working directory, retrying EINTR. Returns the
+;;; descriptor or the errno as an `Os "open"` error.
+(defn open-path [(a (dyn Allocator))
+                 (path (slice u8))
+                 (flags i64)
+                 (mode i64)] (-> (Result i32 DurableError))
+  (try (let [cp (try! (path-cstr a path))
+             (mut fd) (cast i32 -1)
+             (mut code) 0]
+         (loop (let [opened (os/open cp (cast i32 flags) (cast i32 mode))]
+                 (if (>= opened (cast i32 0))
+                     (do
+                       (set! fd opened)
+                       (break))
+                     (let [e (os/os-errno)]
+                       (if (= e SYS-EINTR)
+                           (continue)
+                           (do
+                             (set! code e)
+                             (break)))))))
+         (path-cstr-free a path cp)
+         (if (>= (load fd) (cast i32 0))
+             (Ok (load fd))
+             (Err (Os "open" (load code)))))))
+
+;;; close(2). A failed close is reported, never ignored.
+(defn close-fd [(fd i32)] (-> (Result i64 DurableError))
+  (if (= (os/close fd) (cast i32 0))
+      (Ok 0)
+      (Err (os-error "close"))))
+
+;;; Combine a primary result with the result of closing its descriptor: the primary
+;;; error wins, otherwise a close failure is surfaced.
+(defn close-after [T] [(fd i32) (primary (Result T DurableError))] (-> (Result T
+                                                                               DurableError))
+  (let [closed (close-fd fd)]
+    (match primary
+      (Err [e] (Err e))
+      (Ok [v]
+          (match closed
+            (Err [e] (Err e))
+            (Ok [ignored] (Ok v)))))))
+
+;;; write(2) every byte of `bytes`, looping on partial writes and EINTR.
+(defn write-all-fd [(fd i32) (bytes (slice u8))] (-> (Result i64 DurableError))
+  (try (let [n (len bytes)
+             (mut done) 0]
+         (loop (if (>= (load done) n)
+                   (break)
+                   (let [wrote
+                           (cast i64
+                                 (io/write fd
+                                           (cast (ptr i8)
+                                                 (index (slice-data bytes)
+                                                        (load done)))
+                                           (cast isize (- n (load done)))))]
+                     (if (< wrote 0)
+                         (if (eintr?)
+                             (continue)
+                             (return-from :try (Err (os-error "write"))))
+                         (do
+                           (ensure! (> wrote 0) (Err (Os "write" 0)))
+                           (set! done (+ (load done) wrote)))))))
+         (Ok n))))
+
+;;; pread(2) up to `count` bytes into `buf` from file offset `offset`, retrying
+;;; EINTR. Returns the byte count; zero means end of file.
+(defn pread-some [(fd i32) (buf (ptr u8)) (count i64) (offset i64)] (-> (Result i64
+                                                                                DurableError))
+  (let [(mut result) (Ok [i64 DurableError] 0)]
+    (loop (let [got (pread fd (cast (ptr i8) buf) count offset)]
+            (if (>= got 0)
+                (do
+                  (set! result (Ok got))
+                  (break))
+                (if (eintr?)
+                    (continue)
+                    (do
+                      (set! result (Err (os-error "pread")))
+                      (break))))))
+    (load result)))
+
+;;; fsync(2), retrying EINTR.
+(defn fsync-fd [(fd i32)] (-> (Result i64 DurableError))
+  (let [(mut result) (Ok [i64 DurableError] 0)]
+    (loop (if (= (fsync fd) (cast i32 0))
+              (break)
+              (if (eintr?)
+                  (continue)
+                  (do
+                    (set! result (Err (os-error "fsync")))
+                    (break)))))
+    (load result)))
+
+;;; The current size of the open file, via lseek(2) to the end.
+(defn fd-size [(fd i32)] (-> (Result i64 DurableError))
+  (let [end (lseek fd 0 (cast i32 SYS-SEEK-END))]
+    (if (< end 0)
+        (Err (os-error "lseek"))
+        (Ok end))))
+
+;;; flock(2) with `operation`, retrying EINTR. Returns true when the lock operation
+;;; succeeded and false only when LOCK_NB was requested and the lock is held
+;;; elsewhere.
+(defn flock-fd [(fd i32) (operation i64)] (-> (Result bool DurableError))
+  (let [(mut result) (Ok [bool DurableError] true)]
+    (loop (if (= (flock fd (cast i32 operation)) (cast i32 0))
+              (break)
+              (let [e (os/os-errno)]
+                (cond (= e SYS-EINTR) (continue)
+                      (and (= e SYS-EWOULDBLOCK)
+                           (!= (& operation SYS-LOCK-NB) 0))
+                        (do
+                          (set! result (Ok false))
+                          (break))
+                      :else
+                        (do
+                          (set! result (Err (Os "flock" e)))
+                          (break))))))
+    (load result)))
+
+;;; Ensure at least 64 KiB of spare capacity past `used`, doubling so a long read
+;;; costs amortized linear copying.
+(defn grow-for-read! [(buf (mut (ArrayList u8))) (used i64)] (-> i64)
+  (let [cap (al-cap [u8] (load buf))]
+    (if (>= (- cap used) 65536)
+        0
+        (al-reserve! [u8] (mut buf) (max2 (+ used 65536) (* cap 2))))))
+
+(defn max2 [(x i64) (y i64)] (-> i64)
+  (if (> x y) x y))
+
+;;; Read the whole remaining file behind `fd` (from offset 0) into `a`-owned bytes.
+(defn read-all-fd [(a (dyn Allocator)) (fd i32)] (-> (Result (slice u8)
+                                                             DurableError))
+  (try (let [(mut buf) (al-new [u8] a)
+             (mut offset) 0
+             (mut failure) (None [DurableError])]
+         (loop (do
+                 (grow-for-read! (mut buf) (load offset))
+                 (match (pread-some fd
+                                    (index (.data buf) (load offset))
+                                    (- (al-cap [u8] (load buf)) (load offset))
+                                    (load offset))
+                   (Err [e]
+                        (do
+                          (set! failure (Some e))
+                          (break)))
+                   (Ok [got]
+                       (if (= got 0)
+                           (break)
+                           (set! offset (+ (load offset) got)))))))
+         (match (load failure)
+           (Some [e]
+                 (do
+                   (al-free! [u8] (mut buf))
+                   (Err e)))
+           (None []
+                 (do
+                   (set! (.len buf) (load offset))
+                   (Ok (al-into-slice [u8] (mut buf)))))))))
+
+;;; ftruncate(2) the open file to `size` bytes, retrying EINTR.
+(defn truncate-fd [(fd i32) (size i64)] (-> (Result i64 DurableError))
+  (let [(mut result) (Ok [i64 DurableError] 0)]
+    (loop (if (= (fs/ftruncate fd size) (cast i32 0))
+              (break)
+              (if (eintr?)
+                  (continue)
+                  (do
+                    (set! result (Err (os-error "ftruncate")))
+                    (break)))))
+    (load result)))
+
+;;; The directory part of `path`: everything before the final `/`, `/` for a file in
+;;; the root, and `.` for a bare name. Borrows `path`.
+(defn parent-dir [(path (slice u8))] (-> (slice u8))
+  (let [(mut i) (- (len path) 1)]
+    ;; ignore trailing slashes
+    (loop (if (and (> (load i) 0) (= (cast i64 (get path (load i))) 47))
+              (set! i (- (load i) 1))
+              (break)))
+    (loop (if (or (< (load i) 0) (= (cast i64 (get path (load i))) 47))
+              (break)
+              (set! i (- (load i) 1))))
+    (cond (< (load i) 0) "."
+          (= (load i) 0) "/"
+          :else (subslice [u8] path 0 (load i)))))
+
+;;; The final component of `path` (after the last `/`). Borrows `path`.
+(defn base-name [(path (slice u8))] (-> (slice u8))
+  (let [(mut i) (- (len path) 1)]
+    (loop (if (or (< (load i) 0) (= (cast i64 (get path (load i))) 47))
+              (break)
+              (set! i (- (load i) 1))))
+    (subslice [u8] path (+ (load i) 1) (len path))))
+
+;;; fsync(2) a directory so that entries created, renamed, or removed in it are
+;;; durable.
+(defn fsync-dir [(a (dyn Allocator)) (dir (slice u8))] (-> (Result i64
+                                                                   DurableError))
+  (try (let [fd
+               (try! (open-path a
+                                dir
+                                (| SYS-O-RDONLY
+                                   (| SYS-O-DIRECTORY SYS-O-CLOEXEC))
+                                0))]
+         (close-after fd (fsync-fd fd)))))
+
+;;; Reset errno to zero, for calls that report failure only through errno.
+(defn errno-clear! [] (-> i64)
+  (set! (sys-errno-location) (cast i32 0))
+  0)
+
+;; Copy the name out of a dirent returned by readdir.
+(defn dirent-name [(entry (ptr i8))] (-> (slice u8))
+  (cstr->str (cast (ptr i8) (index (cast (ptr u8) entry) fs/DIRENT-NAME-OFFSET))))
+
+(defn copy-bytes [(a (dyn Allocator)) (bytes (slice u8))] (-> (Result (slice u8)
+                                                                      DurableError))
+  (if (= (len bytes) 0)
+      (Ok "")
+      (match (alloc-bytes a (len bytes) 1)
+        (None [] (Err (OutOfMemory)))
+        (Some [m]
+              (do
+                (mem-copy [u8] (slice-data m) (slice-data bytes) (len bytes))
+                (Ok m))))))
+
+;;; Free a list of names returned by `dir-names-fd`.
+(defn dir-names-free! [(a (dyn Allocator)) (names (mut (ArrayList (slice u8))))] (-> i64)
+  (let [n (len (load names))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [name (get (load names) (load i))]
+                (when (> (len name) 0) (free-bytes a name 1) 0)
+                (set! i (+ (load i) 1)))))
+    (al-free! [(slice u8)] (mut names))))
+
+;; With the stream open: collect every entry except `.` and `..`.
+(defn dir-names-stream [(a (dyn Allocator)) (stream (ptr i8))] (-> (Result (ArrayList (slice u8))
+                                                                           DurableError))
+  (let [(mut names) (al-new [(slice u8)] a)
+        (mut failure) (None [DurableError])]
+    (rewinddir stream)
+    (loop (do
+            (errno-clear!)
+            (let [entry (fs/readdir stream)]
+              (if (= (cast i64 entry) 0)
+                  (do
+                    (let [e (os/os-errno)]
+                      (when (!= e 0) (set! failure (Some (Os "readdir" e))) 0))
+                    (break))
+                  (let [name (dirent-name entry)]
+                    (if (or (= name ".") (= name ".."))
+                        0
+                        (match (copy-bytes a name)
+                          (Err [e]
+                               (do
+                                 (set! failure (Some e))
+                                 (break)))
+                          (Ok [copy]
+                              (push! [(slice u8)] (mut names) copy)))))))))
+    (match (load failure)
+      (Some [e]
+            (do
+              (dir-names-free! a (mut names))
+              (Err e)))
+      (None [] (Ok (load names))))))
+
+;;; The entry names of the open directory `fd` (without `.` and `..`), in the order
+;;; the filesystem returns them, each owned by `a`. `fd` stays open and owned by the
+;;; caller. Free the list with `dir-names-free!`.
+(defn dir-names-fd [(a (dyn Allocator)) (fd i32)] (-> (Result (ArrayList (slice u8))
+                                                              DurableError))
+  (let [copy (dup fd)]
+    (if (< copy (cast i32 0))
+        (Err (os-error "dup"))
+        (let [stream (fdopendir copy)]
+          (if (= (cast i64 stream) 0)
+              (let [err (os-error "fdopendir")]
+                (os/close copy)
+                (Err err))
+              (let [result (dir-names-stream a stream)]
+                (if (= (fs/closedir stream) (cast i32 0))
+                    result
+                    (match result
+                      (Err [e] (Err e))
+                      (Ok [names]
+                          (let [err (os-error "closedir")
+                                (mut owned) names]
+                            (dir-names-free! a (mut owned))
+                            (Err err)))))))))))

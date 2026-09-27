@@ -1,0 +1,565 @@
+(module durable.jsonl-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.result" :use *)
+(import "coil.thread" :use *)
+(import "durable.error" :use *)
+(import "durable.fdio" :use *)
+(import "durable.jsonl" :use *)
+(import "durable.sys" :use *)
+(import "durable.test-support" :use *)
+
+(defn record-at [(batch JournalBatch) (i i64)] (-> JournalRecord)
+  (get (batch-records batch) i))
+
+(defn line-at [(batch JournalBatch) (i i64)] (-> (slice u8))
+  (let [r (record-at batch i)]
+    (.line r)))
+
+(defn offset-at [(batch JournalBatch) (i i64)] (-> i64)
+  (let [r (record-at batch i)]
+    (.offset r)))
+
+(defn next-at [(batch JournalBatch) (i i64)] (-> i64)
+  (let [r (record-at batch i)]
+    (.next-offset r)))
+
+(defn read-ok [(a (dyn Allocator))
+               (path (slice u8))
+               (from i64)
+               (max-records i64)
+               (max-bytes i64)] (-> JournalBatch)
+  (expect-ok a "journal-read" (journal-read a path from max-records max-bytes)))
+
+(defn append-ok [(a (dyn Allocator)) (path (slice u8)) (line (slice u8))] (-> i64)
+  (expect-ok a "journal-append!" (journal-append! a path line false)))
+
+;; The BadCursor offset of a failed read, or -1000 when the read did not fail that way.
+(defn bad-cursor-offset [(r (Result JournalBatch DurableError))] (-> i64)
+  (match r
+    (Err [e]
+         (match e
+           (BadCursor [offset reason] offset)
+           (_ -1000)))
+    (Ok [batch]
+        (let [(mut b) batch]
+          (journal-batch-free! (mut b))
+          -1000))))
+
+(defn invalid? [(r (Result i64 DurableError))] (-> bool)
+  (match r
+    (Err [e]
+         (match e
+           (Invalid [reason] true)
+           (_ false)))
+    (Ok [v] false)))
+
+;; Append raw bytes with no locking or validation, to fabricate torn records.
+(defn raw-append [(a (dyn Allocator)) (path (slice u8)) (bytes (slice u8))] (-> i64)
+  (let [fd
+          (expect-ok a
+                     "open"
+                     (open-path a
+                                path
+                                (| SYS-O-WRONLY (| SYS-O-APPEND SYS-O-CREAT))
+                                384))]
+    (expect-ok a "write" (write-all-fd fd bytes))
+    (expect-ok a "close" (close-fd fd))))
+
+(deftest appends-return-offsets-and-read-back-in-pages
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "pages")
+               path (join a dir "events.jsonl")]
+           (assert-eq (append-ok a path "{\"n\":1}") 0)
+           (assert-eq (append-ok a path "{\"n\":22}") 8)
+           (assert-eq (expect-ok a
+                                 "append"
+                                 (journal-append! a path "{\"n\":333}" true))
+                      17)
+           (assert-eq (expect-ok a "size" (journal-size a path)) 27)
+           (let [(mut all) (read-ok a path 0 100 1000000)]
+             (assert-eq (batch-count all) 3)
+             (assert (= (line-at all 0) "{\"n\":1}"))
+             (assert (= (line-at all 1) "{\"n\":22}"))
+             (assert (= (line-at all 2) "{\"n\":333}"))
+             (assert-eq (offset-at all 1) 8)
+             (assert-eq (next-at all 1) 17)
+             (assert-eq (batch-next-offset all) 27)
+             (journal-batch-free! (mut all)))
+           ;; page by record count
+           (let [(mut first) (read-ok a path 0 2 1000000)]
+             (assert-eq (batch-count first) 2)
+             (assert-eq (batch-next-offset first) 17)
+             (let [(mut second)
+                     (read-ok a path (batch-next-offset first) 2 1000000)]
+               (assert-eq (batch-count second) 1)
+               (assert (= (line-at second 0) "{\"n\":333}"))
+               (assert-eq (batch-next-offset second) 27)
+               (let [(mut tail) (read-ok a path 27 2 1000000)]
+                 (assert-eq (batch-count tail) 0)
+                 (assert-eq (batch-next-offset tail) 27)
+                 (journal-batch-free! (mut tail)))
+               (journal-batch-free! (mut second)))
+             (journal-batch-free! (mut first)))
+           (cleanup a dir)))
+
+(deftest max-bytes-bounds-a-batch-but-always-returns-one-record
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "bytes")
+               path (join a dir "events.jsonl")]
+           ;; three 10-byte records (9 bytes + newline)
+           (append-ok a path "{\"a\":111}")
+           (append-ok a path "{\"b\":222}")
+           (append-ok a path "{\"c\":333}")
+           (let [(mut two) (read-ok a path 0 100 25)]
+             (assert-eq (batch-count two) 2)
+             (assert-eq (batch-next-offset two) 20)
+             (journal-batch-free! (mut two)))
+           (let [(mut exact) (read-ok a path 0 100 20)]
+             (assert-eq (batch-count exact) 2)
+             (journal-batch-free! (mut exact)))
+           (let [(mut one) (read-ok a path 0 100 3)]
+             (assert-eq (batch-count one) 1)
+             (assert (= (line-at one 0) "{\"a\":111}"))
+             (assert-eq (batch-next-offset one) 10)
+             (journal-batch-free! (mut one)))
+           (let [(mut rest) (read-ok a path 10 100 3)]
+             (assert-eq (batch-count rest) 1)
+             (assert (= (line-at rest 0) "{\"b\":222}"))
+             (journal-batch-free! (mut rest)))
+           (cleanup a dir)))
+
+(deftest large-records-span-many-reads
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "large")
+               path (join a dir "events.jsonl")
+               big
+                 (expect-ok a
+                            "alloc"
+                            (ok-or (alloc-bytes a 200000 1) (OutOfMemory)))]
+           (let [(mut i) 0]
+             (loop (if (>= (load i) 200000)
+                       (break)
+                       (do
+                         (slice-set! big
+                                     (load i)
+                                     (cast u8 (+ 97 (% (load i) 26))))
+                         (set! i (+ (load i) 1))))))
+           (append-ok a path "{\"small\":1}")
+           (assert-eq (append-ok a path big) 12)
+           (append-ok a path "{\"small\":2}")
+           (let [(mut b) (read-ok a path 0 100 1000)]
+             (assert-eq (batch-count b) 1)
+             (journal-batch-free! (mut b)))
+           (let [(mut b) (read-ok a path 12 100 1000)]
+             (assert-eq (batch-count b) 1)
+             (assert (= (line-at b 0) big))
+             (assert-eq (batch-next-offset b) 200013)
+             (journal-batch-free! (mut b)))
+           (let [(mut b) (read-ok a path 0 100 10000000)]
+             (assert-eq (batch-count b) 3)
+             (assert (= (line-at b 1) big))
+             (assert (= (line-at b 2) "{\"small\":2}"))
+             (journal-batch-free! (mut b)))
+           (free-bytes a big 1)
+           (cleanup a dir)))
+
+(deftest missing-journal-is-empty-at-zero-only
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "missing")
+               path (join a dir "none.jsonl")]
+           (let [(mut b) (read-ok a path 0 10 1000)]
+             (assert-eq (batch-count b) 0)
+             (assert-eq (batch-next-offset b) 0)
+             (journal-batch-free! (mut b)))
+           (assert-eq (bad-cursor-offset (journal-read a path 5 10 1000)) 5)
+           (assert-eq (expect-ok a "size" (journal-size a path)) 0)
+           (cleanup a dir)))
+
+(deftest cursor-validation-rejects-bad-offsets
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "cursor")
+               path (join a dir "events.jsonl")]
+           (append-ok a path "{\"x\":1}")
+           (append-ok a path "{\"y\":2}")
+           (assert-eq (bad-cursor-offset (journal-read a path -1 10 1000)) -1)
+           (assert-eq (bad-cursor-offset (journal-read a path 17 10 1000)) 17)
+           (assert-eq (bad-cursor-offset (journal-read a path 3 10 1000)) 3)
+           (assert-eq (bad-cursor-offset (journal-read a path 7 10 1000)) 7)
+           (let [(mut at-end) (read-ok a path 16 10 1000)]
+             (assert-eq (batch-count at-end) 0)
+             (journal-batch-free! (mut at-end)))
+           (let [(mut middle) (read-ok a path 8 10 1000)]
+             (assert-eq (batch-count middle) 1)
+             (journal-batch-free! (mut middle)))
+           (assert (match (journal-read a path 0 0 1000)
+                     (Err [e]
+                          (match e
+                            (Invalid [reason] true)
+                            (_ false)))
+                     (Ok [b] false)))
+           (cleanup a dir)))
+
+(deftest append-rejects-newlines-and-empty-records
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "reject")
+               path (join a dir "events.jsonl")]
+           (assert (invalid? (journal-append! a path "{\"a\":\n1}" false)))
+           (assert (invalid? (journal-append! a path "trailing\n" false)))
+           (assert (invalid? (journal-append! a path "" false)))
+           (assert-eq (expect-ok a "size" (journal-size a path)) 0)
+           (cleanup a dir)))
+
+(deftest torn-final-line-is-invisible-until-completed
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "torn")
+               path (join a dir "events.jsonl")]
+           (raw-append a path "{\"done\":1}\n{\"part")
+           (let [(mut b) (read-ok a path 0 10 1000)]
+             (assert-eq (batch-count b) 1)
+             (assert (= (line-at b 0) "{\"done\":1}"))
+             (assert-eq (batch-next-offset b) 11)
+             (journal-batch-free! (mut b)))
+           (let [(mut b) (read-ok a path 11 10 1000)]
+             (assert-eq (batch-count b) 0)
+             (assert-eq (batch-next-offset b) 11)
+             (journal-batch-free! (mut b)))
+           ;; a cursor inside the torn line is not a record boundary
+           (assert-eq (bad-cursor-offset (journal-read a path 13 10 1000)) 13)
+           (raw-append a path "ial\":2}\n")
+           (let [(mut b) (read-ok a path 11 10 1000)]
+             (assert-eq (batch-count b) 1)
+             (assert (= (line-at b 0) "{\"partial\":2}"))
+             (assert-eq (batch-next-offset b) 25)
+             (journal-batch-free! (mut b)))
+           (cleanup a dir)))
+
+(deftest append-discards-a-dead-writers-torn-tail
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "repair")
+               path (join a dir "events.jsonl")]
+           (raw-append a path "{\"ok\":1}\n{\"crashed-mid-rec")
+           (assert-eq (append-ok a path "{\"next\":2}") 9)
+           (let [(mut b) (read-ok a path 0 10 1000)]
+             (assert-eq (batch-count b) 2)
+             (assert (= (line-at b 0) "{\"ok\":1}"))
+             (assert (= (line-at b 1) "{\"next\":2}"))
+             (assert-eq (batch-next-offset b) 20)
+             (journal-batch-free! (mut b)))
+           ;; a journal that is nothing but a torn line
+           (let [only (join a dir "only.jsonl")]
+             (raw-append a only "{\"torn")
+             (assert-eq (append-ok a only "{\"first\":1}") 0)
+             (assert-eq (expect-ok a "size" (journal-size a only)) 12))
+           (cleanup a dir)))
+
+(deftest follower-returns-only-new-records
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "follow")
+               path (join a dir "events.jsonl")
+               (mut f)
+                 (expect-ok a "follower-new" (follower-new a path 0 2 1000000))]
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 0)
+             (journal-batch-free! (mut b)))
+           (append-ok a path "{\"e\":1}")
+           (append-ok a path "{\"e\":2}")
+           (append-ok a path "{\"e\":3}")
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 2)
+             (assert (= (line-at b 1) "{\"e\":2}"))
+             (journal-batch-free! (mut b)))
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 1)
+             (assert (= (line-at b 0) "{\"e\":3}"))
+             (journal-batch-free! (mut b)))
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 0)
+             (journal-batch-free! (mut b)))
+           (raw-append a path "{\"e\":")
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 0)
+             (journal-batch-free! (mut b)))
+           (raw-append a path "4}\n")
+           (let [(mut b) (expect-ok a "poll" (follower-poll! (mut f)))]
+             (assert-eq (batch-count b) 1)
+             (assert (= (line-at b 0) "{\"e\":4}"))
+             (journal-batch-free! (mut b)))
+           (assert-eq (follower-cursor (load f)) 32)
+           ;; resuming from a saved cursor
+           (let [(mut g)
+                   (expect-ok a
+                              "follower-new"
+                              (follower-new a path 16 10 1000000))
+                 (mut b) (expect-ok a "poll" (follower-poll! (mut g)))]
+             (assert-eq (batch-count b) 2)
+             (assert (= (line-at b 0) "{\"e\":3}"))
+             (journal-batch-free! (mut b))
+             (follower-free! (mut g)))
+           (follower-free! (mut f))
+           (cleanup a dir)))
+
+;; ---------------------------------------------------------------------------
+;; Concurrency: PROCESSES forked processes, each running THREADS threads, each
+;; appending RECORDS records of varying size to one journal.
+(const PROCESSES 4)
+
+(const THREADS 4)
+
+(const RECORDS 200)
+
+(defn pad-length [(p i64) (t i64) (i i64)] (-> i64)
+  (+ (% (+ (* i 37) (+ (* t 11) (* p 5))) 5000) 1))
+
+;;; `{"p":P,"t":T,"i":I,"pad":"ccc…"}` with a size that varies per record.
+(defn make-line [(a (dyn Allocator)) (p i64) (t i64) (i i64)] (-> (slice u8))
+  (let [(mut sb) (sb-new a)
+        n (pad-length p t i)
+        c (cast u8 (+ 97 (% (+ (* p THREADS) t) 26)))
+        (mut k) 0]
+    (sb-push-str! (mut sb) "{\"p\":")
+    (sb-push-i64! (mut sb) p)
+    (sb-push-str! (mut sb) ",\"t\":")
+    (sb-push-i64! (mut sb) t)
+    (sb-push-str! (mut sb) ",\"i\":")
+    (sb-push-i64! (mut sb) i)
+    (sb-push-str! (mut sb) ",\"pad\":\"")
+    (loop (if (>= (load k) n)
+              (break)
+              (do
+                (sb-push-byte! (mut sb) c)
+                (set! k (+ (load k) 1)))))
+    (sb-push-str! (mut sb) "\"}")
+    (sb-finish! (mut sb))))
+
+(defstruct Worker
+  [(path (slice u8))
+   (p i64)
+   (t i64)
+   (ok i64)])
+
+(defn worker-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [w (cast (ptr Worker) arg)
+        a (malloc-allocator)
+        (mut offsets) (al-new [i64] a)
+        (mut good) true
+        (mut last) -1
+        (mut i) 0]
+    (loop (if (or (>= (load i) RECORDS) (not (load good)))
+              (break)
+              (let [line (make-line a (.p w) (.t w) (load i))]
+                (match (journal-append! a (.path w) line false)
+                  (Err [e] (set! good false))
+                  (Ok [offset]
+                      (do
+                        (when (<= offset (load last)) (set! good false) 0)
+                        (set! last offset)
+                        (push! [i64] (mut offsets) offset))))
+                (free-bytes a line 1)
+                (set! i (+ (load i) 1)))))
+    ;; every returned offset must be where that exact record starts
+    (set! i 0)
+    (loop (if (or (>= (load i) (len (load offsets))) (not (load good)))
+              (break)
+              (let [offset (get (load offsets) (load i))
+                    line (make-line a (.p w) (.t w) (load i))]
+                (match (journal-read a (.path w) offset 1 1)
+                  (Err [e] (set! good false))
+                  (Ok [batch]
+                      (let [(mut b) batch]
+                        (when (or (!= (batch-count (load b)) 1)
+                                  (not (= (line-at (load b) 0) line))
+                                  (!= (offset-at (load b) 0) offset))
+                          (set! good false)
+                          0)
+                        (journal-batch-free! (mut b)))))
+                (free-bytes a line 1)
+                (set! i (+ (load i) 1)))))
+    (al-free! [i64] (mut offsets))
+    (set! (.ok w) (if (load good) 1 0))
+    (cast (ptr i8) 0)))
+
+;; Body of one forked writer process; returns its exit code.
+(defn writer-process [(path (slice u8)) (p i64)] (-> i64)
+  (let [workers (primitive/alloc-stack (array Worker 4))
+        threads (primitive/alloc-stack (array Thread 4))
+        (mut t) 0
+        (mut failures) 0]
+    (loop (if (>= (load t) THREADS)
+              (break)
+              (let [w (index (cast (ptr Worker) workers) (load t))]
+                (set! (.path w) path)
+                (set! (.p w) p)
+                (set! (.t w) (load t))
+                (set! (.ok w) 0)
+                (when (!= (thread-spawn (index (cast (ptr Thread) threads)
+                                               (load t))
+                                        (fnptr-of worker-main)
+                                        (cast (ptr i8) w))
+                          (cast i32 0))
+                  (set! failures (+ (load failures) 1))
+                  0)
+                (set! t (+ (load t) 1)))))
+    (set! t 0)
+    (loop (if (>= (load t) THREADS)
+              (break)
+              (do
+                (thread-join (index (cast (ptr Thread) threads) (load t)))
+                (when (!= (.ok (index (cast (ptr Worker) workers) (load t))) 1)
+                  (set! failures (+ (load failures) 1))
+                  0)
+                (set! t (+ (load t) 1)))))
+    (if (= (load failures) 0) 0 1)))
+
+;; Parse the leading `{"p":P,"t":T,"i":I` of a record: returns P*1000000+T*10000+I or -1.
+(defn parse-number [(line (slice u8)) (at (mut i64))] (-> i64)
+  (let [(mut v) 0
+        (mut digits) 0]
+    (loop (if (>= (load at) (len line))
+              (break)
+              (let [c (cast i64 (get line (load at)))]
+                (if (and (>= c 48) (<= c 57))
+                    (do
+                      (set! v (+ (* (load v) 10) (- c 48)))
+                      (set! digits (+ (load digits) 1))
+                      (set! at (+ (load at) 1)))
+                    (break)))))
+    (if (= (load digits) 0) -1 (load v))))
+
+(defn expect-literal [(line (slice u8)) (at (mut i64)) (lit (slice u8))] (-> bool)
+  (if (> (+ (load at) (len lit)) (len line))
+      false
+      (if (= (subslice [u8] line (load at) (+ (load at) (len lit))) lit)
+          (do
+            (set! at (+ (load at) (len lit)))
+            true)
+          false)))
+
+(defstruct Key [(p i64) (t i64) (i i64)])
+
+;;; Reap `pid` (retrying EINTR) and return its raw wait status.
+(defn wait-child [(pid i32)] (-> i64)
+  (let [status (primitive/alloc-stack i32)
+        (mut result) -1]
+    (loop (let [r (os/waitpid pid status (cast i32 0))]
+            (cond (= r pid)
+                    (do
+                      (set! result (cast i64 (load status)))
+                      (break))
+                  (= (os/os-errno) SYS-EINTR) (continue)
+                  :else (break))))
+    (load result)))
+
+(defn parse-key [(line (slice u8))] (-> (Option Key))
+  (let [(mut at) 0]
+    (if (not (expect-literal line (mut at) "{\"p\":"))
+        (None)
+        (let [p (parse-number line (mut at))]
+          (if (not (expect-literal line (mut at) ",\"t\":"))
+              (None)
+              (let [t (parse-number line (mut at))]
+                (if (not (expect-literal line (mut at) ",\"i\":"))
+                    (None)
+                    (let [i (parse-number line (mut at))]
+                      (if (or (< p 0) (< t 0) (< i 0))
+                          (None)
+                          (Some (Key
+                                  :p p
+                                  :t t
+                                  :i i)))))))))))
+
+(deftest concurrent-processes-and-threads-never-interleave
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "concurrent")
+               path (join a dir "events.jsonl")
+               pids (primitive/alloc-stack (array i32 4))
+               (mut p) 0]
+           (loop (if (>= (load p) PROCESSES)
+                     (break)
+                     (let [pid (os/fork)]
+                       (assert (>= pid (cast i32 0)))
+                       (when (= pid (cast i32 0))
+                         (os/_exit (cast i32 (writer-process path (load p))))
+                         0)
+                       (set! (index (cast (ptr i32) pids) (load p)) pid)
+                       (set! p (+ (load p) 1)))))
+           (set! p 0)
+           (loop (if (>= (load p) PROCESSES)
+                     (break)
+                     (do
+                       ;; a raw wait status of 0 means "exited normally with code 0"
+                       (assert-eq (wait-child (load (index (cast (ptr i32) pids)
+                                                           (load p))))
+                                  0)
+                       (set! p (+ (load p) 1)))))
+           ;; every line is exactly one record some thread wrote, each exactly once,
+           ;; and each thread's records appear in the order it appended them
+           (let [total (* PROCESSES (* THREADS RECORDS))
+                 seen
+                   (expect-ok a
+                              "alloc"
+                              (ok-or (alloc-bytes a total 1) (OutOfMemory)))
+                 next-i (primitive/alloc-stack (array i64 16))
+                 (mut k) 0
+                 (mut count) 0
+                 (mut cursor) 0]
+             (loop (if (>= (load k) total)
+                       (break)
+                       (do
+                         (slice-set! seen (load k) (cast u8 0))
+                         (set! k (+ (load k) 1)))))
+             (set! k 0)
+             (loop (if (>= (load k) 16)
+                       (break)
+                       (do
+                         (set! (index (cast (ptr i64) next-i) (load k)) 0)
+                         (set! k (+ (load k) 1)))))
+             (loop (let [(mut b) (read-ok a path (load cursor) 97 300000)
+                         n (batch-count (load b))
+                         (mut j) 0]
+                     (loop (if (>= (load j) n)
+                               (break)
+                               (let [line (line-at (load b) (load j))]
+                                 (match (parse-key line)
+                                   (None [] (assert false))
+                                   (Some [key]
+                                         (let [kk key
+                                               expected
+                                                 (make-line a
+                                                            (.p kk)
+                                                            (.t kk)
+                                                            (.i kk))
+                                               slot
+                                                 (+ (* (+ (* (.p kk) THREADS)
+                                                          (.t kk))
+                                                       RECORDS)
+                                                    (.i kk))
+                                               stream
+                                                 (index (cast (ptr i64) next-i)
+                                                        (+ (* (.p kk) THREADS)
+                                                           (.t kk)))]
+                                           (assert (< (.p kk) PROCESSES))
+                                           (assert (< (.t kk) THREADS))
+                                           (assert (< (.i kk) RECORDS))
+                                           (assert (= line expected))
+                                           (assert-eq (cast i64 (get seen slot))
+                                                      0)
+                                           (slice-set! seen slot (cast u8 1))
+                                           (assert-eq (load stream) (.i kk))
+                                           (set! stream (+ (load stream) 1))
+                                           (free-bytes a expected 1)
+                                           0)))
+                                 (set! count (+ (load count) 1))
+                                 (set! j (+ (load j) 1)))))
+                     (set! cursor (batch-next-offset (load b)))
+                     (journal-batch-free! (mut b))
+                     (if (= n 0) (break) 0)))
+             (assert-eq (load count) total)
+             (assert-eq (load cursor)
+                        (expect-ok a "size" (journal-size a path)))
+             (free-bytes a seen 1))
+           (cleanup a dir)))

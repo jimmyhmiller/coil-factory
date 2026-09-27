@@ -1,0 +1,86 @@
+(module agent_tools.test-support)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "coil.process" :as process)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "agent_tools.sys" :as sys)
+
+;;; A fresh, unique directory for one test: `<base>/agent-tools-test-<pid>-<label>`.
+;;; Each deftest runs in its own process, so the pid keeps concurrent runs apart.
+(defn fresh-dir [(a (dyn Allocator)) (base (slice u8)) (label (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (sb-push-str! (mut b) base)
+    (sb-push-str! (mut b) "/agent-tools-test-")
+    (sb-push-i64! (mut b) (process/id))
+    (sb-push-str! (mut b) "-")
+    (sb-push-str! (mut b) label)
+    (let [path (sb-finish! (mut b))]
+      (remove-tree a path)
+      (match (sys/make-directory a path)
+        (Ok [_] path)
+        (Err [code] (do (assert false) path))))))
+
+;;; $HOME/.cache, created if needed. Sandbox tests need a directory outside
+;;; the temporary directories the sandbox always allows.
+(defn cache-dir [(a (dyn Allocator))] (-> (slice u8))
+  (match (os/env-get a "HOME")
+    (Ok [maybe] (match maybe
+                  (Some [owned] (let [dir (path-join a (os/owned-string-slice owned) ".cache")]
+                                  (sys/make-directory a dir)
+                                  dir))
+                  (None [] (do (assert false) ""))))
+    (Err [_] (do (assert false) ""))))
+
+;;; A fresh directory under /private/tmp.
+(defn temp-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
+  (fresh-dir a "/private/tmp" label))
+
+(defn run-argv [(a (dyn Allocator)) (argv (slice (slice u8)))] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)]
+    (match (subprocess/spawn a child (get argv 0) (subslice argv 1 (len argv))
+                             (subprocess/null-stdio) (subprocess/inherit-stdio) (subprocess/inherit-stdio))
+      (Err [_] -1)
+      (Ok [_] (match (subprocess/child-wait child)
+                (Ok [status] (match status
+                               (subprocess/Exited [code] code)
+                               (subprocess/Signaled [signal] (+ 128 signal))))
+                (Err [_] -1))))))
+
+;;; `rm -rf path`.
+(defn remove-tree [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (run-argv a ["/bin/rm" "-rf" path]))
+
+;;; `ln -s target link`.
+(defn symlink! [(a (dyn Allocator)) (target (slice u8)) (link (slice u8))] (-> i64)
+  (run-argv a ["/bin/ln" "-s" target link]))
+
+(defn path-join [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (sb-push-str! (mut b) dir)
+    (sb-push-str! (mut b) "/")
+    (sb-push-str! (mut b) name)
+    (sb-finish! (mut b))))
+
+(defn write-text! [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> i64)
+  (match (fs/write-file a path text)
+    (Ok [n] n)
+    (Err [_] (do (assert false) -1))))
+
+(defn read-text [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (fs/read-file a path)
+    (Ok [bytes] bytes)
+    (Err [_] "<unreadable>")))
+
+(defn exists? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (match (sys/real-path a path)
+    (sys/PathOk [_] true)
+    (sys/PathErrno [_] false)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle)
+    (Some [_] true)
+    (None [] false)))

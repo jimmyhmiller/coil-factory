@@ -1,0 +1,143 @@
+(module durable.lock-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.os" :as os)
+(import "coil.str" :use *)
+(import "durable.atomic" :use *)
+(import "durable.error" :use *)
+(import "durable.lock" :use *)
+(import "durable.sys" :use *)
+(import "durable.test-support" :use *)
+
+(defn is-invalid? [T] [(r (Result T DurableError))] (-> bool)
+  (match r
+    (Err [e]
+         (match e
+           (Invalid [reason] true)
+           (_ false)))
+    (Ok [v] false)))
+
+(defn wait-child [(pid i32)] (-> i64)
+  (let [status (primitive/alloc-stack i32)
+        (mut result) -1]
+    (loop (let [r (os/waitpid pid status (cast i32 0))]
+            (cond (= r pid)
+                    (do
+                      (set! result (cast i64 (load status)))
+                      (break))
+                  (= (os/os-errno) SYS-EINTR) (continue)
+                  :else (break))))
+    (load result)))
+
+;; The exit code of a normally exited child, or -1.
+(defn exit-code [(status i64)] (-> i64)
+  (if (= (& status 127) 0) (& (>> status 8) 255) -1))
+
+(deftest try-lock-fails-while-another-descriptor-holds-it
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "lock")
+               path (join a dir "daemon.lock")
+               (mut first) (expect-ok a "lock-open!" (lock-open! a path))
+               (mut second) (expect-ok a "lock-open!" (lock-open! a path))]
+           (assert (expect-ok a "lock-try!" (lock-try! (mut first))))
+           (assert (lock-held? (load first)))
+           (assert (not (expect-ok a "lock-try!" (lock-try! (mut second)))))
+           (assert (not (lock-held? (load second))))
+           (expect-ok a "unlock!" (unlock! (mut first)))
+           (assert (not (lock-held? (load first))))
+           (assert (expect-ok a "lock-try!" (lock-try! (mut second))))
+           (assert (not (expect-ok a "lock-try!" (lock-try! (mut first)))))
+           ;; closing the holder releases the lock
+           (expect-ok a "lock-close!" (lock-close! (mut second)))
+           (expect-ok a "lock-wait!" (lock-wait! (mut first)))
+           (assert (lock-held? (load first)))
+           (expect-ok a "lock-close!" (lock-close! (mut first)))
+           (assert (is-invalid? (lock-close! (mut first))))
+           (assert (is-invalid? (lock-try! (mut first))))
+           (cleanup a dir)))
+
+(deftest lock-excludes-another-process
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "lockproc")
+               path (join a dir "daemon.lock")
+               (mut held) (expect-ok a "lock-open!" (lock-open! a path))]
+           (assert (expect-ok a "lock-try!" (lock-try! (mut held))))
+           ;; child exits 3 when the lock is busy, 4 if it wrongly gets it, 5 on error
+           (let [pid (os/fork)]
+             (when (= pid (cast i32 0))
+               (os/_exit (cast i32
+                               (match (lock-open! a path)
+                                 (Err [e] 5)
+                                 (Ok [l]
+                                     (let [(mut mine) l]
+                                       (match (lock-try! (mut mine))
+                                         (Err [e] 5)
+                                         (Ok [got] (if got 4 3))))))))
+               0)
+             (assert-eq (exit-code (wait-child pid)) 3))
+           ;; after release, the child's non-blocking attempt succeeds (exit 4)
+           (expect-ok a "unlock!" (unlock! (mut held)))
+           (let [pid (os/fork)]
+             (when (= pid (cast i32 0))
+               (os/_exit (cast i32
+                               (match (lock-open! a path)
+                                 (Err [e] 5)
+                                 (Ok [l]
+                                     (let [(mut mine) l]
+                                       (match (lock-try! (mut mine))
+                                         (Err [e] 5)
+                                         (Ok [got] (if got 4 3))))))))
+               0)
+             (assert-eq (exit-code (wait-child pid)) 4))
+           (expect-ok a "lock-close!" (lock-close! (mut held)))
+           (cleanup a dir)))
+
+(deftest pid-files-round-trip-and-reject-garbage
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "pid")
+               path (join a dir "pid")]
+           (assert (match (expect-ok a "pid-read" (pid-read a path))
+                     (None [] true)
+                     (Some [p] false)))
+           (expect-ok a "pid-write!" (pid-write! a path 4242))
+           (assert (= (match (read-file-if-exists a path)
+                        (Ok [o]
+                            (match o
+                              (Some [b] b)
+                              (None [] "")))
+                        (Err [e] ""))
+                      "4242\n"))
+           (assert (match (expect-ok a "pid-read" (pid-read a path))
+                     (Some [p] (= p 4242))
+                     (None [] false)))
+           (assert (is-invalid? (pid-write! a path 0)))
+           (let [bad (join a dir "bad")]
+             (expect-ok a "write" (write-file-atomic! a bad "12x\n" 420))
+             (assert (match (pid-read a bad)
+                       (Err [e]
+                            (match e
+                              (Corrupt [reason] true)
+                              (_ false)))
+                       (Ok [o] false)))
+             (expect-ok a "write" (write-file-atomic! a bad "  77 \n" 420))
+             (assert (match (expect-ok a "pid-read" (pid-read a bad))
+                       (Some [p] (= p 77))
+                       (None [] false)))
+             (expect-ok a "write" (write-file-atomic! a bad "\n" 420))
+             (assert (match (pid-read a bad)
+                       (Err [e] true)
+                       (Ok [o] false))))
+           (cleanup a dir)))
+
+(deftest pid-alive-checks-processes
+         (let [a (malloc-allocator)]
+           (assert (expect-ok a "self" (pid-alive? (cast i64 (os/getpid)))))
+           ;; pid 1 belongs to root: kill reports EPERM, which still means alive
+           (assert (expect-ok a "init" (pid-alive? 1)))
+           (let [pid (os/fork)]
+             (when (= pid (cast i32 0)) (os/_exit (cast i32 0)) 0)
+             (assert-eq (wait-child pid) 0)
+             ;; reaped, so gone
+             (assert (not (expect-ok a "reaped" (pid-alive? (cast i64 pid))))))
+           (assert (is-invalid? (pid-alive? 0)))
+           (assert (is-invalid? (pid-alive? -1)))))

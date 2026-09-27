@@ -1,0 +1,180 @@
+(module http_app.sse)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "http_app.router" :use *)
+(import "sse.core" :as sse)
+
+;;; What an `SseSource` has after the client's cursor.
+;;; - `SseEvents`: one or more events, oldest first. The slice and every byte it
+;;;   references may come from the step allocator passed to `sse-next`.
+;;; - `SseNothing`: no new events yet; the stream idles and asks again.
+;;; - `SseEnd`: the source is finished; the response ends normally.
+;;; - `SseError`: the source failed; the response is aborted.
+(defsum SseBatch
+  (SseEvents [(events (slice sse/SseEvent))])
+  (SseNothing)
+  (SseEnd)
+  (SseError))
+
+;;; An application event feed. `sse-next` returns the events after `cursor`, the
+;;; id of the last event already delivered (initially the client's
+;;; `Last-Event-ID`, or the application's starting cursor). It must not block.
+;;; `sse-release` is called exactly once when the response ends for any reason.
+(deftrait SseSource [Self]
+  (sse-next [(self (ptr Self)) (allocator (dyn Allocator)) (cursor (slice u8))]
+            (-> SseBatch))
+  (sse-release [(self (ptr Self)) (reason StreamEndReason)] (-> i64)))
+
+;;; `keep-alive-ms`: after this long without any write, send a `: keep-alive`
+;;; comment so proxies and clients see a live connection. `retry-ms`: when
+;;; nonnegative, a `retry:` reconnection hint sent once before the first event.
+(defstruct SseOptions [(keep-alive-ms i64) (retry-ms i64)])
+
+(defn sse-options [] (-> SseOptions)
+  (let [(mut options) (primitive/zeroed SseOptions)]
+    (set! (.keep-alive-ms options) 15000)
+    (set! (.retry-ms options) -1)
+    (load options)))
+
+;;; The `ResponseStream` adapter behind `sse-response`. Its cursor tracks the id of
+;;; the last event written.
+(defstruct SseStream
+  [(source (dyn SseSource))
+   (cursor (ArrayList u8))
+   (options SseOptions)
+   (retry-pending bool)])
+
+;;; One event whose data could be misread: SSE treats CR as a line terminator, and
+;;; `sse.core/sse-encode` splits data lines only on LF.
+(defn event-encodable? [(event sse/SseEvent)] (-> bool)
+  (not (sse/sse-contains-byte? (.data event) 13)))
+
+(defn sse-cursor [(stream (ptr SseStream))] (-> (slice u8))
+  (al-slice [u8] (.cursor stream)))
+
+(defn retry-into! [(stream (ptr SseStream)) (out (mut StrBuf))] (-> i64)
+  (when (and (.retry-pending stream) (>= (.retry-ms (.options stream)) 0))
+    (sb-push-str! (mut out) "retry: ")
+    (sb-push-i64! (mut out) (.retry-ms (.options stream)))
+    (sb-push-str! (mut out) "\n\n")
+    0)
+  (set! (.retry-pending stream) false)
+  0)
+
+;;; Nothing new: send a pending retry hint, a keep-alive comment when the
+;;; connection has been quiet long enough, or idle.
+(defn quiet-step [(stream (ptr SseStream))
+                  (allocator (dyn Allocator))
+                  (idle-ms i64)] (-> StreamStep)
+  (cond (.retry-pending stream)
+          (let [(mut out) (sb-new allocator)]
+            (retry-into! stream (mut out))
+            (StreamChunk (sb-finish! (mut out))))
+        (>= idle-ms (.keep-alive-ms (.options stream)))
+          (StreamChunk ": keep-alive\n\n")
+        :else (StreamIdle)))
+
+(defn events-step [(stream (ptr SseStream))
+                   (allocator (dyn Allocator))
+                   (events (slice sse/SseEvent))] (-> StreamStep)
+  (let [(mut out) (sb-new allocator)
+        (mut i) 0
+        (mut valid) true
+        (mut last-id) (None [(slice u8)])]
+    (retry-into! stream (mut out))
+    (loop (if (or (>= (load i) (len events)) (not (load valid)))
+              (break)
+              (let [event (get events (load i))
+                    encoded
+                      (if (event-encodable? event)
+                          (sse/sse-encode allocator event)
+                          "")]
+                (if (= (len encoded) 0)
+                    (set! valid false)
+                    (do
+                      (sb-push-str! (mut out) encoded)
+                      (when (or (.id-present event) (> (len (.id event)) 0))
+                        (set! last-id (Some (.id event)))
+                        0)
+                      (set! i (+ (load i) 1)))))))
+    (if (not (load valid))
+        (StreamFailed)
+        (do
+          (match (load last-id)
+            (Some [id]
+                  (do
+                    (al-clear! [u8] (mut (.cursor stream)))
+                    (al-extend! [u8]
+                                (mut (.cursor stream))
+                                (slice-data id)
+                                (len id))))
+            (None [] 0))
+          (StreamChunk (sb-finish! (mut out)))))))
+
+(defn next-sse-step [(stream (ptr SseStream))
+                     (allocator (dyn Allocator))
+                     (idle-ms i64)] (-> StreamStep)
+  (match (sse-next (.source stream) allocator (sse-cursor stream))
+    (SseEnd [] (StreamDone))
+    (SseError [] (StreamFailed))
+    (SseNothing [] (quiet-step stream allocator idle-ms))
+    (SseEvents [events]
+               (if (= (len events) 0)
+                   (quiet-step stream allocator idle-ms)
+                   (events-step stream allocator events)))))
+
+(impl ResponseStream SseStream
+  (stream-next [(self (ptr SseStream))
+                (allocator (dyn Allocator))
+                (idle-ms i64)]
+               (-> StreamStep)
+               (next-sse-step self allocator idle-ms))
+  (stream-release [(self (ptr SseStream)) (reason StreamEndReason)]
+                  (-> i64)
+                  (sse-release (.source self) reason)))
+
+;;; The client's `Last-Event-ID` header, or "" when absent.
+(defn last-event-id [(ctx RequestContext)] (-> (slice u8))
+  (header ctx "Last-Event-ID"))
+
+;;; A 200 `text/event-stream` response that delivers `source`'s events after
+;;; `cursor`, with `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The
+;;; adapter and a copy of the cursor are allocated from `a`, which must live until
+;;; the stream is released (the handler's allocator does). `source` must too.
+(defn sse-response [(a (dyn Allocator))
+                    (source (dyn SseSource))
+                    (cursor (slice u8))
+                    (options SseOptions)] (-> Response)
+  (let [(mut initial) (primitive/zeroed SseStream)
+        (mut headers) (al-new [ResponseHeader] a)
+        (mut cache) (primitive/zeroed ResponseHeader)
+        (mut buffering) (primitive/zeroed ResponseHeader)]
+    (set! (.source initial) source)
+    (set! (.cursor initial) (al-new [u8] a))
+    (al-extend! [u8] (mut (.cursor initial)) (slice-data cursor) (len cursor))
+    (set! (.options initial) options)
+    (set! (.retry-pending initial) (>= (.retry-ms options) 0))
+    (set! (.name cache) "Cache-Control")
+    (set! (.value cache) "no-cache")
+    (set! (.name buffering) "X-Accel-Buffering")
+    (set! (.value buffering) "no")
+    (push! [ResponseHeader] (mut headers) (load cache))
+    (push! [ResponseHeader] (mut headers) (load buffering))
+    (let [stream (box! a SseStream (load initial))]
+      (stream-response 200
+                       "text/event-stream; charset=utf-8"
+                       (al-slice [ResponseHeader] headers)
+                       stream))))
+
+;;; An `SseEvent` with data and optional id/name (empty = omitted).
+(defn sse-event [(name (slice u8)) (id (slice u8)) (data (slice u8))] (-> sse/SseEvent)
+  (let [(mut event) (primitive/zeroed sse/SseEvent)]
+    (set! (.name event) name)
+    (set! (.data event) data)
+    (set! (.id event) id)
+    (set! (.id-present event) (> (len id) 0))
+    (set! (.retry-ms event) -1)
+    (load event)))

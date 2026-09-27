@@ -1,0 +1,1088 @@
+;; Terminal styling for command-line programs: color capability detection, SGR
+;; painting, status glyphs with ASCII fallbacks, display-width-aware tables, and
+;; the small humanizing formatters (relative times, byte sizes, counts, plurals)
+;; that make CLI output read well.
+;;
+;; Everything that renders takes an explicit `Term`, the capability record for
+;; one output stream. Detect it once per stream with `term-detect`; tests and
+;; scripts construct one directly with `term`, `term-plain`, or `term-ascii`, so
+;; output is deterministic regardless of where the program runs.
+;;
+;; Functions that return `(slice u8)` allocate the result from the allocator they
+;; are given, exactly sized; free it with `(alloc/free [u8] a s)` or, more simply,
+;; build output in an arena that is released as a whole.
+(module cli.style)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.fail" :use [cli-fail!])
+
+(export Term
+        term
+        term-plain
+        term-ascii
+        term-detect
+        term-stdout
+        term-stderr
+        tty?
+        color-enabled?
+        unicode-enabled?
+        utf8-locale?
+        Color
+        Default
+        Black
+        Red
+        Green
+        Yellow
+        Blue
+        Magenta
+        Cyan
+        White
+        Gray
+        Rgb
+        rgb
+        Style
+        style
+        fg
+        bold
+        dim
+        italic
+        underline
+        style-active?
+        paint
+        paint-into!
+        ok-style
+        warn-style
+        err-style
+        muted-style
+        accent-style
+        strong-style
+        ok
+        warn
+        err
+        muted
+        accent
+        strong
+        glyph-dot
+        glyph-circle
+        glyph-target
+        glyph-diamond
+        glyph-check
+        glyph-cross
+        glyph-warning
+        glyph-arrow
+        glyph-hline
+        glyph-vline
+        glyph-ellipsis
+        codepoint-width
+        display-width
+        push-spaces!
+        pad-right
+        pad-left
+        Align
+        AlignLeft
+        AlignRight
+        Table
+        table-new
+        table-new-headless
+        table-align!
+        table-row!
+        table-row-count
+        table-render
+        table-free!
+        relative-time
+        relative-time-ago
+        human-bytes
+        human-count
+        plural
+        count-noun)
+
+(extern isatty :cc c [i32] (-> i32))
+
+;;; Rendering capabilities of one output stream. `color` enables SGR escape
+;;; sequences; `unicode` selects the Unicode glyphs over their ASCII fallbacks.
+(defstruct Term [(color bool) (unicode bool)])
+
+(defn term [(color bool) (unicode bool)] (-> Term)
+  (Term :color color :unicode unicode))
+
+;;; No color, Unicode glyphs: what a modern terminal shows when piped to a file.
+(defn term-plain [] (-> Term)
+  (Term :color false :unicode true))
+
+;;; No color, ASCII glyphs: safe for any byte sink.
+(defn term-ascii [] (-> Term)
+  (Term :color false :unicode false))
+
+(defn env-value [(name (ptr i8))] (-> (Option (slice u8)))
+  (let [value (os/getenv name)]
+    (if (= (cast i64 value) 0)
+        (None)
+        (Some (cstr->str value)))))
+
+(defn env-nonempty? [(name (ptr i8))] (-> bool)
+  (match (env-value name)
+    (Some [value] (> (len value) 0))
+    (None [] false)))
+
+(defn term-dumb? [] (-> bool)
+  (match (env-value c"TERM")
+    (Some [value] (= value "dumb"))
+    (None [] false)))
+
+;;; True when `fd` refers to a terminal.
+(defn tty? [(fd i32)] (-> bool)
+  (= (isatty fd) 1))
+
+;;; Color policy for a stream, in precedence order:
+;;; `FORCE_COLOR` set (to anything but `0` or `false`) forces color on, and
+;;; `FORCE_COLOR=0`/`false` forces it off; otherwise a non-empty `NO_COLOR`
+;;; (https://no-color.org) or `TERM=dumb` turns it off; otherwise color is on
+;;; exactly when `fd` is a terminal.
+(defn color-enabled? [(fd i32)] (-> bool)
+  (match (env-value c"FORCE_COLOR")
+    (Some [value] (not (or (= value "0") (= value "false"))))
+    (None []
+          (cond (env-nonempty? c"NO_COLOR") false
+                (term-dumb?) false
+                :else (tty? fd)))))
+
+(defn ascii-lower [(b u8)] (-> u8)
+  (if (and (>= b 65) (<= b 90)) (+ b 32) b))
+
+(defn contains-ignoring-case? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (let [n (len hay)
+        m (len needle)
+        (mut start) 0
+        (mut found) false]
+    (loop (if (> (+ (load start) m) n)
+              (break)
+              (let [(mut k) 0]
+                (loop (if (or (>= (load k) m)
+                              (!= (ascii-lower (get hay
+                                                    (+ (load start) (load k))))
+                                  (ascii-lower (get needle (load k)))))
+                          (break)
+                          (set! k (+ (load k) 1))))
+                (if (= (load k) m)
+                    (do (set! found true) (break))
+                    (set! start (+ (load start) 1))))))
+    (load found)))
+
+;;; True when a locale name such as `en_US.UTF-8` or `C.utf8` selects UTF-8.
+(defn utf8-locale? [(locale (slice u8))] (-> bool)
+  (or (contains-ignoring-case? locale "utf-8")
+      (contains-ignoring-case? locale "utf8")))
+
+;;; Unicode glyphs are used when the effective locale (the first non-empty of
+;;; `LC_ALL`, `LC_CTYPE`, `LANG`) is UTF-8 and `TERM` is not `dumb`.
+(defn unicode-enabled? [] (-> bool)
+  (if (term-dumb?)
+      false
+      (cond (env-nonempty? c"LC_ALL")
+              (match (env-value c"LC_ALL")
+                (Some [value] (utf8-locale? value))
+                (None [] false))
+            (env-nonempty? c"LC_CTYPE")
+              (match (env-value c"LC_CTYPE")
+                (Some [value] (utf8-locale? value))
+                (None [] false))
+            (env-nonempty? c"LANG")
+              (match (env-value c"LANG")
+                (Some [value] (utf8-locale? value))
+                (None [] false))
+            :else false)))
+
+;;; Capabilities of the stream on `fd`, from the environment and `isatty`.
+(defn term-detect [(fd i32)] (-> Term)
+  (Term :color (color-enabled? fd) :unicode (unicode-enabled?)))
+
+(defn term-stdout [] (-> Term)
+  (term-detect 1))
+
+(defn term-stderr [] (-> Term)
+  (term-detect 2))
+
+;;; A foreground color: the terminal default, one of the eight basic colors,
+;;; bright black (`Gray`), or a 24-bit truecolor value.
+(defsum Color
+  (Default)
+  (Black)
+  (Red)
+  (Green)
+  (Yellow)
+  (Blue)
+  (Magenta)
+  (Cyan)
+  (White)
+  (Gray)
+  (Rgb [(r u8) (g u8) (b u8)]))
+
+;;; A truecolor value from three channel values in 0..255.
+(defn rgb [(r i64) (g i64) (b i64)] (-> Color)
+  (if (or (< r 0) (> r 255) (< g 0) (> g 255) (< b 0) (> b 255))
+      (do
+        (cli-fail! "rgb: channel values must be in 0..255")
+        (Default))
+      (Rgb
+        :r (cast u8 r)
+        :g (cast u8 g)
+        :b (cast u8 b))))
+
+(defstruct Style
+  [(fg Color)
+   (bold bool)
+   (dim bool)
+   (italic bool)
+   (underline bool)])
+
+;;; The empty style: default color, no attributes.
+(defn style [] (-> Style)
+  (Style
+    :fg (Default)
+    :bold false
+    :dim false
+    :italic false
+    :underline false))
+
+(defn fg [(color Color)] (-> Style)
+  (Style
+    :fg color
+    :bold false
+    :dim false
+    :italic false
+    :underline false))
+
+(defn bold [(s Style)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bold true
+    :dim (.dim s)
+    :italic (.italic s)
+    :underline (.underline s)))
+
+(defn dim [(s Style)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bold (.bold s)
+    :dim true
+    :italic (.italic s)
+    :underline (.underline s)))
+
+(defn italic [(s Style)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bold (.bold s)
+    :dim (.dim s)
+    :italic true
+    :underline (.underline s)))
+
+(defn underline [(s Style)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bold (.bold s)
+    :dim (.dim s)
+    :italic (.italic s)
+    :underline true))
+
+(defn color-default? [(color Color)] (-> bool)
+  (match color
+    (Default [] true)
+    (_ false)))
+
+;;; True when painting with `s` would emit any escape sequence.
+(defn style-active? [(s Style)] (-> bool)
+  (or (not (color-default? (.fg s)))
+      (.bold s)
+      (.dim s)
+      (.italic s)
+      (.underline s)))
+
+(defn sgr-part! [(out (mut StrBuf)) (parts (mut i64)) (code (slice u8))] (-> i64)
+  (when (> (load parts) 0) (sb-push-byte! (mut out) 59) 0)
+  (sb-push-str! (mut out) code)
+  (set! parts (+ (load parts) 1))
+  0)
+
+(defn sgr-color! [(out (mut StrBuf)) (parts (mut i64)) (color Color)] (-> i64)
+  (match color
+    (Default [] 0)
+    (Black [] (sgr-part! (mut out) (mut parts) "30"))
+    (Red [] (sgr-part! (mut out) (mut parts) "31"))
+    (Green [] (sgr-part! (mut out) (mut parts) "32"))
+    (Yellow [] (sgr-part! (mut out) (mut parts) "33"))
+    (Blue [] (sgr-part! (mut out) (mut parts) "34"))
+    (Magenta [] (sgr-part! (mut out) (mut parts) "35"))
+    (Cyan [] (sgr-part! (mut out) (mut parts) "36"))
+    (White [] (sgr-part! (mut out) (mut parts) "37"))
+    (Gray [] (sgr-part! (mut out) (mut parts) "90"))
+    (Rgb [r g b]
+         (do
+           (sgr-part! (mut out) (mut parts) "38;2;")
+           (sb-push-i64! (mut out) (cast i64 r))
+           (sb-push-byte! (mut out) 59)
+           (sb-push-i64! (mut out) (cast i64 g))
+           (sb-push-byte! (mut out) 59)
+           (sb-push-i64! (mut out) (cast i64 b))))))
+
+;;; Append `text` to `out`, wrapped in the escape sequences for `s` when `term`
+;;; has color and `s` is active, and verbatim otherwise.
+(defn paint-into! [(out (mut StrBuf)) (term Term) (s Style) (text (slice u8))] (-> i64)
+  (if (and (.color term) (style-active? s) (> (len text) 0))
+      (let [(mut parts) 0]
+        (sb-push-str! (mut out) "\x1b;[")
+        (when (.bold s) (sgr-part! (mut out) (mut parts) "1") 0)
+        (when (.dim s) (sgr-part! (mut out) (mut parts) "2") 0)
+        (when (.italic s) (sgr-part! (mut out) (mut parts) "3") 0)
+        (when (.underline s) (sgr-part! (mut out) (mut parts) "4") 0)
+        (sgr-color! (mut out) (mut parts) (.fg s))
+        (sb-push-byte! (mut out) 109)
+        (sb-push-str! (mut out) text)
+        (sb-push-str! (mut out) "\x1b;[0m"))
+      (sb-push-str! (mut out) text)))
+
+;;; `text` painted with `s`, as a newly allocated string.
+(defn paint [(a (dyn Allocator)) (term Term) (s Style) (text (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (paint-into! (mut out) term s text)
+    (sb-finish! (mut out))))
+
+(defn ok-style [] (-> Style)
+  (fg (Green)))
+
+(defn warn-style [] (-> Style)
+  (fg (Yellow)))
+
+(defn err-style [] (-> Style)
+  (bold (fg (Red))))
+
+(defn muted-style [] (-> Style)
+  (fg (Gray)))
+
+(defn accent-style [] (-> Style)
+  (fg (Cyan)))
+
+(defn strong-style [] (-> Style)
+  (bold (style)))
+
+;;; Success: green.
+(defn ok [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (ok-style) text))
+
+;;; Needs attention: yellow.
+(defn warn [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (warn-style) text))
+
+;;; Failure: bold red.
+(defn err [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (err-style) text))
+
+;;; Secondary detail: gray.
+(defn muted [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (muted-style) text))
+
+;;; Names, commands, identifiers: cyan.
+(defn accent [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (accent-style) text))
+
+;;; Emphasis: bold.
+(defn strong [(a (dyn Allocator)) (term Term) (text (slice u8))] (-> (slice u8))
+  (paint a term (strong-style) text))
+
+(defn glyph [(term Term) (fancy (slice u8)) (plain (slice u8))] (-> (slice u8))
+  (if (.unicode term) fancy plain))
+
+;;; `●` / `*` — something active or running.
+(defn glyph-dot [(term Term)] (-> (slice u8))
+  (glyph term "\x25cf;" "*"))
+
+;;; `○` / `o` — idle or pending.
+(defn glyph-circle [(term Term)] (-> (slice u8))
+  (glyph term "\x25cb;" "o"))
+
+;;; `◉` / `@` — selected or focused.
+(defn glyph-target [(term Term)] (-> (slice u8))
+  (glyph term "\x25c9;" "@"))
+
+;;; `◆` / `+` — a marker or milestone.
+(defn glyph-diamond [(term Term)] (-> (slice u8))
+  (glyph term "\x25c6;" "+"))
+
+;;; `✓` / `v` — success.
+(defn glyph-check [(term Term)] (-> (slice u8))
+  (glyph term "\x2713;" "v"))
+
+;;; `✗` / `x` — failure.
+(defn glyph-cross [(term Term)] (-> (slice u8))
+  (glyph term "\x2717;" "x"))
+
+;;; `⚠` / `!` — warning.
+(defn glyph-warning [(term Term)] (-> (slice u8))
+  (glyph term "\x26a0;" "!"))
+
+;;; `→` / `->` — leads to.
+(defn glyph-arrow [(term Term)] (-> (slice u8))
+  (glyph term "\x2192;" "->"))
+
+;;; `─` / `-` — horizontal rule segment.
+(defn glyph-hline [(term Term)] (-> (slice u8))
+  (glyph term "\x2500;" "-"))
+
+;;; `│` / `|` — vertical rule segment.
+(defn glyph-vline [(term Term)] (-> (slice u8))
+  (glyph term "\x2502;" "|"))
+
+;;; `…` / `...` — elided text.
+(defn glyph-ellipsis [(term Term)] (-> (slice u8))
+  (glyph term "\x2026;" "..."))
+
+; ---- display width ----------------------------------------------------------
+
+;; Sorted, non-overlapping inclusive [lo hi] pairs.
+;; Zero-width: combining marks, zero-width spaces and joiners, bidi controls,
+;; variation selectors, and emoji skin-tone modifiers (which render fused with
+;; the preceding emoji).
+(const ZERO_WIDTH_RANGES
+       [0x0300
+        0x036F
+        0x0483
+        0x0489
+        0x0591
+        0x05BD
+        0x05BF
+        0x05BF
+        0x05C1
+        0x05C2
+        0x05C4
+        0x05C5
+        0x05C7
+        0x05C7
+        0x0610
+        0x061A
+        0x064B
+        0x065F
+        0x0670
+        0x0670
+        0x06D6
+        0x06DC
+        0x06DF
+        0x06E4
+        0x06E7
+        0x06E8
+        0x06EA
+        0x06ED
+        0x0E31
+        0x0E31
+        0x0E34
+        0x0E3A
+        0x0E47
+        0x0E4E
+        0x1AB0
+        0x1AFF
+        0x1DC0
+        0x1DFF
+        0x200B
+        0x200F
+        0x2028
+        0x202E
+        0x2060
+        0x2064
+        0x20D0
+        0x20FF
+        0x302A
+        0x302D
+        0x3099
+        0x309A
+        0xFE00
+        0xFE0F
+        0xFE20
+        0xFE2F
+        0xFEFF
+        0xFEFF
+        0x1F3FB
+        0x1F3FF
+        0xE0020
+        0xE007F
+        0xE0100
+        0xE01EF])
+
+;; Double-width: East Asian Wide/Fullwidth scripts and emoji-presentation symbols.
+(const WIDE_RANGES
+       [0x1100
+        0x115F
+        0x231A
+        0x231B
+        0x2329
+        0x232A
+        0x23E9
+        0x23EC
+        0x23F0
+        0x23F0
+        0x23F3
+        0x23F3
+        0x25FD
+        0x25FE
+        0x2614
+        0x2615
+        0x2648
+        0x2653
+        0x267F
+        0x267F
+        0x2693
+        0x2693
+        0x26A1
+        0x26A1
+        0x26AA
+        0x26AB
+        0x26BD
+        0x26BE
+        0x26C4
+        0x26C5
+        0x26CE
+        0x26CE
+        0x26D4
+        0x26D4
+        0x26EA
+        0x26EA
+        0x26F2
+        0x26F3
+        0x26F5
+        0x26F5
+        0x26FA
+        0x26FA
+        0x26FD
+        0x26FD
+        0x2705
+        0x2705
+        0x270A
+        0x270B
+        0x2728
+        0x2728
+        0x274C
+        0x274C
+        0x274E
+        0x274E
+        0x2753
+        0x2755
+        0x2757
+        0x2757
+        0x2795
+        0x2797
+        0x27B0
+        0x27B0
+        0x27BF
+        0x27BF
+        0x2B1B
+        0x2B1C
+        0x2B50
+        0x2B50
+        0x2B55
+        0x2B55
+        0x2E80
+        0x303E
+        0x3041
+        0x33FF
+        0x3400
+        0x4DBF
+        0x4E00
+        0x9FFF
+        0xA000
+        0xA4CF
+        0xA960
+        0xA97F
+        0xAC00
+        0xD7A3
+        0xF900
+        0xFAFF
+        0xFE10
+        0xFE19
+        0xFE30
+        0xFE6F
+        0xFF00
+        0xFF60
+        0xFFE0
+        0xFFE6
+        0x16FE0
+        0x16FE4
+        0x17000
+        0x18AFF
+        0x1B000
+        0x1B2FF
+        0x1F004
+        0x1F004
+        0x1F0CF
+        0x1F0CF
+        0x1F18E
+        0x1F18E
+        0x1F191
+        0x1F19A
+        0x1F200
+        0x1F202
+        0x1F210
+        0x1F23B
+        0x1F240
+        0x1F248
+        0x1F250
+        0x1F251
+        0x1F260
+        0x1F265
+        0x1F300
+        0x1F64F
+        0x1F680
+        0x1F6FF
+        0x1F7E0
+        0x1F7EB
+        0x1F90C
+        0x1F9FF
+        0x1FA70
+        0x1FAFF
+        0x20000
+        0x2FFFD
+        0x30000
+        0x3FFFD])
+
+(defn in-ranges? [(ranges (slice i64)) (cp i64)] (-> bool)
+  (let [(mut lo) 0
+        (mut hi) (- (/ (len ranges) 2) 1)
+        (mut found) false]
+    (loop (if (> (load lo) (load hi))
+              (break)
+              (let [mid (/ (+ (load lo) (load hi)) 2)
+                    first (get ranges (* mid 2))
+                    last (get ranges (+ (* mid 2) 1))]
+                (cond (< cp first) (set! hi (- mid 1))
+                      (> cp last) (set! lo (+ mid 1))
+                      :else (do (set! found true) (break))))))
+    (load found)))
+
+;;; Terminal column width of one Unicode scalar value: 0 for control characters,
+;;; combining marks, and zero-width format characters; 2 for East Asian wide
+;;; characters and emoji; 1 otherwise.
+(defn codepoint-width [(cp i64)] (-> i64)
+  (cond (< cp 32) 0
+        (and (>= cp 0x7F) (< cp 0xA0)) 0
+        (in-ranges? ZERO_WIDTH_RANGES cp) 0
+        (in-ranges? WIDE_RANGES cp) 2
+        :else 1))
+
+(defstruct Decoded [(code i64) (size i64)])
+
+(defn cont-byte [(text (slice u8)) (i i64)] (-> i64)
+  (if (>= i (len text))
+      -1
+      (let [b (cast i64 (get text i))]
+        (if (= (& b 0xC0) 0x80) (& b 0x3F) -1))))
+
+;; Decode the scalar at `i`. Malformed input decodes as U+FFFD consuming one
+;; byte, so a width computation over arbitrary bytes always makes progress.
+(defn decode-at [(text (slice u8)) (i i64)] (-> Decoded)
+  (let [b0 (cast i64 (get text i))
+        bad (Decoded :code 0xFFFD :size 1)]
+    (cond (< b0 0x80) (Decoded :code b0 :size 1)
+          (and (>= b0 0xC2) (<= b0 0xDF))
+            (let [c1 (cont-byte text (+ i 1))]
+              (if (< c1 0)
+                  bad
+                  (Decoded :code (| (<< (& b0 0x1F) 6) c1) :size 2)))
+          (and (>= b0 0xE0) (<= b0 0xEF))
+            (let [c1 (cont-byte text (+ i 1))
+                  c2 (cont-byte text (+ i 2))]
+              (if (or (< c1 0)
+                      (< c2 0)
+                      (and (= b0 0xE0) (< c1 0x20))
+                      (and (= b0 0xED) (>= c1 0x20)))
+                  bad
+                  (Decoded :code (| (| (<< (& b0 0x0F) 12) (<< c1 6)) c2)
+                    :size 3)))
+          (and (>= b0 0xF0) (<= b0 0xF4))
+            (let [c1 (cont-byte text (+ i 1))
+                  c2 (cont-byte text (+ i 2))
+                  c3 (cont-byte text (+ i 3))]
+              (if (or (< c1 0)
+                      (< c2 0)
+                      (< c3 0)
+                      (and (= b0 0xF0) (< c1 0x10))
+                      (and (= b0 0xF4) (>= c1 0x10)))
+                  bad
+                  (Decoded :code
+                             (| (| (<< (& b0 0x07) 18) (<< c1 12))
+                                (| (<< c2 6) c3))
+                    :size 4)))
+          :else bad)))
+
+;; Index just past the escape sequence starting at `start` (an ESC byte): CSI
+;; (`ESC [ ... final`), OSC (`ESC ] ... BEL` or `ESC ] ... ESC \`, as used by
+;; hyperlinks), or a two-byte escape.
+(defn skip-escape [(text (slice u8)) (start i64)] (-> i64)
+  (let [n (len text)]
+    (if (>= (+ start 1) n)
+        n
+        (let [kind (cast i64 (get text (+ start 1)))]
+          (cond (= kind 91)
+                  (let [(mut j) (+ start 2)]
+                    (loop (if (or (>= (load j) n)
+                                  (let [b (cast i64 (get text (load j)))]
+                                    (and (>= b 0x40) (<= b 0x7E))))
+                              (break)
+                              (set! j (+ (load j) 1))))
+                    (if (< (load j) n) (+ (load j) 1) n))
+                (= kind 93)
+                  (let [(mut j) (+ start 2)
+                        (mut end) n]
+                    (loop (if (>= (load j) n)
+                              (break)
+                              (let [b (cast i64 (get text (load j)))]
+                                (cond (= b 7)
+                                        (do (set! end (+ (load j) 1)) (break))
+                                      (and (= b 27)
+                                           (< (+ (load j) 1) n)
+                                           (= (cast i64
+                                                    (get text (+ (load j) 1)))
+                                              92))
+                                        (do (set! end (+ (load j) 2)) (break))
+                                      :else (set! j (+ (load j) 1))))))
+                    (load end))
+                :else (+ start 2))))))
+
+;;; Terminal column width of UTF-8 `text`. Escape sequences (SGR colors, OSC
+;;; hyperlinks) occupy no columns, so painted text measures like its plain form.
+;;; A scalar following a zero-width joiner joins the preceding glyph and adds no
+;;; width, so an emoji ZWJ sequence measures as one emoji.
+(defn display-width [(text (slice u8))] (-> i64)
+  (let [n (len text)
+        (mut i) 0
+        (mut width) 0
+        (mut joined) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (cast i64 (get text (load i))) 27)
+                  (set! i (skip-escape text (load i)))
+                  (let [d (decode-at text (load i))]
+                    (set! i (+ (load i) (.size d)))
+                    (if (load joined)
+                        (set! joined false)
+                        (set! width
+                              (+ (load width) (codepoint-width (.code d)))))
+                    (when (= (.code d) 0x200D) (set! joined true) 0)
+                    0))))
+    (load width)))
+
+;;; Append `count` spaces (none when `count` is not positive).
+(defn push-spaces! [(out (mut StrBuf)) (count i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) count)
+              (break)
+              (do
+                (sb-push-byte! (mut out) 32)
+                (set! k (+ (load k) 1)))))
+    0))
+
+;;; `text` followed by spaces up to `width` display columns. Text that is already
+;;; at least that wide is returned unchanged (copied), never truncated.
+(defn pad-right [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) text)
+    (push-spaces! (mut out) (- width (display-width text)))
+    (sb-finish! (mut out))))
+
+;;; Spaces up to `width` display columns followed by `text`.
+(defn pad-left [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-spaces! (mut out) (- width (display-width text)))
+    (sb-push-str! (mut out) text)
+    (sb-finish! (mut out))))
+
+; ---- tables ------------------------------------------------------------------
+(defsum Align (AlignLeft) (AlignRight))
+
+;;; A plain-text table: optional header row, rows of cells, per-column alignment.
+;;; Cells are borrowed; their bytes must outlive the table. Cells may be painted:
+;;; alignment uses display width, which ignores escape sequences.
+(defstruct Table
+  [(allocator (dyn Allocator))
+   (columns i64)
+   (headers (ArrayList (slice u8)))
+   (cells (ArrayList (slice u8)))
+   (aligns (ArrayList Align))])
+
+(defn table-new-headless [(a (dyn Allocator)) (columns i64)] (-> Table)
+  (when (< columns 1)
+    (cli-fail! "table-new-headless: a table needs at least one column")
+    0)
+  (let [(mut aligns) (al-new [Align] a)
+        (mut k) 0]
+    (loop (if (>= (load k) columns)
+              (break)
+              (do
+                (push! (mut aligns) (AlignLeft))
+                (set! k (+ (load k) 1)))))
+    (Table
+      :allocator a
+      :columns columns
+      :headers (al-new [(slice u8)] a)
+      :cells (al-new [(slice u8)] a)
+      :aligns (load aligns))))
+
+;;; A table whose header row is `headers`; the column count is its length. The
+;;; header slice is copied, so it may be a temporary array literal.
+(defn table-new [(a (dyn Allocator)) (headers (slice (slice u8)))] (-> Table)
+  (let [(mut table) (table-new-headless a (len headers))
+        (mut k) 0]
+    (loop (if (>= (load k) (len headers))
+              (break)
+              (do
+                (push! (mut (.headers table)) (get headers (load k)))
+                (set! k (+ (load k) 1)))))
+    (load table)))
+
+(defn table-align! [(table (mut Table)) (column i64) (align Align)] (-> i64)
+  (if (or (< column 0) (>= column (.columns table)))
+      (cli-fail! "table-align!: column index out of range")
+      (set! (mut (.aligns table)) column align)))
+
+;;; Append one row. It must have exactly as many cells as the table has columns.
+(defn table-row! [(table (mut Table)) (cells (slice (slice u8)))] (-> i64)
+  (if (!= (len cells) (.columns table))
+      (cli-fail! "table-row!: row cell count differs from the table's column count")
+      (let [(mut k) 0]
+        (loop (if (>= (load k) (len cells))
+                  (break)
+                  (do
+                    (push! (mut (.cells table)) (get cells (load k)))
+                    (set! k (+ (load k) 1)))))
+        0)))
+
+(defn table-row-count [(table Table)] (-> i64)
+  (/ (len (.cells table)) (.columns table)))
+
+(defn right-aligned? [(align Align)] (-> bool)
+  (match align
+    (AlignRight [] true)
+    (AlignLeft [] false)))
+
+;; Append one rendered line: cells separated by two spaces, each padded to its
+;; column width, with no trailing whitespace.
+(defn table-line! [(out (mut StrBuf))
+                   (term Term)
+                   (table Table)
+                   (widths (slice i64))
+                   (cells (slice (slice u8)))
+                   (header bool)] (-> i64)
+  (let [(mut line) (sb-new (.allocator table))
+        columns (.columns table)
+        (mut k) 0]
+    (loop (if (>= (load k) columns)
+              (break)
+              (let [cell (get cells (load k))
+                    gap (- (get widths (load k)) (display-width cell))
+                    right (right-aligned? (get (.aligns table) (load k)))]
+                (when (> (load k) 0) (sb-push-str! (mut line) "  ") 0)
+                (when right (push-spaces! (mut line) gap) 0)
+                (if header
+                    (paint-into! (mut line) term (muted-style) cell)
+                    (sb-push-str! (mut line) cell))
+                (when (not right) (push-spaces! (mut line) gap) 0)
+                (set! k (+ (load k) 1)))))
+    (let [text (sb-str (load line))
+          (mut end) (len text)]
+      (loop (if (and (> (load end) 0)
+                     (= (cast i64 (get text (- (load end) 1))) 32))
+                (set! end (- (load end) 1))
+                (break)))
+      (sb-push-str! (mut out) (subslice text 0 (load end)))
+      (sb-push-byte! (mut out) 10))
+    (sb-free! (mut line))
+    0))
+
+;;; Render every line of `table`, each terminated by a newline. Headers, when the
+;;; table has them, are painted muted.
+(defn table-render [(a (dyn Allocator)) (term Term) (table Table)] (-> (slice u8))
+  (let [columns (.columns table)
+        rows (table-row-count table)
+        has-header (> (len (.headers table)) 0)
+        (mut widths) (al-new [i64] a)
+        (mut out) (sb-new a)
+        (mut k) 0]
+    (loop (if (>= (load k) columns)
+              (break)
+              (let [(mut w)
+                      (if has-header
+                          (display-width (get (.headers table) (load k)))
+                          0)
+                    (mut r) 0]
+                (loop (if (>= (load r) rows)
+                          (break)
+                          (let [cw
+                                  (display-width (get (.cells table)
+                                                      (+ (* (load r) columns)
+                                                         (load k))))]
+                            (when (> cw (load w)) (set! w cw) 0)
+                            (set! r (+ (load r) 1)))))
+                (push! (mut widths) (load w))
+                (set! k (+ (load k) 1)))))
+    (when has-header
+      (table-line! (mut out)
+                   term
+                   table
+                   (al-slice widths)
+                   (al-slice (.headers table))
+                   true)
+      0)
+    (let [all (al-slice (.cells table))
+          (mut r) 0]
+      (loop (if (>= (load r) rows)
+                (break)
+                (do
+                  (table-line! (mut out)
+                               term
+                               table
+                               (al-slice widths)
+                               (subslice all
+                                         (* (load r) columns)
+                                         (* (+ (load r) 1) columns))
+                               false)
+                  (set! r (+ (load r) 1))))))
+    (al-free! (mut widths))
+    (sb-finish! (mut out))))
+
+(defn table-free! [(table (mut Table))] (-> i64)
+  (al-free! (mut (.headers table)))
+  (al-free! (mut (.cells table)))
+  (al-free! (mut (.aligns table)))
+  0)
+
+; ---- humanized numbers -------------------------------------------------------
+(defn div-round [(n i64) (d i64)] (-> i64)
+  (+ (/ n d) (if (>= (* 2 (% n d)) d) 1 0)))
+
+;; n / d in tenths, rounded half up, without overflowing for n near i64 max.
+(defn tenths-of [(n i64) (d i64)] (-> i64)
+  (+ (* (/ n d) 10) (div-round (* (% n d) 10) d)))
+
+;; Scale a non-negative `n` into the largest unit it reaches. Below ten units one
+;; decimal is shown ("1.5"), dropped when it is zero; from ten up, the rounded
+;; whole number. A value that rounds up to `base` moves to the next unit.
+(defn push-scaled! [(out (mut StrBuf))
+                    (n i64)
+                    (base i64)
+                    (units (slice (slice u8)))
+                    (separator (slice u8))] (-> i64)
+  (if (< n base)
+      (do
+        (sb-push-i64! (mut out) n)
+        (sb-push-str! (mut out) separator)
+        (sb-push-str! (mut out) (get units 0)))
+      (let [(mut unit) 1
+            (mut divisor) base]
+        (loop (if (and (< (+ (load unit) 1) (len units))
+                       (>= (/ n (load divisor)) base))
+                  (do
+                    (set! unit (+ (load unit) 1))
+                    (set! divisor (* (load divisor) base)))
+                  (break)))
+        (when (and (< (+ (load unit) 1) (len units))
+                   (>= (div-round n (load divisor)) base))
+          (set! unit (+ (load unit) 1))
+          (set! divisor (* (load divisor) base))
+          0)
+        (let [tenths (tenths-of n (load divisor))]
+          (if (< tenths 100)
+              (do
+                (sb-push-i64! (mut out) (/ tenths 10))
+                (when (!= (% tenths 10) 0)
+                  (sb-push-byte! (mut out) 46)
+                  (sb-push-i64! (mut out) (% tenths 10))
+                  0)
+                0)
+              (sb-push-i64! (mut out) (div-round n (load divisor)))))
+        (sb-push-str! (mut out) separator)
+        (sb-push-str! (mut out) (get units (load unit))))))
+
+(const BYTE_UNITS ["B" "KiB" "MiB" "GiB" "TiB" "PiB"])
+
+(const COUNT_UNITS ["" "k" "M" "B" "T"])
+
+(defn magnitude [(n i64)] (-> i64)
+  (cond (>= n 0) n
+        (= n -9223372036854775808) 9223372036854775807
+        :else (- 0 n)))
+
+;;; A byte count in binary units: "0 B", "512 B", "1.5 KiB", "12 KiB", "3.4 GiB".
+(defn human-bytes [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (when (< n 0) (sb-push-byte! (mut out) 45) 0)
+    (push-scaled! (mut out) (magnitude n) 1024 BYTE_UNITS " ")
+    (sb-finish! (mut out))))
+
+;;; A count in decimal units: "999", "1.2k", "12k", "3.4M", "2B".
+(defn human-count [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (when (< n 0) (sb-push-byte! (mut out) 45) 0)
+    (push-scaled! (mut out) (magnitude n) 1000 COUNT_UNITS "")
+    (sb-finish! (mut out))))
+
+;;; `singular` when `n` is exactly 1, `plural-form` otherwise.
+(defn plural [(n i64) (singular (slice u8)) (plural-form (slice u8))] (-> (slice u8))
+  (if (= n 1) singular plural-form))
+
+;;; "1 run", "3 runs".
+(defn count-noun [(a (dyn Allocator))
+                  (n i64)
+                  (singular (slice u8))
+                  (plural-form (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-push-byte! (mut out) 32)
+    (sb-push-str! (mut out) (plural n singular plural-form))
+    (sb-finish! (mut out))))
+
+(defn push-age! [(out (mut StrBuf)) (seconds i64)] (-> i64)
+  (cond (< seconds 60)
+          (do (sb-push-i64! (mut out) seconds) (sb-push-str! (mut out) "s"))
+        (< seconds 3600)
+          (do
+            (sb-push-i64! (mut out) (/ seconds 60))
+            (sb-push-str! (mut out) "m"))
+        (< seconds 86400)
+          (do
+            (sb-push-i64! (mut out) (/ seconds 3600))
+            (sb-push-str! (mut out) "h"))
+        (< seconds 2592000)
+          (do
+            (sb-push-i64! (mut out) (/ seconds 86400))
+            (sb-push-str! (mut out) "d"))
+        (< seconds 31536000)
+          (do
+            (sb-push-i64! (mut out) (/ seconds 2592000))
+            (sb-push-str! (mut out) "mo"))
+        :else
+          (do
+            (sb-push-i64! (mut out) (/ seconds 31536000))
+            (sb-push-str! (mut out) "y"))))
+
+;;; A compact age for a millisecond delta (`now - then`): under a second is
+;;; "just now", then "12s", "4m", "3h", "2d", "5mo", "1y" (each unit truncated).
+;;; A negative delta is in the future: "in 4m".
+(defn relative-time [(a (dyn Allocator)) (delta-ms i64)] (-> (slice u8))
+  (let [seconds (/ (magnitude delta-ms) 1000)
+        (mut out) (sb-new a)]
+    (if (< seconds 1)
+        (sb-push-str! (mut out) "just now")
+        (do
+          (when (< delta-ms 0) (sb-push-str! (mut out) "in ") 0)
+          (push-age! (mut out) seconds)))
+    (sb-finish! (mut out))))
+
+;;; Like `relative-time`, with " ago" after past ages: "4m ago", "in 4m", "just now".
+(defn relative-time-ago [(a (dyn Allocator)) (delta-ms i64)] (-> (slice u8))
+  (let [seconds (/ (magnitude delta-ms) 1000)
+        (mut out) (sb-new a)]
+    (cond (< seconds 1) (sb-push-str! (mut out) "just now")
+          (< delta-ms 0)
+            (do (sb-push-str! (mut out) "in ") (push-age! (mut out) seconds))
+          :else
+            (do (push-age! (mut out) seconds) (sb-push-str! (mut out) " ago")))
+    (sb-finish! (mut out))))

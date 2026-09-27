@@ -1,0 +1,108 @@
+(module factory.git)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "factory.proc" :use *)
+
+;;; Every run works in its own git worktree on its own branch, so a run never
+;;; touches the checkout it came from, and every accepted station is a commit
+;;; you can read, cherry-pick, or throw away.
+
+(defstruct GitResult [(ok bool) (output (slice u8)) (message (slice u8))])
+
+(defn git [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> GitResult)
+  (let [result (capture a "git" args dir 300000)]
+    (GitResult :ok (.ok result)
+               :output (.output result)
+               :message (if (.ok result)
+                            ""
+                            (let [text (str-trim (.error result))]
+                              (if (> (len text) 0) text "git failed"))))))
+
+;;; The top of the repository containing `path`, or None if it is not in one.
+(defn git-toplevel [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
+  (let [result (git a path ["rev-parse" "--show-toplevel"])]
+    (if (.ok result) (Some (str-trim (.output result))) (None))))
+
+(defn git-head [(a (dyn Allocator)) (repo (slice u8))] (-> (Option (slice u8)))
+  (let [result (git a repo ["rev-parse" "HEAD"])]
+    (if (.ok result) (Some (str-trim (.output result))) (None))))
+
+(defn git-short [(a (dyn Allocator)) (repo (slice u8)) (rev (slice u8))] (-> (slice u8))
+  (let [result (git a repo ["rev-parse" "--short" rev])]
+    (if (.ok result) (str-trim (.output result)) rev)))
+
+(defn git-has-identity? [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
+  (let [result (git a dir ["config" "user.email"])]
+    (and (.ok result) (> (len (str-trim (.output result))) 0))))
+
+;;; Commit with the user's identity when git has one, and a clearly labelled
+;;; factory identity otherwise.
+(defn git-commit [(a (dyn Allocator)) (dir (slice u8)) (message (slice u8)) (allow-empty bool)] (-> GitResult)
+  (if (git-has-identity? a dir)
+      (if allow-empty
+          (git a dir ["commit" "-q" "--allow-empty" "-m" message])
+          (git a dir ["commit" "-q" "-m" message]))
+      (if allow-empty
+          (git a dir ["-c" "user.name=factory" "-c" "user.email=factory@localhost"
+                      "commit" "-q" "--allow-empty" "-m" message])
+          (git a dir ["-c" "user.name=factory" "-c" "user.email=factory@localhost"
+                      "commit" "-q" "-m" message]))))
+
+;;; A fresh repository with one empty commit, for runs that start from nothing.
+(defn git-init-scratch [(a (dyn Allocator)) (path (slice u8))] (-> GitResult)
+  (let [init (git a path ["init" "-q" "-b" "main"])]
+    (if (not (.ok init))
+        init
+        (git-commit a path "factory: empty starting point" true))))
+
+;;; `git worktree add -b branch path base` in `repo`.
+(defn git-worktree-add [(a (dyn Allocator))
+                        (repo (slice u8))
+                        (worktree (slice u8))
+                        (branch (slice u8))
+                        (base (slice u8))] (-> GitResult)
+  (git a repo ["worktree" "add" "-q" "-b" branch worktree base]))
+
+(defn git-dirty? [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
+  (let [result (git a dir ["status" "--porcelain"])]
+    (and (.ok result) (> (len (str-trim (.output result))) 0))))
+
+;;; Stage everything and commit it, if anything changed. `ok` with an empty
+;;; output means there was nothing to commit.
+(defn git-commit-all [(a (dyn Allocator)) (dir (slice u8)) (message (slice u8))] (-> GitResult)
+  (if (not (git-dirty? a dir))
+      (GitResult :ok true :output "" :message "")
+      (let [add (git a dir ["add" "-A"])]
+        (if (not (.ok add))
+            add
+            (let [commit (git-commit a dir message false)]
+              (if (.ok commit)
+                  (GitResult :ok true :output "committed" :message "")
+                  commit))))))
+
+;;; Changes on this worktree since `base`, including uncommitted and untracked
+;;; files, as `git diff --stat` text.
+(defn git-diff-stat [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
+  (let [committed (git a dir ["diff" "--stat" base])
+        untracked (git a dir ["ls-files" "--others" "--exclude-standard"])
+        (mut out) (sb-new a)]
+    (sb-push-str! (mut out) (.output committed))
+    (when (> (len (str-trim (.output untracked))) 0)
+      (sb-push-str! (mut out) "untracked:\n")
+      (sb-push-str! (mut out) (.output untracked))
+      0)
+    (sb-finish! (mut out))))
+
+;;; The full diff since `base` (tracked files), for review.
+(defn git-diff [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
+  (git-output (git a dir ["diff" base])))
+
+;;; Names of files deleted since `base`.
+(defn git-deleted-files [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
+  (git-output (git a dir ["diff" "--name-only" "--diff-filter=D" base])))
+
+(defn git-ok? [(result GitResult)] (-> bool) (.ok result))
+(defn git-output [(result GitResult)] (-> (slice u8)) (.output result))
+(defn git-message [(result GitResult)] (-> (slice u8)) (.message result))

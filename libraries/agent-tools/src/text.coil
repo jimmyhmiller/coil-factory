@@ -1,0 +1,149 @@
+(module agent_tools.text)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; Small text helpers shared by the tools. Every returned string is allocated
+;;; in the allocator passed in, unless it is documented as a borrowed view.
+
+(defn join2 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (sb-push-str! (mut b) x)
+    (sb-push-str! (mut b) y)
+    (sb-finish! (mut b))))
+
+(defn join3 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8)) (z (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (sb-push-str! (mut b) x)
+    (sb-push-str! (mut b) y)
+    (sb-push-str! (mut b) z)
+    (sb-finish! (mut b))))
+
+;;; `"text"` with the quotes, for messages.
+(defn quoted [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (join3 a "\"" text "\""))
+
+(defn byte-at [(s (slice u8)) (i i64)] (-> i64)
+  (primitive/cast i64 (get s i)))
+
+;;; Length of the valid UTF-8 sequence starting at `i`, or 0 when the bytes
+;;; there are not valid UTF-8 (including a sequence cut off by the end).
+(defn utf8-sequence-length [(s (slice u8)) (i i64)] (-> i64)
+  (let [n (len s)
+        b0 (byte-at s i)
+        width (cond (< b0 128) 1
+                    (and (>= b0 194) (<= b0 223)) 2
+                    (and (>= b0 224) (<= b0 239)) 3
+                    (and (>= b0 240) (<= b0 244)) 4
+                    :else 0)]
+    (cond (= width 0) 0
+          (= width 1) 1
+          (> (+ i width) n) 0
+          :else
+            (let [b1 (byte-at s (+ i 1))
+                  ;; The second byte's range excludes overlong encodings and
+                  ;; UTF-16 surrogates, as in the Unicode well-formed table.
+                  lo (cond (= b0 224) 160 (= b0 240) 144 :else 128)
+                  hi (cond (= b0 237) 159 (= b0 244) 143 :else 191)
+                  (mut ok) (and (>= b1 lo) (<= b1 hi))
+                  (mut k) 2]
+              (loop (if (or (not (load ok)) (>= (load k) width))
+                        (break)
+                        (let [bk (byte-at s (+ i (load k)))]
+                          (when (or (< bk 128) (> bk 191))
+                            (set! ok false)
+                            0)
+                          (set! k (+ (load k) 1)))))
+              (if (load ok) width 0)))))
+
+(defn utf8-valid? [(s (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut ok) true]
+    (loop (if (or (not (load ok)) (>= (load i) (len s)))
+              (break)
+              (let [w (utf8-sequence-length s (load i))]
+                (if (= w 0)
+                    (set! ok false)
+                    (set! i (+ (load i) w))))))
+    (load ok)))
+
+;;; `s` itself when it is valid UTF-8; otherwise a copy in which each invalid
+;;; byte is replaced by U+FFFD. Tool output becomes JSON text for the model,
+;;; which must be UTF-8.
+(defn sanitize-utf8 [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
+  (if (utf8-valid? s)
+      s
+      (let [(mut b) (sb-new a)
+            (mut i) 0]
+        (loop (if (>= (load i) (len s))
+                  (break)
+                  (let [w (utf8-sequence-length s (load i))]
+                    (if (= w 0)
+                        (do (sb-push-str! (mut b) "\xfffd;")
+                            (set! i (+ (load i) 1)))
+                        (do (sb-push-str! (mut b) (subslice s (load i) (+ (load i) w)))
+                            (set! i (+ (load i) w)))))))
+        (sb-finish! (mut b)))))
+
+;;; The longest prefix of `s` that is at most `limit` bytes and does not end in
+;;; the middle of a UTF-8 sequence. A borrowed view.
+(defn utf8-prefix [(s (slice u8)) (limit i64)] (-> (slice u8))
+  (if (<= (len s) limit)
+      s
+      (let [(mut end) limit]
+        (loop (if (and (> (load end) 0)
+                       (let [b (byte-at s (load end))] (and (>= b 128) (<= b 191))))
+                  (set! end (- (load end) 1))
+                  (break)))
+        (subslice s 0 (load end)))))
+
+;;; A NUL byte in the first 8 KiB is the signature of a binary file; text never
+;;; contains one.
+(defn binary? [(bytes (slice u8))] (-> bool)
+  (let [limit (if (> (len bytes) 8192) 8192 (len bytes))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) limit))
+              (break)
+              (do (when (= (get bytes (load i)) (primitive/cast u8 0))
+                    (set! found true)
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;;; Number of lines: newline count, plus one for a final line without a newline.
+(defn line-count [(bytes (slice u8))] (-> i64)
+  (let [(mut count) 0
+        (mut i) 0
+        n (len bytes)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (when (= (get bytes (load i)) (primitive/cast u8 #\newline))
+                    (set! count (+ (load count) 1))
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (if (and (> n 0) (!= (get bytes (- n 1)) (primitive/cast u8 #\newline)))
+        (+ (load count) 1)
+        (load count))))
+
+(defn decimal-width [(n i64)] (-> i64)
+  (let [(mut w) 1
+        (mut v) n]
+    (loop (if (< (load v) 10)
+              (break)
+              (do (set! v (/ (load v) 10))
+                  (set! w (+ (load w) 1)))))
+    (load w)))
+
+;;; Append the gutter for one numbered line: the number right-aligned in five
+;;; columns, then "│ " (`   12│ text`).
+(defn push-line-number! [(b (mut StrBuf)) (line i64)] (-> i64)
+  (let [(mut pad) (- 5 (decimal-width line))]
+    (loop (if (<= (load pad) 0)
+              (break)
+              (do (sb-push-byte! (mut b) (primitive/cast u8 #\space))
+                  (set! pad (- (load pad) 1)))))
+    (sb-push-i64! (mut b) line)
+    (sb-push-str! (mut b) "\x2502; ")
+    0))

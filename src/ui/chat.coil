@@ -1,0 +1,764 @@
+(module factory.ui.chat)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator free])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [starts-with str-trim str-find])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [copy-bytes])
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "tui.widgets" :use *)
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+
+;;; One agent's conversation. History comes from its transcript checkpoint
+;;; (full fidelity); what happened since the checkpoint comes from the journal
+;;; (the "overlay"), and operator messages not yet read are shown as pending.
+;;; A checkpoint is written when a turn starts and when the agent stops, so
+;;; the journal records `agent.turn`, `station.finished` and
+;;; `conversation.finished` mark the moments to refetch the transcript and
+;;; start the overlay afresh.
+
+;; ---------------------------------------------------------------------------
+;; Display lines (shared with other views)
+
+;;; A display line: a gutter, the text, and an optional suffix, each in its
+;;; own tone.
+(defstruct Line
+  [(gutter (slice u8))
+   (gutter-tone Tone)
+   (text (slice u8))
+   (tone Tone)
+   (suffix (slice u8))
+   (suffix-tone Tone)])
+
+(defn line [(gutter (slice u8))
+            (gutter-tone Tone)
+            (text (slice u8))
+            (tone Tone)] (-> Line)
+  (Line
+    :gutter gutter
+    :gutter-tone gutter-tone
+    :text text
+    :tone tone
+    :suffix ""
+    :suffix-tone (ToneMuted)))
+
+;;; Draw the visible window of `lines` in `r`, following `sv` (sticky bottom).
+(defn draw-lines! [(c (ptr Canvas))
+                   (r Rect)
+                   (sv (ptr ScrollView))
+                   (lines (slice Line))
+                   (theme Theme)] (-> i64)
+  (let [total (len lines)
+        max-offset (if (> total (.h r)) (- total (.h r)) 0)]
+    (set! (.total sv) total)
+    (set! (.height sv) (.h r))
+    (when (or (.stick-bottom sv) (> (.offset sv) max-offset))
+      (set! (.offset sv) max-offset))
+    (let [(mut row) 0]
+      (loop (if (or (>= (load row) (.h r))
+                    (>= (+ (.offset sv) (load row)) total))
+                (break)
+                (let [l (index (slice-data lines) (+ (.offset sv) (load row)))
+                      y (+ (.y r) (load row))
+                      gw
+                        (put-text! c
+                                   r
+                                   (.x r)
+                                   y
+                                   (.gutter l)
+                                   (tone-style theme (.gutter-tone l)))
+                      tw
+                        (put-text-ellipsis! c
+                                            r
+                                            (+ (.x r) gw)
+                                            y
+                                            (.text l)
+                                            (tone-style theme (.tone l)))]
+                  (when (> (len (.suffix l)) 0)
+                    (put-text-ellipsis! c
+                                        r
+                                        (+ (+ (.x r) gw) (+ tw 2))
+                                        y
+                                        (.suffix l)
+                                        (tone-style theme (.suffix-tone l))))
+                  (set! row (+ (load row) 1)))))
+      (load row))))
+
+;; ---------------------------------------------------------------------------
+;; Conversation items
+(defsum ItemKind
+  (ItemUser)
+  (ItemAssistant)
+  (ItemThought)
+  (ItemTool)
+  (ItemEvent))
+
+;;; One thing in the conversation. For tools, `text` is the glyph + subject,
+;;; `result` the ✓/✗ summary and `output` the tool's output.
+(defstruct ChatItem
+  [(kind ItemKind)
+   (from (slice u8))
+   (text (slice u8))
+   (tone Tone)
+   (result (slice u8))
+   (result-tone Tone)
+   (output (slice u8))
+   (call (slice u8))])
+
+(defn item [(kind ItemKind) (from (slice u8)) (text (slice u8)) (tone Tone)] (-> ChatItem)
+  (ChatItem
+    :kind kind
+    :from from
+    :text text
+    :tone tone
+    :result ""
+    :result-tone (ToneMuted)
+    :output ""
+    :call ""))
+
+;;; An operator message sent from this dashboard or not yet read by the agent.
+(defstruct PendingSend [(ref i64) (text (slice u8)) (sent-t i64)])
+
+(defstruct Chat
+  [(allocator (dyn Allocator))
+   (run (slice u8))
+   (agent (slice u8))
+   (transcript Snap)
+   (overlay-arenas Arenas)
+   (overlay (ArrayList ChatItem))
+   (cursor i64)
+   (loaded bool)
+   (needs-transcript bool)
+   (exact bool)
+   (transcript-cursor i64)
+   (local (ArrayList PendingSend))
+   (waiting-arenas Arenas)
+   (waiting (ArrayList PendingSend))
+   (version i64)
+   (lines-arenas Arenas)
+   (lines (ArrayList Line))
+   (lines-version i64)
+   (lines-width i64)
+   (lines-details bool)
+   (details bool)
+   (sv ScrollView)
+   (input TextInput)])
+
+(defn chat-init! [(chat (ptr Chat)) (a (dyn Allocator))] (-> i64)
+  (set! (.allocator chat) a)
+  (set! (.run chat) "")
+  (set! (.agent chat) "")
+  (snap-init! (field chat transcript) a)
+  (arenas-init! (field chat overlay-arenas) a)
+  (set! (.overlay chat) (al-new [ChatItem] a))
+  (set! (.local chat) (al-new [PendingSend] a))
+  (arenas-init! (field chat waiting-arenas) a)
+  (set! (.waiting chat) (al-new [PendingSend] a))
+  (arenas-init! (field chat lines-arenas) a)
+  (set! (.lines chat) (al-new [Line] a))
+  (set! (.lines-version chat) -1)
+  (set! (.version chat) 0)
+  (set! (.details chat) false)
+  (set! (.sv chat) (scroll-view-new))
+  (set! (.input chat) (text-input-new a true))
+  (set! (.cursor chat) 0)
+  (set! (.loaded chat) false)
+  (set! (.needs-transcript chat) true)
+  (set! (.exact chat) false)
+  (set! (.transcript-cursor chat) 0)
+  0)
+
+(defn chat--clear-local! [(chat (ptr Chat))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (.local chat)))
+              (break)
+              (do
+                (free [u8]
+                      (.allocator chat)
+                      (.text (al-elem (field chat local) (load i))))
+                (set! i (+ (load i) 1))))))
+  (al-clear! (mut (.local chat)))
+  0)
+
+;;; Point the chat at `run`/`agent`, forgetting everything shown before.
+(defn chat-open! [(chat (ptr Chat)) (run (slice u8)) (agent (slice u8))] (-> i64)
+  (let [a (.allocator chat)]
+    (when (> (len (.run chat)) 0) (free [u8] a (.run chat)))
+    (when (> (len (.agent chat)) 0) (free [u8] a (.agent chat)))
+    (set! (.run chat) (copy-bytes a run))
+    (set! (.agent chat) (copy-bytes a agent))
+    (snap-reset! (field chat transcript))
+    (arenas-clear! (field chat overlay-arenas))
+    (al-clear! (mut (.overlay chat)))
+    (chat--clear-local! chat)
+    (al-clear! (mut (.waiting chat)))
+    (set! (.cursor chat) 0)
+    (set! (.loaded chat) false)
+    (set! (.needs-transcript chat) true)
+    (set! (.exact chat) false)
+    (set! (.transcript-cursor chat) 0)
+    (set! (.sv chat) (scroll-view-new))
+    (input-clear! (field chat input))
+    (set! (.version chat) (+ (.version chat) 1))
+    0))
+
+(defn chat-bump! [(chat (ptr Chat))] (-> i64)
+  (set! (.version chat) (+ (.version chat) 1))
+  0)
+
+;;; Show a transcript (`{"transcript": [...]}` from the agents endpoint).
+(defn chat-set-transcript! [(chat (ptr Chat)) (agent-doc JVal) (t i64)] (-> i64)
+  (snap-commit! (field chat transcript) agent-doc t)
+  (set! (.needs-transcript chat) false)
+  (chat-bump! chat))
+
+;;; Take an agent document (`{"transcript", "transcript_cursor"}`), which was
+;;; fetched into `(snap-spare (field chat transcript))`. With a cursor the
+;;; merge is exact: the overlay is rebuilt from the journal records at or past
+;;; it, so this returns true when the caller must read events from
+;;; `(.cursor chat)` again. A document no newer than the one shown is dropped.
+;;; Without a cursor (0, an older site) the transcript is shown as is and the
+;;; overlay follows the checkpoint records instead (`chat-start-from-tail!`).
+(defn chat-adopt-transcript! [(chat (ptr Chat)) (agent-doc JVal) (t i64)] (-> bool)
+  (let [tc (ji agent-doc "transcript_cursor")]
+    (cond (<= tc 0) (do (chat-set-transcript! chat agent-doc t) false)
+          (and (.exact chat) (<= tc (.transcript-cursor chat)))
+            (do (set! (.needs-transcript chat) false) false)
+          :else
+            (do
+              (chat-set-transcript! chat agent-doc t)
+              (set! (.exact chat) true)
+              (set! (.transcript-cursor chat) tc)
+              (al-clear! (mut (.overlay chat)))
+              (arenas-clear! (field chat overlay-arenas))
+              (set! (.cursor chat) tc)
+              (set! (.loaded chat) true)
+              (chat-bump! chat)
+              true))))
+
+;; ---------------------------------------------------------------------------
+;; The overlay: journal records since the last checkpoint
+(defn chat--overlay-push! [(chat (ptr Chat)) (it ChatItem)] (-> i64)
+  (push! (mut (.overlay chat)) it)
+  (chat-bump! chat))
+
+(defn chat--checkpoint-kind? [(kind (slice u8))] (-> bool)
+  (or (= kind "agent.turn")
+      (= kind "station.finished")
+      (= kind "conversation.finished")))
+
+;;; A record after which this agent's checkpoint is complete: its own turn
+;;; start or stop, or the end of the run (a cancelled agent writes its
+;;; checkpoint on the way out but no station record).
+(defn chat--checkpoint? [(chat (ptr Chat)) (record JVal)] (-> bool)
+  (or (= (js record "kind") "run.finished")
+      (and (= (js record "agent") (.agent chat))
+           (chat--checkpoint-kind? (js record "kind")))))
+
+;;; Apply one journal record. Records for other agents are ignored.
+(defn chat-ingest! [(chat (ptr Chat)) (record JVal)] (-> i64)
+  (let [a (arenas-active (field chat overlay-arenas))
+        kind (js record "kind")]
+    (if (not (or (= (js record "agent") (.agent chat))
+                 (chat--checkpoint? chat record)))
+        0
+        (cond (and (chat--checkpoint? chat record) (.exact chat))
+              ;; The overlay is exactly the records past the transcript's
+              ;; cursor, so it stays; a newer checkpoint just shortens it.
+              (do (set! (.needs-transcript chat) true) 0)
+                (chat--checkpoint? chat record)
+              (do
+                (al-clear! (mut (.overlay chat)))
+                (arenas-clear! (field chat overlay-arenas))
+                (set! (.needs-transcript chat) true)
+                (chat-bump! chat))
+                (= kind "agent.text")
+              (chat--overlay-push! chat
+                                   (item (ItemAssistant)
+                                         ""
+                                         (copy-bytes a (js record "text"))
+                                         (TonePlain)))
+                (= kind "agent.thought")
+              (chat--overlay-push! chat
+                                   (item (ItemThought)
+                                         ""
+                                         (copy-bytes a (js record "text"))
+                                         (ToneThought)))
+                (= kind "message.received")
+              (chat--overlay-push! chat
+                                   (item (ItemUser)
+                                         (copy-bytes a (js record "from"))
+                                         (copy-bytes a (js record "text"))
+                                         (TonePlain)))
+                (= kind "tool.started")
+              (chat--overlay-push! chat
+                                   (ChatItem
+                                     :kind (ItemTool)
+                                     :from ""
+                                     :text
+                                       (concat a
+                                               [(tool-glyph (js record "tool"))
+                                                " "
+                                                (tool-summary-text (js record
+                                                                       "tool")
+                                                                   (js record
+                                                                       "summary"))])
+                                     :tone (TonePlain)
+                                     :result ""
+                                     :result-tone (ToneMuted)
+                                     :output ""
+                                     :call (copy-bytes a (js record "call"))))
+                (= kind "tool.finished")
+              (let [call (js record "call")
+                    n (len (.overlay chat))
+                    (mut i) (- n 1)]
+                (loop (if (< (load i) 0)
+                          (break)
+                          (let [candidate
+                                  (al-elem (field chat overlay) (load i))]
+                            (if (= (.call candidate) call)
+                                (do
+                                  (set! (.result candidate)
+                                        (tool-result-text-for a record))
+                                  (set! (.result-tone candidate)
+                                        (if (jb record "ok")
+                                            (ToneSuccess)
+                                            (ToneError)))
+                                  (set! (.output candidate)
+                                        (copy-bytes a (js record "output")))
+                                  (break))
+                                (set! i (- (load i) 1))))))
+                (chat-bump! chat))
+                (= kind "gate.started")
+              (chat--overlay-push! chat
+                                   (item (ItemEvent)
+                                         "◈"
+                                         (concat a
+                                                 ["gate: "
+                                                  (js record "command")])
+                                         (ToneAccentAlt)))
+                (= kind "gate.finished")
+              (chat--overlay-push! chat
+                                   (if (jb record "ok")
+                                       (item (ItemEvent)
+                                             "◈"
+                                             "gate passed"
+                                             (ToneSuccess))
+                                       (item (ItemEvent)
+                                             "◈"
+                                             (concat a
+                                                     ["gate failed (exit "
+                                                      (int-text a
+                                                                (ji record
+                                                                    "exit"))
+                                                      "): "
+                                                      (first-line (js record
+                                                                      "output"))])
+                                             (ToneError))))
+                (= kind "finding")
+              (chat--overlay-push! chat
+                                   (item (ItemEvent)
+                                         (severity-glyph (js record
+                                                             "severity"))
+                                         (concat a
+                                                 ["overseer ["
+                                                  (js record "code")
+                                                  "] "
+                                                  (first-line (js record
+                                                                  "message"))])
+                                         (severity-tone (js record "severity"))))
+                (= kind "agent.retry")
+              (chat--overlay-push! chat
+                                   (item (ItemEvent)
+                                         "↻"
+                                         (concat a
+                                                 ["model retry "
+                                                  (int-text a
+                                                            (ji record
+                                                                "attempt"))
+                                                  ": "
+                                                  (first-line (js record
+                                                                  "message"))])
+                                         (ToneWarning)))
+                :else
+              0))))
+
+(defn tool-result-text-for [(a (dyn Allocator)) (record JVal)] (-> (slice u8))
+  (let [ms (ji record "ms")
+        took (fmt-ms a ms)]
+    (concat a [(if (jb record "ok") "✓ " "✗ ") took])))
+
+;;; Ingest `{"cursor", "records"}` read after `(.cursor chat)`.
+(defn chat-ingest-page! [(chat (ptr Chat)) (page JVal)] (-> i64)
+  (let [records (jv-get page "records")
+        n (jv-len records)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (chat-ingest! chat (jv-nth records (load i)))
+                (set! i (+ (load i) 1)))))
+    (set! (.cursor chat) (ji page "cursor"))
+    (set! (.loaded chat) true)
+    n))
+
+;;; Start from a `?tail=N` page: the overlay is whatever this agent did after
+;;; its most recent checkpoint record.
+(defn chat-start-from-tail! [(chat (ptr Chat)) (page JVal)] (-> i64)
+  (let [records (jv-get page "records")
+        n (jv-len records)
+        (mut start) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [r (jv-nth records (load i))]
+                (when (chat--checkpoint? chat r)
+                  (set! start (+ (load i) 1)))
+                (set! i (+ (load i) 1)))))
+    (set! i (load start))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (chat-ingest! chat (jv-nth records (load i)))
+                (set! i (+ (load i) 1)))))
+    (set! (.cursor chat) (ji page "cursor"))
+    (set! (.loaded chat) true)
+    ;; The transcript fetched next already covers everything before `start`.
+    (set! (.needs-transcript chat) true)
+    n))
+
+;; ---------------------------------------------------------------------------
+;; Pending operator messages
+
+;;; Remember a message this dashboard just sent (journal offset `ref`).
+(defn chat-add-local! [(chat (ptr Chat)) (ref i64) (text (slice u8)) (t i64)] (-> i64)
+  (push! (mut (.local chat))
+         (PendingSend
+           :ref ref
+           :text (copy-bytes (.allocator chat) text)
+           :sent-t t))
+  (chat-bump! chat))
+
+;;; Reconcile with a folded run state: messages it lists as pending for this
+;;; agent are waiting; local sends it has folded past are no longer ours to show
+;;; (they are waiting, or already read and part of the conversation).
+(defn chat-sync-pending! [(chat (ptr Chat)) (run-state JVal)] (-> i64)
+  (let [a (arenas-spare (field chat waiting-arenas))
+        pending (jv-get run-state "pending_messages")
+        folded (ji run-state "cursor")
+        before (len (.waiting chat))
+        (mut i) 0]
+    (al-clear! (mut (.waiting chat)))
+    (loop (if (>= (load i) (jv-len pending))
+              (break)
+              (let [m (jv-nth pending (load i))]
+                (when (= (js m "agent") (.agent chat))
+                  (push! (mut (.waiting chat))
+                         (PendingSend
+                           :ref (ji m "ref")
+                           :text (copy-bytes a (js m "text"))
+                           :sent-t (ji m "t"))))
+                (set! i (+ (load i) 1)))))
+    (arenas-flip! (field chat waiting-arenas))
+    (let [(mut k) 0
+          (mut removed) false]
+      (loop (if (>= (load k) (len (.local chat)))
+                (break)
+                (let [p (al-elem (field chat local) (load k))]
+                  (if (> folded (.ref p))
+                      (do
+                        (free [u8] (.allocator chat) (.text p))
+                        ;; Remove by moving the last entry here.
+                        (let [last (- (len (.local chat)) 1)]
+                          (set! p (get (.local chat) last))
+                          (set! (.len (.local chat)) last))
+                        (set! removed true))
+                      (set! k (+ (load k) 1))))))
+      (when (or (load removed)
+                (!= before (len (.waiting chat)))
+                (> (len (.waiting chat)) 0))
+        (chat-bump! chat))
+      0)))
+
+(defn chat--waiting-has? [(chat (ptr Chat)) (ref i64)] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) (len (.waiting chat)))
+              (break)
+              (if (= (.ref (al-elem (field chat waiting) (load i))) ref)
+                  (do (set! found true) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;; ---------------------------------------------------------------------------
+;; Turning the conversation into lines
+(defstruct Builder
+  [(a (dyn Allocator))
+   (lines (ptr (ArrayList Line)))
+   (width i64)
+   (details bool)
+   (agent (slice u8))
+   (speaker (slice u8))])
+
+(defn b--push! [(b (ptr Builder)) (l Line)] (-> i64)
+  (push! (.lines b) l)
+  0)
+
+(defn b--blank! [(b (ptr Builder))] (-> i64)
+  (when (> (len (load (.lines b))) 0)
+    (b--push! b (line "" (ToneMuted) "" (TonePlain))))
+  0)
+
+;;; A speaker label, emitted when the speaker changes.
+(defn b--speaker! [(b (ptr Builder))
+                   (who (slice u8))
+                   (label (slice u8))
+                   (tone Tone)] (-> i64)
+  (when (not (= who (.speaker b)))
+    (b--blank! b)
+    (b--push! b (line "" tone label (if (= who "you") (ToneAccentAlt) tone)))
+    (set! (.speaker b) who))
+  0)
+
+;;; `text` wrapped under a gutter; at most `max-lines` rows unless details are on
+;;; (0 = unlimited), with a note about what was folded.
+(defn b--body! [(b (ptr Builder))
+                (text (slice u8))
+                (gutter (slice u8))
+                (gutter-tone Tone)
+                (tone Tone)
+                (max-lines i64)] (-> i64)
+  (let [a (.a b)
+        wrapped (wrap-text a (str-trim text) (- (.width b) (text-width gutter)))
+        n (len wrapped)
+        limit
+          (if (or (.details b) (<= max-lines 0) (<= n (+ max-lines 1)))
+              n
+              max-lines)
+        (mut i) 0
+        (mut shown) 0]
+    ;; Folded bodies skip blank lines so the rows shown carry text.
+    (loop (if (or (>= (load i) n) (>= (load shown) limit))
+              (break)
+              (let [row (get wrapped (load i))]
+                (when (or (= limit n) (> (len (str-trim row)) 0))
+                  (b--push! b (line gutter gutter-tone row tone))
+                  (set! shown (+ (load shown) 1)))
+                (set! i (+ (load i) 1)))))
+    (when (< (load i) n)
+      (b--push! b
+                (line gutter
+                      gutter-tone
+                      (concat a
+                              ["… "
+                               (int-text a (- n (load i)))
+                               " more lines · ctrl-t shows all"])
+                      (ToneSubtle))))
+    0))
+
+;;; The sender of a delivered message: the NAME of a leading "[NAME] ", or "".
+(defn b--sender [(text (slice u8))] (-> (slice u8))
+  (if (and (> (len text) 2) (= (cast i64 (get text 0)) #\[))
+      (let [(mut i) 1
+            (mut end) -1]
+        (loop (if (or (>= (load i) (len text)) (> (load i) 24))
+                  (break)
+                  (let [ch (cast i64 (get text (load i)))]
+                    (cond (= ch #\]) (do (set! end (load i)) (break))
+                          (or (= ch 32) (= ch 10)) (break)
+                          :else (set! i (+ (load i) 1))))))
+        (if (and (> (load end) 1)
+                 (< (+ (load end) 1) (len text))
+                 (= (cast i64 (get text (+ (load end) 1))) 32))
+            (subslice text 1 (load end))
+            ""))
+      ""))
+
+(defn b--user! [(b (ptr Builder)) (from (slice u8)) (text (slice u8))] (-> i64)
+  (cond (= from "operator")
+          (do
+            (b--speaker! b "you" "you" (ToneAccentAlt))
+            (b--body! b text "│ " (ToneAccentAlt) (TonePlain) 0))
+        (= from "overseer")
+          (do
+            (b--speaker! b "overseer" "overseer" (ToneWarning))
+            (b--body! b text "│ " (ToneWarning) (TonePlain) 0))
+        (and (> (len from) 0) (not (= from "factory")))
+          (do
+            (b--speaker! b from from (ToneWarning))
+            (b--body! b text "│ " (ToneWarning) (TonePlain) 0))
+        :else
+          (do
+            (b--speaker! b "factory" "factory" (ToneMuted))
+            (b--body! b text "│ " (ToneSubtle) (ToneMuted) 3))))
+
+(defn b--agent! [(b (ptr Builder))] (-> i64)
+  (b--speaker! b "agent" (.agent b) (ToneAccent)))
+
+(defn b--thought! [(b (ptr Builder)) (text (slice u8))] (-> i64)
+  (when (> (len (str-trim text)) 0)
+    (b--agent! b)
+    (b--body! b text "┊ " (ToneSubtle) (ToneThought) 2))
+  0)
+
+(defn b--said! [(b (ptr Builder)) (text (slice u8))] (-> i64)
+  (when (> (len (str-trim text)) 0)
+    (b--agent! b)
+    (b--body! b text "│ " (ToneAccent) (TonePlain) 0))
+  0)
+
+(defn b--tool! [(b (ptr Builder))
+                (text (slice u8))
+                (result (slice u8))
+                (result-tone Tone)
+                (output (slice u8))] (-> i64)
+  (b--agent! b)
+  (b--push! b
+            (Line
+              :gutter "│ "
+              :gutter-tone (ToneAccent)
+              :text text
+              :tone (ToneMuted)
+              :suffix result
+              :suffix-tone result-tone))
+  (when (and (.details b) (> (len (str-trim output)) 0))
+    (b--body! b output "│   " (ToneAccent) (ToneSubtle) 12))
+  0)
+
+(defn b--event! [(b (ptr Builder))
+                 (glyph (slice u8))
+                 (text (slice u8))
+                 (tone Tone)] (-> i64)
+  (b--blank! b)
+  (b--push! b (line (concat (.a b) [glyph " "]) tone text tone))
+  (set! (.speaker b) "")
+  0)
+
+;;; The result of a transcript tool call: the matching `tool` message.
+(defn b--tool-output [(messages JVal) (from i64) (id (slice u8))] (-> (slice u8))
+  (let [(mut i) from
+        (mut out) ""]
+    (loop (if (>= (load i) (jv-len messages))
+              (break)
+              (let [m (jv-nth messages (load i))]
+                (if (and (= (js m "role") "tool") (= (js m "tool_call_id") id))
+                    (do (set! out (js m "content")) (break))
+                    (set! i (+ (load i) 1))))))
+    (load out)))
+
+(defn b--transcript! [(b (ptr Builder)) (messages JVal)] (-> i64)
+  (let [a (.a b)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len messages))
+              (break)
+              (let [m (jv-nth messages (load i))
+                    role (js m "role")
+                    content (js m "content")]
+                (cond (= role "user")
+                        (let [from (b--sender content)]
+                          (b--user! b
+                                    from
+                                    (if (> (len from) 0)
+                                        (subslice content
+                                                  (+ (len from) 3)
+                                                  (len content))
+                                        content)))
+                      (= role "assistant")
+                        (let [calls (jv-get m "tool_calls")
+                              (mut k) 0]
+                          (b--thought! b (js m "reasoning_content"))
+                          (b--said! b content)
+                          (loop (if (>= (load k) (jv-len calls))
+                                    (break)
+                                    (let [call (jv-nth calls (load k))
+                                          fun (jv-get call "function")
+                                          tool (js fun "name")
+                                          output
+                                            (b--tool-output messages
+                                                            (+ (load i) 1)
+                                                            (js call "id"))]
+                                      (b--tool! b
+                                                (concat a
+                                                        [(tool-glyph tool)
+                                                         " "
+                                                         (tool-subject a
+                                                                       tool
+                                                                       (js fun
+                                                                           "arguments"))])
+                                                (concat a
+                                                        ["→ "
+                                                         (first-line output)])
+                                                (ToneSubtle)
+                                                output)
+                                      (set! k (+ (load k) 1))))))
+                      :else 0)
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn b--overlay! [(b (ptr Builder)) (items (ptr (ArrayList ChatItem)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (load items)))
+              (break)
+              (let [it (al-elem items (load i))]
+                (match (.kind it)
+                  (ItemUser [] (b--user! b (.from it) (.text it)))
+                  (ItemAssistant [] (b--said! b (.text it)))
+                  (ItemThought [] (b--thought! b (.text it)))
+                  (ItemTool []
+                            (b--tool! b
+                                      (.text it)
+                                      (if (> (len (.result it)) 0)
+                                          (.result it)
+                                          "…")
+                                      (.result-tone it)
+                                      (.output it)))
+                  (ItemEvent [] (b--event! b (.from it) (.text it) (.tone it))))
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn b--pending! [(b (ptr Builder)) (p (ptr PendingSend)) (label (slice u8))] (-> i64)
+  (b--speaker! b label label (ToneSubtle))
+  (b--body! b (.text p) "│ " (ToneSubtle) (ToneMuted) 0))
+
+;;; The conversation as display lines for `width` columns, rebuilt only when
+;;; something changed.
+(defn chat-lines [(chat (ptr Chat)) (width i64)] (-> (slice Line))
+  (when (or (!= (.lines-version chat) (.version chat))
+            (!= (.lines-width chat) width)
+            (!= (.lines-details chat) (.details chat)))
+    (let [a (arenas-spare (field chat lines-arenas))
+          b (primitive/alloc-stack Builder)]
+      (al-clear! (mut (.lines chat)))
+      (set! b
+            (Builder
+              :a a
+              :lines (field chat lines)
+              :width (if (< width 8) 8 width)
+              :details (.details chat)
+              :agent (.agent chat)
+              :speaker ""))
+      (b--transcript! b (jv-get (.value (field chat transcript)) "transcript"))
+      (b--overlay! b (field chat overlay))
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (len (.waiting chat)))
+                  (break)
+                  (do
+                    (b--pending! b
+                                 (al-elem (field chat waiting) (load i))
+                                 "you · waiting for the agent")
+                    (set! i (+ (load i) 1))))))
+      (let [(mut i) 0]
+        (loop (if (>= (load i) (len (.local chat)))
+                  (break)
+                  (let [p (al-elem (field chat local) (load i))]
+                    (when (not (chat--waiting-has? chat (.ref p)))
+                      (b--pending! b p "you · sending"))
+                    (set! i (+ (load i) 1))))))
+      (arenas-flip! (field chat lines-arenas))
+      (set! (.lines-version chat) (.version chat))
+      (set! (.lines-width chat) width)
+      (set! (.lines-details chat) (.details chat))))
+  (al-slice (.lines chat)))

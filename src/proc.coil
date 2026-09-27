@@ -1,0 +1,175 @@
+(module factory.proc)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "coil.time" :as time)
+(import "agent.fail" :use *)
+(import "agent.json" :use *)
+
+;;; Processes: running a program to completion with captured output, finding
+;;; this executable so it can start copies of itself, and turning the current
+;;; process into a detached one with its output in a log file.
+
+(extern setsid :cc c [] (-> i32))
+(extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(defn env-or [(a (dyn Allocator)) (name (slice u8)) (fallback (slice u8))] (-> (slice u8))
+  (match (os/env-get a name)
+    (Ok [found] (match found
+                  (Some [value] (let [text (os/owned-string-slice value)]
+                                  (if (> (len text) 0) text fallback)))
+                  (None [] fallback)))
+    (Err [failure] fallback)))
+
+(defn pid [] (-> i64) (cast i64 (os/getpid)))
+
+;;; Whether a process with this id exists (EPERM counts as alive).
+(defn process-alive? [(process i64)] (-> bool)
+  (if (<= process 0)
+      false
+      (if (= (os/kill (cast i32 process) 0) 0)
+          true
+          (= (os/os-errno) 1))))
+
+(defn signal-process [(process i64) (signal i64)] (-> bool)
+  (and (> process 0) (= (os/kill (cast i32 process) (cast i32 signal)) 0)))
+
+(defstruct Captured [(ok bool) (exit i64) (output (slice u8)) (error (slice u8))])
+
+(defn exit-code [(status subprocess/ExitStatus)] (-> i64)
+  (match status
+    (subprocess/Exited [code] code)
+    (subprocess/Signaled [signal] (+ 128 signal))))
+
+;;; Run `program args…` in `cwd` ("" inherits) to completion, capturing stdout
+;;; and stderr (each bounded to 4 MiB). `ok` means it ran and exited 0.
+(defn capture [(a (dyn Allocator))
+               (program (slice u8))
+               (args (slice (slice u8)))
+               (cwd (slice u8))
+               (timeout-ms i64)] (-> Captured)
+  (capture-limited a program args cwd timeout-ms 4194304))
+
+;;; `capture` with an explicit bound on each captured stream.
+(defn capture-limited [(a (dyn Allocator))
+                       (program (slice u8))
+                       (args (slice (slice u8)))
+                       (cwd (slice u8))
+                       (timeout-ms i64)
+                       (limit i64)] (-> Captured)
+  (let [deadline (match (time/duration-millis timeout-ms)
+                   (Ok [duration] (match (time/deadline-after duration)
+                                    (Ok [instant] (Some instant))
+                                    (Err [e] (None [time/Instant]))))
+                   (Err [e] (None [time/Instant])))
+        grace (match (time/duration-millis 2000)
+                (Ok [duration] duration)
+                (Err [e] (fail [time/Duration] "factory.proc: invalid grace duration")))
+        options (subprocess/run-options program args cwd limit limit deadline
+                                        (cast (ptr coil.cancellation.Cancellation) 0)
+                                        grace)
+        (mut result) (primitive/zeroed Captured)
+        slot (primitive/alloc-stack subprocess/RunResult)]
+    (match (subprocess/run a slot options)
+      (Err [failure]
+           (do (set! (.ok result) false)
+               (set! (.exit result) -1)
+               (set! (.output result) "")
+               (set! (.error result) (copy-bytes a program))))
+      (Ok [ran]
+          (let [r ran
+                code (exit-code (.status r))]
+            (set! (.exit result) code)
+            (set! (.ok result) (and (= code 0) (not (.timed-out r))))
+            (set! (.output result) (copy-bytes a (.stdout r)))
+            (set! (.error result) (copy-bytes a (if (.timed-out r) "timed out" (.stderr r))))
+            (subprocess/run-result-free a r)
+            0)))
+    (load result)))
+
+;;; The trimmed stdout of a command that must succeed, or None.
+(defn capture-line [(a (dyn Allocator))
+                    (program (slice u8))
+                    (args (slice (slice u8)))
+                    (cwd (slice u8))] (-> (Option (slice u8)))
+  (let [result (capture a program args cwd 60000)]
+    (if (.ok result) (Some (str-trim (.output result))) (None))))
+
+;;; Canonical absolute form of an existing path, or None.
+(defn real-path [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
+  (let [buffer (primitive/alloc-stack (array u8 4096))
+        resolved (realpath (str->cstr a path) (cast (ptr i8) buffer))]
+    (if (= (cast i64 resolved) 0)
+        (None)
+        (Some (copy-bytes a (cstr->str resolved))))))
+
+(defn argv0-cell [] (-> (ptr (slice u8))) (primitive/alloc-static (slice u8)))
+
+;;; Record argv[0] at startup so `self-executable` can find this program.
+(defn remember-argv0! [(argv0 (slice u8))] (-> i64)
+  (store! (argv0-cell) argv0))
+
+(defn search-path [(a (dyn Allocator)) (name (slice u8))] (-> (Option (slice u8)))
+  (let [dirs (str-split a (env-or a "PATH" "/usr/bin:/bin") ":")
+        (mut found) (: (None) (Option (slice u8)))]
+    (for dir (iter dirs)
+      (when (and (> (len dir) 0) (match (load found) (None [] true) (_ false)))
+        (let [(mut candidate) (sb-new a)]
+          (sb-push-str! (mut candidate) dir)
+          (sb-push-str! (mut candidate) "/")
+          (sb-push-str! (mut candidate) name)
+          (match (real-path a (sb-finish! (mut candidate)))
+            (Some [path] (set! found (Some path)))
+            (None [] 0))
+          0)
+        0))
+    (load found)))
+
+;;; The absolute path of this executable, so a process can start another copy
+;;; of itself (the daemon, a run, a chat). Resolved from argv[0], through PATH
+;;; when argv[0] is a bare name.
+(defn self-executable [(a (dyn Allocator))] (-> (slice u8))
+  (let [argv0 (load (argv0-cell))]
+    (if (= (len argv0) 0)
+        (fail [(slice u8)] "factory: argv[0] was not recorded at startup")
+        (match (str-find argv0 "/")
+          (Some [at] (match (real-path a argv0)
+                       (Some [path] path)
+                       (None [] (fail [(slice u8)] "factory: cannot resolve this executable's path"))))
+          (None [] (match (search-path a argv0)
+                     (Some [path] path)
+                     (None [] (fail [(slice u8)] "factory: cannot find this executable on PATH"))))))))
+
+;;; Start `program args…` detached from this process: no inherited stdio, its
+;;; own session (it calls `become-detached!` itself), not waited for here.
+;;; Returns the child's pid, or -1.
+(defn spawn-detached [(a (dyn Allocator))
+                      (program (slice u8))
+                      (args (slice (slice u8)))] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)]
+    (match (subprocess/spawn a child program args
+                             (subprocess/null-stdio)
+                             (subprocess/null-stdio)
+                             (subprocess/null-stdio))
+      (Ok [spawned] (subprocess/child-id spawned))
+      (Err [failure] -1))))
+
+;;; Detach from the controlling terminal and send stdout and stderr to
+;;; `log-path` (appended). Stdin reads /dev/null.
+(defn become-detached! [(a (dyn Allocator)) (log-path (slice u8))] (-> bool)
+  (let [log (os/open (str->cstr a log-path) (cast i32 (| fs/O_WRONLY (| fs/O_APPEND fs/O_CREAT))) 420)
+        null (os/open c"/dev/null" 0)]
+    (setsid)
+    (if (or (< log 0) (< null 0))
+        false
+        (do (os/dup2 null 0)
+            (os/dup2 log 1)
+            (os/dup2 log 2)
+            (os/close log)
+            (os/close null)
+            true))))

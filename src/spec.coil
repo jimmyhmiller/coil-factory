@@ -1,0 +1,95 @@
+(module factory.spec)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+
+;;; A factory definition: Markdown with front matter, shared context, and one
+;;; `## Station: name` section per station. See DESIGN.md "Factories".
+
+(defstruct StationSpec
+  [(name (slice u8))
+   (instructions (slice u8))
+   (gate (slice u8))
+   (attempts i64)
+   (model (slice u8))
+   (tools (slice u8))
+   (line i64)])
+
+(defstruct FactorySpec
+  [(name (slice u8))
+   (description (slice u8))
+   (input (slice u8))
+   (model (slice u8))
+   (tools (slice u8))
+   (attempts i64)
+   (context (slice u8))
+   (stations (ArrayList StationSpec))])
+
+(defstruct SpecProblem [(line i64) (message (slice u8))])
+
+(defn station-count [(spec (ptr FactorySpec))] (-> i64) (len (.stations spec)))
+
+(defn station-spec [(spec (ptr FactorySpec)) (index i64)] (-> (ptr StationSpec))
+  (al-elem [StationSpec] (field spec stations) index))
+
+(defn find-station [(spec (ptr FactorySpec)) (name (slice u8))] (-> i64)
+  (let [(mut i) 0
+        n (len (.stations spec))
+        (mut found) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (.name (station-spec spec (load i))) name)
+                  (do (set! found (load i)) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;;; The station's tools, falling back to the factory's, then to both groups.
+(defn station-tools [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> (slice u8))
+  (cond (> (len (.tools station)) 0) (.tools station)
+        (> (len (.tools spec)) 0) (.tools spec)
+        :else "files, shell"))
+
+(defn station-attempts [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> i64)
+  (cond (> (.attempts station) 0) (.attempts station)
+        (> (.attempts spec) 0) (.attempts spec)
+        :else 3))
+
+;;; The model a station uses: its own, the factory's, then `fallback`.
+(defn station-model [(spec (ptr FactorySpec)) (station (ptr StationSpec)) (fallback (slice u8))] (-> (slice u8))
+  (cond (> (len (.model station)) 0) (.model station)
+        (> (len (.model spec)) 0) (.model spec)
+        :else fallback))
+
+(defn kebab-name? [(name (slice u8))] (-> bool)
+  (let [n (len name)
+        (mut ok) (and (> n 0) (<= n 48))
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (not (load ok)))
+              (break)
+              (let [c (cast i64 (get name (load i)))]
+                (when (not (or (and (>= c 97) (<= c 122))
+                               (and (>= c 48) (<= c 57))
+                               (and (= c 45) (> (load i) 0) (< (load i) (- n 1)))))
+                  (set! ok false)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load ok)))
+
+;;; Every name in a comma-separated tool list is `files` or `shell`.
+(defn tool-list-problem [(a (dyn Allocator)) (tools (slice u8))] (-> (slice u8))
+  (let [(mut problem) ""]
+    (for raw (iter (str-split a tools ","))
+      (let [name (str-trim raw)]
+        (when (and (= (len (load problem)) 0)
+                   (not (or (= name "files") (= name "shell"))))
+          (let [(mut out) (sb-new a)]
+            (sb-push-str! (mut out) "unknown tool group \"")
+            (sb-push-str! (mut out) name)
+            (sb-push-str! (mut out) "\"; the groups are files and shell")
+            (set! problem (sb-finish! (mut out)))
+            0)
+          0)))
+    (load problem)))

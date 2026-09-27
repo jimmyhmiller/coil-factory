@@ -1,0 +1,197 @@
+(module factory.ui.chatview)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "tui.widgets" :use *)
+(import "tui.app" :use [Frame])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.chat" :use *)
+(import "factory.ui.model" :use *)
+
+;;; Talking to one agent: its conversation, what it is doing right now, and an
+;;; input whose meaning depends on the run (steer, unblock, or converse).
+(defn chat-agent-state [(d (ptr Dash))] (-> JVal)
+  (agent-named (.value (field d run)) (.agent (field d chat))))
+
+(defn chat-run-status [(d (ptr Dash))] (-> (slice u8))
+  (js (.value (field d run)) "status"))
+
+(defn chat-placeholder [(status (slice u8))] (-> (slice u8))
+  (cond (= status "blocked") "Answer the agent — your reply resumes the run"
+        (or (= status "running") (= status "queued") (= status "paused"))
+          "Steer the agent — it reads this at its next turn"
+        (= status "") "Message the agent…"
+        :else "Ask the agent something — it answers from its workspace"))
+
+(defn draw-chat-header! [(d (ptr Dash))
+                         (c (ptr Canvas))
+                         (a (dyn Allocator))
+                         (r Rect)] (-> i64)
+  (let [theme (.theme d)
+        chat (field d chat)
+        status (chat-run-status d)
+        x (draw-topbar! d c a r [(.run chat) (.agent chat)])]
+    (when (> (len status) 0)
+      (draw-badge! c
+                   r
+                   (+ x 2)
+                   (.y r)
+                   status
+                   (badge-style theme (status-color status))))
+    0))
+
+;;; The line above the input: what the agent is doing, or what a message does.
+(defn draw-chat-status! [(d (ptr Dash))
+                         (c (ptr Canvas))
+                         (a (dyn Allocator))
+                         (r Rect)
+                         (tick i64)] (-> i64)
+  (let [theme (.theme d)
+        agent (chat-agent-state d)
+        phase (js agent "phase")
+        status (chat-run-status d)
+        x (+ (.x r) 1)]
+    (cond (phase-active? phase)
+            (let [x2
+                    (span! c r x (spinner-frame tick) (phase-style theme phase))
+                  x3 (span! c r (+ x2 1) phase (bold (phase-style theme phase)))]
+              (put-text-ellipsis! c
+                                  r
+                                  (+ x3 2)
+                                  (.y r)
+                                  (js agent "activity")
+                                  (.muted theme)))
+          (= status "blocked")
+            (put-text-ellipsis! c
+                                r
+                                x
+                                (.y r)
+                                (concat a
+                                        ["▲ blocked — "
+                                         (first-line (js (.value (field d run))
+                                                         "reason"))])
+                                (bold (.warning theme)))
+          (= status "paused")
+            (put-text! c
+                       r
+                       x
+                       (.y r)
+                       "‖ paused — messages wait until you resume (p)"
+                       (.warning theme))
+          (finished-status? status)
+            (put-text-ellipsis! c
+                                r
+                                x
+                                (.y r)
+                                (concat a
+                                        [(status-glyph status 0)
+                                         " run "
+                                         status
+                                         " — a message starts a conversation in the run's workspace"])
+                                (tone-style theme
+                                            (if (= status "succeeded")
+                                                (ToneSuccess)
+                                                (ToneMuted))))
+          (> (len phase) 0)
+            (put-text-ellipsis! c
+                                r
+                                x
+                                (.y r)
+                                (concat a
+                                        ["· " phase "  " (js agent "activity")])
+                                (.muted theme))
+          :else
+            (put-text! c
+                       r
+                       x
+                       (.y r)
+                       "· this agent has not started yet"
+                       (.subtle theme)))
+    0))
+
+(const CHAT-HINTS
+       [(KeyHint :key "enter" :label "send")
+        (KeyHint :key "shift/alt-enter" :label "newline")
+        (KeyHint :key "pgup/pgdn" :label "scroll")
+        (KeyHint :key "ctrl-t" :label "details")
+        (KeyHint :key "esc" :label "back")])
+
+(defn draw-chat-view! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
+  (let [c (.canvas frame)
+        a (.scratch frame)
+        theme (.theme d)
+        chat (field d chat)
+        full (canvas-rect c)
+        banner (if (hub-down? d) 1 0)
+        (mut parts) (zeroed (array Rect 4))]
+    (split-vertical full [(Fixed 1) (Fixed banner) (Fill 1) (Fixed 1)] 0 parts)
+    (draw-chat-header! d c a (index parts 0))
+    (when (hub-down? d) (draw-hub-banner! d c a (index parts 1)))
+    (let [box (index parts 2)
+          agent (chat-agent-state d)
+          (mut opts)
+            (panel-opts theme
+                        (concat a [(.agent chat) " · conversation"])
+                        true)]
+      (set! (.footer opts)
+            (concat a
+                    [(int-text a (ji agent "turns"))
+                     " turns · "
+                     (fmt-tokens a
+                                 (+ (ji agent "input_tokens")
+                                    (ji agent "output_tokens")))
+                     " tokens"
+                     (if (.details chat) " · details on" "")]))
+      (let [inner (draw-box! c box opts)
+            input-rows
+              (let [n (input-visual-rows (field chat input) (- (.w inner) 3))]
+                (if (> n 6) 6 n))
+            divider-y (- (rect-bottom inner) (+ input-rows 1))
+            status-r (rect (.x inner) (- divider-y 1) (.w inner) 1)
+            transcript-r
+              (rect-inset-xy (rect (.x inner)
+                                   (.y inner)
+                                   (.w inner)
+                                   (- (- divider-y 1) (.y inner)))
+                             1
+                             0)
+            input-r (rect-take-bottom inner input-rows)
+            body transcript-r
+            lines (chat-lines chat (.w body))]
+        (if (and (not (.has (field chat transcript))) (= (len lines) 0))
+            (put-text! c
+                       body
+                       (.x body)
+                       (.y body)
+                       "Loading the conversation…"
+                       (.subtle theme))
+            (draw-lines! c body (field chat sv) lines theme))
+        ;; The scrollbar rides on the box's right border.
+        (draw-scrollbar! c
+                         (rect (- (rect-right box) 1) (.y body) 1 (.h body))
+                         (len lines)
+                         (.offset (.sv chat))
+                         (.h body)
+                         (.border-focus theme)
+                         (bold (.accent theme)))
+        (draw-chat-status! d c a status-r (.tick frame))
+        (draw-box-divider! c box divider-y (Rounded) (.border-focus theme))
+        (put-text! c
+                   input-r
+                   (+ (.x input-r) 1)
+                   (.y input-r)
+                   "❯"
+                   (bold (.accent theme)))
+        (draw-input! c
+                     (rect-drop-left input-r 3)
+                     (field chat input)
+                     (.text theme)
+                     (chat-placeholder (chat-run-status d))
+                     (.subtle theme)
+                     (not (or (.help d) (.confirm-stop d))))))
+    (draw-footer! d c (index parts 3) CHAT-HINTS)
+    0))

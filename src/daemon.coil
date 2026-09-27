@@ -1,0 +1,200 @@
+(module factory.daemon)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.atomic" :as atomic-ops)
+(import "coil.primitive" :as primitive)
+(import "coil.signals" :as signals)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.thread" :as thread)
+(import "durable.atomic" :as atomic)
+(import "durable.ids" :as ids)
+(import "durable.lock" :as lock)
+(import "http_app.router" :as app)
+(import "http_app.server" :as server)
+(import "agent.json" :use *)
+(import "agent.loop" :as loop)
+(import "factory.api" :as api)
+(import "factory.config" :use *)
+(import "factory.overseer" :as overseer)
+(import "factory.hub" :as hub)
+(import "coil.scratch" :as scratch)
+(import "factory.proc" :use *)
+(import "factory.runstate" :use *)
+(import "factory.site" :use *)
+
+;;; `factory daemon`: one per site. It serves the API, supervises runs, and
+;;; runs the overseer, each on its own thread. Runs are separate processes,
+;;; so stopping the daemon never stops a run; the next daemon adopts them.
+
+(defstruct Daemon
+  [(site (ptr Site))
+   (hub (ptr hub/Hub))
+   (overseer (ptr overseer/Overseer))
+   (server (ptr server/Server))
+   (stopping i64)])
+
+(defn stopping? [(daemon (ptr Daemon))] (-> bool)
+  (!= (atomic-ops/atomic-load (field daemon stopping)) 0))
+
+(defn supervisor-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [daemon (cast (ptr Daemon) arg)
+        site (.site daemon)]
+    (loop (if (stopping? daemon)
+              (break)
+              (do (site-lock! site)
+                  (supervise! site)
+                  (site-unlock! site)
+                  (loop/sleep-ms 500)
+                  0)))
+    (cast (ptr i8) 0)))
+
+;;; What the overseer needs from each active run, copied out under the lock
+;;; so the review itself runs without holding it.
+(defn overseer-subjects [(site (ptr Site)) (a (dyn Allocator))] (-> (ArrayList overseer/Subject))
+  (let [(mut out) (al-new [overseer/Subject] a)]
+    (site-lock! site)
+    (for entry (iter (.runs site))
+      (let [st (field entry state)]
+        (when (= (.status st) "running")
+          (push! [overseer/Subject] (mut out)
+                 (overseer/Subject :id (copy-bytes a (.id entry))
+                                   :status (copy-bytes a (.status st))
+                                   :workspace (workspace-path a (.home site) (.id entry))
+                                   :base (copy-bytes a (.base st))
+                                   :brief (copy-bytes a (.brief st))))
+          0)))
+    (site-unlock! site)
+    (load out)))
+
+(defn overseer-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [daemon (cast (ptr Daemon) arg)
+        site (.site daemon)
+        interval (* 1000 (.overseer-interval-s (field site config)))]
+    (loop (if (stopping? daemon)
+              (break)
+              (do (let [a (malloc-allocator)
+                        (mut subjects) (overseer-subjects site a)]
+                    (for subject (iter subjects)
+                      (overseer/review-run! (.overseer daemon) subject))
+                    (al-free! [overseer/Subject] (mut subjects)))
+                  (let [(mut waited) 0]
+                    (loop (if (or (>= (load waited) interval) (stopping? daemon))
+                              (break)
+                              (do (loop/sleep-ms 500) (set! waited (+ (load waited) 500)))))
+                    0))))
+    (cast (ptr i8) 0)))
+
+(defn signal-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [daemon (cast (ptr Daemon) arg)
+        subscription (primitive/alloc-stack signals/SignalSubscription)]
+    (match (signals/signal-subscribe subscription [(cast i32 2) (cast i32 15) (cast i32 1)])
+      (Err [failure] 0)
+      (Ok [subscribed]
+          (match (signals/signal-read subscribed)
+            (Ok [number] (do (println "factory daemon: signal {}, stopping" number)
+                             (atomic-ops/atomic-store (field daemon stopping) 1)
+                             (server/server-stop! (.server daemon))
+                             0))
+            (Err [failure] 0))))
+    (cast (ptr i8) 0)))
+
+;;; The site's API token, created on first use (0600).
+(defn ensure-token [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (let [path (path-join a home "token")]
+    (match (atomic/read-file-if-exists a path)
+      (Ok [found]
+          (match found
+            (Some [text] (str-trim text))
+            (None [] (match (ids/random-hex a 24)
+                       (Ok [token] (match (atomic/write-file-atomic! a path token 384)
+                                     (Ok [written] token)
+                                     (Err [failure] "")))
+                       (Err [failure] "")))))
+      (Err [failure] ""))))
+
+(defn daemon-main [(a (dyn Allocator)) (home (slice u8))] (-> i64)
+  (block :main
+         (match (atomic/ensure-dir! a (path-join a home "factories") 448)
+           (Err [failure] (do (println "factory daemon: cannot create {s}" home) (return-from :main 73)))
+           (Ok [made] 0))
+         (atomic/ensure-dir! a (runs-dir a home) 448)
+         (let [config (match (load-site-config a home)
+                        (SiteConfigOk [c] c)
+                        (SiteConfigBad [message] (do (println "factory daemon: {s}" message)
+                                                     (return-from :main 78))))
+               token (ensure-token a home)
+               (mut daemon-lock) (match (lock/lock-open! a (path-join a home "daemon.lock"))
+                                   (Ok [l] l)
+                                   (Err [failure] (do (println "factory daemon: cannot open the daemon lock")
+                                                      (return-from :main 73))))]
+           (when (= (len token) 0)
+             (println "factory daemon: cannot create the API token")
+             (return-from :main 73))
+           (match (lock/lock-try! (mut daemon-lock))
+             (Ok [held] (when (not held)
+                          (println "factory daemon: already running for {s}" home)
+                          (return-from :main 0)))
+             (Err [failure] (return-from :main 73)))
+           (lock/pid-write! a (path-join a home "daemon.pid") (pid))
+           (let [site (site-open a home config token (self-executable a))
+                 daemon (box! a Daemon (primitive/zeroed Daemon))
+                 remotes (hub/hub-open a home)
+                 router (api/build-router a site remotes)
+                 http (box! a server/Server (primitive/zeroed server/Server))
+                 (mut server-config) (server/server-config)]
+             (set! (.site daemon) site)
+             (set! (.hub daemon) remotes)
+             (set! (.overseer daemon) (overseer/overseer-new a home config))
+             (set! (.server daemon) http)
+             (set! (.port server-config) (.port config))
+             (set! (.idle-poll-ms server-config) 200)
+             (set! (.max-request-bytes server-config) 8388608)
+             (match (server/server-listen! http (load server-config) router)
+               (Err [failure]
+                    (do (match failure
+                          (server/ServerInvalidConfig [message] (println "factory daemon: bad server configuration: {s}" message))
+                          (server/ServerListenFailed [code]
+                                                    (println "factory daemon: cannot listen on 127.0.0.1:{} (errno {}; is another daemon using the port?)" (.port config) code))
+                          (server/ServerSetupFailed [message code] (println "factory daemon: server setup failed: {s} (errno {})" message code))
+                          (server/ServerAcceptFailed [code] (println "factory daemon: accept failed (errno {})" code)))
+                        (return-from :main 69)))
+               (Ok [port] (println "factory daemon: site {s} listening on 127.0.0.1:{}" (.name config) port)))
+             (let [supervisor (primitive/alloc-stack thread/Thread)
+                   watcher (primitive/alloc-stack thread/Thread)
+                   signaller (primitive/alloc-stack thread/Thread)
+                   poller (primitive/alloc-stack thread/Thread)]
+               (thread/thread-spawn supervisor (fnptr-of supervisor-main) (cast (ptr i8) daemon))
+               (thread/thread-spawn watcher (fnptr-of overseer-main) (cast (ptr i8) daemon))
+               (thread/thread-spawn signaller (fnptr-of signal-main) (cast (ptr i8) daemon))
+               (thread/thread-spawn poller (fnptr-of poller-main) (cast (ptr i8) daemon))
+               (server/server-serve! http)
+               (atomic-ops/atomic-store (field daemon stopping) 1)
+               (thread/thread-join supervisor)
+               (thread/thread-join watcher)
+               (thread/thread-join poller)
+               (server/server-close! http)
+               (atomic/unlink-path a (path-join a home "daemon.pid"))
+               (lock/unlock! (mut daemon-lock))
+               (println "factory daemon: stopped")
+               0)))))
+
+;;; Keeps every remote site's tunnel up and its overview fresh.
+(defn poller-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [daemon (cast (ptr Daemon) arg)
+        remotes (.hub daemon)
+        (mut arena) (primitive/zeroed scratch/ScratchArena)]
+    (scratch/scratch-init (mut arena) (malloc-allocator))
+    (loop (if (stopping? daemon)
+              (break)
+              (do (let [t (scratch/scratch-allocator (mut arena))]
+                    (for remote (iter (hub/remotes-snapshot remotes t))
+                      (hub/poll-remote! remotes remote t)))
+                  (scratch/scratch-reset! (mut arena))
+                  (let [(mut waited) 0]
+                    (loop (if (or (>= (load waited) 2000) (stopping? daemon))
+                              (break)
+                              (do (loop/sleep-ms 250) (set! waited (+ (load waited) 250))))))
+                  0)))
+    (scratch/scratch-close! (mut arena))
+    (cast (ptr i8) 0)))

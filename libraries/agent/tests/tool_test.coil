@@ -1,0 +1,41 @@
+(module agent.tool-test)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.tool" :use *)
+
+(defstruct Upper [(calls i64)])
+
+(impl Tool Upper
+  (tool-spec [(self (ptr Upper))] (-> ToolSpec)
+    (ToolSpec :name "upper" :description "Uppercase" :parameters "{\"type\":\"object\"}"))
+  (tool-summary [(self (ptr Upper)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (call-string call "text"))
+  (tool-run [(self (ptr Upper)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (do (set! (.calls self) (+ (.calls self) 1))
+        (if (tool-cancelled? context)
+            (ToolFailed "cancelled")
+            (ToolOk (call-string call "text"))))))
+
+(deftest registry-finds-and-refuses-duplicates
+  (let [a (malloc-allocator)
+        tool (box! a Upper (Upper :calls 0))
+        (mut registry) (registry-new a)]
+    (assert (registry-add! (mut registry) tool))
+    (assert (not (registry-add! (mut registry) tool)))
+    (assert-eq (registry-count (mut registry)) 1)
+    (match (registry-find (mut registry) "upper")
+      (Some [found]
+            (match (from-json [JVal] a "{\"text\":\"hi\"}")
+              (Ok [args]
+                  (let [never (box! a NeverCancelled (NeverCancelled :unused 0))]
+                    (match (tool-run found a (tool-call "c1" "upper" args "") never)
+                      (ToolOk [out] (assert (= out "hi")))
+                      (ToolFailed [m] (assert false)))))
+              (Err [e] (assert false))))
+      (None [] (assert false)))
+    (assert-eq (.calls tool) 1)
+    (match (registry-find (mut registry) "missing")
+      (Some [x] (assert false))
+      (None [] 0))))

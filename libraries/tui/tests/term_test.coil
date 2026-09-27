@@ -1,0 +1,42 @@
+(module tui.term-test)
+(import "coil.primitive" :as primitive)
+(import "tui.canvas" :use [ColorMode NoColor Ansi16 Ansi256 TrueColor])
+(import "tui.term" :use *)
+
+(defn mode-code [(m ColorMode)] (-> i64)
+  (match m (NoColor [] 0) (Ansi16 [] 16) (Ansi256 [] 256) (TrueColor [] 24)))
+
+(deftest detects-color-capability-from-the-environment
+         (assert-eq (mode-code (color-mode-from-env ""
+                                                    "truecolor"
+                                                    "xterm-256color"
+                                                    ""))
+                    24)
+         (assert-eq (mode-code (color-mode-from-env "" "24bit" "xterm" "")) 24)
+         (assert-eq (mode-code (color-mode-from-env "" "" "xterm-256color" ""))
+                    256)
+         (assert-eq (mode-code (color-mode-from-env "" "" "xterm" "")) 16)
+         (assert-eq (mode-code (color-mode-from-env "" "" "xterm-direct" ""))
+                    24)
+         (assert-eq (mode-code (color-mode-from-env "1"
+                                                    "truecolor"
+                                                    "xterm-256color"
+                                                    ""))
+                    0)
+         (assert-eq (mode-code (color-mode-from-env "" "truecolor" "dumb" ""))
+                    0)
+         (assert-eq (mode-code (color-mode-from-env "" "" "" "")) 0)
+         (assert-eq (mode-code (color-mode-from-env "1" "" "xterm" "256")) 256))
+
+(deftest size-falls-back-to-a-usable-value
+         (let [size (term-size)]
+           (assert (> (.width size) 0))
+           (assert (> (.height size) 0))))
+
+(deftest entering-without-a-terminal-is-an-error
+         (when (not (stdin-tty?))
+           (match (term-enter! (term-options-default))
+             (Err [e] (match e (NotATerminal [] 0) (_ (do (assert false) 0))))
+             (Ok [v] (do (assert false) 0)))
+           (assert (not (term-active?))))
+         0)

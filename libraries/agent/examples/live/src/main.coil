@@ -1,0 +1,88 @@
+(module agent-live-example)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :use *)
+(import "ai.chat" :as chat)
+(import "ai.openai" :as openai)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+
+;;; A live check of the agent loop against a real OpenAI-compatible model:
+;;;     coil run -- [model] [chat-completions-url] [key-env-var]
+;;; Defaults: deepseek-v4-flash, DeepSeek's endpoint, DEEPSEEK_API_KEY.
+
+(defstruct Add [(unused u8)])
+
+(impl Tool Add
+  (tool-spec [(self (ptr Add))] (-> ToolSpec)
+    (ToolSpec :name "add"
+              :description "Add two integers exactly."
+              :parameters "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"}},\"required\":[\"a\",\"b\"],\"additionalProperties\":false}"))
+  (tool-summary [(self (ptr Add)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "add")
+  (tool-run [(self (ptr Add)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (let [(mut out) (sb-new a)]
+      (sb-push-i64! (mut out) (+ (call-int call "a" 0) (call-int call "b" 0)))
+      (ToolOk (sb-finish! (mut out))))))
+
+(defstruct Answer [(unused u8)])
+
+(impl Tool Answer
+  (tool-spec [(self (ptr Answer))] (-> ToolSpec)
+    (ToolSpec :name "answer"
+              :description "Report the final answer."
+              :parameters "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false}"))
+  (tool-summary [(self (ptr Answer)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "answer")
+  (tool-run [(self (ptr Answer)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (ToolOk "recorded")))
+
+(defstruct Printer [(unused u8)])
+
+(impl AgentObserver Printer
+  (observe [(self (ptr Printer)) (event AgentEvent)] (-> i64)
+    (do
+      (match event
+        (TurnStarted [turn] (println "turn {}" turn))
+        (Thought [text] (println "  thinking: {} bytes" (len text)))
+        (Said [text] (println "  said: {s}" text))
+        (ToolStarted [call summary] (println "  tool {s}" summary))
+        (ToolEnded [call summary ok output ms] (println "  -> {s}" output))
+        (UsageReported [i o] (println "  tokens {} in / {} out" i o))
+        (ModelRetrying [attempt error delay] (println "  retry {}" attempt))
+        (_ (println "  event")))
+      0)))
+
+(defstruct Quiet [(unused u8)])
+
+(impl AgentControl Quiet
+  (control-check [(self (ptr Quiet))] (-> Control) (Proceed))
+  (control-inbox [(self (ptr Quiet)) (a (dyn Allocator))] (-> (ArrayList Inbound)) (al-new [Inbound] a))
+  (control-idle [(self (ptr Quiet))] (-> i64) 0))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [a (malloc-allocator)
+        model (if (> argc 1) (cstr->str (load (primitive/index argv 1))) "deepseek-v4-flash")
+        url (if (> argc 2) (cstr->str (load (primitive/index argv 2))) "https://api.deepseek.com/chat/completions")
+        key-env (if (> argc 3) (cstr->str (load (primitive/index argv 3))) "DEEPSEEK_API_KEY")
+        key (match (os/env-get a key-env)
+              (Ok [found] (match found (Some [s] (os/owned-string-slice s)) (None [] "")))
+              (Err [e] ""))
+        transport (box! a openai/NativeChatHttp (primitive/zeroed openai/NativeChatHttp))
+        provider (box! a openai/OpenAiChat (primitive/zeroed openai/OpenAiChat))
+        (mut tools) (registry-new a)]
+    (set! (.url provider) url)
+    (set! (.api-key provider) key)
+    (set! (.transport provider) transport)
+    (registry-add! (mut tools) (box! a Add (Add :unused 0)))
+    (registry-add! (mut tools) (box! a Answer (Answer :unused 0)))
+    (let [(mut agent) (agent-new a provider (agent-config model "answer") (mut tools)
+                                 (box! a Printer (Printer :unused 0))
+                                 (box! a Quiet (Quiet :unused 0)))]
+      (agent-add-system! (mut agent) "Use the add tool for arithmetic, then call answer.")
+      (agent-add-user! (mut agent) "What is (1234 + 4321) + 99? Add step by step with the tool.")
+      (match (agent-run! (mut agent))
+        (Finished [call result] (do (println "FINISHED value={}" (call-int call "value" -1)) 0))
+        (Replied [text] (do (println "REPLIED {s}" text) 1))
+        (Cancelled [] (do (println "CANCELLED") 1))
+        (Failed [error] (let [e error] (println "FAILED {s} {} {s}" (.kind e) (.status e) (.message e)) 1))))))

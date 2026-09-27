@@ -1,0 +1,73 @@
+(module agent_tools.workspace-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "agent_tools.workspace" :use *)
+(import "agent_tools.test-support" :use *)
+
+(defn open-ws [(a (dyn Allocator)) (root (slice u8))] (-> Workspace)
+  (match (workspace-open a root)
+    (Ok [ws] ws)
+    (Err [message] (do (println "{}" message) (assert false) (Workspace :root "")))))
+
+(defn resolve-error [(a (dyn Allocator)) (ws Workspace) (path (slice u8))] (-> (slice u8))
+  (match (resolve a ws path)
+    (Ok [(ResolvedPath :absolute absolute)] (do (println "unexpectedly resolved {} -> {}" path absolute) ""))
+    (Err [message] message)))
+
+(deftest workspace-root-is-canonical
+  (let [a (malloc-allocator)
+        dir (fresh-dir a "/tmp" "canon")
+        ws (open-ws a dir)]
+    (assert (contains? (workspace-root ws) "/private/tmp/agent-tools-test-"))
+    (assert (contains? (resolve-error a ws "") "empty"))
+    (match (workspace-open a "relative/dir")
+      (Ok [_] (assert false))
+      (Err [m] (assert (contains? m "not an absolute path"))))
+    (remove-tree a dir)))
+
+(deftest resolve-normalizes-inside-paths
+  (let [a (malloc-allocator)
+        dir (temp-dir a "norm")
+        ws (open-ws a dir)]
+    (match (resolve a ws "./src//a/../main.coil")
+      (Ok [(ResolvedPath :relative relative :absolute absolute)]
+          (do (assert (= relative "src/main.coil"))
+              (assert (= absolute (path-join a (workspace-root ws) "src/main.coil")))))
+      (Err [m] (do (println "{}" m) (assert false))))
+    (match (resolve a ws ".")
+      (Ok [(ResolvedPath :relative relative :absolute absolute)]
+          (do (assert (= relative "."))
+              (assert (= absolute (workspace-root ws)))))
+      (Err [m] (assert false)))
+    (remove-tree a dir)))
+
+(deftest resolve-refuses-escapes
+  (let [a (malloc-allocator)
+        dir (temp-dir a "escape")
+        ws (open-ws a dir)
+        outside (temp-dir a "escape-outside")]
+    (assert (contains? (resolve-error a ws "/etc/passwd") "is absolute"))
+    (assert (contains? (resolve-error a ws (path-join a (workspace-root ws) "src/x.coil"))
+                       "relative to the workspace root instead: \"src/x.coil\""))
+    (assert (contains? (resolve-error a ws "..") "leave the workspace"))
+    (assert (contains? (resolve-error a ws "src/../../etc") "leave the workspace"))
+    (assert (contains? (resolve-error a ws "a\x0;b") "NUL"))
+    (symlink! a outside (path-join a dir "out"))
+    (assert (contains? (resolve-error a ws "out/secret.txt") "outside the workspace"))
+    (assert (contains? (resolve-error a ws "out") "outside the workspace"))
+    (symlink! a "/nonexistent-agent-tools-target" (path-join a dir "dangling"))
+    (assert (contains? (resolve-error a ws "dangling") "does not exist"))
+    (assert (contains? (resolve-error a ws "dangling/child") "does not exist"))
+    (assert (contains? (resolve-error a ws "dangling") "symbolic link \"dangling\""))
+    (symlink! a "sub" (path-join a dir "inner"))
+    (write-text! a (path-join a dir "file.txt") "x")
+    (match (resolve a ws "file.txt/under")
+      (Ok [(ResolvedPath :relative relative)] (assert (= relative "file.txt/under")))
+      (Err [m] (do (println "{}" m) (assert false))))
+    (assert (contains? (resolve-error a ws "inner/new.txt") "does not exist"))
+    (run-argv a ["/bin/mkdir" (path-join a dir "sub")])
+    (match (resolve a ws "inner/new.txt")
+      (Ok [(ResolvedPath :relative relative)] (assert (= relative "inner/new.txt")))
+      (Err [m] (do (println "{}" m) (assert false))))
+    (remove-tree a dir)
+    (remove-tree a outside)))

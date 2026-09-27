@@ -1,0 +1,139 @@
+(module factory.create)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "durable.ids" :as ids)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.git" :use *)
+(import "factory.journal" :use *)
+(import "factory.library" :use *)
+(import "factory.proc" :use *)
+(import "factory.runspec" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+
+;;; Making a run: everything `POST /v1/runs` does before the supervisor takes
+;;; over. The factory is resolved and validated, the project's commit is
+;;; pinned now (so later commits to the checkout don't change what the run
+;;; starts from), and the run directory, `run.json`, and `run.created` record
+;;; are written. The run is then `queued`.
+
+(defstruct NewRun
+  ;;; A factory name or path on this site, or "" when `factory-text` is given.
+  [(factory (slice u8))
+   (factory-text (slice u8))
+   (brief (slice u8))
+   (project (slice u8))
+   (base (slice u8))
+   (model (slice u8))])
+
+(defsum Created
+  (CreatedRun [(id (slice u8))])
+  (CreateRejected [(code (slice u8)) (message (slice u8))]))
+
+(defn expand-home [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (if (or (= path "~") (starts-with path "~/"))
+      (path-join a (env-or a "HOME" "/") (subslice [u8] path (if (= path "~") 1 2) (len path)))
+      path))
+
+;;; A new run id: the factory name and four hex digits.
+(defn new-run-id [(a (dyn Allocator)) (home (slice u8)) (factory (slice u8))] (-> (slice u8))
+  (let [(mut result) ""
+        (mut tries) 0]
+    (loop (if (or (> (len (load result)) 0) (> (load tries) 50))
+              (break)
+              (do (set! tries (+ (load tries) 1))
+                  (match (ids/random-hex a 2)
+                    (Err [failure] 0)
+                    (Ok [suffix]
+                        (let [(mut id) (sb-new a)]
+                          (sb-push-str! (mut id) factory)
+                          (sb-push-str! (mut id) "-")
+                          (sb-push-str! (mut id) suffix)
+                          (let [candidate (sb-finish! (mut id))]
+                            (match (atomic/dir-exists? a (run-dir a home candidate))
+                              (Ok [exists] (when (not exists) (set! result candidate) 0))
+                              (Err [failure] 0))
+                            0)))))))
+    (if (= (len (load result)) 0)
+        (primitive/zeroed (slice u8))
+        (load result))))
+
+(defn create-run! [(a (dyn Allocator)) (config (ptr SiteConfig)) (request NewRun)] (-> Created)
+  (let [home (.home config)]
+    (block :create
+           (let [text (if (> (len (.factory-text request)) 0)
+                          (.factory-text request)
+                          (match (resolve-factory a home (.factory request))
+                            (Found [entry] (let [e entry] (.text e)))
+                            (NotFound [message] (return-from :create (CreateRejected "unknown_factory" message)))))
+                 spec (match (parse-factory a text)
+                        (SpecOk [parsed] parsed)
+                        (SpecBad [problems]
+                                 (return-from :create
+                                                (CreateRejected "invalid_factory" (problems-text a problems)))))
+                 (mut project) ""
+                 (mut base) (.base request)]
+             (when (> (len (.project request)) 0)
+               (let [expanded (expand-home a (.project request))]
+                 (match (real-path a expanded)
+                   (None [] (return-from :create
+                                           (CreateRejected "unknown_project"
+                                                           (join a ["no directory at " (.project request) " on this site"]))))
+                   (Some [path]
+                         (let [bare (git a path ["rev-parse" "--is-bare-repository"])]
+                           (if (and (git-ok? bare) (= (str-trim (git-output bare)) "true"))
+                               (set! project path)
+                               (match (git-toplevel a path)
+                                 (Some [top] (set! project top))
+                                 (None [] (return-from :create
+                                                         (CreateRejected "not_a_repository"
+                                                                         (join a [(.project request) " is not inside a git repository"])))))))))
+                 (when (= (len (load base)) 0)
+                   (match (git-head a (load project))
+                     (Some [head] (set! base head))
+                     (None [] (return-from :create
+                                             (CreateRejected "empty_repository"
+                                                             (join a [(.project request) " has no commits to start from"]))))))
+                 0))
+             (let [id (new-run-id a home (.name spec))]
+               (when (= (len id) 0)
+                 (return-from :create (CreateRejected "internal" "could not choose a run id")))
+               (match (atomic/ensure-dir! a (path-join a (run-dir a home id) "agents") 448)
+                 (Err [failure] (return-from :create (CreateRejected "internal" "could not create the run directory")))
+                 (Ok [made] 0))
+               (let [(mut run) (primitive/zeroed RunSpec)]
+                 (set! (.id run) id)
+                 (set! (.factory-name run) (.name spec))
+                 (set! (.factory-text run) text)
+                 (set! (.brief run) (.brief request))
+                 (set! (.project run) (load project))
+                 (set! (.base run) (load base))
+                 (set! (.branch run) (join a ["factory/" id]))
+                 (set! (.model run) (.model request))
+                 (set! (.site run) (.name config))
+                 (set! (.created run) (wall-ms))
+                 (when (not (save-run-spec! a home (mut run)))
+                   (return-from :create (CreateRejected "internal" "could not write run.json")))
+                 (let [record (ev a "run.created")
+                       stations (jv-array a)]
+                   (for station (iter (.stations spec))
+                     (let [s station] (jv-push! stations (JStr (.name s)))))
+                   (ev-str! record "factory" (.name spec))
+                   (ev-str! record "site" (.name config))
+                   (ev-str! record "project" (load project))
+                   (ev-str! record "base" (load base))
+                   (ev-str! record "branch" (.branch run))
+                   (ev-str! record "model" (if (> (len (.model request)) 0) (.model request)
+                                               (if (> (len (.model spec)) 0) (.model spec) (.default-model config))))
+                   (ev-text! a record "brief" (.brief request) 4000)
+                   (ev-put! record "stations" stations)
+                   (match (append-run-event! a home id record)
+                     (AppendedAt [offset] (CreatedRun id))
+                     (AppendFailed [message] (CreateRejected "internal" message))))))))))

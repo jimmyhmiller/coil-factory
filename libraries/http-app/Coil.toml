@@ -1,0 +1,10 @@
+[package]
+name = "http-app"
+source-roots = ["src", "tests"]
+
+[dependencies]
+sse = { path = "../sse" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

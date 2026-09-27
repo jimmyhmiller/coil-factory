@@ -1,0 +1,136 @@
+(module factory.client)
+(import "coil.alloc" :use *)
+(import "coil.http.client" :as http)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "sse.core" :as sse)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+
+;;; The CLI's connection to the hub: JSON over loopback HTTP with the site's
+;;; bearer token, and Server-Sent Events for live streams.
+
+(defstruct Hub [(base-url (slice u8)) (token (slice u8))])
+
+(defsum Reply
+  (ReplyOk [(status i64) (body JVal) (text (slice u8))])
+  (ReplyFailed [(message (slice u8))]))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+(defn read-token [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (match (atomic/read-file-if-exists a (path-join a home "token"))
+    (Ok [found] (match found (Some [text] (str-trim text)) (None [] "")))
+    (Err [failure] "")))
+
+(defn hub-for [(a (dyn Allocator)) (config (ptr SiteConfig))] (-> Hub)
+  (Hub :base-url (join a ["http://127.0.0.1:" (int-text a (.port config))])
+       :token (read-token a (.home config))))
+
+(defn http-request [(a (dyn Allocator)) (hub Hub) (method (slice u8)) (path (slice u8)) (body (slice u8)) (timeout-ms i64)] (-> http/Request)
+  (let [headers (box! a (array http/Header 2) (primitive/zeroed (array http/Header 2)))
+        hp (cast (ptr http/Header) headers)
+        (mut request) (primitive/zeroed http/Request)]
+    (set! (primitive/index hp 0) (http/Header :name "Content-Type" :value "application/json"))
+    (set! (primitive/index hp 1) (http/Header :name "Authorization" :value (join a ["Bearer " (.token hub)])))
+    (set! (.method request) method)
+    (set! (.url request) (join a [(.base-url hub) path]))
+    (set! (.headers request) (slice-new [http/Header] hp 2))
+    (set! (.body request) body)
+    (set! (.connect-timeout-ms request) 3000)
+    (set! (.timeout-ms request) timeout-ms)
+    (set! (.follow-redirects request) false)
+    (set! (.ca-info request) "")
+    (load request)))
+
+(defn hub-call [(a (dyn Allocator)) (hub Hub) (method (slice u8)) (path (slice u8)) (body (slice u8)) (timeout-ms i64)] (-> Reply)
+  (match (http/request a (box! a http/Request (http-request a hub method path body timeout-ms)))
+    (Err [failure] (ReplyFailed "the hub is not reachable"))
+    (Ok [response]
+        (let [status (http/response-status response)
+              text (copy-bytes a (http/response-body response))]
+          (http/response-free a response)
+          (ReplyOk status (match (jv-parse a text) (Some [v] v) (None [] (JNull))) text)))))
+
+(defn hub-get [(a (dyn Allocator)) (hub Hub) (path (slice u8))] (-> Reply)
+  (hub-call a hub "GET" path "" 30000))
+
+(defn hub-post [(a (dyn Allocator)) (hub Hub) (path (slice u8)) (body JVal)] (-> Reply)
+  (hub-call a hub "POST" path (jv-encode a body) 120000))
+
+;;; The error message of an API error body, or a description of the status.
+(defn reply-error [(a (dyn Allocator)) (reply Reply)] (-> (slice u8))
+  (match reply
+    (ReplyFailed [message] message)
+    (ReplyOk [status body text]
+             (let [message (jv-string-or (jv-get (jv-get body "error") "message") "")]
+               (if (> (len message) 0)
+                   message
+                   (join a ["the hub answered HTTP " (int-text a status)]))))))
+
+(defn reply-ok? [(reply Reply)] (-> bool)
+  (match reply
+    (ReplyOk [status body text] (and (>= status 200) (< status 300)))
+    (ReplyFailed [message] false)))
+
+(defn reply-body [(reply Reply)] (-> JVal)
+  (match reply
+    (ReplyOk [status body text] body)
+    (ReplyFailed [message] (JNull))))
+
+;; ---------------------------------------------------------------------------
+;; Streams
+
+;;; Receives each record of a run's event stream. Return false to stop.
+(deftrait EventHandler [Self]
+  (on-event [(self (ptr Self)) (cursor (slice u8)) (record JVal)] (-> bool)))
+
+(defstruct StreamDecoder
+  [(allocator (dyn Allocator))
+   (handler (dyn EventHandler))
+   (stopped bool)])
+
+(impl sse/SseEventSink StreamDecoder
+  (consume-sse-event [(self (ptr StreamDecoder)) (event sse/SseEvent)] (-> bool)
+                     (match (jv-parse (.allocator self) (.data event))
+                       (None [] true)
+                       (Some [record]
+                             (if (on-event (.handler self) (.id event) record)
+                                 true
+                                 (do (set! (.stopped self) true) false))))))
+
+(defn stream-chunk [(data (ptr u8)) (length i64) (context (ptr i8))] (-> i64)
+  (if (sse/sse-decoder-feed! (cast (ptr sse/SseDecoder) context) (slice-new [u8] data length))
+      http/BODY-CONTINUE
+      http/BODY-STOP))
+
+;;; Follow `path` (an SSE endpoint) until the server ends it or the handler
+;;; stops. Returns "" or what went wrong.
+(defn hub-stream [(a (dyn Allocator)) (hub Hub) (path (slice u8)) (handler (dyn EventHandler))] (-> (slice u8))
+  (let [context (box! a StreamDecoder (StreamDecoder :allocator a :handler handler :stopped false))
+        decoder (box! a sse/SseDecoder (sse/sse-decoder-new a context 8388608))
+        (mut sink) (primitive/zeroed http/BodySink)
+        request (box! a http/Request (http-request a hub "GET" path "" 0))]
+    (set! (.context sink) (cast (ptr i8) decoder))
+    (set! (.consume sink) (fnptr-of stream-chunk))
+    (let [result (match (http/request-stream a request (load sink))
+                   (Err [failure] (if (.stopped context) "" "the event stream was interrupted"))
+                   (Ok [response]
+                       (let [status (http/streaming-response-status response)]
+                         (http/streaming-response-free a response)
+                         (if (and (>= status 200) (< status 300))
+                             ""
+                             (join a ["the hub answered HTTP " (int-text a status)])))))]
+      (sse/sse-decoder-free! decoder)
+      result)))

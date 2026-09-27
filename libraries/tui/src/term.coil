@@ -1,0 +1,420 @@
+(module tui.term)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use [cstr->str str-eq str-find])
+(import "coil.os" :use [getenv os-errno])
+(import "tui.fatal"
+        :use
+        [fatal fatal-set-restore-hook! fatal-clear-restore-hook!])
+(import "tui.canvas" :use [ColorMode NoColor Ansi16 Ansi256 TrueColor])
+
+(extern isatty :cc c [i32] (-> i32))
+
+(extern ioctl :cc c [i32 u64 ...] (-> i32))
+
+(extern tcgetattr :cc c [i32 (ptr Termios)] (-> i32))
+
+(extern tcsetattr :cc c [i32 i32 (ptr Termios)] (-> i32))
+
+(extern cfmakeraw :cc c [(ptr Termios)] (-> void))
+
+(extern raise :cc c [i32] (-> i32))
+
+(extern signal :cc c [i32 (ptr i8)] (-> (ptr i8)))
+
+(extern pipe :cc c [(ptr i32)] (-> i32))
+
+(extern fcntl :cc c [i32 i32 ...] (-> i32))
+
+(extern close :cc c [i32] (-> i32))
+
+(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+
+(extern read :cc c [i32 (ptr i8) isize] (-> isize))
+
+;;; Expression macro: `linux` on Linux targets, `darwin` otherwise.
+(defn term--os [(linux Code) (darwin Code)] (-> Code)
+  (if (= (primitive/target-os) `linux) linux darwin))
+
+(const TCSAFLUSH 2)
+
+(const F-GETFL 3)
+
+(const F-SETFL 4)
+
+(const SIGHUP 1)
+
+(const SIGINT 2)
+
+(const SIGQUIT 3)
+
+(const SIGABRT 6)
+
+(const SIGSEGV 11)
+
+(const SIGTERM 15)
+
+(const SIGWINCH 28)
+
+(defn term--sigbus [] (-> i64)
+  (term--os 7 10))
+
+(defn term--sigtstp [] (-> i64)
+  (term--os 20 18))
+
+(defn term--o-nonblock [] (-> i64)
+  (term--os 2048 4))
+
+;; ioctl request numbers are operations, not probes: the Linux number on Darwin
+;; selects a different operation that would overwrite the buffer.
+(defn term--tiocgwinsz [] (-> u64)
+  (cast u64 (term--os 21523 1074295912)))
+
+;;; libc's termios, kept opaque. The storage is aligned and larger than the
+;;; structure on every supported POSIX host.
+(defstruct Termios [(storage (array u64 32))])
+
+(defstruct Winsize [(rows u16) (columns u16) (x-pixels u16) (y-pixels u16)])
+
+;;; What `term-enter!` switches on. Everything is undone by `term-leave!`.
+(defstruct TermOptions
+  [(alt-screen bool)
+   (hide-cursor bool)
+   (bracketed-paste bool)])
+
+;;; Alternate screen, hidden cursor and bracketed paste: the full-screen setup.
+(defn term-options-default [] (-> TermOptions)
+  (TermOptions
+    :alt-screen true
+    :hide-cursor true
+    :bracketed-paste true))
+
+;;; Terminal size in cells.
+(defstruct TermSize [(width i64) (height i64)])
+
+(defsum TermError
+  (NotATerminal)
+  (AlreadyActive)
+  (GetAttrFailed [(errno i64)])
+  (SetAttrFailed [(errno i64)])
+  (PipeFailed [(errno i64)])
+  (WriteFailed [(errno i64)]))
+
+(const HANDLED-SIGNAL-COUNT 7)
+
+;; Process-global because the terminal and signal dispositions are: the signal
+;; handlers must reach the saved attributes without any argument.
+(defstruct TermState
+  [(active bool)
+   (options TermOptions)
+   (saved Termios)
+   (previous (array (ptr i8) 7))
+   (previous-winch (ptr i8))
+   (wake-read i32)
+   (wake-write i32)])
+
+(defn term--state [] (-> (ptr TermState))
+  (primitive/alloc-static TermState))
+
+(defn term--signal [(i i64)] (-> i64)
+  (case i 0
+        SIGHUP 1
+        SIGINT 2
+        SIGQUIT 3
+        SIGABRT 4
+        SIGSEGV 5
+        SIGTERM (term--sigbus)))
+
+;;; True when file descriptor `fd` is a terminal.
+(defn fd-tty? [(fd i64)] (-> bool)
+  (= (isatty (cast i32 fd)) (cast i32 1)))
+
+(defn stdin-tty? [] (-> bool)
+  (fd-tty? 0))
+
+(defn stdout-tty? [] (-> bool)
+  (fd-tty? 1))
+
+;;; Write all of `bytes` to `fd`, retrying partial writes and EINTR. The
+;;; renderer builds a whole frame first, so a frame is one write in practice.
+(defn write-fd [(fd i64) (bytes (slice u8))] (-> (Result i64 TermError))
+  (let [(mut at) 0
+        (mut failure) 0
+        n (len bytes)]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [written
+                      (cast i64
+                            (write (cast i32 fd)
+                                   (cast (ptr i8)
+                                         (index (slice-data bytes) (load at)))
+                                   (cast isize (- n (load at)))))]
+                (if (> written 0)
+                    (set! at (+ (load at) written))
+                    (let [errno (os-errno)]
+                      (when (!= errno 4)
+                        (set! failure (if (= errno 0) -1 errno))
+                        (break)))))))
+    (if (= (load failure) 0) (Ok n) (Err (WriteFailed (load failure))))))
+
+;;; Write a frame to standard output.
+(defn term-write! [(bytes (slice u8))] (-> (Result i64 TermError))
+  (write-fd 1 bytes))
+
+(defn term--env [(name (ptr i8))] (-> (slice u8))
+  (let [value (getenv name)]
+    (if (= (cast i64 value) 0) "" (cstr->str value))))
+
+(defn term--contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(defn term--env-int [(name (ptr i8))] (-> i64)
+  (let [text (term--env name)
+        (mut value) 0
+        (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break)
+              (let [b (cast i64 (get text (load i)))]
+                (if (and (>= b 48) (<= b 57) (< (load value) 100000))
+                    (do
+                      (set! value (+ (* (load value) 10) (- b 48)))
+                      (set! i (+ (load i) 1)))
+                    (do (set! value 0) (break))))))
+    (load value)))
+
+;;; Terminal size from TIOCGWINSZ on stdout, then stdin, then the COLUMNS/LINES
+;;; environment variables, then 80x24.
+(defn term-size [] (-> TermSize)
+  (let [ws (primitive/alloc-stack Winsize)
+        _ (set! ws (zeroed Winsize))
+        ok
+          (or (= (ioctl (cast i32 1) (term--tiocgwinsz) ws) (cast i32 0))
+              (= (ioctl (cast i32 0) (term--tiocgwinsz) ws) (cast i32 0)))
+        cols (if ok (cast i64 (.columns ws)) 0)
+        rows (if ok (cast i64 (.rows ws)) 0)
+        env-cols (term--env-int c"COLUMNS")
+        env-rows (term--env-int c"LINES")]
+    (TermSize :width (cond (> cols 0) cols (> env-cols 0) env-cols :else 80)
+      :height (cond (> rows 0) rows (> env-rows 0) env-rows :else 24))))
+
+;;; The color capability implied by these environment values: NO_COLOR (any
+;;; non-empty value disables color), COLORTERM and TERM. `override` is the
+;;; TUI_COLOR variable ("truecolor", "256", "16", "none"; empty = detect).
+(defn color-mode-from-env [(no-color (slice u8))
+                           (colorterm (slice u8))
+                           (term (slice u8))
+                           (override (slice u8))] (-> ColorMode)
+  (cond (= override "truecolor") (TrueColor)
+        (= override "256") (Ansi256)
+        (= override "16") (Ansi16)
+        (= override "none") (NoColor)
+        (> (len override) 0)
+          (do (fatal "TUI_COLOR must be truecolor, 256, 16 or none") (NoColor))
+        (> (len no-color) 0) (NoColor)
+        (or (= (len term) 0) (= term "dumb")) (NoColor)
+        (or (= colorterm "truecolor") (= colorterm "24bit")) (TrueColor)
+        (or (term--contains? term "direct") (term--contains? term "truecolor"))
+          (TrueColor)
+        (term--contains? term "256color") (Ansi256)
+        :else (Ansi16)))
+
+;;; Detect the color capability of the current terminal from the environment.
+(defn detect-color-mode [] (-> ColorMode)
+  (color-mode-from-env (term--env c"NO_COLOR")
+                       (term--env c"COLORTERM")
+                       (term--env c"TERM")
+                       (term--env c"TUI_COLOR")))
+
+(defn term--raw-write [(text (slice u8))] (-> i64)
+  ;; Used from signal handlers: plain write(2), no allocation, errors ignored
+  ;; because there is nothing left to report them to.
+  (write (cast i32 1) (cast (ptr i8) (slice-data text)) (cast isize (len text)))
+  0)
+
+(defn term--emit-enter [(options TermOptions)] (-> i64)
+  (when (.alt-screen options) (term--raw-write "\x1b;[?1049h"))
+  (when (.hide-cursor options) (term--raw-write "\x1b;[?25l"))
+  (when (.bracketed-paste options) (term--raw-write "\x1b;[?2004h"))
+  (term--raw-write "\x1b;[?7l\x1b;[0m\x1b;[H\x1b;[2J")
+  0)
+
+(defn term--emit-leave [(options TermOptions)] (-> i64)
+  (term--raw-write "\x1b;[0m\x1b;[?7h")
+  (when (.bracketed-paste options) (term--raw-write "\x1b;[?2004l"))
+  (term--raw-write "\x1b;[?25h")
+  (when (.alt-screen options) (term--raw-write "\x1b;[?1049l"))
+  0)
+
+;;; Async-signal-safe restoration: escape sequences via write(2) and the saved
+;;; attributes via tcsetattr(3), both on the async-signal-safe list.
+(defn term--restore-now [] (-> i64)
+  (let [state (term--state)]
+    (when (.active state)
+      (set! (.active state) false)
+      (term--emit-leave (.options state))
+      (tcsetattr (cast i32 0) (cast i32 TCSAFLUSH) (mut (.saved state)))
+      0)
+    0))
+
+(defn term--fatal-signal-handler [(sig i32)] (-> i64)
+  (term--restore-now)
+  (let [state (term--state)
+        (mut i) 0]
+    ;; Put back the disposition that was there before us, then deliver the
+    ;; signal again: it is blocked while this handler runs, so it fires on return
+    ;; (default action terminates, or the previous handler runs).
+    (loop (if (>= (load i) HANDLED-SIGNAL-COUNT)
+              (break)
+              (do
+                (when (= (term--signal (load i)) (cast i64 sig))
+                  (signal sig (load (index (field state previous) (load i))))
+                  0)
+                (set! i (+ (load i) 1)))))
+    (raise sig)
+    0))
+
+(defn term--winch-handler [(sig i32)] (-> i64)
+  (let [state (term--state)
+        byte (primitive/alloc-stack u8)]
+    (set! byte (cast u8 1))
+    (when (>= (cast i64 (.wake-write state)) 0)
+      (write (.wake-write state) (cast (ptr i8) byte) (cast isize 1))
+      0)
+    0))
+
+(defn term--restore-hook [] (-> i64)
+  (term--restore-now)
+  (term--uninstall-handlers)
+  0)
+
+(defn term--install-handlers [] (-> i64)
+  (let [state (term--state)
+        handler (cast (ptr i8) (fnptr-of term--fatal-signal-handler))
+        (mut i) 0]
+    (loop (if (>= (load i) HANDLED-SIGNAL-COUNT)
+              (break)
+              (do
+                (set! (index (field state previous) (load i))
+                      (signal (cast i32 (term--signal (load i))) handler))
+                (set! i (+ (load i) 1)))))
+    (set! (.previous-winch state)
+          (signal (cast i32 SIGWINCH)
+                  (cast (ptr i8) (fnptr-of term--winch-handler))))
+    0))
+
+(defn term--uninstall-handlers [] (-> i64)
+  (let [state (term--state)
+        (mut i) 0]
+    (loop (if (>= (load i) HANDLED-SIGNAL-COUNT)
+              (break)
+              (do
+                (signal (cast i32 (term--signal (load i)))
+                        (load (index (field state previous) (load i))))
+                (set! i (+ (load i) 1)))))
+    (signal (cast i32 SIGWINCH) (.previous-winch state))
+    0))
+
+(defn term--open-wake-pipe [] (-> i64)
+  (let [state (term--state)
+        (mut fds) (zeroed (array i32 2))]
+    (if (!= (pipe (index fds 0)) (cast i32 0))
+        (os-errno)
+        (let [r (load (index fds 0))
+              w (load (index fds 1))]
+          (fcntl r
+                 (cast i32 F-SETFL)
+                 (primitive/ior (cast i64 (fcntl r (cast i32 F-GETFL)))
+                                (term--o-nonblock)))
+          (fcntl w
+                 (cast i32 F-SETFL)
+                 (primitive/ior (cast i64 (fcntl w (cast i32 F-GETFL)))
+                                (term--o-nonblock)))
+          (set! (.wake-read state) r)
+          (set! (.wake-write state) w)
+          0))))
+
+(defn term--close-wake-pipe [] (-> i64)
+  (let [state (term--state)]
+    (when (>= (cast i64 (.wake-read state)) 0)
+      (close (.wake-read state))
+      (close (.wake-write state)))
+    (set! (.wake-read state) (cast i32 -1))
+    (set! (.wake-write state) (cast i32 -1))
+    0))
+
+;;; Take over the terminal: raw mode (no echo, no line buffering, no signal keys
+;;; — Ctrl-C arrives as a key), plus whatever `options` asks for. Autowrap is
+;;; disabled while active. Fatal signals (HUP, INT, QUIT, ABRT, SEGV, BUS, TERM)
+;;; restore the terminal and then re-raise; a `tui.fatal` abort restores too.
+(defn term-enter! [(options TermOptions)] (-> (Result i64 TermError))
+  (let [state (term--state)]
+    (cond (.active state) (Err (AlreadyActive))
+          (or (not (stdin-tty?)) (not (stdout-tty?))) (Err (NotATerminal))
+          (!= (tcgetattr (cast i32 0) (mut (.saved state))) (cast i32 0))
+            (Err (GetAttrFailed (os-errno)))
+          :else
+            (let [(mut raw) (.saved state)]
+              (cfmakeraw (mut raw))
+              (if (!= (tcsetattr (cast i32 0) (cast i32 TCSAFLUSH) (mut raw))
+                      (cast i32 0))
+                  (Err (SetAttrFailed (os-errno)))
+                  (do
+                    (set! (.wake-read state) (cast i32 -1))
+                    (set! (.wake-write state) (cast i32 -1))
+                    (let [pipe-error (term--open-wake-pipe)]
+                      (if (!= pipe-error 0)
+                          (do
+                            (tcsetattr (cast i32 0)
+                                       (cast i32 TCSAFLUSH)
+                                       (mut (.saved state)))
+                            (Err (PipeFailed pipe-error)))
+                          (do
+                            (set! (.options state) options)
+                            (set! (.active state) true)
+                            (term--install-handlers)
+                            (fatal-set-restore-hook! (fnptr-of term--restore-hook))
+                            (term--emit-enter options)
+                            (Ok 0))))))))))
+
+;;; Give the terminal back exactly as it was. Idempotent.
+(defn term-leave! [] (-> i64)
+  (when (.active (term--state))
+    (term--restore-now)
+    (term--uninstall-handlers)
+    (term--close-wake-pipe)
+    (fatal-clear-restore-hook!))
+  0)
+
+(defn term-active? [] (-> bool)
+  (.active (term--state)))
+
+;;; A descriptor that becomes readable when the window is resized (SIGWINCH),
+;;; or -1 while the terminal is not active. Drain it with `term-drain-wake!`.
+(defn term-wake-fd [] (-> i64)
+  (if (.active (term--state)) (cast i64 (.wake-read (term--state))) -1))
+
+;;; Discard pending resize notifications.
+(defn term-drain-wake! [] (-> i64)
+  (let [fd (term-wake-fd)
+        buf (primitive/alloc-stack (array u8 64))]
+    (when (>= fd 0)
+      (loop (when (<= (cast i64
+                            (read (cast i32 fd)
+                                  (cast (ptr i8) (index buf 0))
+                                  (cast isize 64)))
+                      0)
+              (break))))
+    0))
+
+;;; Ctrl-Z support: restore the terminal, stop the process (SIGTSTP), and take
+;;; the terminal over again when the shell resumes it. Callers should repaint
+;;; fully afterwards (`canvas-invalidate!`).
+(defn term-suspend! [] (-> (Result i64 TermError))
+  (let [state (term--state)]
+    (if (not (.active state))
+        (Ok 0)
+        (let [options (.options state)]
+          (term-leave!)
+          (signal (cast i32 (term--sigtstp)) (cast (ptr i8) 0))
+          (raise (cast i32 (term--sigtstp)))
+          (term-enter! options)))))

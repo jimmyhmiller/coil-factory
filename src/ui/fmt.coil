@@ -1,0 +1,324 @@
+(module factory.ui.fmt)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.slice" :use *)
+(import "coil.str"
+        :use
+        [StrBuf
+         sb-new
+         sb-push-str!
+         sb-push-byte!
+         sb-push-i64!
+         sb-finish!
+         str-trim])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [jv-parse])
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use [Theme spinner-frame])
+
+;;; Formatting shared by every dashboard view: times, durations, token counts,
+;;; and the glyph + style vocabulary for run statuses, station states, agent
+;;; phases and tools. Everything that allocates takes the frame's scratch
+;;; allocator.
+
+;; ---------------------------------------------------------------------------
+;; JSON field access (missing fields read as "" / 0 / false)
+(defn js [(v JVal) (key (slice u8))] (-> (slice u8))
+  (jv-str (jv-get v key)))
+
+(defn ji [(v JVal) (key (slice u8))] (-> i64)
+  (jv-int (jv-get v key)))
+
+(defn jb [(v JVal) (key (slice u8))] (-> bool)
+  (match (jv-get v key) (JBool [b] b) (_ false)))
+
+;; ---------------------------------------------------------------------------
+;; Text
+
+;;; The first non-blank line of `text`, trimmed. Borrows `text`.
+(defn first-line [(text (slice u8))] (-> (slice u8))
+  (let [n (len text)
+        (mut start) 0
+        (mut result) ""]
+    (loop (if (>= (load start) n)
+              (break)
+              (let [(mut end) (load start)]
+                (loop (if (or (>= (load end) n)
+                              (= (cast i64 (get text (load end))) 10))
+                          (break)
+                          (set! end (+ (load end) 1))))
+                (let [line (str-trim (subslice text (load start) (load end)))]
+                  (if (> (len line) 0)
+                      (do (set! result line) (break))
+                      (set! start (+ (load end) 1)))))))
+    (load result)))
+
+;;; Number of lines in `text` (a trailing newline does not open a new one).
+(defn line-count [(text (slice u8))] (-> i64)
+  (let [(mut n) (if (> (len text) 0) 1 0)
+        (mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break)
+              (do
+                (when (and (= (cast i64 (get text (load i))) 10)
+                           (< (+ (load i) 1) (len text)))
+                  (set! n (+ (load n) 1)))
+                (set! i (+ (load i) 1)))))
+    (load n)))
+
+(defn concat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) (len parts))
+              (break)
+              (do
+                (sb-push-str! (mut out) (get parts (load i)))
+                (set! i (+ (load i) 1)))))
+    (sb-finish! (mut out))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+(defn fmt--two! [(out (mut StrBuf)) (n i64)] (-> i64)
+  (when (< n 10) (sb-push-byte! (mut out) (cast u8 48)))
+  (sb-push-i64! (mut out) n)
+  0)
+
+;; ---------------------------------------------------------------------------
+;; Time
+(defstruct Tm [(fields (array i32 16))])
+
+(extern localtime_r :cc c [(ptr i64) (ptr Tm)] (-> (ptr Tm)))
+
+;;; Local wall-clock time of `t-ms` as "HH:MM" or, with `seconds`, "HH:MM:SS".
+(defn fmt-clock [(a (dyn Allocator)) (t-ms i64) (seconds bool)] (-> (slice u8))
+  (let [secs (primitive/alloc-stack i64)
+        tm (primitive/alloc-stack Tm)
+        (mut out) (sb-new a)]
+    (set! secs (/ t-ms 1000))
+    (set! tm (zeroed Tm))
+    (localtime_r secs tm)
+    (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 2))))
+    (sb-push-byte! (mut out) (cast u8 #\:))
+    (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 1))))
+    (when seconds
+      (sb-push-byte! (mut out) (cast u8 #\:))
+      (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 0)))))
+    (sb-finish! (mut out))))
+
+;;; A compact age: "now", "42s", "7m", "3h", "2d".
+(defn fmt-age [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (let [s (/ (if (< ms 0) 0 ms) 1000)]
+    (cond (< s 5) "now"
+          (< s 60) (concat a [(int-text a s) "s"])
+          (< s 3600) (concat a [(int-text a (/ s 60)) "m"])
+          (< s 86400) (concat a [(int-text a (/ s 3600)) "h"])
+          :else (concat a [(int-text a (/ s 86400)) "d"]))))
+
+;;; A duration: "45s", "12m04s", "3h07m".
+(defn fmt-duration [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (let [s (/ (if (< ms 0) 0 ms) 1000)
+        (mut out) (sb-new a)]
+    (cond (< s 60) (do (sb-push-i64! (mut out) s) (sb-push-str! (mut out) "s"))
+          (< s 3600)
+            (do
+              (sb-push-i64! (mut out) (/ s 60))
+              (sb-push-str! (mut out) "m")
+              (fmt--two! (mut out) (% s 60))
+              (sb-push-str! (mut out) "s"))
+          :else
+            (do
+              (sb-push-i64! (mut out) (/ s 3600))
+              (sb-push-str! (mut out) "h")
+              (fmt--two! (mut out) (/ (% s 3600) 60))
+              (sb-push-str! (mut out) "m")))
+    (sb-finish! (mut out))))
+
+;;; Token counts: "812", "12.3k", "4.1M".
+(defn fmt-tokens [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        unit (cond (< n 1000) 1 (< n 1000000) 1000 :else 1000000)]
+    (sb-push-i64! (mut out) (/ n unit))
+    (when (> unit 1)
+      (let [tenths (/ (% n unit) (/ unit 10))]
+        (when (< (/ n unit) 100)
+          (sb-push-str! (mut out) ".")
+          (sb-push-i64! (mut out) tenths))
+        (sb-push-str! (mut out) (if (= unit 1000) "k" "M"))))
+    (sb-finish! (mut out))))
+
+;; ---------------------------------------------------------------------------
+;; Status vocabulary
+(defn active-status? [(status (slice u8))] (-> bool)
+  (or (= status "running") (= status "queued")))
+
+(defn finished-status? [(status (slice u8))] (-> bool)
+  (or (= status "succeeded") (= status "failed") (= status "cancelled")))
+
+;;; A run status as a one-cell glyph; running runs spin with `tick`.
+(defn status-glyph [(status (slice u8)) (tick i64)] (-> (slice u8))
+  (cond (= status "running") (spinner-frame tick)
+        (= status "queued") "◌"
+        (= status "paused") "‖"
+        (= status "blocked") "▲"
+        (= status "succeeded") "✓"
+        (= status "failed") "✗"
+        (= status "cancelled") "⊘"
+        (= status "lost") "?"
+        :else "·"))
+
+(defn status-style [(theme Theme) (status (slice u8))] (-> Style)
+  (cond (= status "running") (.accent theme)
+        (= status "queued") (.muted theme)
+        (= status "paused") (.warning theme)
+        (= status "blocked") (bold (.warning theme))
+        (= status "succeeded") (.success theme)
+        (= status "failed") (.error theme)
+        (= status "cancelled") (.subtle theme)
+        (= status "lost") (.error theme)
+        :else (.muted theme)))
+
+;;; The badge color of a run status.
+(defn status-color [(status (slice u8))] (-> Color)
+  (cond (= status "running") (hex 0x7AA2F7)
+        (= status "blocked") (hex 0xE0AF68)
+        (= status "paused") (hex 0xE0AF68)
+        (= status "succeeded") (hex 0x9ECE6A)
+        (or (= status "failed") (= status "lost")) (hex 0xF7768E)
+        :else (hex 0x8089B3)))
+
+;;; A station state glyph: ○ pending, spinner running, ⛨ gate, ✓ passed,
+;;; ▲ blocked, ✗ failed.
+(defn station-glyph [(status (slice u8)) (tick i64)] (-> (slice u8))
+  (cond (= status "running") (spinner-frame tick)
+        (= status "gate") "◈"
+        (= status "passed") "✓"
+        (= status "blocked") "▲"
+        (= status "failed") "✗"
+        :else "○"))
+
+(defn station-style [(theme Theme) (status (slice u8))] (-> Style)
+  (cond (= status "running") (bold (.accent theme))
+        (= status "gate") (bold (.accent-alt theme))
+        (= status "passed") (.success theme)
+        (= status "blocked") (bold (.warning theme))
+        (= status "failed") (.error theme)
+        :else (.subtle theme)))
+
+;;; Whether an agent phase means it is working right now.
+(defn phase-active? [(phase (slice u8))] (-> bool)
+  (or (= phase "thinking") (= phase "tool") (= phase "gate")))
+
+(defn phase-style [(theme Theme) (phase (slice u8))] (-> Style)
+  (cond (= phase "thinking") (.accent-alt theme)
+        (= phase "tool") (.accent theme)
+        (= phase "gate") (.info theme)
+        (= phase "waiting") (bold (.warning theme))
+        (= phase "done") (.success theme)
+        :else (.muted theme)))
+
+(defn severity-glyph [(severity (slice u8))] (-> (slice u8))
+  (cond (= severity "alert") "✗" (= severity "warn") "⚠" :else "ℹ"))
+
+(defn severity-style [(theme Theme) (severity (slice u8))] (-> Style)
+  (cond (= severity "alert") (bold (.error theme))
+        (= severity "warn") (.warning theme)
+        :else (.info theme)))
+
+(defn verdict-style [(theme Theme) (verdict (slice u8))] (-> Style)
+  (cond (= verdict "on_track") (.success theme)
+        (= verdict "drifting") (.warning theme)
+        (= verdict "stuck") (.warning theme)
+        (= verdict "cheating") (bold (.error theme))
+        :else (.muted theme)))
+
+;; ---------------------------------------------------------------------------
+;; Tools
+
+;;; The glyph for a tool: `$` shell, `✎` writes and edits, `▤` reads and
+;;; listings, `⌕` search, `⚑` finish.
+(defn tool-glyph [(tool (slice u8))] (-> (slice u8))
+  (cond (= tool "shell") "$"
+        (or (= tool "edit_file") (= tool "write_file")) "✎"
+        (or (= tool "read_file") (= tool "list_dir")) "▤"
+        (= tool "search") "⌕"
+        (= tool "finish") "⚑"
+        :else "⚙"))
+
+;;; One human line for a tool call, from its name and JSON arguments:
+;;; "coil test", "src/x.coil", "\"pattern\"", "done: summary".
+(defn tool-subject [(a (dyn Allocator))
+                    (tool (slice u8))
+                    (arguments (slice u8))] (-> (slice u8))
+  (let [args (match (jv-parse a arguments) (Some [v] v) (None [] (JNull)))]
+    (cond (= tool "shell") (first-line (js args "command"))
+          (or (= tool "edit_file") (= tool "write_file") (= tool "read_file"))
+            (js args "path")
+          (= tool "list_dir")
+            (let [p (js args "path")] (if (= (len p) 0) "." p))
+          (= tool "search") (concat a ["\"" (js args "pattern") "\""])
+          (= tool "finish")
+            (concat a
+                    [(js args "outcome") ": " (first-line (js args "summary"))])
+          :else (concat a [tool " " (first-line arguments)]))))
+
+;; ---------------------------------------------------------------------------
+;; Tones: a style chosen when data arrives, resolved against the theme at draw
+(defsum Tone
+  (TonePlain)
+  (ToneStrong)
+  (ToneMuted)
+  (ToneSubtle)
+  (ToneThought)
+  (ToneAccent)
+  (ToneAccentAlt)
+  (ToneInfo)
+  (ToneSuccess)
+  (ToneWarning)
+  (ToneError))
+
+(defn tone-style [(theme Theme) (tone Tone)] (-> Style)
+  (match tone
+    (TonePlain [] (.text theme))
+    (ToneStrong [] (bold (.text theme)))
+    (ToneMuted [] (.muted theme))
+    (ToneSubtle [] (.subtle theme))
+    (ToneThought [] (italic (.subtle theme)))
+    (ToneAccent [] (.accent theme))
+    (ToneAccentAlt [] (.accent-alt theme))
+    (ToneInfo [] (.info theme))
+    (ToneSuccess [] (.success theme))
+    (ToneWarning [] (.warning theme))
+    (ToneError [] (.error theme))))
+
+(defn severity-tone [(severity (slice u8))] (-> Tone)
+  (cond (= severity "alert") (ToneError)
+        (= severity "warn") (ToneWarning)
+        :else (ToneInfo)))
+
+(defn verdict-tone [(verdict (slice u8))] (-> Tone)
+  (cond (= verdict "on_track") (ToneSuccess)
+        (= verdict "cheating") (ToneError)
+        (= verdict "") (ToneMuted)
+        :else (ToneWarning)))
+
+;;; A journal tool summary without the glyph it already starts with ("$ ").
+(defn tool-summary-text [(tool (slice u8)) (summary (slice u8))] (-> (slice u8))
+  (if (and (= tool "shell")
+           (>= (len summary) 2)
+           (= (subslice summary 0 2) "$ "))
+      (subslice summary 2 (len summary))
+      summary))
+
+;;; How long a tool took: "12ms", "1.5s", "2m03s".
+(defn fmt-ms [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (cond (< ms 1000) (concat a [(int-text a ms) "ms"])
+        (< ms 60000)
+          (concat a
+                  [(int-text a (/ ms 1000))
+                   "."
+                   (int-text a (/ (% ms 1000) 100))
+                   "s"])
+        :else (fmt-duration a ms)))

@@ -1,0 +1,111 @@
+;; Live tunnel tests. Opt-in: `coil test --suite live`. The remote's sshd
+;; listens on its own 127.0.0.1:22, so a forward to it must deliver the
+;; server's "SSH-2.0-" identification banner end to end.
+(module ssh.tunnel-live)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.socket" :as socket)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "ssh.target" :use *)
+(import "ssh.tunnel" :use *)
+
+(defn live-host [] (-> Target)
+  (target "" "computer.jimmyhmiller.com" 0))
+
+(defn ready-port [(status TunnelStatus)] (-> i64)
+  (match status
+    (TunnelReady [port] port)
+    (TunnelFailed [message] (do (assert-eq message "<ready>") -1))))
+
+(defn failure-of [(status TunnelStatus)] (-> (slice u8))
+  (match status
+    (TunnelReady [_] "<ready>")
+    (TunnelFailed [message] message)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle)
+    (Some [_] true)
+    (None [] false)))
+
+;; Connect to the local end and read until the first newline or end of stream.
+(defn read-first-line [(a (dyn Allocator)) (port i64)] (-> (slice u8))
+  (let [connection (primitive/alloc-stack socket/TcpConnection)
+        chunk (primitive/alloc-stack (array u8 256))
+        (mut line) (sb-new a)]
+    (try (let [opened
+                 (try-or! (socket/tcp-connect a connection "127.0.0.1" port)
+                          (assert false))]
+           (do
+             (loop (match (socket/tcp-read opened (cast (ptr i8) chunk) 256)
+                     (Ok [n]
+                         (if (<= n 0)
+                             (break)
+                             (do
+                               (sb-push-str! (mut line)
+                                             (slice-new (cast (ptr u8) chunk) n))
+                               (when (>= (match (str-find (sb-str (load line))
+                                                          "\n")
+                                           (Some [at] at)
+                                           (None [] -1))
+                                         0)
+                                 (break)
+                                 0)
+                               0)))
+                     (Err [_] (break))))
+             (socket/tcp-connection-close! opened)
+             0)))
+    (sb-finish! (mut line))))
+
+(deftest forwards-to-the-remote-sshd
+         (let [a (malloc-allocator)
+               (mut tunnel) (tunnel-new a (tunnel-spec (live-host) 22))
+               port (ready-port (tunnel-ensure! (mut tunnel)))]
+           (assert (> port 0))
+           (assert (tunnel-alive? (mut tunnel)))
+           (assert-eq (tunnel-local-port tunnel) port)
+           (assert (starts-with (read-first-line a port) "SSH-2.0-"))
+           (assert-eq (ready-port (tunnel-ensure! (mut tunnel))) port)
+           (assert (starts-with (read-first-line a port) "SSH-2.0-"))
+           (tunnel-close! (mut tunnel))
+           (assert (not (tunnel-alive? (mut tunnel))))
+           (assert-eq (tunnel-local-port tunnel) 0)
+           (tunnel-free! (mut tunnel))))
+
+(deftest ensure-reopens-a-dead-tunnel
+         (let [a (malloc-allocator)
+               (mut tunnel) (tunnel-new a (tunnel-spec (live-host) 22))
+               first (ready-port (tunnel-ensure! (mut tunnel)))]
+           (assert (> first 0))
+           (subprocess/child-kill (field tunnel child))
+           (subprocess/child-wait (field tunnel child))
+           (assert (not (tunnel-alive? (mut tunnel))))
+           (let [second (ready-port (tunnel-ensure! (mut tunnel)))]
+             (assert (> second 0))
+             (assert (starts-with (read-first-line a second) "SSH-2.0-")))
+           (tunnel-free! (mut tunnel))))
+
+(deftest a-closed-remote-port-still-establishes-the-tunnel
+         (let [a (malloc-allocator)
+               (mut tunnel) (tunnel-new a (tunnel-spec (live-host) 1))
+               port (ready-port (tunnel-ensure! (mut tunnel)))]
+           (assert (> port 0))
+           (assert-eq (read-first-line a port) "")
+           (tunnel-free! (mut tunnel))))
+
+(deftest an-unknown-host-fails-with-sshs-explanation
+         (let [a (malloc-allocator)
+               (mut tunnel)
+                 (tunnel-new a
+                             (tunnel-spec (target ""
+                                                  "nonexistent-host.invalid"
+                                                  0)
+                                          22))
+               message (failure-of (tunnel-ensure! (mut tunnel)))]
+           (assert (starts-with message
+                                "ssh tunnel to nonexistent-host.invalid exited before the forwarded port accepted connections: "))
+           (assert (contains? message "nonexistent-host.invalid"))
+           (assert-eq (tunnel-last-error tunnel) message)
+           (assert-eq (failure-of (tunnel-ensure! (mut tunnel))) message)
+           (tunnel-free! (mut tunnel))))

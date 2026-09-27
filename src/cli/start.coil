@@ -1,0 +1,200 @@
+(module factory.cli.start)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.prompt" :as prompt)
+(import "cli.style" :as style)
+(import "ssh.exec" :as sshx)
+(import "ssh.target" :as target)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.git" :use *)
+(import "factory.library" :use [resolve-factory Found NotFound CatalogEntry])
+(import "factory.proc" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use *)
+(import "factory.cli.runs" :as runs)
+(import "factory.cli.sites" :as sites)
+
+;;; Starting a run anywhere, and bringing its branch home.
+
+(defstruct StartOptions
+  [(factory (slice u8))
+   (on (slice u8))
+   (project (slice u8))
+   (brief (slice u8))
+   (model (slice u8))
+   (watch bool)])
+
+(defn base-name [(path (slice u8))] (-> (slice u8))
+  (let [(mut start) 0
+        (mut i) 0
+        trimmed (if (and (> (len path) 1) (= (cast i64 (get path (- (len path) 1))) 47))
+                    (subslice [u8] path 0 (- (len path) 1))
+                    path)]
+    (loop (if (>= (load i) (len trimmed))
+              (break)
+              (do (when (= (cast i64 (get trimmed (load i))) 47) (set! start (+ (load i) 1)) 0)
+                  (set! i (+ (load i) 1)))))
+    (subslice [u8] trimmed (load start) (len trimmed))))
+
+;;; The site entry named `name` from the hub, or JNull.
+(defn site-named [(ctx (ptr Ctx)) (name (slice u8))] (-> JVal)
+  (match (get-json ctx "/v1/sites")
+    (FetchedFailed [code] (JNull))
+    (FetchedOk [list]
+               (let [(mut found) (JNull)
+                     (mut i) 0]
+                 (loop (if (>= (load i) (jv-count list))
+                           (break)
+                           (do (when (= (str-field (jv-nth list (load i)) "name") name) (set! found (jv-nth list (load i))) 0)
+                               (set! i (+ (load i) 1)))))
+                 (load found)))))
+
+(defn ssh-url [(a (dyn Allocator)) (t target/Target) (remote-path (slice u8))] (-> (slice u8))
+  (join a ["ssh://" (if (> (len (.user t)) 0) (join a [(.user t) "@"]) "") (.host t)
+           (if (> (.port t) 0) (join a [":" (int-text a (.port t))]) "")
+           "/~/" remote-path]))
+
+(defstruct Shipped [(ok bool) (project (slice u8)) (base (slice u8))])
+
+;;; Push the repository's HEAD to a bare mirror on the remote site, so the run
+;;; there can make a worktree from it.
+(defn ship-project [(ctx (ptr Ctx)) (ssh (slice u8)) (root (slice u8))] (-> Shipped)
+  (let [a (.allocator ctx)
+        failed (Shipped :ok false :project "" :base "")]
+    (block :ship
+           (let [t (match (target/parse-target ssh) (Ok [t] t) (Err [m] (do (fail-with ctx m) (return-from :ship failed))))
+                 name (base-name root)
+                 mirror (join a [".factory/mirrors/" name ".git"])
+                 head (match (git-head a root) (Some [h] h) (None [] (do (fail-with ctx "the project has no commits") (return-from :ship failed))))
+                 made (sites/remote ctx t (join a ["mkdir -p ~/.factory/mirrors && git init --bare -q ~/" mirror]) (None) 60000)]
+             (when (not (.ok made))
+               (sites/remote-failed ctx "could not create the project mirror on the remote site" made)
+               (return-from :ship failed))
+             (let [ref (join a ["HEAD:refs/heads/factory-base-" (git-short a root "HEAD")])
+                   pushed (git a root ["push" "-q" "--force" (ssh-url a t mirror) ref])]
+               (when (not (git-ok? pushed))
+                 (fail-with ctx (join a ["could not push the project: " (git-message pushed)]))
+                 (return-from :ship failed))
+               (sites/step-done ctx (join a ["shipped " name " @ " (git-short a root "HEAD") " to the site"]))
+               (Shipped :ok true :project (join a ["~/" mirror]) :base head))))))
+
+(defn cmd-start [(ctx (ptr Ctx)) (options StartOptions)] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (block :start
+           (when (not (hub-up? ctx)) (return-from :start (hub-down-message ctx)))
+           (let [entry (match (resolve-factory a (.home ctx) (.factory options))
+                         (Found [found] found)
+                         (NotFound [message] (return-from :start (fail-with ctx message))))
+                 spec (match (parse-factory a (.text entry))
+                        (SpecOk [parsed] parsed)
+                        (SpecBad [problems]
+                                 (do (fail-with ctx (join a ["the factory has problems:\n" (problems-text a problems)]))
+                                     (return-from :start 1))))
+                 brief (if (and (= (len (.brief options)) 0) (> (len (.input spec)) 0) (sites-interactive?))
+                           (let [(mut p) (prompt/prompter-new a)]
+                             (match (prompt/ask (mut p) (.input spec) "")
+                               (Ok [answer] answer)
+                               (Err [e] "")))
+                           (.brief options))
+                 on (.on options)
+                 remote-site (if (or (= (len on) 0) (= on (.name (field ctx config)))) (JNull) (site-named ctx on))
+                 (mut project) ""
+                 (mut base) ""]
+             (when (and (> (len on) 0) (not (= on (.name (field ctx config)))) (jv-null? remote-site))
+               (return-from :start (fail-with ctx (join a ["no site named \"" on "\"; `factory sites` lists them"]))))
+             (when (> (len (.project options)) 0)
+               (let [root (match (git-toplevel a (.project options))
+                            (Some [top] top)
+                            (None [] (return-from :start (fail-with ctx (join a [(.project options) " is not inside a git repository"])))))]
+                 (when (git-dirty? a root)
+                   (hint ctx (join a ["note: the run starts from HEAD (" (git-short a root "HEAD") "); uncommitted changes in " root " are not included"]))
+                   0)
+                 (if (jv-null? remote-site)
+                     (set! project root)
+                     (let [shipped (ship-project ctx (str-field remote-site "ssh") root)]
+                       (when (not (.ok shipped)) (return-from :start 1))
+                       (set! project (.project shipped))
+                       (set! base (.base shipped))))
+                 0))
+             (let [body (jv-object a)]
+               (jv-put! body "factory_text" (JStr (.text entry)))
+               (jv-put! body "brief" (JStr brief))
+               (jv-put! body "project" (JStr (load project)))
+               (jv-put! body "base" (JStr (load base)))
+               (jv-put! body "model" (JStr (.model options)))
+               (jv-put! body "site" (JStr on))
+               (match (post-json ctx "/v1/runs" body)
+                 (FetchedFailed [code] (return-from :start code))
+                 (FetchedOk [run]
+                            (let [id (copy-bytes a (str-field run "id"))
+                                  stations (jv-get run "stations")
+                                  first (str-field (jv-nth stations 0) "name")
+                                  (mut chain) (sb-new a)
+                                  (mut i) 0]
+                              (loop (if (>= (load i) (jv-count stations))
+                                        (break)
+                                        (do (when (> (load i) 0) (sb-push-str! (mut chain) (style/muted a term " → ")) 0)
+                                            (sb-push-str! (mut chain) (str-field (jv-nth stations (load i)) "name"))
+                                            (set! i (+ (load i) 1)))))
+                              (say "")
+                              (say (join a [(paint-bold a term (violet) "◆ ") (style/strong a term id) "  started on "
+                                            (style/strong a term (str-field run "site"))]))
+                              (say (join a [(style/muted a term "  project   ")
+                                            (if (> (len (.project options)) 0) (.project options) "empty workspace")
+                                            (style/muted a term " → ") (str-field run "branch")]))
+                              (say (join a [(style/muted a term "  stations  ") (sb-finish! (mut chain))]))
+                              (say (join a [(style/muted a term "  model     ") (str-field run "model")]))
+                              (say "")
+                              (say (join a [(style/muted a term "  watch  ") (style/accent a term (join a ["factory watch " id]))
+                                            (style/muted a term "     talk  ") (style/accent a term (join a ["factory chat " id "/" first]))]))
+                              (if (.watch options)
+                                  (do (say "") (runs/cmd-watch ctx id false false))
+                                  0)))))))))
+
+(defn sites-interactive? [] (-> bool)
+  (style/tty? 0))
+
+;;; `factory pull RUN`: fetch the run's branch into the repository you are in.
+(defn cmd-pull [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (block :pull
+           (let [run (match (get-json ctx (join a ["/v1/runs/" reference]))
+                       (FetchedFailed [code] (return-from :pull code))
+                       (FetchedOk [value] value))
+                 id (str-field run "id")
+                 branch (str-field run "branch")
+                 here (match (git-toplevel a ".")
+                        (Some [top] top)
+                        (None [] (return-from :pull (fail-with ctx "run `factory pull` inside the git repository to pull into"))))
+                 local-site (= (str-field run "site") (.name (field ctx config)))
+                 source (if local-site
+                            (workspace-path a (.home ctx) id)
+                            (let [site (site-named ctx (str-field run "site"))]
+                              (match (target/parse-target (str-field site "ssh"))
+                                (Ok [t] (ssh-url a t (join a [".factory/runs/" id "/workspace"])))
+                                (Err [m] (return-from :pull (fail-with ctx (join a ["cannot reach site " (str-field run "site")])))))))]
+             (when (and local-site (= (str-field run "project") here))
+               (say (join a [(style/ok a term "✓ ") (style/strong a term branch) " is already in this repository (the run worked on a worktree of it)"]))
+               (return-from :pull 0))
+             (let [fetched (git a here ["fetch" "-q" source (join a ["+" branch ":" branch])])]
+               (when (not (git-ok? fetched))
+                 (return-from :pull (fail-with ctx (join a ["could not fetch " branch ": " (git-message fetched)]))))
+               (let [log (git a here ["log" "--oneline" (join a [(str-field run "base") ".." branch])])]
+                 (say (join a [(style/ok a term "✓ fetched ") (style/strong a term branch)]))
+                 (for line (iter (str-split a (str-trim (git-output log)) "\n"))
+                   (when (> (len line) 0) (say (join a ["  " line])) 0))
+                 (say (style/muted a term (join a ["\n  git diff " (preview-sha a (str-field run "base")) "..." branch "     git merge " branch])))
+                 0))))))
+
+(defn preview-sha [(a (dyn Allocator)) (sha (slice u8))] (-> (slice u8))
+  (if (> (len sha) 10) (subslice [u8] sha 0 10) sha))

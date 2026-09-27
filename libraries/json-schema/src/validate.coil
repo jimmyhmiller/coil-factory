@@ -1,0 +1,554 @@
+(module json_schema.validate)
+(import "coil.alloc" :use *)
+(import "coil.json" :as json)
+(import "coil.match" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(import "coil.serde.json" :as serde_json)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; This is a deliberately bounded JSON Schema subset. Unknown validation
+;;; keywords fail closed instead of silently accepting data they would reject.
+(defstruct Validation [(ok bool) (path (slice u8)) (message (slice u8))])
+
+(defn valid [] (-> Validation)
+  (let [(mut result) (primitive/zeroed Validation)]
+    (set! (.ok result) true)
+    (set! (.path result) "$")
+    (set! (.message result) "")
+    (load result)))
+
+(defn invalid [(path (slice u8)) (message (slice u8))] (-> Validation)
+  (let [(mut result) (primitive/zeroed Validation)]
+    (set! (.ok result) false)
+    (set! (.path result) path)
+    (set! (.message result) message)
+    (load result)))
+
+(defn decoded [(a (dyn Allocator)) (doc json/Doc) (at i64)] (-> (slice u8))
+  (let [tok (json/token doc at)]
+    (match (serde_json/jd-unescape a
+                                   (json/string-text doc tok)
+                                   0)
+      (Ok [value] value)
+      (Err [failure] ""))))
+
+(defn lookup [(a (dyn Allocator)) (doc json/Doc) (at i64) (name (slice u8))] (-> i64)
+  (if (or (< at 0) (not (json/is-object? (json/token doc at))))
+      -1
+      (let [(mut i) 0
+            (mut found) -1
+            count (json/child-count (json/token doc at))]
+        (loop (if (>= (load i) count)
+                  (break)
+                  (let [key (json/object-key doc at (load i))]
+                    (if (= (decoded a doc key) name)
+                        (do
+                          (set! found (json/object-value doc at (load i)))
+                          (break))
+                        (set! i (+ (load i) 1))))))
+        (load found))))
+
+(defn child-path [(a (dyn Allocator)) (path (slice u8)) (part (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) path)
+    (sb-push-str! (mut out) ".")
+    (sb-push-str! (mut out) part)
+    (sb-finish! (mut out))))
+
+(defn index-path [(a (dyn Allocator)) (path (slice u8)) (index i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) path)
+    (sb-push-str! (mut out) "[")
+    (sb-push-i64! (mut out) index)
+    (sb-push-str! (mut out) "]")
+    (sb-finish! (mut out))))
+
+(defn integer? [(doc json/Doc) (at i64)] (-> bool)
+  (let [number (json/number-text doc (json/token doc at))]
+    (and (match (str-find number ".") (Some [p] false) (None [] true))
+         (match (str-find number "e") (Some [p] false) (None [] true))
+         (match (str-find number "E") (Some [p] false) (None [] true)))))
+
+(defn type-matches? [(name (slice u8)) (doc json/Doc) (at i64)] (-> bool)
+  (let [tok (json/token doc at)]
+    (cond (= name "null") (json/is-null? tok)
+          (= name "boolean") (json/is-bool? tok)
+          (= name "number") (json/is-number? tok)
+          (= name "integer") (and (json/is-number? tok) (integer? doc at))
+          (= name "string") (json/is-string? tok)
+          (= name "array") (json/is-array? tok)
+          (= name "object") (json/is-object? tok)
+          :else false)))
+
+(defn equal-value? [(a (dyn Allocator))
+                    (left json/Doc)
+                    (li i64)
+                    (right json/Doc)
+                    (ri i64)
+                    (depth i64)] (-> bool)
+  (if (> depth 64)
+      false
+      (let [lt (json/token left li)
+            rt (json/token right ri)]
+        (cond (!= (json/kind lt) (json/kind rt)) false
+              (json/is-null? lt) true
+              (json/is-bool? lt) (= (json/bool lt) (json/bool rt))
+              (json/is-number? lt)
+                (= (json/number-text left lt) (json/number-text right rt))
+              (json/is-string? lt) (= (decoded a left li) (decoded a right ri))
+              (json/is-array? lt)
+                (if (!= (json/child-count lt) (json/child-count rt))
+                    false
+                    (let [(mut i) 0
+                          (mut same) true]
+                      (loop (if (or (>= (load i) (json/child-count lt))
+                                    (not (load same)))
+                                (break)
+                                (do
+                                  (set! same
+                                        (equal-value? a
+                                                      left
+                                                      (json/array-nth left
+                                                                      li
+                                                                      (load i))
+                                                      right
+                                                      (json/array-nth right
+                                                                      ri
+                                                                      (load i))
+                                                      (+ depth 1)))
+                                  (set! i (+ (load i) 1)))))
+                      (load same)))
+              (json/is-object? lt)
+                (if (!= (json/child-count lt) (json/child-count rt))
+                    false
+                    (let [(mut i) 0
+                          (mut same) true]
+                      (loop (if (or (>= (load i) (json/child-count lt))
+                                    (not (load same)))
+                                (break)
+                                (let [name
+                                        (decoded a
+                                                 left
+                                                 (json/object-key left
+                                                                  li
+                                                                  (load i)))
+                                      found (lookup a right ri name)]
+                                  (set! same
+                                        (and (>= found 0)
+                                             (equal-value? a
+                                                           left
+                                                           (json/object-value left
+                                                                              li
+                                                                              (load i))
+                                                           right
+                                                           found
+                                                           (+ depth 1))))
+                                  (set! i (+ (load i) 1)))))
+                      (load same)))
+              :else false))))
+
+(defn allowed-key? [(name (slice u8))] (-> bool)
+  (or (= name "type")
+      (= name "properties")
+      (= name "required")
+      (= name "additionalProperties")
+      (= name "items")
+      (= name "enum")
+      (= name "anyOf")
+      (= name "description")
+      (= name "title")))
+
+(defn validate-at [(a (dyn Allocator))
+                   (schema json/Doc)
+                   (si i64)
+                   (value json/Doc)
+                   (vi i64)
+                   (path (slice u8))
+                   (depth i64)] (-> Validation)
+  (block :validation
+         (if (> depth 64)
+             (return-from :validation
+                            (invalid path "schema nesting exceeds 64 levels"))
+             0)
+         (let [st (json/token schema si)]
+           (if (not (json/is-object? st))
+               (return-from :validation
+                              (invalid path "schema must be an object"))
+               0)
+           (let [(mut i) 0]
+             (loop (if (>= (load i) (json/child-count st))
+                       (break)
+                       (let [key
+                               (decoded a
+                                        schema
+                                        (json/object-key schema si (load i)))]
+                         (if (not (allowed-key? key))
+                             (return-from :validation
+                                            (invalid path
+                                                     "unsupported schema keyword"))
+                             (set! i (+ (load i) 1))))))))
+         (let [type-at (lookup a schema si "type")]
+           (when (>= type-at 0)
+             (let [tok (json/token schema type-at)]
+               (if (not (json/is-string? tok))
+                   (return-from :validation
+                                  (invalid path "type must be a string"))
+                   (let [name (decoded a schema type-at)]
+                     (if (not (or (= name "null")
+                                  (= name "boolean")
+                                  (= name "number")
+                                  (= name "integer")
+                                  (= name "string")
+                                  (= name "array")
+                                  (= name "object")))
+                         (return-from :validation
+                                        (invalid path "unknown JSON type"))
+                         (if (not (type-matches? name value vi))
+                             (return-from :validation
+                                            (invalid path "type mismatch"))
+                             0)))))
+             0))
+         (let [enum-at (lookup a schema si "enum")]
+           (when (>= enum-at 0)
+             (let [tok (json/token schema enum-at)
+                   (mut i) 0
+                   (mut matched) false]
+               (if (not (json/is-array? tok))
+                   (return-from :validation
+                                  (invalid path "enum must be an array"))
+                   0)
+               (loop (if (>= (load i) (json/child-count tok))
+                         (break)
+                         (do
+                           (when (equal-value? a
+                                               schema
+                                               (json/array-nth schema
+                                                               enum-at
+                                                               (load i))
+                                               value
+                                               vi
+                                               0)
+                             (set! matched true)
+                             0)
+                           (set! i (+ (load i) 1)))))
+               (if (not (load matched))
+                   (return-from :validation
+                                  (invalid path "value is not in enum"))
+                   0))
+             0))
+         (let [any-at (lookup a schema si "anyOf")]
+           (when (>= any-at 0)
+             (let [tok (json/token schema any-at)
+                   (mut i) 0
+                   (mut matched) false]
+               (if (or (not (json/is-array? tok)) (= (json/child-count tok) 0))
+                   (return-from :validation
+                                  (invalid path
+                                           "anyOf must be a nonempty array"))
+                   0)
+               (loop (if (>= (load i) (json/child-count tok))
+                         (break)
+                         (let [branch
+                                 (validate-at a
+                                              schema
+                                              (json/array-nth schema
+                                                              any-at
+                                                              (load i))
+                                              value
+                                              vi
+                                              path
+                                              (+ depth 1))]
+                           (when (.ok branch)
+                             (set! matched true)
+                             0)
+                           (set! i (+ (load i) 1)))))
+               (if (not (load matched))
+                   (return-from :validation
+                                  (invalid path "no anyOf branch matched"))
+                   0))
+             0))
+         (let [properties (lookup a schema si "properties")
+               required (lookup a schema si "required")
+               additional (lookup a schema si "additionalProperties")]
+           (when (>= properties 0)
+             (if (not (json/is-object? (json/token schema properties)))
+                 (return-from :validation
+                                (invalid path "properties must be an object"))
+                 0)
+             0)
+           (when (>= required 0)
+             (let [rt (json/token schema required)]
+               (if (not (json/is-array? rt))
+                   (return-from :validation
+                                  (invalid path "required must be an array"))
+                   0)
+               (let [(mut i) 0]
+                 (loop (if (>= (load i) (json/child-count rt))
+                           (break)
+                           (let [name-at
+                                   (json/array-nth schema required (load i))]
+                             (if (not (json/is-string? (json/token schema
+                                                                   name-at)))
+                                 (return-from :validation
+                                                (invalid path
+                                                         "required entries must be strings"))
+                                 (when (and (json/is-object? (json/token value
+                                                                         vi))
+                                            (< (lookup a
+                                                       value
+                                                       vi
+                                                       (decoded a
+                                                                schema
+                                                                name-at))
+                                               0))
+                                   (return-from :validation
+                                                  (invalid (child-path a
+                                                                       path
+                                                                       (decoded a
+                                                                                schema
+                                                                                name-at))
+                                                           "required property is missing"))
+                                   0))
+                             (set! i (+ (load i) 1)))))))
+             0)
+           (when (>= additional 0)
+             (if (not (json/is-bool? (json/token schema additional)))
+                 (return-from :validation
+                                (invalid path
+                                         "additionalProperties must be a boolean"))
+                 0)
+             0)
+           (when (json/is-object? (json/token value vi))
+             (let [(mut i) 0
+                   count (json/child-count (json/token value vi))]
+               (loop (if (>= (load i) count)
+                         (break)
+                         (let [name
+                                 (decoded a
+                                          value
+                                          (json/object-key value vi (load i)))
+                               field-path (child-path a path name)
+                               field-schema
+                                 (if (>= properties 0)
+                                     (lookup a schema properties name)
+                                     -1)]
+                           (if (>= field-schema 0)
+                               (let [result
+                                       (validate-at a
+                                                    schema
+                                                    field-schema
+                                                    value
+                                                    (json/object-value value
+                                                                       vi
+                                                                       (load i))
+                                                    field-path
+                                                    (+ depth 1))]
+                                 (if (not (.ok result))
+                                     (return-from :validation result)
+                                     0))
+                               (when (and (>= additional 0)
+                                          (not (json/bool (json/token schema
+                                                                      additional))))
+                                 (return-from :validation
+                                                (invalid field-path
+                                                         "additional property is forbidden"))
+                                 0))
+                           (set! i (+ (load i) 1))))))
+             0))
+         (let [items (lookup a schema si "items")]
+           (when (>= items 0)
+             (if (not (json/is-object? (json/token schema items)))
+                 (return-from :validation
+                                (invalid path "items must be a schema object"))
+                 0)
+             (when (json/is-array? (json/token value vi))
+               (let [(mut i) 0
+                     count (json/child-count (json/token value vi))]
+                 (loop (if (>= (load i) count)
+                           (break)
+                           (let [result
+                                   (validate-at a
+                                                schema
+                                                items
+                                                value
+                                                (json/array-nth value
+                                                                vi
+                                                                (load i))
+                                                (index-path a path (load i))
+                                                (+ depth 1))]
+                             (if (not (.ok result))
+                                 (return-from :validation result)
+                                 (set! i (+ (load i) 1)))))))
+               0)))
+         (valid)))
+
+;;; Check the whole schema before looking at a value. Otherwise an unsupported
+;;; keyword in an absent property or an unsuccessful `anyOf` branch could be
+;;; silently ignored.
+(defn check-schema-at [(a (dyn Allocator))
+                       (schema json/Doc)
+                       (at i64)
+                       (path (slice u8))
+                       (depth i64)] (-> Validation)
+  (block :check
+         (if (> depth 64)
+             (return-from :check
+                            (invalid path "schema nesting exceeds 64 levels"))
+             0)
+         (let [node (json/token schema at)]
+           (if (not (json/is-object? node))
+               (return-from :check (invalid path "schema must be an object"))
+               0)
+           (let [(mut i) 0]
+             (loop (if (>= (load i) (json/child-count node))
+                       (break)
+                       (let [key
+                               (decoded a
+                                        schema
+                                        (json/object-key schema at (load i)))
+                             value-at (json/object-value schema at (load i))
+                             value (json/token schema value-at)
+                             field-path (child-path a path key)]
+                         (if (not (allowed-key? key))
+                             (return-from :check
+                                            (invalid field-path
+                                                     "unsupported schema keyword"))
+                             0)
+                         (cond (= key "type")
+                                 (if (not (json/is-string? value))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "type must be a string"))
+                                     (let [name (decoded a schema value-at)]
+                                       (if (not (or (= name "null")
+                                                    (= name "boolean")
+                                                    (= name "number")
+                                                    (= name "integer")
+                                                    (= name "string")
+                                                    (= name "array")
+                                                    (= name "object")))
+                                           (return-from :check
+                                                          (invalid field-path
+                                                                   "unknown JSON type"))
+                                           0)))
+                               (= key "properties")
+                                 (if (not (json/is-object? value))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "properties must be an object"))
+                                     (let [(mut j) 0]
+                                       (loop (if (>= (load j)
+                                                     (json/child-count value))
+                                                 (break)
+                                                 (let [name
+                                                         (decoded a
+                                                                  schema
+                                                                  (json/object-key schema
+                                                                                   value-at
+                                                                                   (load j)))
+                                                       child
+                                                         (json/object-value schema
+                                                                            value-at
+                                                                            (load j))
+                                                       result
+                                                         (check-schema-at a
+                                                                          schema
+                                                                          child
+                                                                          (child-path a
+                                                                                      field-path
+                                                                                      name)
+                                                                          (+ depth
+                                                                             1))]
+                                                   (if (not (.ok result))
+                                                       (return-from :check
+                                                                      result)
+                                                       (set! j (+ (load j) 1))))))))
+                               (= key "items")
+                                 (let [result
+                                         (check-schema-at a
+                                                          schema
+                                                          value-at
+                                                          field-path
+                                                          (+ depth 1))]
+                                   (if (not (.ok result))
+                                       (return-from :check result)
+                                       0))
+                               (= key "anyOf")
+                                 (if (or (not (json/is-array? value))
+                                         (= (json/child-count value) 0))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "anyOf must be a nonempty array"))
+                                     (let [(mut j) 0]
+                                       (loop (if (>= (load j)
+                                                     (json/child-count value))
+                                                 (break)
+                                                 (let [child
+                                                         (json/array-nth schema
+                                                                         value-at
+                                                                         (load j))
+                                                       result
+                                                         (check-schema-at a
+                                                                          schema
+                                                                          child
+                                                                          (index-path a
+                                                                                      field-path
+                                                                                      (load j))
+                                                                          (+ depth
+                                                                             1))]
+                                                   (if (not (.ok result))
+                                                       (return-from :check
+                                                                      result)
+                                                       (set! j (+ (load j) 1))))))))
+                               (= key "required")
+                                 (if (not (json/is-array? value))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "required must be an array"))
+                                     (let [(mut j) 0]
+                                       (loop (if (>= (load j)
+                                                     (json/child-count value))
+                                                 (break)
+                                                 (let [item
+                                                         (json/token schema
+                                                                     (json/array-nth schema
+                                                                                     value-at
+                                                                                     (load j)))]
+                                                   (if (not (json/is-string? item))
+                                                       (return-from :check
+                                                                      (invalid (index-path a
+                                                                                           field-path
+                                                                                           (load j))
+                                                                               "required entry must be a string"))
+                                                       (set! j (+ (load j) 1))))))))
+                               (= key "enum")
+                                 (if (or (not (json/is-array? value))
+                                         (= (json/child-count value) 0))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "enum must be a nonempty array"))
+                                     0)
+                               (= key "additionalProperties")
+                                 (if (not (json/is-bool? value))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "additionalProperties must be a boolean"))
+                                     0)
+                               (or (= key "description") (= key "title"))
+                                 (if (not (json/is-string? value))
+                                     (return-from :check
+                                                    (invalid field-path
+                                                             "annotation must be a string"))
+                                     0)
+                               :else 0)
+                         (set! i (+ (load i) 1)))))))
+         (valid)))
+
+;;; The caller owns and keeps both Doc values alive during validation.
+(defn validate [(a (dyn Allocator)) (schema json/Doc) (value json/Doc)] (-> Validation)
+  (let [checked (check-schema-at a schema 0 "$" 0)]
+    (if (.ok checked)
+        (validate-at a schema 0 value 0 "$" 0)
+        checked)))

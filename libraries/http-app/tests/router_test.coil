@@ -1,0 +1,198 @@
+(module http-app-router-test)
+(import "coil.alloc" :use *)
+(import "coil.http.server" :as http)
+(import "coil.match" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "http_app.router" :use *)
+
+(defstruct NoteHandler [(seen-id (ptr i64))])
+
+(impl Handler NoteHandler
+  (handle [(self (ptr NoteHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (if (= (param ctx "id") "42")
+              (do
+                (set! (load (field self seen-id)) 1)
+                (response 200 "text/plain" "the note"))
+              (response 400 "text/plain" "wrong id"))))
+
+(deftest routes-an-unrelated-notes-api
+         (let [a (malloc-allocator)
+               seen (box! a i64 0)
+               handler (primitive/alloc-stack NoteHandler)
+               router (primitive/alloc-stack Router)
+               parsed
+                 (http/parse-request a
+                                     "GET /notes/42?view=short HTTP/1.1\r\nHost: example.test\r\n\r\n")]
+           (set! (.seen-id handler) seen)
+           (set! router (router-new a))
+           (assert (route-add! router "GET" "/notes/{id}" handler))
+           (assert (not (route-add! router "GET" "/notes/{id}" handler)))
+           (match parsed
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [reply (dispatch router request)]
+                   (assert-eq (.status reply) 200)
+                   (assert (= (.body reply) "the note"))
+                   (assert-eq (load seen) 1))))
+           (router-free! router)))
+
+(deftest unmatched-paths-return-404-and-other-methods-405
+         (let [a (malloc-allocator)
+               seen (box! a i64 0)
+               handler (primitive/alloc-stack NoteHandler)
+               router (primitive/alloc-stack Router)
+               wrong-method
+                 (http/parse-request a
+                                     "POST /notes/42 HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n")
+               wrong-path
+                 (http/parse-request a
+                                     "GET /nothing/42 HTTP/1.1\r\nHost: example.test\r\n\r\n")]
+           (set! (.seen-id handler) seen)
+           (set! router (router-new a))
+           (assert (route-add! router "GET" "/notes/{id}" handler))
+           (assert (route-add! router "PUT" "/notes/{id}" handler))
+           (match wrong-method
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [reply (dispatch router request)]
+                   (assert-eq (.status reply) 405)
+                   (assert-eq (len (.headers reply)) 1)
+                   (let [(mut allow) (get (.headers reply) 0)]
+                     (assert (= (.name allow) "Allow"))
+                     (assert (= (.value allow) "GET, PUT"))))))
+           (match wrong-path
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [reply (dispatch router request)]
+                   (assert-eq (.status reply) 404)
+                   (assert (= (.body reply) "not found")))))
+           (assert-eq (load seen) 0)
+           (router-free! router)))
+
+(deftest encodes-bounded-response-and-rejects-header-injection
+         (let [a (malloc-allocator)
+               rendered (encode-response a (response 200 "text/plain" "hi"))
+               rejected
+                 (encode-response a
+                                  (response 200
+                                            "text/plain\r\nX-Fake: yes"
+                                            "hi"))]
+           (assert (= rendered
+                      "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi"))
+           (assert (= rejected ""))))
+
+(deftest encodes-extra-headers-and-rejects-framing-or-invalid-headers
+         (let [a (malloc-allocator)
+               base (response 201 "application/json" "{}")
+               with-cache
+                 (response-add-header a base "Cache-Control" "no-store")
+               with-two
+                 (response-add-header a with-cache "WWW-Authenticate" "Bearer")]
+           (assert-eq (len (.headers base)) 0)
+           (assert-eq (len (.headers with-two)) 2)
+           (assert (= (encode-response a with-two)
+                      "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nWWW-Authenticate: Bearer\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}"))
+           (assert (= (encode-response a
+                                       (response-add-header a
+                                                            base
+                                                            "Content-Length"
+                                                            "5"))
+                      ""))
+           (assert (= (encode-response a
+                                       (response-add-header a
+                                                            base
+                                                            "Bad Name"
+                                                            "x"))
+                      ""))
+           (assert (= (encode-response a
+                                       (response-add-header a
+                                                            base
+                                                            "X-Ok"
+                                                            "a\nInjected: yes"))
+                      ""))
+           (assert (= (encode-response a (response 204 "" ""))
+                      "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"))
+           (assert (= (encode-response a (response 204 "" "body")) ""))
+           (assert (= (encode-response a (response 99 "" "")) ""))))
+
+(deftest percent-decoding-and-query-lookup
+         (let [a (malloc-allocator)
+               parsed
+                 (http/parse-request a
+                                     "GET /q?a=1&name=J%C3%BCrgen+M&flag&empty=&name=second&bad=%4 HTTP/1.1\r\nHost: h\r\n\r\n")]
+           (match (percent-decode a "a%2Fb+c" false)
+             (Some [decoded] (assert (= decoded "a/b+c")))
+             (None [] (assert false)))
+           (match (percent-decode a "a%2fb+c" true)
+             (Some [decoded] (assert (= decoded "a/b c")))
+             (None [] (assert false)))
+           (match (percent-decode a "plain" true)
+             (Some [decoded] (assert (= decoded "plain")))
+             (None [] (assert false)))
+           (assert (match (percent-decode a "%G1" true)
+                     (Some [decoded] false)
+                     (None [] true)))
+           (assert (match (percent-decode a "%1" true)
+                     (Some [decoded] false)
+                     (None [] true)))
+           (match parsed
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [(mut ctx) (primitive/zeroed RequestContext)]
+                   (set! (.request ctx) request)
+                   (set! (.params ctx)
+                         (slice-new [PathParam] (cast (ptr PathParam) 0) 0))
+                   (set! (.path ctx) (path-of (http/target request)))
+                   (set! (.query ctx) (query-of (http/target request)))
+                   (match (query-param a (load ctx) "name")
+                     (QueryFound [value] (assert (= value "Jürgen M")))
+                     (_ (assert false)))
+                   (match (query-param a (load ctx) "flag")
+                     (QueryFound [value] (assert-eq (len value) 0))
+                     (_ (assert false)))
+                   (match (query-param a (load ctx) "empty")
+                     (QueryFound [value] (assert-eq (len value) 0))
+                     (_ (assert false)))
+                   (match (query-param a (load ctx) "a")
+                     (QueryFound [value] (assert (= value "1")))
+                     (_ (assert false)))
+                   (assert (match (query-param a (load ctx) "bad")
+                             (QueryMalformed [] true)
+                             (_ false)))
+                   (assert (match (query-param a (load ctx) "absent")
+                             (QueryMissing [] true)
+                             (_ false)))
+                   (assert (= (header (load ctx) "HOST") "h"))
+                   (assert (match (header-opt (load ctx) "missing")
+                             (None [] true)
+                             (Some [v] false))))))))
+
+(deftest bearer-tokens-and-constant-time-comparison
+         (let [a (malloc-allocator)
+               ok
+                 (http/parse-request a
+                                     "GET / HTTP/1.1\r\nAuthorization: BEARER  tok-1 \r\n\r\n")
+               basic
+                 (http/parse-request a
+                                     "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcg==\r\n\r\n")]
+           (match ok
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [(mut ctx) (primitive/zeroed RequestContext)]
+                   (set! (.request ctx) request)
+                   (match (bearer-token (load ctx))
+                     (Some [token] (assert (= token "tok-1")))
+                     (None [] (assert false))))))
+           (match basic
+             (Err [failure] (assert false))
+             (Ok [request]
+                 (let [(mut ctx) (primitive/zeroed RequestContext)]
+                   (set! (.request ctx) request)
+                   (assert (match (bearer-token (load ctx))
+                             (Some [token] false)
+                             (None [] true))))))
+           (assert (constant-time-equal? "secret" "secret"))
+           (assert (not (constant-time-equal? "secret" "secreT")))
+           (assert (not (constant-time-equal? "secret" "secrets")))))

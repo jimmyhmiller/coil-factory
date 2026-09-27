@@ -1,0 +1,6 @@
+[package]
+name = "tui-demo"
+entry = "src/main.coil"
+
+[dependencies]
+tui = { path = "../.." }

@@ -1,0 +1,820 @@
+(module http-app-server-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.http.client" :as client)
+(import "coil.primitive" :as primitive)
+(import "coil.selectors" :as selectors)
+(import "coil.slice" :use *)
+(import "coil.socket" :as socket)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "http_app.json" :use *)
+(import "http_app.native" :as native)
+(import "http_app.router" :use *)
+(import "http_app.server" :use *)
+(import "http_app.sse" :use *)
+(import "sse.core" :as sse)
+
+;; ---------------------------------------------------------------------------
+;; Application under test
+(defstruct NoteHandler [(reserved u8)])
+
+(impl Handler NoteHandler
+  (handle [(self (ptr NoteHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (let [(mut out) (sb-new a)]
+            (sb-push-str! (mut out) "{\"id\":")
+            (json-string-into! (mut out) (param ctx "id"))
+            (sb-push-str! (mut out) "}")
+            (json-response 200 (sb-finish! (mut out))))))
+
+;;; Echoes the decoded `q` query parameter, the `X-Custom` header, and the body size.
+(defstruct EchoHandler [(reserved u8)])
+
+(impl Handler EchoHandler
+  (handle [(self (ptr EchoHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (match (query-param a ctx "q")
+            (QueryMalformed []
+                            (json-error a
+                                        400
+                                        "bad_query"
+                                        "malformed query string"))
+            (QueryMissing []
+                          (json-error a 400 "missing_query" "q is required"))
+            (QueryFound [q]
+                        (let [(mut out) (sb-new a)]
+                          (sb-push-str! (mut out) "{\"q\":")
+                          (json-string-into! (mut out) q)
+                          (sb-push-str! (mut out) ",\"custom\":")
+                          (json-string-into! (mut out) (header ctx "x-custom"))
+                          (sb-push-str! (mut out) ",\"body\":")
+                          (sb-push-i64! (mut out) (len (body ctx)))
+                          (sb-push-str! (mut out) "}")
+                          (json-response 200 (sb-finish! (mut out))))))))
+
+(defstruct SecretHandler [(token (slice u8))])
+
+(impl Handler SecretHandler
+  (handle [(self (ptr SecretHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (let [authorized
+                  (match (bearer-token ctx)
+                    (Some [token] (constant-time-equal? token (.token self)))
+                    (None [] false))]
+            (if authorized
+                (json-response 200 "{\"secret\":true}")
+                (response-add-header a
+                                     (json-error a
+                                                 401
+                                                 "unauthorized"
+                                                 "a valid bearer token is required")
+                                     "WWW-Authenticate"
+                                     "Bearer")))))
+
+;;; Release reasons observed by the stream sources, shared with the test thread.
+(defn release-count [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn release-reason [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn reason-code [(reason StreamEndReason)] (-> i64)
+  (match reason
+    (ReleaseCompleted [] 1)
+    (ReleaseDisconnected [] 2)
+    (ReleaseStopping [] 3)
+    (ReleaseFailed [] 4)))
+
+;;; Emits `tick N` events (id N) every `interval-ms` until `total`, resuming after
+;;; the client's cursor.
+(defstruct TickSource [(total i64) (interval-ms i64) (next-at i64)])
+
+(defn monotonic-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [error] (native/fatal [i64] "clock unavailable"))))
+
+(impl SseSource TickSource
+  (sse-next [(self (ptr TickSource)) (a (dyn Allocator)) (cursor (slice u8))]
+            (-> SseBatch)
+            (let [delivered
+                    (if (= (len cursor) 0)
+                        0
+                        (match (str-parse-int cursor)
+                          (Some [n] n)
+                          (None [] -1)))]
+              (cond (< delivered 0) (SseError)
+                    (>= delivered (.total self)) (SseEnd)
+                    (< (monotonic-ms) (.next-at self)) (SseNothing)
+                    :else
+                      (let [(mut id) (sb-new a)
+                            (mut data) (sb-new a)
+                            (mut events) (al-new [sse/SseEvent] a)]
+                        (sb-push-i64! (mut id) (+ delivered 1))
+                        (sb-push-str! (mut data) "tick ")
+                        (sb-push-i64! (mut data) (+ delivered 1))
+                        (push! [sse/SseEvent]
+                               (mut events)
+                               (sse-event "tick"
+                                          (sb-finish! (mut id))
+                                          (sb-finish! (mut data))))
+                        (set! (.next-at self)
+                              (+ (monotonic-ms) (.interval-ms self)))
+                        (SseEvents (al-slice [sse/SseEvent] events))))))
+  (sse-release [(self (ptr TickSource)) (reason StreamEndReason)]
+               (-> i64)
+               (atomic/atomic-store (release-reason) (reason-code reason))
+               (atomic/atomic-add (release-count) 1)
+               0))
+
+(defstruct TickHandler [(total i64) (interval-ms i64) (keep-alive-ms i64)])
+
+(impl Handler TickHandler
+  (handle [(self (ptr TickHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (let [(mut source) (primitive/zeroed TickSource)
+                (mut options) (sse-options)]
+            (set! (.total source) (.total self))
+            (set! (.interval-ms source) (.interval-ms self))
+            (set! (.next-at source) 0)
+            (set! (.keep-alive-ms options) (.keep-alive-ms self))
+            (set! (.retry-ms options) 2500)
+            (sse-response a
+                          (box! a TickSource (load source))
+                          (last-event-id ctx)
+                          options))))
+
+;;; Returns a response whose header the server must refuse to send.
+(defstruct BrokenHandler [(reserved u8)])
+
+(impl Handler BrokenHandler
+  (handle [(self (ptr BrokenHandler)) (a (dyn Allocator)) (ctx RequestContext)]
+          (-> Response)
+          (response-add-header a
+                               (json-response 200 "{}")
+                               "Connection"
+                               "keep-alive")))
+
+(defstruct App
+  [(router Router)
+   (broken BrokenHandler)
+   (errors JsonErrors)
+   (notes NoteHandler)
+   (echo EchoHandler)
+   (secret SecretHandler)
+   (ticks TickHandler)
+   (forever TickHandler)
+   (quiet TickHandler)])
+
+(defn app-init! [(app (ptr App))] (-> i64)
+  (set! app (primitive/zeroed App))
+  (set! (.router app) (router-new (malloc-allocator)))
+  (router-set-errors! (field app router) (field app errors))
+  (set! (.token (.secret app)) "s3cret")
+  (set! (.total (.ticks app)) 4)
+  (set! (.interval-ms (.ticks app)) 120)
+  (set! (.keep-alive-ms (.ticks app)) 50)
+  (set! (.total (.forever app)) 1000000)
+  (set! (.interval-ms (.forever app)) 20)
+  (set! (.keep-alive-ms (.forever app)) 60000)
+  (set! (.total (.quiet app)) 2)
+  (set! (.interval-ms (.quiet app)) 60000)
+  (set! (.keep-alive-ms (.quiet app)) 60000)
+  (assert (route-add! (field app router) "GET" "/notes/{id}" (field app notes)))
+  (assert (route-add! (field app router) "GET" "/search" (field app echo)))
+  (assert (route-add! (field app router) "POST" "/search" (field app echo)))
+  (assert (route-add! (field app router) "GET" "/secret" (field app secret)))
+  (assert (route-add! (field app router) "GET" "/ticks" (field app ticks)))
+  (assert (route-add! (field app router) "GET" "/forever" (field app forever)))
+  (assert (route-add! (field app router) "GET" "/quiet" (field app quiet)))
+  (assert (route-add! (field app router) "GET" "/broken" (field app broken)))
+  (assert (route-add! (field app router) "HEAD" "/notes/{id}" (field app notes)))
+  (atomic/atomic-store (release-count) 0)
+  (atomic/atomic-store (release-reason) 0)
+  0)
+
+(defn start! [(server (ptr Server)) (app (ptr App)) (config ServerConfig)] (-> i64)
+  (app-init! app)
+  (let [port
+          (match (server-listen! server config (field app router))
+            (Ok [port] port)
+            (Err [error] (do (assert false) 0)))]
+    (assert (> port 0))
+    (match (server-start! server)
+      (Ok [zero] 0)
+      (Err [error] (do (assert false) 0)))
+    port))
+
+(defn stop! [(server (ptr Server))] (-> i64)
+  (server-stop! server)
+  (match (server-wait! server)
+    (Ok [accepted] 0)
+    (Err [error] (do (assert false) 0)))
+  (assert-eq (server-active-connections server) 0)
+  (server-close! server))
+
+;; ---------------------------------------------------------------------------
+;; Client helpers
+(defn url [(a (dyn Allocator)) (port i64) (path (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "http://127.0.0.1:")
+    (sb-push-i64! (mut out) port)
+    (sb-push-str! (mut out) path)
+    (sb-finish! (mut out))))
+
+(defn client-request [(method (slice u8))
+                      (target (slice u8))
+                      (headers (slice client/Header))
+                      (body (slice u8))] (-> client/Request)
+  (let [(mut request) (primitive/zeroed client/Request)]
+    (set! (.method request) method)
+    (set! (.url request) target)
+    (set! (.headers request) headers)
+    (set! (.body request) body)
+    (set! (.connect-timeout-ms request) 5000)
+    (set! (.timeout-ms request) 20000)
+    (set! (.follow-redirects request) false)
+    (set! (.ca-info request) "")
+    (load request)))
+
+(defn no-client-headers [] (-> (slice client/Header))
+  (slice-new [client/Header] (cast (ptr client/Header) 0) 0))
+
+(defn one-header [(a (dyn Allocator)) (name (slice u8)) (value (slice u8))] (-> (slice client/Header))
+  (let [(mut headers) (al-new [client/Header] a)
+        (mut item) (primitive/zeroed client/Header)]
+    (set! (.name item) name)
+    (set! (.value item) value)
+    (push! [client/Header] (mut headers) (load item))
+    (al-slice [client/Header] headers)))
+
+(defn fetch [(a (dyn Allocator))
+             (method (slice u8))
+             (target (slice u8))
+             (headers (slice client/Header))
+             (body (slice u8))] (-> client/Response)
+  (let [request (primitive/alloc-stack client/Request)]
+    (set! request (client-request method target headers body))
+    (match (client/request a request)
+      (Ok [reply] reply)
+      (Err [error] (do (assert false) (primitive/zeroed client/Response))))))
+
+(defn response-header [(reply client/Response) (name (slice u8))] (-> (slice u8))
+  (let [(mut i) 0
+        (mut found) ""]
+    (loop (if (>= (load i) (client/response-header-count reply))
+              (break)
+              (let [(mut item) (client/response-header-at reply (load i))]
+                (if (ascii-ci-eq (.name item) name)
+                    (do (set! found (.value item)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle)
+    (Some [at] true)
+    (None [] false)))
+
+;;; Collects a streamed body; stops after `stop-after` bytes when positive.
+(defstruct Collector [(bytes (ArrayList u8)) (stop-after i64)])
+
+(defn collect-chunk [(data (ptr u8)) (n i64) (ctx (ptr i8))] (-> i64)
+  (let [collector (cast (ptr Collector) ctx)]
+    (al-extend! [u8] (mut (.bytes collector)) data n)
+    (if (and (> (.stop-after collector) 0)
+             (>= (len (.bytes collector)) (.stop-after collector)))
+        client/BODY-STOP
+        client/BODY-CONTINUE)))
+
+(defn stream-get [(a (dyn Allocator))
+                  (target (slice u8))
+                  (headers (slice client/Header))
+                  (stop-after i64)
+                  (collector (ptr Collector))] (-> client/StreamingResponse)
+  (let [request (primitive/alloc-stack client/Request)
+        sink (primitive/alloc-stack client/BodySink)]
+    (set! request (client-request "GET" target headers ""))
+    (set! (.bytes collector) (al-new [u8] a))
+    (set! (.stop-after collector) stop-after)
+    (set! (.context sink) (cast (ptr i8) collector))
+    (set! (.consume sink) (fnptr-of collect-chunk))
+    (match (client/request-stream a request (load sink))
+      (Ok [reply] reply)
+      (Err [error]
+           (do (assert false) (primitive/zeroed client/StreamingResponse))))))
+
+;;; Decoded SSE events, via the real `sse.core` decoder.
+(defstruct EventLog
+  [(ids (ArrayList (slice u8)))
+   (data (ArrayList (slice u8)))
+   (a (dyn Allocator))])
+
+(impl sse/SseEventSink EventLog
+  (consume-sse-event [(self (ptr EventLog)) (event sse/SseEvent)]
+                     (-> bool)
+                     (match (str-concat (.a self) "" (.id event))
+                       (Some [id] (push! [(slice u8)] (mut (.ids self)) id))
+                       (None [] 0))
+                     (match (str-concat (.a self) "" (.data event))
+                       (Some [data]
+                             (push! [(slice u8)] (mut (.data self)) data))
+                       (None [] 0))
+                     true))
+
+(defn decode-events [(a (dyn Allocator))
+                     (bytes (slice u8))
+                     (log (ptr EventLog))] (-> i64)
+  (set! (.ids log) (al-new [(slice u8)] a))
+  (set! (.data log) (al-new [(slice u8)] a))
+  (set! (.a log) a)
+  (let [decoder (primitive/alloc-stack sse/SseDecoder)]
+    (set! decoder (sse/sse-decoder-new a log 65536))
+    (assert (sse/sse-decoder-feed! decoder bytes))
+    (sse/sse-decoder-free! decoder)
+    (len (.ids log))))
+
+(defn wait-until-released [(expected-count i64)] (-> bool)
+  (let [deadline (+ (monotonic-ms) 5000)
+        (mut done) false]
+    (loop (if (or (load done) (> (monotonic-ms) deadline))
+              (break)
+              (if (>= (atomic/atomic-load (release-count)) expected-count)
+                  (set! done true)
+                  (match (time/duration-millis 10)
+                    (Ok [pause] (do (time/sleep pause) 0))
+                    (Err [error] 0)))))
+    (load done)))
+
+;;; A raw TCP client for byte-exact scenarios curl cannot produce.
+(defn raw-connect [(a (dyn Allocator)) (port i64)] (-> (ptr socket/TcpConnection))
+  (let [connection
+          (box! a socket/TcpConnection (primitive/zeroed socket/TcpConnection))]
+    (match (socket/tcp-connect a connection "127.0.0.1" port)
+      (Ok [c] c)
+      (Err [error] (do (assert false) connection)))))
+
+(defn raw-send [(connection (ptr socket/TcpConnection)) (bytes (slice u8))] (-> i64)
+  (match (socket/tcp-write connection
+                           (cast (ptr i8) (slice-data bytes))
+                           (len bytes))
+    (Ok [n] (do (assert-eq n (len bytes)) n))
+    (Err [error] (do (assert false) 0))))
+
+;;; Read until EOF or `timeout-ms`, returning everything received.
+(defn raw-read-all [(a (dyn Allocator))
+                    (connection (ptr socket/TcpConnection))
+                    (timeout-ms i64)] (-> (slice u8))
+  (let [(mut out) (al-new [u8] a)
+        buffer (primitive/alloc-stack (array u8 4096))
+        deadline (+ (monotonic-ms) timeout-ms)]
+    (loop (let [remaining (- deadline (monotonic-ms))]
+            (if (<= remaining 0)
+                (break)
+                (match (time/duration-millis remaining)
+                  (Err [error] (break))
+                  (Ok [duration]
+                      (match (selectors/wait-fd-for (.fd connection)
+                                                    (selectors/interest-readable)
+                                                    duration)
+                        (Err [error] (break))
+                        (Ok [ready]
+                            (match (socket/tcp-read connection
+                                                    (cast (ptr i8) buffer)
+                                                    4096)
+                              (Err [error] (break))
+                              (Ok [n]
+                                  (if (= n 0)
+                                      (break)
+                                      (al-extend! [u8]
+                                                  (mut out)
+                                                  (cast (ptr u8) buffer)
+                                                  n)))))))))))
+    (al-slice [u8] out)))
+
+;; ---------------------------------------------------------------------------
+;; Tests
+(deftest listener-is-close-on-exec-and-serves-routes-with-params
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (assert (native/cloexec? (server-listener-fd server)))
+           (let [reply
+                   (fetch a
+                          "GET"
+                          (url a port "/notes/abc-42")
+                          (no-client-headers)
+                          "")]
+             (assert-eq (client/response-status reply) 200)
+             (assert (= (client/response-body reply) "{\"id\":\"abc-42\"}"))
+             (assert (= (response-header reply "Content-Type")
+                        "application/json"))
+             (assert (= (response-header reply "Connection") "close")))
+           (stop! server)))
+
+(deftest unknown-paths-are-json-404-and-wrong-methods-are-405-with-allow
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (let [missing
+                   (fetch a "GET" (url a port "/nope") (no-client-headers) "")]
+             (assert-eq (client/response-status missing) 404)
+             (assert (= (client/response-body missing)
+                        "{\"error\":{\"code\":\"not_found\",\"message\":\"not found\"}}")))
+           (let [wrong
+                   (fetch a
+                          "DELETE"
+                          (url a port "/notes/1")
+                          (no-client-headers)
+                          "")]
+             (assert-eq (client/response-status wrong) 405)
+             (assert (= (response-header wrong "Allow") "GET, HEAD"))
+             (assert (= (client/response-body wrong)
+                        "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"}}")))
+           (let [both
+                   (fetch a "PUT" (url a port "/search") (no-client-headers) "")]
+             (assert-eq (client/response-status both) 405)
+             (assert (= (response-header both "Allow") "GET, POST")))
+           (stop! server)))
+
+(deftest decodes-query-parameters-headers-and-bodies
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (let [reply
+                   (fetch a
+                          "POST"
+                          (url a
+                               port
+                               "/search?x=1&q=hello%20w%C3%B6rld+%22again%22&q=second")
+                          (one-header a "X-Custom" "Mixed Case Value")
+                          "twelve bytes")]
+             (assert-eq (client/response-status reply) 200)
+             (assert (= (client/response-body reply)
+                        "{\"q\":\"hello wörld \\\"again\\\"\",\"custom\":\"Mixed Case Value\",\"body\":12}")))
+           (let [malformed
+                   (fetch a
+                          "GET"
+                          (url a port "/search?q=%zz")
+                          (no-client-headers)
+                          "")]
+             (assert-eq (client/response-status malformed) 400)
+             (assert (= (client/response-body malformed)
+                        "{\"error\":{\"code\":\"bad_query\",\"message\":\"malformed query string\"}}")))
+           (let [missing
+                   (fetch a
+                          "GET"
+                          (url a port "/search?qq=1")
+                          (no-client-headers)
+                          "")]
+             (assert-eq (client/response-status missing) 400))
+           (stop! server)))
+
+(deftest bearer-auth-rejects-with-www-authenticate
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (let [denied
+                   (fetch a "GET" (url a port "/secret") (no-client-headers) "")]
+             (assert-eq (client/response-status denied) 401)
+             (assert (= (response-header denied "WWW-Authenticate") "Bearer"))
+             (assert (= (client/response-body denied)
+                        "{\"error\":{\"code\":\"unauthorized\",\"message\":\"a valid bearer token is required\"}}")))
+           (let [wrong
+                   (fetch a
+                          "GET"
+                          (url a port "/secret")
+                          (one-header a "Authorization" "Bearer nope")
+                          "")]
+             (assert-eq (client/response-status wrong) 401))
+           (let [allowed
+                   (fetch a
+                          "GET"
+                          (url a port "/secret")
+                          (one-header a "authorization" "bearer s3cret")
+                          "")]
+             (assert-eq (client/response-status allowed) 200)
+             (assert (= (client/response-body allowed) "{\"secret\":true}")))
+           (stop! server)))
+
+(deftest oversized-requests-get-413-and-the-server-keeps-serving
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               (mut config) (server-config)
+               (mut big) (sb-new a)
+               (mut i) 0]
+           (set! (.max-request-bytes config) 4096)
+           (loop (if (>= (load i) 20000)
+                     (break)
+                     (do (sb-push-str! (mut big) "x") (set! i (+ (load i) 1)))))
+           (let [port (start! server app (load config))
+                 body (sb-finish! (mut big))
+                 reply
+                   (fetch a
+                          "POST"
+                          (url a port "/search?q=1")
+                          (no-client-headers)
+                          body)]
+             (assert-eq (client/response-status reply) 413)
+             (assert (= (client/response-body reply)
+                        "{\"error\":{\"code\":\"payload_too_large\",\"message\":\"the request exceeds the size limit\"}}"))
+             (let [after
+                     (fetch a
+                            "GET"
+                            (url a port "/notes/7")
+                            (no-client-headers)
+                            "")]
+               (assert-eq (client/response-status after) 200))
+             (stop! server))))
+
+(deftest slow-requests-get-408-and-garbage-gets-400
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               (mut config) (server-config)]
+           (set! (.read-timeout-ms config) 300)
+           (let [port (start! server app (load config))
+                 slow (raw-connect a port)]
+             (raw-send slow "GET /notes/1 HTTP/1.1\r\nHost: x\r\n")
+             (let [answer (raw-read-all a slow 3000)]
+               (assert (starts-with answer "HTTP/1.1 408 Request Timeout\r\n"))
+               (assert (contains? answer "\"code\":\"request_timeout\"")))
+             (socket/tcp-connection-close! slow)
+             (let [garbage (raw-connect a port)]
+               (raw-send garbage "NOT HTTP AT ALL\r\n\r\n")
+               (let [answer (raw-read-all a garbage 3000)]
+                 (assert (starts-with answer "HTTP/1.1 400 Bad Request\r\n")))
+               (socket/tcp-connection-close! garbage))
+             (stop! server))))
+
+(defn fast-poll-config [] (-> ServerConfig)
+  (let [(mut config) (server-config)]
+    (set! (.idle-poll-ms config) 10)
+    (load config)))
+
+(deftest streams-sse-events-over-time-with-keep-alives-then-ends
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (fast-poll-config))
+               collector (primitive/alloc-stack Collector)
+               log (primitive/alloc-stack EventLog)
+               started (monotonic-ms)
+               reply
+                 (stream-get a
+                             (url a port "/ticks")
+                             (no-client-headers)
+                             0
+                             collector)
+               elapsed (- (monotonic-ms) started)
+               body (al-slice [u8] (.bytes collector))]
+           (assert-eq (client/streaming-response-status reply) 200)
+           (assert (not (client/streaming-response-stopped reply)))
+           (assert (starts-with body
+                                "retry: 2500\n\nevent: tick\nid: 1\ndata: tick 1\n\n"))
+           (assert (contains? body ": keep-alive\n\n"))
+           (assert-eq (decode-events a body log) 4)
+           (assert (= (get (.ids log) 3) "4"))
+           (assert (= (get (.data log) 0) "tick 1"))
+           (assert (= (get (.data log) 3) "tick 4"))
+           ;; Four events 120 ms apart: the body really was produced over time.
+           (assert (>= elapsed 300))
+           (assert (wait-until-released 1))
+           (assert-eq (atomic/atomic-load (release-reason)) 1)
+           (let [resumed (primitive/alloc-stack Collector)
+                 resumed-log (primitive/alloc-stack EventLog)
+                 again
+                   (stream-get a
+                               (url a port "/ticks")
+                               (one-header a "Last-Event-ID" "2")
+                               0
+                               resumed)]
+             (assert-eq (client/streaming-response-status again) 200)
+             (assert-eq (decode-events a
+                                       (al-slice [u8] (.bytes resumed))
+                                       resumed-log)
+                        2)
+             (assert (= (get (.ids resumed-log) 0) "3")))
+           (stop! server)))
+
+(deftest client-disconnect-mid-stream-releases-the-stream
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))
+               collector (primitive/alloc-stack Collector)
+               reply
+                 (stream-get a
+                             (url a port "/forever")
+                             (no-client-headers)
+                             60
+                             collector)]
+           (assert-eq (client/streaming-response-status reply) 200)
+           (assert (client/streaming-response-stopped reply))
+           (assert (wait-until-released 1))
+           (assert-eq (atomic/atomic-load (release-reason)) 2)
+           (let [after
+                   (fetch a
+                          "GET"
+                          (url a port "/notes/9")
+                          (no-client-headers)
+                          "")]
+             (assert-eq (client/response-status after) 200))
+           (assert-eq (atomic/atomic-load (release-count)) 1)
+           (stop! server)))
+
+(deftest stop-releases-open-streams-and-serve-returns-promptly
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))
+               quiet (raw-connect a port)]
+           (raw-send quiet "GET /quiet HTTP/1.1\r\nHost: x\r\n\r\n")
+           (let [first (raw-read-all a quiet 300)]
+             (assert (starts-with first "HTTP/1.1 200 OK\r\n"))
+             (assert (contains? first "Transfer-Encoding: chunked\r\n"))
+             (assert (contains? first "Cache-Control: no-cache\r\n"))
+             (assert (contains? first "data: tick 1")))
+           (assert-eq (server-active-connections server) 1)
+           (let [before (monotonic-ms)]
+             (stop! server)
+             (assert (< (- (monotonic-ms) before) 2000)))
+           (assert (wait-until-released 1))
+           (assert-eq (atomic/atomic-load (release-reason)) 3)
+           (let [rest (raw-read-all a quiet 1000)]
+             (assert (contains? rest "0\r\n\r\n")))
+           (socket/tcp-connection-close! quiet)))
+
+(deftest invalid-configs-and-taken-ports-are-reported
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               other (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               (mut bad) (server-config)]
+           (app-init! app)
+           (set! (.host bad) "localhost")
+           (assert (match (server-listen! other (load bad) (field app router))
+                     (Err [error]
+                          (match error
+                            (ServerListenFailed [code] (= code 22))
+                            (_ false)))
+                     (Ok [port] false)))
+           (server-close! other)
+           (set! (.host bad) "127.0.0.1")
+           (set! (.idle-poll-ms bad) 0)
+           (assert (match (server-listen! other (load bad) (field app router))
+                     (Err [error]
+                          (match error
+                            (ServerInvalidConfig [message] true)
+                            (_ false)))
+                     (Ok [port] false)))
+           (let [port
+                   (match (server-listen! server
+                                          (server-config)
+                                          (field app router))
+                     (Ok [port] port)
+                     (Err [error] (do (assert false) 0)))
+                 (mut same) (server-config)]
+             (assert (native/cloexec? (server-listener-fd server)))
+             (set! (.port same) port)
+             (assert (match (server-listen! other
+                                            (load same)
+                                            (field app router))
+                       (Err [error]
+                            (match error
+                              (ServerListenFailed [code] true)
+                              (_ false)))
+                       (Ok [port] false)))
+             (server-close! server)
+             ;; SO_REUSEADDR: the port can be bound again as soon as it is released.
+             (assert (match (server-listen! other
+                                            (load same)
+                                            (field app router))
+                       (Err [error] false)
+                       (Ok [again] (= again port))))
+             (server-close! other))))
+
+(deftest excess-connections-get-503
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               (mut config) (server-config)]
+           (set! (.max-connections config) 1)
+           (let [port (start! server app (load config))
+                 quiet (raw-connect a port)]
+             (raw-send quiet "GET /quiet HTTP/1.1\r\nHost: x\r\n\r\n")
+             (assert (contains? (raw-read-all a quiet 300) "data: tick 1"))
+             (let [rejected
+                     (fetch a
+                            "GET"
+                            (url a port "/notes/1")
+                            (no-client-headers)
+                            "")]
+               (assert-eq (client/response-status rejected) 503)
+               (assert (= (client/response-body rejected)
+                          "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"too many connections\"}}")))
+             (socket/tcp-connection-close! quiet)
+             (assert (wait-until-released 1))
+             (assert-eq (atomic/atomic-load (release-reason)) 2)
+             (let [after
+                     (fetch a
+                            "GET"
+                            (url a port "/notes/1")
+                            (no-client-headers)
+                            "")]
+               (assert-eq (client/response-status after) 200))
+             (stop! server))))
+
+(deftest expect-continue-head-and-chunked-request-bodies
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (let [continued
+                   (fetch a
+                          "POST"
+                          (url a port "/search?q=c")
+                          (one-header a "Expect" "100-continue")
+                          "hello")]
+             (assert-eq (client/response-status continued) 200)
+             (assert (= (client/response-body continued)
+                        "{\"q\":\"c\",\"custom\":\"\",\"body\":5}")))
+           (let [chunked (raw-connect a port)]
+             (raw-send chunked
+                       "POST /search?q=t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+             (match (time/duration-millis 50)
+               (Ok [pause] (do (time/sleep pause) 0))
+               (Err [error] 0))
+             (raw-send chunked "lo\r\n3\r\n!!!\r\n0\r\n\r\n")
+             (let [answer (raw-read-all a chunked 3000)]
+               (assert (starts-with answer "HTTP/1.1 200 OK\r\n"))
+               (assert (contains? answer "\"body\":8}")))
+             (socket/tcp-connection-close! chunked))
+           (let [head (raw-connect a port)]
+             (raw-send head "HEAD /notes/5 HTTP/1.1\r\nHost: x\r\n\r\n")
+             (let [answer (raw-read-all a head 3000)]
+               (assert (starts-with answer "HTTP/1.1 200 OK\r\n"))
+               (assert (contains? answer "Content-Length: 10\r\n"))
+               (assert (contains? answer "\r\n\r\n"))
+               (assert (not (contains? answer "{\"id\""))))
+             (socket/tcp-connection-close! head))
+           (stop! server)))
+
+(deftest invalid-handler-responses-become-500-and-huge-headers-431
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (server-config))]
+           (let [broken
+                   (fetch a "GET" (url a port "/broken") (no-client-headers) "")]
+             (assert-eq (client/response-status broken) 500)
+             (assert (= (client/response-body broken)
+                        "{\"error\":{\"code\":\"internal_error\",\"message\":\"the handler produced an invalid response\"}}")))
+           (let [huge (raw-connect a port)
+                 (mut filler) (sb-new a)
+                 (mut i) 0]
+             (sb-push-str! (mut filler) "GET /notes/1 HTTP/1.1\r\nX-Filler: ")
+             (loop (if (>= (load i) 70000)
+                       (break)
+                       (do
+                         (sb-push-str! (mut filler) "y")
+                         (set! i (+ (load i) 1)))))
+             (raw-send huge (sb-finish! (mut filler)))
+             (let [answer (raw-read-all a huge 3000)]
+               (assert (starts-with answer
+                                    "HTTP/1.1 431 Request Header Fields Too Large\r\n")))
+             (socket/tcp-connection-close! huge))
+           (stop! server)))
+
+(deftest http10-streams-are-close-delimited-and-failures-truncate
+         (let [a (malloc-allocator)
+               server (primitive/alloc-stack Server)
+               app (primitive/alloc-stack App)
+               port (start! server app (fast-poll-config))]
+           (let [old (raw-connect a port)]
+             (raw-send old "GET /ticks HTTP/1.0\r\n\r\n")
+             (let [answer (raw-read-all a old 5000)]
+               (assert (starts-with answer "HTTP/1.1 200 OK\r\n"))
+               (assert (not (contains? answer "Transfer-Encoding")))
+               (assert (contains? answer "data: tick 4\n\n")))
+             (socket/tcp-connection-close! old))
+           (assert (wait-until-released 1))
+           (assert-eq (atomic/atomic-load (release-reason)) 1)
+           (let [failing (raw-connect a port)]
+             ;; The source cannot parse this cursor and reports SseError.
+             (raw-send failing
+                       "GET /ticks HTTP/1.1\r\nHost: x\r\nLast-Event-ID: not-a-number\r\n\r\n")
+             (let [answer (raw-read-all a failing 3000)]
+               (assert (starts-with answer "HTTP/1.1 200 OK\r\n"))
+               (assert (contains? answer "Transfer-Encoding: chunked\r\n"))
+               (assert (not (contains? answer "0\r\n\r\n"))))
+             (socket/tcp-connection-close! failing))
+           (assert (wait-until-released 2))
+           (assert-eq (atomic/atomic-load (release-reason)) 4)
+           (stop! server)))

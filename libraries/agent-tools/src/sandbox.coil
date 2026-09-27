@@ -1,0 +1,223 @@
+(module agent_tools.sandbox)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(export SandboxOptions SandboxPolicy NoSandbox MacSandbox Bubblewrap sandbox-options sandbox-options-with-paths sandbox-name sandbox-argv
+        sandbox-detect workspace-git-dirs workspace-sandbox-options)
+
+;;; What a sandbox allows beyond the workspace itself.
+;;; `extra-writable` paths must be absolute and canonical (realpath'd): the
+;;; macOS sandbox compares resolved paths, so "/tmp/x" would never match.
+(defstruct SandboxOptions
+  [(allow-network bool)
+   (extra-writable (slice (slice u8)))])
+
+;;; How shell commands are confined.
+;;; - `NoSandbox`: run `/bin/sh -c` directly.
+;;; - `MacSandbox`: `sandbox-exec` with writes confined to the workspace, the
+;;;   temporary directories, and `extra-writable`.
+;;; - `Bubblewrap`: `bwrap` with a read-only system, a writable workspace, a
+;;;   private /tmp, and a private PID namespace.
+(defsum SandboxPolicy
+  (NoSandbox)
+  (MacSandbox [(options SandboxOptions)])
+  (Bubblewrap [(options SandboxOptions)]))
+
+(const MAC_SANDBOX_EXEC "/usr/bin/sandbox-exec")
+(const SHELL "/bin/sh")
+
+(defn sandbox-options [(allow-network bool)] (-> SandboxOptions)
+  (SandboxOptions :allow-network allow-network :extra-writable (slice-new (primitive/cast (ptr (slice u8)) 0) 0)))
+
+(defn sandbox-options-with-paths [(allow-network bool) (extra-writable (slice (slice u8)))] (-> SandboxOptions)
+  (SandboxOptions :allow-network allow-network :extra-writable extra-writable))
+
+(defn sandbox-name [(policy SandboxPolicy)] (-> (slice u8))
+  (match policy
+    (NoSandbox [] "none")
+    (MacSandbox [_] "sandbox-exec")
+    (Bubblewrap [_] "bwrap")))
+
+;;; A string literal in the sandbox profile language: quotes and backslashes
+;;; are escaped, everything else is taken literally.
+(defn sbpl-string [(b (mut StrBuf)) (text (slice u8))] (-> i64)
+  (sb-push-byte! (mut b) (primitive/cast u8 #\"))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len text))
+              (break)
+              (let [c (get text (load i))]
+                (when (or (= c (primitive/cast u8 #\")) (= c (primitive/cast u8 #\\)))
+                  (sb-push-byte! (mut b) (primitive/cast u8 #\\))
+                  0)
+                (sb-push-byte! (mut b) c)
+                (set! i (+ (load i) 1))))))
+  (sb-push-byte! (mut b) (primitive/cast u8 #\"))
+  0)
+
+(defn sbpl-subpath [(b (mut StrBuf)) (path (slice u8))] (-> i64)
+  (sb-push-str! (mut b) " (subpath ")
+  (sbpl-string (mut b) path)
+  (sb-push-str! (mut b) ")")
+  0)
+
+(defn sbpl-literal [(b (mut StrBuf)) (path (slice u8))] (-> i64)
+  (sb-push-str! (mut b) " (literal ")
+  (sbpl-string (mut b) path)
+  (sb-push-str! (mut b) ")")
+  0)
+
+;;; The macOS sandbox profile. Everything is allowed except writing files,
+;;; which is allowed only in the workspace, the per-user and shared temporary
+;;; directories (compilers and git use $TMPDIR, which lives under
+;;; /private/var/folders), the terminal and null devices, and `extra-writable`.
+;;; Without network access, IP traffic in both directions is denied; local
+;;; Unix-domain sockets (used by system services) keep working.
+(defn mac-profile [(a (dyn Allocator)) (root (slice u8)) (options SandboxOptions)] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        extra (.extra-writable options)]
+    (sb-push-str! (mut b) "(version 1)(allow default)(deny file-write*)(allow file-write*")
+    (sbpl-subpath (mut b) root)
+    (sbpl-subpath (mut b) "/private/tmp")
+    (sbpl-subpath (mut b) "/private/var/tmp")
+    (sbpl-subpath (mut b) "/private/var/folders")
+    (sbpl-literal (mut b) "/dev/null")
+    (sbpl-literal (mut b) "/dev/zero")
+    (sbpl-literal (mut b) "/dev/tty")
+    (sbpl-literal (mut b) "/dev/stdout")
+    (sbpl-literal (mut b) "/dev/stderr")
+    (sbpl-literal (mut b) "/dev/dtracehelper")
+    (sbpl-subpath (mut b) "/dev/fd")
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (len extra))
+                (break)
+                (do (sbpl-subpath (mut b) (get extra (load i)))
+                    (set! i (+ (load i) 1))))))
+    (sb-push-str! (mut b) ")")
+    (when (not (.allow-network options))
+      (sb-push-str! (mut b) "(deny network-outbound (remote ip))(deny network-inbound (local ip))")
+      0)
+    (sb-finish! (mut b))))
+
+(defn push-all! [(argv (mut (ArrayList (slice u8)))) (items (slice (slice u8)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len items))
+              (break)
+              (do (push! (mut argv) (get items (load i)))
+                  (set! i (+ (load i) 1)))))
+    0))
+
+;;; The complete argv (argv[0] is the program) that runs `/bin/sh -c command`
+;;; under `policy`, with the workspace root as the writable directory. The
+;;; caller runs it with the working directory set to `root`.
+(defn sandbox-argv [(a (dyn Allocator)) (policy SandboxPolicy) (root (slice u8)) (command (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut argv) (al-new [(slice u8)] a)]
+    (match policy
+      (NoSandbox [] 0)
+      (MacSandbox [options]
+                  (push-all! (mut argv) [MAC_SANDBOX_EXEC "-p" (mac-profile a root options)]))
+      (Bubblewrap [(SandboxOptions :allow-network allow-network :extra-writable extra)]
+                  (do (push-all! (mut argv)
+                                 ["bwrap" "--die-with-parent" "--new-session" "--unshare-pid"
+                                  "--ro-bind" "/" "/"
+                                  "--dev" "/dev"
+                                  "--proc" "/proc"
+                                  "--tmpfs" "/tmp"
+                                  "--bind" root root])
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) (len extra))
+                                  (break)
+                                  (let [path (get extra (load i))]
+                                    (push-all! (mut argv) ["--bind" path path])
+                                    (set! i (+ (load i) 1))))))
+                      (push-all! (mut argv) ["--chdir" root])
+                      (when (not allow-network)
+                        (push! (mut argv) "--unshare-net")
+                        0)
+                      (push! (mut argv) "--")
+                      0)))
+    (push-all! (mut argv) [SHELL "-c" command])
+    (load argv)))
+
+(defn linux-code [] (-> Code)
+  (if (= (primitive/target-os) `linux) `true `false))
+
+(const TARGET_LINUX (linux-code))
+
+;;; The strongest sandbox this machine offers: `sandbox-exec` on macOS when
+;;; /usr/bin/sandbox-exec exists, `bwrap` on Linux when it is on PATH, and
+;;; otherwise `NoSandbox`. Callers that require isolation must check the result
+;;; is not `NoSandbox` rather than silently running unconfined.
+(defn sandbox-detect [(a (dyn Allocator)) (options SandboxOptions)] (-> SandboxPolicy)
+  (if TARGET_LINUX
+      (match (sys/find-on-path a "bwrap")
+        (Some [path] (do (free-bytes a path 1) (Bubblewrap options)))
+        (None [] (NoSandbox)))
+      (if (sys/executable? a MAC_SANDBOX_EXEC)
+          (MacSandbox options)
+          (NoSandbox))))
+
+(defn trim-trailing-newlines [(text (slice u8))] (-> (slice u8))
+  (let [(mut n) (len text)]
+    (loop (if (and (> (load n) 0)
+                   (or (= (get text (- (load n) 1)) (primitive/cast u8 #\newline))
+                       (= (get text (- (load n) 1)) (primitive/cast u8 #\return))))
+              (set! n (- (load n) 1))
+              (break)))
+    (subslice text 0 (load n))))
+
+;;; The directories git writes to for this workspace, beyond the workspace
+;;; itself. A plain checkout keeps everything in `<root>/.git`, so this is
+;;; empty. A `git worktree` has a `.git` file pointing at
+;;; `<main>/.git/worktrees/<name>`, and commits write objects and refs into the
+;;; main repository's `.git`; that common directory is returned (canonical), so
+;;; a sandboxed agent can still commit. Err explains a malformed `.git` file.
+(defn workspace-git-dirs [(a (dyn Allocator)) (workspace Workspace)] (-> (Result (ArrayList (slice u8)) (slice u8)))
+  (let [(mut dirs) (al-new [(slice u8)] a)
+        root (workspace-root workspace)
+        dotgit (join2 a root "/.git")]
+    (if (or (not (sys/existing-file? a dotgit)) (sys/directory? a dotgit))
+        (Ok (load dirs))
+        (match (sys/read-small-file a dotgit 4096)
+          (Err [message] (Err message))
+          (Ok [text]
+              (if (not (starts-with text "gitdir: "))
+                  (Err (join3 a "the .git file in " root " does not start with \"gitdir: \""))
+                  (let [target (trim-trailing-newlines (subslice text 8 (len text)))
+                        gitdir (if (and (> (len target) 0) (= (get target 0) (primitive/cast u8 #\/)))
+                                   target
+                                   (join3 a root "/" target))]
+                    (match (sys/real-path a gitdir)
+                      (sys/PathErrno [code]
+                                     (Err (join3 a "cannot resolve the worktree git directory " gitdir (join2 a ": " (sys/errno-text code)))))
+                      (sys/PathOk [real-gitdir]
+                                  (let [commondir-file (join2 a real-gitdir "/commondir")]
+                                    (if (not (sys/existing-file? a commondir-file))
+                                        (do (push! (mut dirs) real-gitdir) (Ok (load dirs)))
+                                        (match (sys/read-small-file a commondir-file 4096)
+                                          (Err [message] (Err message))
+                                          (Ok [common-text]
+                                              (let [common (trim-trailing-newlines common-text)
+                                                    common-path (if (and (> (len common) 0) (= (get common 0) (primitive/cast u8 #\/)))
+                                                                    common
+                                                                    (join3 a real-gitdir "/" common))]
+                                                (match (sys/real-path a common-path)
+                                                  (sys/PathErrno [code]
+                                                                 (Err (join3 a "cannot resolve the common git directory " common-path (join2 a ": " (sys/errno-text code)))))
+                                                  (sys/PathOk [real-common]
+                                                              (do (push! (mut dirs) real-common)
+                                                                  (Ok (load dirs)))))))))))))))))))
+
+;;; Sandbox options for an agent working in `workspace`: the network choice,
+;;; plus the git directories outside the workspace that git must write to
+;;; (see `workspace-git-dirs`), so commits work inside a sandboxed worktree.
+(defn workspace-sandbox-options [(a (dyn Allocator)) (workspace Workspace) (allow-network bool)] (-> (Result SandboxOptions (slice u8)))
+  (match (workspace-git-dirs a workspace)
+    (Err [message] (Err message))
+    (Ok [dirs] (let [(mut owned) dirs]
+                 (Ok (sandbox-options-with-paths allow-network (al-into-slice (mut owned))))))))

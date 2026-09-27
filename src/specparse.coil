@@ -1,0 +1,222 @@
+(module factory.specparse)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "mddoc.doc" :as md)
+(import "agent.json" :use *)
+(import "factory.spec" :use *)
+
+;;; Reading a factory file. Unknown keys and settings are errors rather than
+;;; ignored, so a typo like `gates:` is caught by `factory check` instead of
+;;; silently producing a station without a gate.
+
+(defsum SpecResult
+  (SpecOk [(spec FactorySpec)])
+  (SpecBad [(problems (ArrayList SpecProblem))]))
+
+(defn problem! [(a (dyn Allocator)) (problems (mut (ArrayList SpecProblem))) (line i64) (parts (slice (slice u8)))] (-> i64)
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (let [message (sb-finish! (mut out))]
+      (push! [SpecProblem] (mut problems) (SpecProblem :line line :message message)))))
+
+(defn known-front-key? [(key (slice u8))] (-> bool)
+  (or (= key "name") (= key "description") (= key "input") (= key "model")
+      (= key "tools") (= key "attempts")))
+
+(defn known-station-key? [(key (slice u8))] (-> bool)
+  (or (= key "gate") (= key "attempts") (= key "model") (= key "tools")))
+
+(defn lower-ascii [(c i64)] (-> i64)
+  (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+
+;;; The station name when `title` is `Station: name` (any case), else None.
+(defn station-title [(title (slice u8))] (-> (Option (slice u8)))
+  (let [prefix "station:"
+        n (len prefix)]
+    (if (< (len title) n)
+        (None)
+        (let [(mut i) 0
+              (mut same) true]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do (when (!= (lower-ascii (cast i64 (get title (load i))))
+                                  (cast i64 (get prefix (load i))))
+                          (set! same false)
+                          0)
+                        (set! i (+ (load i) 1)))))
+          (if (load same)
+              (Some (str-trim (subslice [u8] title n (len title))))
+              (None))))))
+
+;;; A tool list written either `files, shell` or `[files, shell]`, as the
+;;; canonical comma-separated text.
+(defn front-tools [(a (dyn Allocator)) (entry md/FrontEntry)] (-> (slice u8))
+  (if (.is-list entry)
+      (let [(mut out) (sb-new a)
+            (mut first) true]
+        (for item (iter (.items entry))
+          (when (not (load first)) (sb-push-str! (mut out) ", ") 0)
+          (sb-push-str! (mut out) (str-trim item))
+          (set! first false))
+        (sb-finish! (mut out)))
+      (.scalar entry)))
+
+(defn parse-attempts [(a (dyn Allocator))
+                      (problems (mut (ArrayList SpecProblem)))
+                      (text (slice u8))
+                      (line i64)] (-> i64)
+  (match (str-parse-int (str-trim text))
+    (Some [n] (if (and (>= n 1) (<= n 20))
+                  n
+                  (do (problem! a (mut problems) line ["attempts must be between 1 and 20, not " text]) 0)))
+    (None [] (do (problem! a (mut problems) line ["attempts must be a whole number, not \"" text "\""]) 0))))
+
+;;; Lines of `body` (whose first line is `body-line`) before `stop-line`.
+(defn text-before-line [(body (slice u8)) (body-line i64) (stop-line i64)] (-> (slice u8))
+  (let [(mut at) 0
+        (mut line) body-line
+        n (len body)]
+    (loop (if (or (>= (load at) n) (>= (load line) stop-line))
+              (break)
+              (do (loop (if (or (>= (load at) n) (= (cast i64 (get body (load at))) 10))
+                            (break)
+                            (set! at (+ (load at) 1))))
+                  (when (< (load at) n) (set! at (+ (load at) 1)) 0)
+                  (set! line (+ (load line) 1)))))
+    (subslice [u8] body 0 (load at))))
+
+(defn parse-factory [(a (dyn Allocator)) (text (slice u8))] (-> SpecResult)
+  (let [(mut problems) (al-new [SpecProblem] a)
+        (mut spec) (primitive/zeroed FactorySpec)]
+    (set! (.stations spec) (al-new [StationSpec] a))
+    (set! (.name spec) "")
+    (set! (.description spec) "")
+    (set! (.input spec) "")
+    (set! (.model spec) "")
+    (set! (.tools spec) "")
+    (set! (.context spec) "")
+    (match (md/parse-document a text)
+      (Err [failure]
+           (let [e failure]
+             (problem! a (mut problems) (.line e) [(.message e)])))
+      (Ok [parsed]
+          (let [doc parsed]
+            (when (not (md/doc-has-front-matter? doc))
+              (problem! a (mut problems) 1 ["a factory starts with front matter: a line `---`, then `name: my-factory`, then `---`"])
+              0)
+            (for front (iter (md/front-entries doc))
+              (let [entry front
+                    key (.key entry)]
+                (cond (not (known-front-key? key))
+                        (problem! a (mut problems) (.line entry)
+                                  ["unknown front-matter key \"" key "\"; the keys are name, description, input, model, tools, attempts"])
+                      (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
+                      (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
+                      (= key "input") (do (set! (.input spec) (.scalar entry)) 0)
+                      (= key "model") (do (set! (.model spec) (.scalar entry)) 0)
+                      (= key "tools")
+                        (let [tools (front-tools a entry)
+                              trouble (tool-list-problem a tools)]
+                          (set! (.tools spec) tools)
+                          (when (> (len trouble) 0) (problem! a (mut problems) (.line entry) [trouble]) 0)
+                          0)
+                      (= key "attempts")
+                        (do (set! (.attempts spec) (parse-attempts a (mut problems) (.scalar entry) (.line entry))) 0)
+                      :else 0)))
+            (when (and (md/doc-has-front-matter? doc) (= (len (.name spec)) 0))
+              (problem! a (mut problems) 1 ["the front matter needs a name, for example `name: fix-issue`"])
+              0)
+            (when (and (> (len (.name spec)) 0) (not (kebab-name? (.name spec))))
+              (problem! a (mut problems) 1 ["the name \"" (.name spec) "\" must be lowercase letters, digits, and dashes"])
+              0)
+            (let [(mut first-station-line) -1
+                  (mut extra) (sb-new a)]
+              (for section (iter (md/doc-sections doc))
+                (let [s section]
+                  (match (station-title (.title s))
+                    (Some [name]
+                          (if (!= (.level s) 2)
+                              (problem! a (mut problems) (.line s) ["a station heading must be level 2: `## Station: " name "`"])
+                              (do
+                                (when (< (load first-station-line) 0) (set! first-station-line (.line s)) 0)
+                                (cond (not (kebab-name? name))
+                                        (problem! a (mut problems) (.line s)
+                                                  ["station name \"" name "\" must be lowercase letters, digits, and dashes"])
+                                      (>= (find-station (mut spec) name) 0)
+                                        (problem! a (mut problems) (.line s) ["there is already a station named \"" name "\""])
+                                      :else 0)
+                                (match (md/section-attributes a (.body s) (.body-line s))
+                                  (Err [failure]
+                                       (let [e failure] (problem! a (mut problems) (.line e) [(.message e)])))
+                                  (Ok [found]
+                                      (let [settings found
+                                            (mut station) (primitive/zeroed StationSpec)]
+                                        (set! (.name station) name)
+                                        (set! (.line station) (.line s))
+                                        (set! (.gate station) "")
+                                        (set! (.model station) "")
+                                        (set! (.tools station) "")
+                                        (set! (.instructions station) (str-trim (.rest settings)))
+                                        (for attribute (iter (.attrs settings))
+                                          (let [attr attribute
+                                                key (.key attr)]
+                                            (cond (not (known-station-key? key))
+                                                    (problem! a (mut problems) (.line attr)
+                                                              ["unknown station setting \"" key "\"; the settings are gate, attempts, model, tools"])
+                                                  (= key "gate") (do (set! (.gate station) (.value attr)) 0)
+                                                  (= key "model") (do (set! (.model station) (.value attr)) 0)
+                                                  (= key "tools")
+                                                    (let [trouble (tool-list-problem a (.value attr))]
+                                                      (set! (.tools station) (.value attr))
+                                                      (when (> (len trouble) 0) (problem! a (mut problems) (.line attr) [trouble]) 0)
+                                                      0)
+                                                  (= key "attempts")
+                                                    (do (set! (.attempts station)
+                                                              (parse-attempts a (mut problems) (.value attr) (.line attr)))
+                                                        0)
+                                                  :else 0)))
+                                        (when (= (len (.instructions station)) 0)
+                                          (problem! a (mut problems) (.line s) ["station \"" name "\" has no instructions"])
+                                          0)
+                                        (push! [StationSpec] (mut (.stations spec)) (load station))
+                                        0)))
+                                0)))
+                    (None []
+                          ;; Sections after the first station that are not
+                          ;; stations are shared context too.
+                          (when (and (>= (load first-station-line) 0) (= (.level s) 2))
+                            (sb-push-str! (mut extra) "\n## ")
+                            (sb-push-str! (mut extra) (.title s))
+                            (sb-push-str! (mut extra) "\n\n")
+                            (sb-push-str! (mut extra) (.body s))
+                            0)))))
+              (when (= (len (.stations spec)) 0)
+                (problem! a (mut problems) 1 ["a factory needs at least one `## Station: name` section"])
+                0)
+              (let [before (if (>= (load first-station-line) 0)
+                               (text-before-line (md/doc-body doc) (md/doc-body-line doc) (load first-station-line))
+                               (md/doc-body doc))
+                    (mut context) (sb-new a)]
+                (sb-push-str! (mut context) (str-trim before))
+                (sb-push-str! (mut context) (sb-str (load extra)))
+                (set! (.context spec) (sb-finish! (mut context)))
+                0)))))
+    (if (> (len problems) 0)
+        (SpecBad (load problems))
+        (SpecOk (load spec)))))
+
+(defn problems-text [(a (dyn Allocator)) (problems (ArrayList SpecProblem))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut first) true]
+    (for problem (iter problems)
+      (let [p problem]
+        (when (not (load first)) (sb-push-str! (mut out) "\n") 0)
+        (sb-push-str! (mut out) "line ")
+        (sb-push-i64! (mut out) (.line p))
+        (sb-push-str! (mut out) ": ")
+        (sb-push-str! (mut out) (.message p))
+        (set! first false)))
+    (sb-finish! (mut out))))

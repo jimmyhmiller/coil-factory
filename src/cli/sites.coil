@@ -1,0 +1,331 @@
+(module factory.cli.sites)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.style" :as style)
+(import "ssh.exec" :as sshx)
+(import "ssh.target" :as target)
+(import "durable.lock" :as lock)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "agent.loop" :as loop)
+(import "factory.client" :as client)
+(import "factory.config" :use *)
+(import "factory.events" :use [preview])
+(import "factory.git" :use *)
+(import "factory.proc" :use *)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use *)
+
+;;; Starting and stopping the hub, and the machines it reaches.
+
+(defn site-line [(a (dyn Allocator)) (term style/Term) (site JVal)] (-> (ArrayList (slice u8)))
+  (let [(mut cells) (al-new [(slice u8)] a)
+        status (str-field site "status")
+        up (= status "up")]
+    (push! [(slice u8)] (mut cells) (if up (style/ok a term "●") (if (= status "connecting") (style/warn a term "◌") (style/err a term "●"))))
+    (push! [(slice u8)] (mut cells) (style/strong a term (str-field site "name")))
+    (push! [(slice u8)] (mut cells) (style/muted a term (if (= (str-field site "kind") "ssh") (str-field site "ssh") "this machine")))
+    (push! [(slice u8)] (mut cells) (if up (style/ok a term "up") (paint-fg a term (if (= status "connecting") (amber) (soft-red)) status)))
+    (push! [(slice u8)] (mut cells) (if up (join a [(int-text a (int-field site "running")) "/" (int-text a (int-field site "max_runs")) " running"]) ""))
+    (push! [(slice u8)] (mut cells) (if up (style/muted a term (join a [(str-field site "isolation") " · " (str-field site "default_model")])) ""))
+    (push! [(slice u8)] (mut cells) (truncate a (style/err a term (str-field site "error")) 60))
+    (load cells)))
+
+(defn print-sites [(ctx (ptr Ctx)) (sites JVal)] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut table) (style/table-new-headless a 7)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-count sites))
+              (break)
+              (do (style/table-row! (mut table) (al-slice [(slice u8)] (site-line a term (jv-nth sites (load i)))))
+                  (set! i (+ (load i) 1)))))
+    (print "{s}" (style/table-render a term (load table)))
+    0))
+
+(defn cmd-sites [(ctx (ptr Ctx))] (-> i64)
+  (match (get-json ctx "/v1/sites")
+    (FetchedFailed [code] code)
+    (FetchedOk [sites] (print-sites ctx sites))))
+
+;;; `factory status`: whether this machine's daemon is up, quietly.
+(defn cmd-status [(ctx (ptr Ctx))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (client/hub-get a (.hub ctx) "/v1/site")
+      (client/ReplyFailed [message]
+                          (do (say (join a [(style/err a term "●") " factory is not running here  " (style/muted a term "(factory up)")])) 3))
+      (client/ReplyOk [status body text]
+                      (if (= status 200)
+                          (do (say (join a [(style/ok a term "●") " " (style/strong a term (str-field body "name"))
+                                            " is up  " (style/muted a term (join a [(int-text a (int-field body "running")) " running · "
+                                                                                    (int-text a (int-field body "runs")) " runs · port "
+                                                                                    (int-text a (.port (field ctx config)))]))]))
+                              0)
+                          (do (say (join a [(style/err a term "●") " something else answers on port "
+                                            (int-text a (.port (field ctx config)))]))
+                              3))))))
+
+;;; Wait up to `ms` for the hub to answer.
+(defn wait-for-hub [(ctx (ptr Ctx)) (ms i64)] (-> bool)
+  (let [(mut waited) 0
+        (mut up) false]
+    (loop (if (or (load up) (>= (load waited) ms))
+              (break)
+              (do
+                ;; A fresh site creates its token when the daemon first starts.
+                (set! (.token (field ctx hub)) (client/read-token (.allocator ctx) (.home ctx)))
+                (if (hub-up? ctx)
+                    (set! up true)
+                    (do (loop/sleep-ms 100) (set! waited (+ (load waited) 100)))))))
+    (load up)))
+
+(defn cmd-up [(ctx (ptr Ctx)) (quiet bool)] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        already (hub-up? ctx)]
+    (block :up
+           (when (not already)
+             (let [child (spawn-detached a (self-executable a) ["daemon" "--background"])]
+               (when (< child 0)
+                 (return-from :up (fail-with ctx "could not start the daemon")))
+               (when (not (wait-for-hub ctx 8000))
+                 (fail-with ctx "the daemon did not come up")
+                 (hint ctx (join a ["  its log: " (path-join a (.home ctx) "daemon.log")]))
+                 (return-from :up 1))
+               0))
+           (when quiet (return-from :up 0))
+           (say (join a [(paint-bold a term (violet) "◆ factory") "  "
+                         (if already "already running" "started") (style/muted a term (join a ["  127.0.0.1:" (int-text a (.port (field ctx config)))]))]))
+           ;; Remote tunnels take a moment on a fresh start.
+           (when (not already) (loop/sleep-ms 1200) 0)
+           (match (get-json ctx "/v1/sites")
+             (FetchedFailed [code] (return-from :up code))
+             (FetchedOk [sites] (print-sites ctx sites)))
+           (say "")
+           (say (join a [(style/muted a term "  next  ") (style/accent a term "factory") (style/muted a term "                     the dashboard")]))
+           (say (join a [(style/muted a term "        ") (style/accent a term "factory start haiku") (style/muted a term "         a first, tiny run")]))
+           (say (join a [(style/muted a term "        ") (style/accent a term "factory new NAME") (style/muted a term "            design your own factory")]))
+           0)))
+
+(defn cmd-down [(ctx (ptr Ctx))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        pid-path (path-join a (.home ctx) "daemon.pid")]
+    (match (lock/pid-read a pid-path)
+      (Err [failure] (fail-with ctx "cannot read daemon.pid"))
+      (Ok [found]
+          (match found
+            (None [] (do (say (style/muted a term "factory is not running")) 0))
+            (Some [daemon-pid]
+                  (if (not (signal-process daemon-pid 15))
+                      (do (say (style/muted a term "factory is not running")) 0)
+                      (let [(mut waited) 0]
+                        (loop (if (or (not (process-alive? daemon-pid)) (>= (load waited) 10000))
+                                  (break)
+                                  (do (loop/sleep-ms 100) (set! waited (+ (load waited) 100)))))
+                        (if (process-alive? daemon-pid)
+                            (fail-with ctx "the daemon did not stop within 10 seconds")
+                            (do (say (join a [(style/ok a term "✓") " factory stopped"
+                                              (style/muted a term "  (runs keep going; the next `factory up` adopts them)")]))
+                                0))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Remote machines
+
+(defn ssh-target-or-fail [(ctx (ptr Ctx)) (text (slice u8))] (-> (Option target/Target))
+  (match (target/parse-target text)
+    (Ok [t] (Some t))
+    (Err [message] (do (fail-with ctx (join (.allocator ctx) ["bad ssh destination \"" text "\": " message])) (None)))))
+
+(defstruct Remote [(ok bool) (exit i64) (out (slice u8)) (err (slice u8))])
+
+(defn remote [(ctx (ptr Ctx)) (t target/Target) (command (slice u8)) (stdin (Option (slice u8))) (timeout-ms i64)] (-> Remote)
+  (let [a (.allocator ctx)]
+    (match (sshx/ssh-run a t (sshx/ssh-options) command stdin timeout-ms)
+      (Err [failure] (Remote :ok false :exit -1 :out "" :err (sshx/ssh-error-message a failure)))
+      (Ok [ran] (let [r ran]
+                  (Remote :ok (sshx/ssh-result-ok? r) :exit (.exit-code r) :out (.stdout r)
+                          :err (if (.timed-out r) "timed out" (.stderr r))))))))
+
+(defn step [(ctx (ptr Ctx)) (text (slice u8))] (-> i64)
+  (let [a (.allocator ctx)]
+    (say (join a [(style/muted a (.out ctx) "  · ") text]))))
+
+(defn step-done [(ctx (ptr Ctx)) (text (slice u8))] (-> i64)
+  (let [a (.allocator ctx)]
+    (say (join a [(style/ok a (.out ctx) "  ✓ ") text]))))
+
+(defn remote-failed [(ctx (ptr Ctx)) (what (slice u8)) (r Remote)] (-> i64)
+  (let [a (.allocator ctx)]
+    (fail-with ctx what)
+    (let [detail (str-trim (join a [(.err r) "\n" (.out r)]))]
+      (when (> (len detail) 0) (hint ctx (preview a detail 3000)) 0))
+    1))
+
+;;; `factory site add NAME --ssh HOST [--sandbox] [--port N]`
+(defn cmd-site-add [(ctx (ptr Ctx)) (name (slice u8)) (ssh (slice u8)) (sandbox bool) (port i64)] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (block :add
+           (when (not (hub-up? ctx)) (return-from :add (hub-down-message ctx)))
+           (let [t (match (ssh-target-or-fail ctx ssh) (Some [t] t) (None [] (return-from :add 1)))]
+             (say (join a ["Adding " (style/strong a term name) (style/muted a term (join a [" (" ssh ")"]))]))
+             (let [probe (remote ctx t "test -x ~/.factory/bin/factory && echo installed || echo missing" (None) 30000)]
+               (when (not (.ok probe)) (return-from :add (remote-failed ctx (join a ["cannot run commands on " ssh " over ssh"]) probe)))
+               (when (not (= (str-trim (.out probe)) "installed"))
+                 (fail-with ctx (join a ["factory is not installed on " ssh]))
+                 (hint ctx (join a ["  install it first:  factory site install " name " --ssh " ssh]))
+                 (return-from :add 1))
+               (step-done ctx "factory is installed there"))
+             (let [config (join a ["mkdir -p ~/.factory && chmod 700 ~/.factory && if [ ! -f ~/.factory/site.json ]; then printf '%s' "
+                                   (sshx/shell-quote a (join a ["{\"name\": \"" name "\", \"isolation\": \"" (if sandbox "sandbox" "none") "\"}"]))
+                                   " > ~/.factory/site.json && echo created; else echo kept; fi"])
+                   made (remote ctx t config (None) 30000)]
+               (when (not (.ok made)) (return-from :add (remote-failed ctx "could not write the remote site.json" made)))
+               (if (= (str-trim (.out made)) "created")
+                   (step-done ctx (join a ["configured it" (if sandbox " (sandboxed)" "")]))
+                   (step ctx "kept its existing site.json"))
+               0)
+             (let [started (remote ctx t "~/.factory/bin/factory up --quiet" (None) 60000)]
+               (when (not (.ok started)) (return-from :add (remote-failed ctx "the remote daemon did not start" started)))
+               (step-done ctx "its daemon is running"))
+             (let [token (remote ctx t "cat ~/.factory/token" (None) 30000)]
+               (when (or (not (.ok token)) (= (len (str-trim (.out token))) 0))
+                 (return-from :add (remote-failed ctx "could not read the remote token" token)))
+               (let [body (jv-object a)]
+                 (jv-put! body "name" (JStr name))
+                 (jv-put! body "ssh" (JStr ssh))
+                 (jv-put! body "token" (JStr (str-trim (.out token))))
+                 (jv-put! body "port" (JInt port))
+                 (match (post-json ctx "/v1/sites" body)
+                   (FetchedFailed [code] (return-from :add code))
+                   (FetchedOk [sites] (step-done ctx "registered with this hub")))))
+             ;; Give the hub a moment to bring up the tunnel and read the site.
+             (let [(mut waited) 0
+                   (mut state) "connecting"]
+               (loop (if (or (not (= (load state) "connecting")) (>= (load waited) 20000))
+                         (break)
+                         (do (loop/sleep-ms 500)
+                             (set! waited (+ (load waited) 500))
+                             (match (client/hub-get a (.hub ctx) "/v1/sites")
+                               (client/ReplyOk [s sites text]
+                                               (let [(mut i) 0]
+                                                 (loop (if (>= (load i) (jv-count sites))
+                                                           (break)
+                                                           (do (when (= (str-field (jv-nth sites (load i)) "name") name)
+                                                                 (set! state (copy-bytes a (str-field (jv-nth sites (load i)) "status")))
+                                                                 0)
+                                                               (set! i (+ (load i) 1)))))
+                                                 0))
+                               (client/ReplyFailed [m] 0)))))
+               (say "")
+               (cmd-sites ctx)
+               (if (= (load state) "up")
+                   (do (say (join a ["\nRun something there:  " (style/accent a term (join a ["factory start haiku --on " name]))])) 0)
+                   1))))))
+
+(defn cmd-site-remove [(ctx (ptr Ctx)) (name (slice u8))] (-> i64)
+  (let [a (.allocator ctx)]
+    (match (post-json ctx (join a ["/v1/sites/" name "/remove"]) (jv-object a))
+      (FetchedFailed [code] code)
+      (FetchedOk [sites] (do (step-done ctx (join a ["removed " name " from this hub (its runs keep going there)"])) 0)))))
+
+;;; The target triple for a machine's `uname -sm`, or "".
+(defn triple-for [(uname (slice u8))] (-> (slice u8))
+  (cond (= uname "Linux x86_64") "x86_64-unknown-linux-gnu"
+        (= uname "Linux aarch64") "aarch64-unknown-linux-gnu"
+        (= uname "Darwin arm64") "arm64-apple-macosx11.0.0"
+        (= uname "Darwin x86_64") "x86_64-apple-macosx11.0.0"
+        :else ""))
+
+;;; `factory site install NAME --ssh HOST [--source DIR]`: compile factory for
+;;; the remote machine here, ship the object, and link it there. The remote
+;;; machine needs only a C toolchain's `cc` and libcurl, not Coil.
+(defn cmd-site-install [(ctx (ptr Ctx)) (name (slice u8)) (ssh (slice u8)) (source (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (block :install
+           (let [t (match (ssh-target-or-fail ctx ssh) (Some [t] t) (None [] (return-from :install 1)))
+                 root (match (git-toplevel a (if (> (len source) 0) source "."))
+                        (Some [top] top)
+                        (None [] (return-from :install (fail-with ctx "run this inside the factory source checkout, or pass --source DIR"))))
+                 app root]
+             (match (atomic/file-exists? a (path-join a app "Coil.toml"))
+               (Ok [exists] (when (not exists) (return-from :install (fail-with ctx (join a [root " is not the factory source (no Coil.toml)"])))))
+               (Err [e] (return-from :install (fail-with ctx (join a ["cannot read " app])))))
+             (say (join a ["Installing factory on " (style/strong a term name) (style/muted a term (join a [" (" ssh ") from " root " @ " (git-short a root "HEAD")]))]))
+             (let [probe (remote ctx t "uname -sm; command -v cc >/dev/null && echo cc-ok || echo cc-missing" (None) 30000)]
+               (when (not (.ok probe)) (return-from :install (remote-failed ctx (join a ["cannot run commands on " ssh " over ssh"]) probe)))
+               (let [lines (str-split a (str-trim (.out probe)) "\n")
+                     uname (str-trim (get lines 0))
+                     triple (triple-for uname)
+                     linux (starts-with uname "Linux")]
+                 (when (= (len triple) 0)
+                   (return-from :install (fail-with ctx (join a ["factory does not know how to build for \"" uname "\""]))))
+                 (when (not (= (str-trim (get lines (- (len lines) 1))) "cc-ok"))
+                   (fail-with ctx "the remote machine has no `cc` to link with")
+                   (hint ctx "  install a C toolchain there (build-essential on Debian/Ubuntu) and libcurl's development package")
+                   (return-from :install 1))
+                 (step-done ctx (join a [uname " → " triple]))
+                 (let [object (path-join a (.home ctx) (join a ["factory-" triple ".o"]))
+                       compiled (capture-limited a "coil" ["emit-obj" "src/main.coil" "--target" triple "-o" object] app 900000 16777216)]
+                   (when (not (.ok compiled))
+                     (fail-with ctx "compiling for the remote machine failed")
+                     (hint ctx (preview a (str-trim (join a [(.error compiled) "\n" (.output compiled)])) 3000))
+                     (return-from :install 1))
+                   (let [bytes (match (atomic/read-file-if-exists a object)
+                                 (Ok [found] (match found (Some [b] b) (None [] "")))
+                                 (Err [e] ""))]
+                     (when (= (len bytes) 0) (return-from :install (fail-with ctx "the compiled object is missing")))
+                     (step-done ctx (join a ["compiled here (" (style/human-bytes a (len bytes)) ")"]))
+                     (let [link (join a ["set -e; mkdir -p ~/.factory/bin; cat > ~/.factory/bin/factory.o; cd ~/.factory/bin; "
+                                         "cc factory.o -o factory.new -lcurl -lpthread -lm" (if linux " -ldl" "")
+                                         " 2>&1; mv factory.new factory; rm -f factory.o"])
+                           linked (remote ctx t link (Some bytes) 600000)]
+                       (atomic/unlink-path a object)
+                       (when (not (.ok linked)) (return-from :install (remote-failed ctx "linking on the remote machine failed" linked)))
+                       (step-done ctx "linked ~/.factory/bin/factory there")))))
+               (let [check (remote ctx t "~/.factory/bin/factory --version" (None) 30000)]
+                 (when (not (.ok check)) (return-from :install (remote-failed ctx "the installed binary does not run" check)))
+                 (step-done ctx (join a ["runs: " (str-trim (.out check))])))
+               (say (join a ["\nNext:  " (style/accent a term (join a ["factory site add " name " --ssh " ssh]))]))
+               0)))))
+
+;;; `factory site secrets NAME VAR...`: copy each variable's value from this
+;;; shell into the remote site's secrets.env (0600), over ssh stdin.
+(defn cmd-site-secrets [(ctx (ptr Ctx)) (name (slice u8)) (vars (slice (slice u8)))] (-> i64)
+  (let [a (.allocator ctx)]
+    (block :secrets
+           (let [ssh (match (get-json ctx "/v1/sites")
+                       (FetchedFailed [code] (return-from :secrets code))
+                       (FetchedOk [sites]
+                                  (let [(mut found) ""
+                                        (mut i) 0]
+                                    (loop (if (>= (load i) (jv-count sites))
+                                              (break)
+                                              (do (when (= (str-field (jv-nth sites (load i)) "name") name)
+                                                    (set! found (str-field (jv-nth sites (load i)) "ssh"))
+                                                    0)
+                                                  (set! i (+ (load i) 1)))))
+                                    (load found))))]
+             (when (= (len ssh) 0)
+               (return-from :secrets (fail-with ctx (join a ["no remote site named \"" name "\" (`factory sites`)"]))))
+             (let [t (match (ssh-target-or-fail ctx ssh) (Some [t] t) (None [] (return-from :secrets 1)))]
+               (for var (iter vars)
+                 (let [value (env-or a var "")]
+                   (if (= (len value) 0)
+                       (do (fail-with ctx (join a [var " is not set in this shell"])) 0)
+                       (let [script (join a ["set -e; umask 077; mkdir -p ~/.factory; f=~/.factory/secrets.env; touch \"$f\"; grep -v '^"
+                                             var "=' \"$f\" > \"$f.tmp\" || true; cat >> \"$f.tmp\"; mv \"$f.tmp\" \"$f\""])
+                             r (remote ctx t script (Some (join a [var "=" value "\n"])) 30000)]
+                         (if (.ok r)
+                             (step-done ctx (join a [var " → " name]))
+                             (remote-failed ctx (join a ["could not store " var]) r))
+                         0))))
+               (hint ctx "  a running remote daemon reads secrets.env when each run starts; no restart needed")
+               0)))))

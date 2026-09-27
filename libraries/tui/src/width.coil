@@ -1,0 +1,386 @@
+(module tui.width)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [string-view-unchecked])
+(import "coil.unicode.grapheme" :use [grapheme-next-offset])
+(import "tui.fatal" :use [fatal])
+(import "tui.width.tables" :use [ZERO-WIDTH-RANGES WIDE-RANGES])
+
+;;; U+FFFD, substituted for every byte that does not begin a valid UTF-8 sequence.
+(const REPLACEMENT-RUNE 0xFFFD)
+
+;;; One decoded scalar. `valid` is false for a malformed sequence, in which case
+;;; `rune` is U+FFFD and `len` is 1 (the decoder resynchronizes on the next byte).
+(defstruct Utf8Decoded [(rune i64) (len i64) (valid bool)])
+
+;;; The sequence length announced by a UTF-8 lead byte: 1-4, or 0 when `lead` is
+;;; a continuation byte or can never start a well-formed sequence.
+(defn utf8-sequence-length [(lead u8)] (-> i64)
+  (let [b (cast i64 lead)]
+    (cond (< b 0x80) 1
+          (< b 0xC2) 0
+          (< b 0xE0) 2
+          (< b 0xF0) 3
+          (< b 0xF5) 4
+          :else 0)))
+
+(defn utf8--cont? [(bytes (slice u8)) (at i64)] (-> bool)
+  (and (< at (len bytes))
+       (= (primitive/iand (cast i64 (get bytes at)) 0xC0) 0x80)))
+
+(defn utf8--invalid [] (-> Utf8Decoded)
+  (Utf8Decoded
+    :rune REPLACEMENT-RUNE
+    :len 1
+    :valid false))
+
+;;; Decode the scalar starting at byte `at`. Rejects overlong forms, surrogates,
+;;; values above U+10FFFF and truncated sequences. `at` must be inside `bytes`.
+(defn utf8-decode [(bytes (slice u8)) (at i64)] (-> Utf8Decoded)
+  (when (or (< at 0) (>= at (len bytes)))
+    (fatal "utf8-decode: offset outside the byte slice"))
+  (let [lead (cast i64 (get bytes at))
+        n (utf8-sequence-length (get bytes at))]
+    (cond (= n 1)
+            (Utf8Decoded
+              :rune lead
+              :len 1
+              :valid true)
+          (= n 0) (utf8--invalid)
+          (not (utf8--cont? bytes (+ at 1))) (utf8--invalid)
+          (= n 2)
+            (Utf8Decoded
+              :rune
+                (primitive/ior (primitive/ishl (primitive/iand lead 0x1F) 6)
+                               (primitive/iand (cast i64 (get bytes (+ at 1)))
+                                               0x3F))
+              :len 2
+              :valid true)
+          (not (utf8--cont? bytes (+ at 2))) (utf8--invalid)
+          (= n 3)
+            (let [rune
+                    (primitive/ior (primitive/ior (primitive/ishl (primitive/iand lead
+                                                                                  0x0F)
+                                                                  12)
+                                                  (primitive/ishl (primitive/iand (cast i64
+                                                                                        (get bytes
+                                                                                             (+ at
+                                                                                                1)))
+                                                                                  0x3F)
+                                                                  6))
+                                   (primitive/iand (cast i64
+                                                         (get bytes (+ at 2)))
+                                                   0x3F))]
+              (if (or (< rune 0x800) (and (>= rune 0xD800) (<= rune 0xDFFF)))
+                  (utf8--invalid)
+                  (Utf8Decoded
+                    :rune rune
+                    :len 3
+                    :valid true)))
+          (not (utf8--cont? bytes (+ at 3))) (utf8--invalid)
+          :else
+            (let [rune
+                    (primitive/ior (primitive/ior (primitive/ishl (primitive/iand lead
+                                                                                  0x07)
+                                                                  18)
+                                                  (primitive/ishl (primitive/iand (cast i64
+                                                                                        (get bytes
+                                                                                             (+ at
+                                                                                                1)))
+                                                                                  0x3F)
+                                                                  12))
+                                   (primitive/ior (primitive/ishl (primitive/iand (cast i64
+                                                                                        (get bytes
+                                                                                             (+ at
+                                                                                                2)))
+                                                                                  0x3F)
+                                                                  6)
+                                                  (primitive/iand (cast i64
+                                                                        (get bytes
+                                                                             (+ at
+                                                                                3)))
+                                                                  0x3F)))]
+              (if (or (< rune 0x10000) (> rune 0x10FFFF))
+                  (utf8--invalid)
+                  (Utf8Decoded
+                    :rune rune
+                    :len 4
+                    :valid true))))))
+
+;;; True when `rune` is a Unicode scalar value (not a surrogate, at most U+10FFFF).
+(defn rune-valid? [(rune i64)] (-> bool)
+  (and (>= rune 0)
+       (<= rune 0x10FFFF)
+       (not (and (>= rune 0xD800) (<= rune 0xDFFF)))))
+
+;;; Number of bytes `rune` occupies in UTF-8. Aborts on a non-scalar.
+(defn utf8-encoded-len [(rune i64)] (-> i64)
+  (cond (not (rune-valid? rune))
+          (fatal "utf8-encoded-len: not a Unicode scalar value")
+        (< rune 0x80) 1
+        (< rune 0x800) 2
+        (< rune 0x10000) 3
+        :else 4))
+
+;;; Write the UTF-8 encoding of `rune` into `out` (which must have room for 4
+;;; bytes) and return the byte count. Aborts on a non-scalar.
+(defn utf8-encode-into [(out (ptr u8)) (rune i64)] (-> i64)
+  (let [n (utf8-encoded-len rune)]
+    (case n 1
+          (set! out (cast u8 rune)) 2
+          (do
+            (set! out (cast u8 (primitive/ior 0xC0 (primitive/ishr rune 6))))
+            (set! (index out 1)
+                  (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F)))))
+            3
+          (do
+            (set! out (cast u8 (primitive/ior 0xE0 (primitive/ishr rune 12))))
+            (set! (index out 1)
+                  (cast u8
+                        (primitive/ior 0x80
+                                       (primitive/iand (primitive/ishr rune 6)
+                                                       0x3F))))
+            (set! (index out 2)
+                  (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F)))))
+            (do
+              (set! out (cast u8 (primitive/ior 0xF0 (primitive/ishr rune 18))))
+              (set! (index out 1)
+                    (cast u8
+                          (primitive/ior 0x80
+                                         (primitive/iand (primitive/ishr rune
+                                                                         12)
+                                                         0x3F))))
+              (set! (index out 2)
+                    (cast u8
+                          (primitive/ior 0x80
+                                         (primitive/iand (primitive/ishr rune 6)
+                                                         0x3F))))
+              (set! (index out 3)
+                    (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F))))))
+    n))
+
+;;; Append the UTF-8 encoding of `rune` to `out`. Aborts on a non-scalar.
+(defn utf8-encode! [(out (mut (ArrayList u8))) (rune i64)] (-> i64)
+  (let [(mut buf) (zeroed (array u8 4))
+        n (utf8-encode-into (index buf 0) rune)]
+    (al-extend! (mut out) (index buf 0) n)
+    n))
+
+;;; End offset of the longest well-formed UTF-8 run starting at `at`.
+(defn utf8-valid-run-end [(bytes (slice u8)) (at i64)] (-> i64)
+  (let [(mut i) at
+        n (len bytes)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [b (cast i64 (get bytes (load i)))]
+                (if (< b 0x80)
+                    (set! i (+ (load i) 1))
+                    (let [d (utf8-decode bytes (load i))]
+                      (if (.valid d)
+                          (set! i (+ (load i) (.len d)))
+                          (break)))))))
+    (load i)))
+
+(defn width--in-ranges? [(table (slice (array i64 2))) (rune i64)] (-> bool)
+  ;; Read the pairs through a flat i64 view: `get` on a slice of arrays currently
+  ;; miscompiles (see README, "Known compiler issues").
+  (let [flat (cast (ptr i64) (slice-data table))
+        (mut lo) 0
+        (mut hi) (- (len table) 1)
+        (mut found) false]
+    (loop (if (> (load lo) (load hi))
+              (break)
+              (let [mid (/ (+ (load lo) (load hi)) 2)
+                    first (load (index flat (* mid 2)))
+                    last (load (index flat (+ (* mid 2) 1)))]
+                (cond (< rune first) (set! hi (- mid 1))
+                      (> rune last) (set! lo (+ mid 1))
+                      :else (do (set! found true) (break))))))
+    (load found)))
+
+;;; C0/C1 control characters and DEL. They occupy no cells and are never drawn.
+(defn rune-control? [(rune i64)] (-> bool)
+  (or (< rune 0x20) (and (>= rune 0x7F) (<= rune 0x9F))))
+
+;;; Terminal cell width of one scalar in isolation: 0 for controls, combining
+;;; marks, format characters (including ZWJ and variation selectors), 2 for East
+;;; Asian Wide/Fullwidth and emoji-presentation scalars, 1 otherwise.
+(defn rune-width [(rune i64)] (-> i64)
+  (cond (and (>= rune 0x20) (< rune 0x7F)) 1
+        (rune-control? rune) 0
+        (width--in-ranges? ZERO-WIDTH-RANGES rune) 0
+        (width--in-ranges? WIDE-RANGES rune) 2
+        :else 1))
+
+;;; One extended grapheme cluster of a byte string: bytes [start, end), its
+;;; terminal width, and its first scalar (`rune`, U+FFFD for a malformed byte).
+;;; `single` is true when the cluster renders as exactly the scalar `rune` (a
+;;; malformed byte renders as U+FFFD, so it is `single` too).
+(defstruct Cluster [(start i64) (end i64) (width i64) (rune i64) (single bool)])
+
+;;; Iterator over the grapheme clusters of arbitrary bytes. Well-formed UTF-8 is
+;;; segmented per UAX #29; each malformed byte becomes its own U+FFFD cluster.
+(defstruct ClusterIter [(text (slice u8)) (offset i64) (valid-end i64)])
+
+(defn clusters [(text (slice u8))] (-> ClusterIter)
+  (ClusterIter
+    :text text
+    :offset 0
+    :valid-end 0))
+
+(defn width--regional-indicator? [(rune i64)] (-> bool)
+  (and (>= rune 0x1F1E6) (<= rune 0x1F1FF)))
+
+;;; Width of a multi-scalar cluster: that of its base, widened to 2 by an emoji
+;;; presentation selector (U+FE0F) or a regional-indicator pair (a flag).
+(defn width--cluster-width [(text (slice u8)) (start i64) (end i64) (base i64)] (-> i64)
+  (let [base-width (rune-width base)]
+    (if (or (= base-width 2) (rune-control? base))
+        base-width
+        (let [(mut at) start
+              (mut width) base-width
+              (mut regional) 0]
+          (loop (if (>= (load at) end)
+                    (break)
+                    (let [d (utf8-decode text (load at))]
+                      (when (= (.rune d) 0xFE0F) (set! width 2))
+                      (when (width--regional-indicator? (.rune d))
+                        (set! regional (+ (load regional) 1)))
+                      (set! at (+ (load at) (.len d))))))
+          (if (>= (load regional) 2) 2 (load width))))))
+
+;;; Advance to the next cluster, or None at the end of the text.
+(defn cluster-next! [(it (mut ClusterIter))] (-> (Option Cluster))
+  (let [text (.text it)
+        n (len text)
+        start (.offset it)]
+    (if (>= start n)
+        (None)
+        (let [b (cast i64 (get text start))]
+          (cond ;; ASCII followed by ASCII (or the end) always breaks, except CR LF.
+                (and (< b 0x80)
+                     (or (= (+ start 1) n)
+                         (and (< (cast i64 (get text (+ start 1))) 0x80)
+                              (not (and (= b 13)
+                                        (= (cast i64 (get text (+ start 1))) 10))))))
+                  (do
+                    (set! (.offset it) (+ start 1))
+                    (Some (Cluster
+                            :start start
+                            :end (+ start 1)
+                            :width (rune-width b)
+                            :rune b
+                            :single true)))
+                :else
+                  (do
+                    (when (<= (.valid-end it) start)
+                      (set! (.valid-end it) (utf8-valid-run-end text start)))
+                    (if (= (.valid-end it) start)
+                        (do
+                          (set! (.offset it) (+ start 1))
+                          (Some (Cluster
+                                  :start start
+                                  :end (+ start 1)
+                                  :width 1
+                                  :rune REPLACEMENT-RUNE
+                                  :single true)))
+                        (let [view
+                                (string-view-unchecked (subslice text
+                                                                 0
+                                                                 (.valid-end it)))
+                              end (grapheme-next-offset view start)
+                              first (utf8-decode text start)
+                              single (= (+ start (.len first)) end)]
+                          (set! (.offset it) end)
+                          (Some (Cluster
+                                  :start start
+                                  :end end
+                                  :width
+                                    (if single
+                                        (rune-width (.rune first))
+                                        (width--cluster-width text
+                                                              start
+                                                              end
+                                                              (.rune first)))
+                                  :rune (.rune first)
+                                  :single single))))))))))
+
+;;; Display width in terminal cells of UTF-8 text (grapheme aware).
+(defn text-width [(text (slice u8))] (-> i64)
+  (let [(mut it) (clusters text)
+        (mut total) 0]
+    (loop (match (cluster-next! (mut it))
+            (None [] (break))
+            (Some [(Cluster :width w)] (set! total (+ (load total) w)))))
+    (load total)))
+
+;;; A byte prefix of some text together with its display width.
+(defstruct WidthPrefix [(bytes i64) (width i64)])
+
+;;; The longest whole-cluster prefix of `text` whose width is at most `max-width`.
+(defn prefix-within-width [(text (slice u8)) (max-width i64)] (-> WidthPrefix)
+  (let [(mut it) (clusters text)
+        (mut bytes) 0
+        (mut width) 0]
+    (loop (match (cluster-next! (mut it))
+            (None [] (break))
+            (Some [(Cluster :width w :end end)]
+                  (if (> (+ (load width) w) max-width)
+                      (break)
+                      (do
+                        (set! bytes end)
+                        (set! width (+ (load width) w)))))))
+    (WidthPrefix :bytes (load bytes) :width (load width))))
+
+(const ELLIPSIS "…")
+
+;;; `text` cut to at most `max-width` cells. With `ellipsis`, a cut string ends in
+;;; "…" (still within `max-width`). The result borrows `text` when no ellipsis is
+;;; added and is allocated from `a` otherwise, so pass a per-frame scratch
+;;; allocator. A negative `max-width` is treated as 0.
+(defn truncate-to-width [(a (dyn Allocator))
+                         (text (slice u8))
+                         (max-width i64)
+                         (ellipsis bool)] (-> (slice u8))
+  (let [limit (if (< max-width 0) 0 max-width)]
+    (if (<= (text-width text) limit)
+        text
+        (if (or (not ellipsis) (< limit 1))
+            (let [keep (prefix-within-width text limit)]
+              (subslice text 0 (.bytes keep)))
+            (let [keep (prefix-within-width text (- limit 1))
+                  (mut out) (al-new [u8] a)]
+              (al-extend! (mut out) (slice-data text) (.bytes keep))
+              (al-extend! (mut out) (slice-data ELLIPSIS) (len ELLIPSIS))
+              (al-into-slice (mut out)))))))
+
+;;; `text` truncated (with "…") and then right-padded with spaces to exactly
+;;; `width` cells. Allocated from `a` whenever padding or an ellipsis is needed.
+(defn pad-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+  (let [cut (truncate-to-width a text width true)
+        w (text-width cut)]
+    (if (>= w width)
+        cut
+        (let [(mut out) (al-new [u8] a)
+              (mut i) w]
+          (al-extend! (mut out) (slice-data cut) (len cut))
+          (loop (if (>= (load i) width)
+                    (break)
+                    (do (push! (mut out) (cast u8 32)) (set! i (+ (load i) 1)))))
+          (al-into-slice (mut out))))))
+
+;;; Like `pad-to-width`, but pads on the left (right-aligned text).
+(defn pad-left-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+  (let [cut (truncate-to-width a text width true)
+        w (text-width cut)]
+    (if (>= w width)
+        cut
+        (let [(mut out) (al-new [u8] a)
+              (mut i) w]
+          (loop (if (>= (load i) width)
+                    (break)
+                    (do (push! (mut out) (cast u8 32)) (set! i (+ (load i) 1)))))
+          (al-extend! (mut out) (slice-data cut) (len cut))
+          (al-into-slice (mut out))))))

@@ -1,0 +1,7 @@
+[package]
+name = "sse"
+source-roots = ["src", "tests"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

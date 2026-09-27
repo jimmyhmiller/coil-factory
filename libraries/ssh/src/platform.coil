@@ -1,0 +1,16 @@
+;; Internal: compile-time platform selection. Kept in its own module so the
+;; macro's compilation for the metaprogram engine pulls in nothing else.
+(module ssh.platform)
+(import "coil.primitive" :as primitive)
+
+(export platform-pick)
+
+;;; Expand to `linux` when compiling for Linux and to `darwin` otherwise; the
+;;; choice follows the target being built, not the machine building it.
+;;;
+;;; `primitive/code-eq` is deliberate. `coil lint` suggests `=`, but a macro
+;;; comparing Code with `=` cannot currently be compiled into the metaprogram
+;;; engine (the `Eq` impl drags in `coil.slice/slice-new`, whose debug-check
+;;; macro is then called as a function), so that rewrite breaks the build.
+(defn platform-pick [(linux Code) (darwin Code)] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux) linux darwin))

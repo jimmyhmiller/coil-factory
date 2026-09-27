@@ -1,0 +1,176 @@
+(module factory.config)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "factory.proc" :use *)
+
+;;; Where a site keeps its state, and how it is configured.
+;;;
+;;;     ~/.factory/            (FACTORY_HOME overrides)
+;;;       site.json            this site's configuration
+;;;       secrets.env          KEY=value lines, read when the environment lacks a key
+;;;       token                bearer token for this site's API
+;;;       sites.json           remote sites this hub reaches
+;;;       factories/*.md       the site's factory library
+;;;       runs/<id>/…          one directory per run
+
+(defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) base)
+    (when (and (> (len base) 0) (!= (cast i64 (get base (- (len base) 1))) 47))
+      (sb-push-str! (mut out) "/")
+      0)
+    (sb-push-str! (mut out) child)
+    (sb-finish! (mut out))))
+
+(defn factory-home [(a (dyn Allocator))] (-> (slice u8))
+  (let [explicit (env-or a "FACTORY_HOME" "")]
+    (if (> (len explicit) 0)
+        explicit
+        (path-join a (env-or a "HOME" "/tmp") ".factory"))))
+
+(defn runs-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "runs"))
+
+(defn run-dir [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+  (path-join a (runs-dir a home) run-id))
+
+(defn run-file [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8)) (name (slice u8))] (-> (slice u8))
+  (path-join a (run-dir a home run-id) name))
+
+(defn events-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+  (run-file a home run-id "events.jsonl"))
+
+(defn workspace-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+  (run-file a home run-id "workspace"))
+
+(defn transcript-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8)) (agent (slice u8))] (-> (slice u8))
+  (let [(mut name) (sb-new a)]
+    (sb-push-str! (mut name) "agents/")
+    (sb-push-str! (mut name) agent)
+    (sb-push-str! (mut name) ".json")
+    (run-file a home run-id (sb-finish! (mut name)))))
+
+(defn factories-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "factories"))
+
+;;; An OpenAI-compatible server declared in site.json.
+(defstruct ProviderDecl
+  [(name (slice u8))
+   (base-url (slice u8))
+   (key-env (slice u8))])
+
+(defstruct SiteConfig
+  [(home (slice u8))
+   (name (slice u8))
+   (port i64)
+   (max-runs i64)
+   ;;; none | sandbox
+   (isolation (slice u8))
+   (default-model (slice u8))
+   ;;; observe | nudge | pause
+   (overseer-policy (slice u8))
+   (overseer-model (slice u8))
+   (overseer-interval-s i64)
+   (providers (ArrayList ProviderDecl))])
+
+(defn read-text [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
+  (match (fs/read-file a path)
+    (Ok [bytes] (Some bytes))
+    (Err [failure] (None))))
+
+(defn json-str-or [(object JVal) (key (slice u8)) (fallback (slice u8))] (-> (slice u8))
+  (match (jv-get object key)
+    (JStr [s] (if (> (len s) 0) s fallback))
+    (_ fallback)))
+
+(defn json-int-or [(object JVal) (key (slice u8)) (fallback i64)] (-> i64)
+  (match (jv-get object key)
+    (JInt [n] n)
+    (_ fallback)))
+
+(defn hostname [(a (dyn Allocator))] (-> (slice u8))
+  (match (capture-line a "hostname" ["-s"] "")
+    (Some [name] (if (> (len name) 0) name "local"))
+    (None [] "local")))
+
+;;; The site's configuration: site.json when present, otherwise defaults.
+;;; A malformed site.json is an error the operator must fix, never ignored.
+(defsum SiteConfigResult
+  (SiteConfigOk [(config SiteConfig)])
+  (SiteConfigBad [(message (slice u8))]))
+
+(defn load-site-config [(a (dyn Allocator)) (home (slice u8))] (-> SiteConfigResult)
+  (let [(mut config) (primitive/zeroed SiteConfig)
+        path (path-join a home "site.json")]
+    (set! (.home config) home)
+    (set! (.providers config) (al-new [ProviderDecl] a))
+    (let [root (match (read-text a path)
+                 (None [] (Some (jv-object a)))
+                 (Some [text] (jv-parse a text)))]
+      (match root
+        (None [] (SiteConfigBad "site.json is not valid JSON"))
+        (Some [object]
+              (do
+                (set! (.name config) (json-str-or object "name" (hostname a)))
+                (set! (.port config) (json-int-or object "port" 7788))
+                (set! (.max-runs config) (json-int-or object "max_runs" 4))
+                (set! (.isolation config) (json-str-or object "isolation" "none"))
+                (set! (.default-model config)
+                      (json-str-or object "default_model" "deepseek/deepseek-v4-flash"))
+                (let [overseer (jv-get object "overseer")]
+                  (set! (.overseer-policy config) (json-str-or overseer "policy" "nudge"))
+                  (set! (.overseer-model config)
+                        (json-str-or overseer "model" (.default-model config)))
+                  (set! (.overseer-interval-s config) (json-int-or overseer "interval_seconds" 20)))
+                (let [providers (jv-get object "providers")
+                      n (jv-count providers)
+                      (mut i) 0]
+                  (loop (if (>= (load i) n)
+                            (break)
+                            (let [entry (jv-nth providers (load i))
+                                  (mut decl) (primitive/zeroed ProviderDecl)]
+                              (set! (.name decl) (json-str-or entry "name" ""))
+                              (set! (.base-url decl) (json-str-or entry "base_url" ""))
+                              (set! (.key-env decl) (json-str-or entry "key_env" ""))
+                              (push! [ProviderDecl] (mut (.providers config)) (load decl))
+                              (set! i (+ (load i) 1))))))
+                (cond (not (or (= (.isolation config) "none") (= (.isolation config) "sandbox")))
+                        (SiteConfigBad "site.json: isolation must be \"none\" or \"sandbox\"")
+                      (not (or (= (.overseer-policy config) "observe")
+                               (= (.overseer-policy config) "nudge")
+                               (= (.overseer-policy config) "pause")))
+                        (SiteConfigBad "site.json: overseer.policy must be observe, nudge, or pause")
+                      (< (.max-runs config) 1)
+                        (SiteConfigBad "site.json: max_runs must be at least 1")
+                      :else (SiteConfigOk (load config)))))))))
+
+;;; A secret by name: the environment first, then `secrets.env` in the site
+;;; home (`NAME=value` lines; `#` comments). "" when absent.
+(defn secret [(a (dyn Allocator)) (home (slice u8)) (name (slice u8))] (-> (slice u8))
+  (let [from-env (env-or a name "")]
+    (if (> (len from-env) 0)
+        from-env
+        (match (read-text a (path-join a home "secrets.env"))
+          (None [] "")
+          (Some [text]
+                (let [lines (str-split a text "\n")
+                      (mut found) ""]
+                  (for raw (iter lines)
+                    (let [line (str-trim raw)]
+                      (when (and (> (len line) 0)
+                                 (!= (cast i64 (get line 0)) 35)
+                                 (= (len (load found)) 0))
+                        (match (str-find line "=")
+                          (Some [at]
+                                (when (= (str-trim (subslice [u8] line 0 at)) name)
+                                  (set! found (str-trim (subslice [u8] line (+ at 1) (len line))))
+                                  0))
+                          (None [] 0))
+                        0)))
+                  (load found)))))))

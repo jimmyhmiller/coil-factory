@@ -1,0 +1,46 @@
+(module factory.ui-fmt-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "factory.ui.fmt" :use *)
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern tzset :cc c [] (-> void))
+
+(deftest formats-times-durations-and-tokens
+         (let [a (malloc-allocator)]
+           (setenv c"TZ" c"UTC" 1)
+           (tzset)
+           (assert (= (fmt-clock a 1790476449080 true) "02:34:09"))
+           (assert (= (fmt-clock a 1790476449080 false) "02:34"))
+           (assert (= (fmt-age a 2000) "now"))
+           (assert (= (fmt-age a 42000) "42s"))
+           (assert (= (fmt-age a 420000) "7m"))
+           (assert (= (fmt-age a 10800000) "3h"))
+           (assert (= (fmt-age a 180000000) "2d"))
+           (assert (= (fmt-duration a 45000) "45s"))
+           (assert (= (fmt-duration a 724000) "12m04s"))
+           (assert (= (fmt-duration a 11220000) "3h07m"))
+           (assert (= (fmt-tokens a 812) "812"))
+           (assert (= (fmt-tokens a 12345) "12.3k"))
+           (assert (= (fmt-tokens a 123456) "123k"))
+           (assert (= (fmt-tokens a 4100000) "4.1M"))))
+
+(deftest summarizes-tool-calls
+         (let [a (malloc-allocator)]
+           (assert (= (tool-subject a
+                                    "shell"
+                                    "{\"command\": \"coil test\\nmore\"}")
+                      "coil test"))
+           (assert (= (tool-subject a "edit_file" "{\"path\": \"src/x.coil\"}")
+                      "src/x.coil"))
+           (assert (= (tool-subject a "list_dir" "{}") "."))
+           (assert (= (tool-subject a "search" "{\"pattern\": \"TODO\"}")
+                      "\"TODO\""))
+           (assert (= (tool-subject a
+                                    "finish"
+                                    "{\"outcome\": \"done\", \"summary\": \"wrote it\\nmore\"}")
+                      "done: wrote it"))
+           (assert (= (tool-glyph "shell") "$"))
+           (assert (= (first-line "\n  hello  \nworld") "hello"))
+           (assert-eq (line-count "a\nb\n") 2)))

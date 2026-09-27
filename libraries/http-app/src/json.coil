@@ -1,0 +1,128 @@
+(module http_app.json)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "http_app.router" :use *)
+
+(defn json-content-type [] (-> (slice u8))
+  "application/json")
+
+;;; A buffered JSON response. `body` is already-encoded JSON text and is borrowed.
+(defn json-response [(status i64) (body (slice u8))] (-> Response)
+  (response status (json-content-type) body))
+
+(defn continuation? [(b i64)] (-> bool)
+  (and (>= b 128) (<= b 191)))
+
+(defn byte-at [(s (slice u8)) (i i64)] (-> i64)
+  (if (< i (len s)) (cast i64 (get s i)) -1))
+
+(defn in-range? [(b i64) (lo i64) (hi i64)] (-> bool)
+  (and (>= b lo) (<= b hi)))
+
+;;; Length of the well-formed UTF-8 scalar starting at `at`, or 0 when the bytes
+;;; there are not well-formed (overlong, surrogate, out of range, or truncated).
+(defn utf8-sequence-length [(s (slice u8)) (at i64)] (-> i64)
+  (let [b0 (byte-at s at)
+        b1 (byte-at s (+ at 1))
+        b2 (byte-at s (+ at 2))
+        b3 (byte-at s (+ at 3))]
+    (cond (< b0 128) 1
+          (in-range? b0 194 223) (if (continuation? b1) 2 0)
+          (= b0 224) (if (and (in-range? b1 160 191) (continuation? b2)) 3 0)
+          (or (in-range? b0 225 236) (in-range? b0 238 239))
+            (if (and (continuation? b1) (continuation? b2)) 3 0)
+          (= b0 237) (if (and (in-range? b1 128 159) (continuation? b2)) 3 0)
+          (= b0 240)
+            (if (and (in-range? b1 144 191)
+                     (continuation? b2)
+                     (continuation? b3))
+                4
+                0)
+          (in-range? b0 241 243)
+            (if (and (continuation? b1) (continuation? b2) (continuation? b3))
+                4
+                0)
+          (= b0 244)
+            (if (and (in-range? b1 128 143)
+                     (continuation? b2)
+                     (continuation? b3))
+                4
+                0)
+          :else 0)))
+
+(defn hex-digit [(v i64)] (-> u8)
+  (cast u8 (if (< v 10) (+ v 48) (+ (- v 10) 97))))
+
+;;; Append `value` as a JSON string literal (with quotes). `"`, `\`, and control
+;;; characters are escaped. Bytes that are not well-formed UTF-8 are replaced by
+;;; U+FFFD, one replacement per invalid byte, so the output is always valid JSON.
+(defn json-string-into! [(out (mut StrBuf)) (value (slice u8))] (-> i64)
+  (let [(mut at) 0
+        n (len value)]
+    (sb-push-byte! (mut out) (cast u8 34))
+    (loop (if (>= (load at) n)
+              (break)
+              (let [b (cast i64 (get value (load at)))
+                    width (utf8-sequence-length value (load at))]
+                (cond (= b 34) (sb-push-str! (mut out) "\\\"")
+                      (= b 92) (sb-push-str! (mut out) "\\\\")
+                      (= b 10) (sb-push-str! (mut out) "\\n")
+                      (= b 13) (sb-push-str! (mut out) "\\r")
+                      (= b 9) (sb-push-str! (mut out) "\\t")
+                      (= b 8) (sb-push-str! (mut out) "\\b")
+                      (= b 12) (sb-push-str! (mut out) "\\f")
+                      (< b 32)
+                        (do
+                          (sb-push-str! (mut out) "\\u00")
+                          (sb-push-byte! (mut out) (hex-digit (/ b 16)))
+                          (sb-push-byte! (mut out) (hex-digit (% b 16))))
+                      (= width 0) (sb-push-str! (mut out) "\\ufffd")
+                      :else
+                        (sb-push-str! (mut out)
+                                      (subslice [u8]
+                                                value
+                                                (load at)
+                                                (+ (load at) width))))
+                (set! at (+ (load at) (if (= width 0) 1 width))))))
+    (sb-push-byte! (mut out) (cast u8 34))))
+
+;;; `value` as an allocator-owned JSON string literal, including quotes.
+(defn json-quote [(a (dyn Allocator)) (value (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (json-string-into! (mut out) value)
+    (sb-finish! (mut out))))
+
+;;; The body `{"error":{"code":CODE,"message":MESSAGE}}`, allocated from `a`.
+(defn json-error-body [(a (dyn Allocator))
+                       (code (slice u8))
+                       (message (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "{\"error\":{\"code\":")
+    (json-string-into! (mut out) code)
+    (sb-push-str! (mut out) ",\"message\":")
+    (json-string-into! (mut out) message)
+    (sb-push-str! (mut out) "}}")
+    (sb-finish! (mut out))))
+
+;;; A JSON error response with body `{"error":{"code":..,"message":..}}`.
+(defn json-error [(a (dyn Allocator))
+                  (status i64)
+                  (code (slice u8))
+                  (message (slice u8))] (-> Response)
+  (json-response status (json-error-body a code message)))
+
+;;; An `ErrorResponder` that renders router and server errors as `json-error`.
+;;; Install with `(router-set-errors! router (primitive/alloc-stack JsonErrors))`
+;;; or any storage that outlives the router.
+(defstruct JsonErrors [(reserved u8)])
+
+(impl ErrorResponder JsonErrors
+  (error-response [(self (ptr JsonErrors))
+                   (allocator (dyn Allocator))
+                   (status i64)
+                   (code (slice u8))
+                   (message (slice u8))]
+                  (-> Response)
+                  (json-error allocator status code message)))

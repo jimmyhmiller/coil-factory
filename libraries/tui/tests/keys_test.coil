@@ -1,0 +1,142 @@
+(module tui.keys-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "tui.keys" :use *)
+
+;; A compact, comparable spelling of a decode result: kind * 1_000_000 + payload,
+;; and consumed bytes returned separately.
+(defn key-code [(key Key)] (-> i64)
+  (match key
+    (Char [r] (+ 1000000 r))
+    (Enter [] 2)
+    (Tab [] 3)
+    (BackTab [] 4)
+    (Backspace [] 5)
+    (Delete [] 6)
+    (Insert [] 7)
+    (Escape [] 8)
+    (Up [] 9)
+    (Down [] 10)
+    (Left [] 11)
+    (Right [] 12)
+    (Home [] 13)
+    (End [] 14)
+    (PageUp [] 15)
+    (PageDown [] 16)
+    (Function [n] (+ 2000000 n))
+    (Ctrl [l] (+ 3000000 l))
+    (Alt [r] (+ 4000000 r))
+    (AltEnter [] 17)
+    (ShiftEnter [] 18)
+    (AltBackspace [] 19)
+    (WordLeft [] 20)
+    (WordRight [] 21)
+    (Paste [t] (+ 5000000 (len t)))
+    (Resize [w h] 22)
+    (NoKey [] 23)
+    (Eof [] 24)
+    (Unknown [] 25)))
+
+(defn dec [(bytes (slice u8)) (final bool)] (-> i64)
+  (match (decode-key bytes final)
+    (Incomplete [] -1)
+    (Decoded [key used] (+ (* (key-code key) 100) used))))
+
+(deftest decodes-printable-and-control-bytes
+         (assert-eq (dec "a" false) (+ (* (+ 1000000 #\a) 100) 1))
+         (assert-eq (dec "ab" false) (+ (* (+ 1000000 #\a) 100) 1))
+         (assert-eq (dec "\r" false) 201)
+         (assert-eq (dec "\t" false) 301)
+         (assert-eq (dec "\x7f;" false) 501)
+         (assert-eq (dec "\x8;" false) 501)
+         (assert-eq (dec "\x3;" false) (+ (* (+ 3000000 #\c) 100) 1))
+         (assert-eq (dec "\x17;" false) (+ (* (+ 3000000 #\w) 100) 1))
+         (assert-eq (dec "\x0;" false) (+ (* (+ 3000000 32) 100) 1)))
+
+(deftest decodes-multibyte-utf8-and-waits-for-partial-sequences
+         (assert-eq (dec "é" false) (+ (* (+ 1000000 0xE9) 100) 2))
+         (assert-eq (dec "😀x" false) (+ (* (+ 1000000 0x1F600) 100) 4))
+         (assert-eq (dec (subslice "😀" 0 2) false) -1)
+         (assert-eq (dec (subslice "😀" 0 2) true)
+                    (+ (* (+ 1000000 0xFFFD) 100) 1))
+         (assert-eq (dec "\xff;" false) (+ (* (+ 1000000 0xFF) 100) 2)))
+
+(deftest decodes-escape-sequences
+         (assert-eq (dec "\x1b;[A" false) 903)
+         (assert-eq (dec "\x1b;[B" false) 1003)
+         (assert-eq (dec "\x1b;[C" false) 1203)
+         (assert-eq (dec "\x1b;[D" false) 1103)
+         (assert-eq (dec "\x1b;OA" false) 903)
+         (assert-eq (dec "\x1b;[H" false) 1303)
+         (assert-eq (dec "\x1b;[4~" false) 1404)
+         (assert-eq (dec "\x1b;[3~" false) 604)
+         (assert-eq (dec "\x1b;[5~" false) 1504)
+         (assert-eq (dec "\x1b;[6~" false) 1604)
+         (assert-eq (dec "\x1b;[Z" false) 403)
+         (assert-eq (dec "\x1b;[15~" false) (+ (* 2000005 100) 5))
+         (assert-eq (dec "\x1b;OP" false) (+ (* 2000001 100) 3))
+         (assert-eq (dec "\x1b;[1;5D" false) 2006)
+         (assert-eq (dec "\x1b;[1;3C" false) 2106)
+         (assert-eq (dec "\x1b;[1;2A" false) 906)
+         (assert-eq (dec "\x1b;[13;2u" false) 1807)
+         (assert-eq (dec "\x1b;[I" false) 2503)
+         (assert-eq (dec "\x1b;[<0;3;4M" false) 2509))
+
+(deftest decodes-alt-and-lone-escape
+         (assert-eq (dec "\x1b;" false) -1)
+         (assert-eq (dec "\x1b;" true) 801)
+         (assert-eq (dec "\x1b;b" false) (+ (* (+ 4000000 #\b) 100) 2))
+         (assert-eq (dec "\x1b;é" false) (+ (* (+ 4000000 0xE9) 100) 3))
+         (assert-eq (dec "\x1b;\r" false) 1702)
+         (assert-eq (dec "\x1b;\x7f;" false) 1902)
+         (assert-eq (dec "\x1b;\x1b;[A" false) 801)
+         (assert-eq (dec "\x1b;[" false) -1)
+         (assert-eq (dec "\x1b;[" true) (+ (* (+ 4000000 #\[) 100) 2))
+         (assert-eq (dec "\x1b;O" false) -1)
+         (assert-eq (dec "\x1b;[1;" false) -1)
+         (assert-eq (dec "\x1b;[1;" true) 2504))
+
+(deftest decodes-bracketed-paste
+         (assert-eq (dec "\x1b;[200~hel" false) -1)
+         (assert-eq (dec "\x1b;[200~hel" true) -1)
+         (assert-eq (dec "\x1b;[20" false) -1)
+         (match (decode-key "\x1b;[200~hi\nthere\x1b;[201~x" false)
+           (Decoded [key used]
+                    (do
+                      (assert-eq used 20)
+                      (match key
+                        (Paste [text] (do (assert (= text "hi\nthere")) 0))
+                        (_ (do (assert false) 0)))))
+           (Incomplete [] (do (assert false) 0))))
+
+(extern pipe :cc c [(ptr i32)] (-> i32))
+
+(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+
+(extern close :cc c [i32] (-> i32))
+
+(defn feed [(fd i32) (bytes (slice u8))] (-> i64)
+  (cast i64
+        (write fd (cast (ptr i8) (slice-data bytes)) (cast isize (len bytes)))))
+
+(deftest reader-reassembles-sequences-and-times-out-a-lone-escape
+         (let [fds (primitive/alloc-stack (array i32 2))
+               (mut r) (key-reader-new (malloc-allocator))]
+           (assert-eq (cast i64 (pipe (index fds 0))) 0)
+           (set! (.fd r) (cast i64 (load (index fds 0))))
+           (let [w (load (index fds 1))]
+             (feed w "a\x1b;[")
+             (assert-eq (key-code (read-key! (mut r) 100)) (+ 1000000 #\a))
+             (feed w "A\x1b;")
+             (assert-eq (key-code (read-key! (mut r) 100)) 9)
+             (assert-eq (key-code (read-key! (mut r) 200)) 8)
+             (assert-eq (key-code (read-key! (mut r) 20)) 23)
+             (feed w "\x1b;[200~multi\nline\x1b;[201~")
+             (match (read-key! (mut r) 100)
+               (Paste [text] (do (assert (= text "multi\nline")) 0))
+               (_ (do (assert false) 0)))
+             (close w)
+             (assert-eq (key-code (read-key! (mut r) 100)) 24))
+           (key-reader-free! (mut r))))

@@ -1,0 +1,139 @@
+(module durable.ids)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.io" :as io)
+(import "coil.slice" :use *)
+(import "coil.time" :as time)
+(import "coil.try" :use *)
+(import "durable.error" :use *)
+(import "durable.sys" :use *)
+
+;;; Fill `out` with cryptographically secure random bytes from getentropy(3)
+;;; (available on macOS and glibc >= 2.25), in the 256-byte chunks it accepts.
+(defn random-fill! [(out (slice u8))] (-> (Result i64 DurableError))
+  (try (let [n (len out)
+             (mut done) 0]
+         (loop (if (>= (load done) n)
+                   (break)
+                   (let [chunk
+                           (if (> (- n (load done)) 256) 256 (- n (load done)))]
+                     (ensure! (= (getentropy (cast (ptr i8)
+                                                   (index (slice-data out)
+                                                          (load done)))
+                                             chunk)
+                                 (cast i32 0))
+                              (Err (os-error "getentropy")))
+                     (set! done (+ (load done) chunk)))))
+         (Ok n))))
+
+(defn hex-digit [(v i64)] (-> u8)
+  (cast u8 (if (< v 10) (+ v 48) (+ v 87))))
+
+;;; `byte-count` random bytes rendered as `2 * byte-count` lowercase hex characters,
+;;; owned by `a` (release with `(free-bytes a hex 1)`).
+(defn random-hex [(a (dyn Allocator)) (byte-count i64)] (-> (Result (slice u8)
+                                                                    DurableError))
+  (try (ensure! (> byte-count 0)
+                (Err (Invalid "random-hex needs a positive byte count")))
+       (let [raw
+               (match (alloc-bytes a byte-count 1)
+                 (Some [m] m)
+                 (None [] (return-from :try (Err (OutOfMemory)))))
+             out
+               (match (alloc-bytes a (* byte-count 2) 1)
+                 (Some [m] m)
+                 (None []
+                       (do
+                         (free-bytes a raw 1)
+                         (return-from :try (Err (OutOfMemory))))))]
+         (match (random-fill! raw)
+           (Err [e]
+                (do
+                  (free-bytes a raw 1)
+                  (free-bytes a out 1)
+                  (Err e)))
+           (Ok [ignored]
+               (do
+                 (let [(mut i) 0]
+                   (loop (if (>= (load i) byte-count)
+                             (break)
+                             (let [b (cast i64 (get raw (load i)))]
+                               (slice-set! out
+                                           (* (load i) 2)
+                                           (hex-digit (>> b 4)))
+                               (slice-set! out
+                                           (+ (* (load i) 2) 1)
+                                           (hex-digit (& b 15)))
+                               (set! i (+ (load i) 1))))))
+                 (free-bytes a raw 1)
+                 (Ok out)))))))
+
+;;; Milliseconds since the Unix epoch from the realtime clock. clock_gettime on
+;;; CLOCK_REALTIME cannot fail on a supported platform; if it ever does, this aborts
+;;; with a message instead of inventing a timestamp.
+(defn now-ms [] (-> i64)
+  (match (time/wall-now-ms)
+    (Ok [ms] ms)
+    (Err [e]
+         (do
+           (io/print-str (io/stderr)
+                         "durable.ids/now-ms: clock_gettime(CLOCK_REALTIME) failed\n")
+           (abort)
+           0))))
+
+;;; Width of the timestamp field of a time id: nine base-36 digits cover
+;;; millisecond timestamps until the year 5138, so ids sort by time as strings.
+(const TIME-ID-STAMP-WIDTH 9)
+
+;;; Random bytes in a time id's suffix (rendered as twice as many hex characters).
+(const TIME-ID-RANDOM-BYTES 4)
+
+(defn base36-digit [(v i64)] (-> u8)
+  (cast u8 (if (< v 10) (+ v 48) (+ v 87))))
+
+;;; A sortable identifier for timestamp `ms`: nine zero-padded lowercase base-36
+;;; digits, `-`, then eight random hex characters, e.g. `0mfz3k1q2-9c41be07`.
+;;; Owned by `a`. Ids made in the same millisecond order randomly among themselves.
+(defn time-id-at [(a (dyn Allocator)) (ms i64)] (-> (Result (slice u8)
+                                                            DurableError))
+  (try (ensure! (>= ms 0)
+                (Err (Invalid "time-id timestamp must not be negative")))
+       (let [suffix (try! (random-hex a TIME-ID-RANDOM-BYTES))
+             suffix-len (len suffix)
+             total (+ (+ TIME-ID-STAMP-WIDTH 1) suffix-len)
+             out
+               (match (alloc-bytes a total 1)
+                 (Some [m] m)
+                 (None []
+                       (do
+                         (free-bytes a suffix 1)
+                         (return-from :try (Err (OutOfMemory))))))
+             (mut rest) ms
+             (mut i) (- TIME-ID-STAMP-WIDTH 1)]
+         (loop (if (< (load i) 0)
+                   (break)
+                   (do
+                     (slice-set! out (load i) (base36-digit (% (load rest) 36)))
+                     (set! rest (/ (load rest) 36))
+                     (set! i (- (load i) 1)))))
+         (when (!= (load rest) 0)
+           (free-bytes a suffix 1)
+           (free-bytes a out 1)
+           (return-from :try
+                          (Err (Invalid "time-id timestamp does not fit nine base-36 digits")))
+           0)
+         (slice-set! out TIME-ID-STAMP-WIDTH (cast u8 45))
+         (let [(mut j) 0]
+           (loop (if (>= (load j) suffix-len)
+                     (break)
+                     (do
+                       (slice-set! out
+                                   (+ (+ TIME-ID-STAMP-WIDTH 1) (load j))
+                                   (get suffix (load j)))
+                       (set! j (+ (load j) 1))))))
+         (free-bytes a suffix 1)
+         (Ok out))))
+
+;;; `time-id-at` for the current wall-clock millisecond.
+(defn time-id [(a (dyn Allocator))] (-> (Result (slice u8) DurableError))
+  (time-id-at a (now-ms)))

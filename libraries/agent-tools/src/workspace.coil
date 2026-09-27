@@ -1,0 +1,200 @@
+(module agent_tools.workspace)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(export Workspace ResolvedPath workspace-open workspace-root workspace-contains? resolve)
+
+;;; The one directory an agent works in. `root` is absolute and canonical (the
+;;; result of `realpath`), with no trailing slash unless it is "/" itself.
+(defstruct Workspace [(root (slice u8))])
+
+;;; A model-supplied path after it has been checked. `absolute` is what the
+;;; tools open; `relative` is the normalized workspace-relative spelling ("."
+;;; for the root) used in messages.
+(defstruct ResolvedPath [(absolute (slice u8)) (relative (slice u8))])
+
+(defn workspace-root [(workspace Workspace)] (-> (slice u8))
+  (.root workspace))
+
+;;; Open a workspace at an absolute directory path. The root is canonicalized
+;;; with realpath, so later containment checks compare canonical paths.
+(defn workspace-open [(a (dyn Allocator)) (path (slice u8))] (-> (Result Workspace (slice u8)))
+  (cond (= (len path) 0) (Err "workspace root is empty; pass an absolute directory path")
+        (!= (get path 0) (primitive/cast u8 #\/))
+          (Err (join3 a "workspace root " (quoted a path) " is not an absolute path"))
+        :else
+          (match (sys/real-path a path)
+            (sys/PathErrno [code]
+                           (Err (join3 a
+                                       "cannot open workspace root "
+                                       (quoted a path)
+                                       (join2 a ": " (sys/errno-text code)))))
+            (sys/PathOk [real]
+                        (if (sys/directory? a real)
+                            (Ok (Workspace :root real))
+                            (Err (join3 a "workspace root " (quoted a path) " is not a directory")))))))
+
+;;; Whether a canonical absolute path is the root or lies beneath it.
+(defn workspace-contains? [(workspace Workspace) (absolute (slice u8))] (-> bool)
+  (let [root (.root workspace)
+        n (len root)]
+    (cond (= root "/") (and (> (len absolute) 0) (= (get absolute 0) (primitive/cast u8 #\/)))
+          (= absolute root) true
+          (<= (len absolute) n) false
+          :else (and (= (subslice absolute 0 n) root)
+                     (= (get absolute n) (primitive/cast u8 #\/))))))
+
+;;; The lexical parent of an absolute path ("/a/b" -> "/a", "/a" -> "/").
+(defn parent-path [(path (slice u8))] (-> (slice u8))
+  (let [(mut i) (- (len path) 1)]
+    (loop (if (or (<= (load i) 0) (= (get path (load i)) (primitive/cast u8 #\/)))
+              (break)
+              (set! i (- (load i) 1))))
+    (if (<= (load i) 0) "/" (subslice path 0 (load i)))))
+
+(defn has-nul? [(path (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (len path)))
+              (break)
+              (do (when (= (get path (load i)) (primitive/cast u8 0))
+                    (set! found true)
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;;; Split a relative path into components, dropping empty and "." parts and
+;;; applying "..". None when ".." would climb above the root.
+(defn normalize-components [(a (dyn Allocator)) (path (slice u8))] (-> (Option (ArrayList (slice u8))))
+  (let [(mut parts) (al-new [(slice u8)] a)
+        n (len path)
+        (mut start) 0
+        (mut i) 0
+        (mut escaped) false]
+    (loop (if (or (load escaped) (> (load i) n))
+              (break)
+              (do (when (or (= (load i) n) (= (get path (load i)) (primitive/cast u8 #\/)))
+                    (let [part (subslice path (load start) (load i))]
+                      (cond (= (len part) 0) 0
+                            (= part ".") 0
+                            (= part "..") (match (pop! (mut parts))
+                                            (Some [_] 0)
+                                            (None [] (do (set! escaped true) 0)))
+                            :else (push! (mut parts) part))
+                      (set! start (+ (load i) 1))
+                      0)
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (if (load escaped)
+        (do (al-free! (mut parts)) (None))
+        (Some (load parts)))))
+
+(defn join-components [(a (dyn Allocator)) (parts (ArrayList (slice u8)))] (-> (slice u8))
+  (if (= (len parts) 0)
+      "."
+      (let [(mut b) (sb-new a)
+            (mut i) 0]
+        (loop (if (>= (load i) (len parts))
+                  (break)
+                  (do (when (> (load i) 0)
+                        (sb-push-byte! (mut b) (primitive/cast u8 #\/))
+                        0)
+                      (sb-push-str! (mut b) (get parts (load i)))
+                      (set! i (+ (load i) 1)))))
+        (sb-finish! (mut b)))))
+
+(defn absolute-error [(a (dyn Allocator)) (workspace Workspace) (path (slice u8))] (-> (slice u8))
+  (let [root (.root workspace)
+        inside (and (> (len path) (+ (len root) 1))
+                    (workspace-contains? workspace path))]
+    (if inside
+        (join3 a
+               (join3 a "path " (quoted a path) " is absolute. Pass it relative to the workspace root instead: ")
+               (quoted a (subslice path (+ (len root) 1) (len path)))
+               ".")
+        (join3 a
+               "path "
+               (quoted a path)
+               " is absolute. Tools only reach files inside the workspace; pass a path relative to the workspace root, such as \"src/main.coil\"."))))
+
+;;; The workspace-relative spelling of a lexical absolute path under the root.
+(defn relative-of [(workspace Workspace) (absolute (slice u8))] (-> (slice u8))
+  (let [root (.root workspace)
+        skip (if (= root "/") 1 (+ (len root) 1))]
+    (if (<= (len absolute) skip)
+        "."
+        (subslice absolute skip (len absolute)))))
+
+;;; Check that the path's existing prefix, after following every symbolic
+;;; link, stays inside the workspace. Components that do not exist yet cannot
+;;; be links, except a dangling link, which is refused.
+(defn check-links [(a (dyn Allocator))
+                   (workspace Workspace)
+                   (relative (slice u8))
+                   (absolute (slice u8))] (-> (Result i64 (slice u8)))
+  (let [(mut candidate) absolute
+        (mut outcome) (: (Ok 0) (Result i64 (slice u8)))]
+    (loop (match (sys/real-path a (load candidate))
+            (sys/PathOk [real]
+                        (do (when (not (workspace-contains? workspace real))
+                              (set! outcome
+                                    (Err (join3 a
+                                                (join3 a "path " (quoted a relative) " resolves through a symbolic link to ")
+                                                (quoted a real)
+                                                ", which is outside the workspace. Only paths inside the workspace are allowed.")))
+                              0)
+                            (break)))
+            (sys/PathErrno [code]
+                           (cond (and (= code sys/ENOENT) (sys/symlink? a (load candidate)))
+                                   (do (set! outcome
+                                             (Err (join3 a
+                                                         (join3 a "path " (quoted a relative) " goes through the symbolic link ")
+                                                         (quoted a (relative-of workspace (load candidate)))
+                                                         ", whose target does not exist. Refusing to follow it.")))
+                                       (break))
+                                 (and (or (= code sys/ENOENT) (= code sys/ENOTDIR))
+                                      (> (len (load candidate)) (len (.root workspace))))
+                                   (set! candidate (parent-path (load candidate)))
+                                 :else
+                                   (do (set! outcome
+                                             (Err (join3 a
+                                                         "cannot resolve path "
+                                                         (quoted a relative)
+                                                         (join2 a ": " (sys/errno-text code)))))
+                                       (break))))))
+    (load outcome)))
+
+;;; Resolve a model-supplied path against the workspace. Refuses empty paths,
+;;; NUL bytes, absolute paths, ".." that climbs above the root, and symbolic
+;;; links whose targets leave the workspace. The messages say what to do
+;;; instead, because the model reads them.
+(defn resolve [(a (dyn Allocator)) (workspace Workspace) (path (slice u8))] (-> (Result ResolvedPath (slice u8)))
+  (cond (= (len path) 0)
+          (Err "path is empty. Pass a path relative to the workspace root, such as \"src/main.coil\", or \".\" for the root.")
+        (has-nul? path)
+          (Err "path contains a NUL byte. Pass a plain path relative to the workspace root.")
+        (= (get path 0) (primitive/cast u8 #\/))
+          (Err (absolute-error a workspace path))
+        :else
+          (match (normalize-components a path)
+            (None []
+                 (Err (join3 a
+                             "path "
+                             (quoted a path)
+                             " uses \"..\" to leave the workspace. Only paths inside the workspace are allowed.")))
+            (Some [parts]
+                (let [relative (join-components a parts)
+                      root (.root workspace)
+                      absolute (cond (= relative ".") root
+                                     (= root "/") (join2 a "/" relative)
+                                     :else (join3 a root "/" relative))]
+                  (let [(mut owned) parts]
+                    (al-free! (mut owned)))
+                  (match (check-links a workspace relative absolute)
+                    (Err [message] (Err message))
+                    (Ok [_] (Ok (ResolvedPath :absolute absolute :relative relative)))))))))

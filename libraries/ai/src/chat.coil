@@ -1,0 +1,106 @@
+(module ai.chat)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; `messages` is the provider-neutral chat transcript in JSON form. It permits
+;;; provider-specific content blocks and complete tool-call replay without losing
+;;; information by forcing them through a text-only message type.
+(defstruct ChatRequest
+  [(model (slice u8))
+   (messages JVal)
+   (tools JVal)
+   (timeout-ms i64)])
+
+(defstruct ChatResponse
+  [(text (slice u8))
+   (tool-calls JVal)
+   (finish-reason (slice u8))
+   (input-tokens i64)
+   (output-tokens i64)
+   (raw JVal)])
+
+(defstruct ChatError
+  [(kind (slice u8))
+   (status i64)
+   (message (slice u8))])
+
+(defsum ChatResult
+  (ChatOk [(value ChatResponse)])
+  (ChatFailed [(error ChatError)]))
+
+(deftrait ChatProvider [Self]
+  (complete [(self (ptr Self))
+             (allocator (dyn Allocator))
+             (request ChatRequest)]
+            (-> ChatResult)))
+
+(defstruct ChatDelta
+  [(text (slice u8))
+   (tool-calls JVal)
+   (finish-reason (slice u8))
+   (raw JVal)])
+
+(deftrait ChatDeltaSink [Self]
+  (on-chat-delta [(self (ptr Self)) (delta ChatDelta)] (-> bool)))
+
+(defsum StreamResult
+  (StreamFinished [])
+  (StreamFailed [(error ChatError)]))
+
+(deftrait StreamingChatProvider [Self]
+  (complete-stream [(self (ptr Self))
+                    (allocator (dyn Allocator))
+                    (request ChatRequest)
+                    (sink (dyn ChatDeltaSink))]
+                   (-> StreamResult)))
+
+(defn chat-error [(kind (slice u8)) (status i64) (message (slice u8))] (-> ChatError)
+  (let [(mut result) (primitive/zeroed ChatError)]
+    (set! (.kind result) kind)
+    (set! (.status result) status)
+    (set! (.message result) message)
+    (load result)))
+
+(defn object-new [(a (dyn Allocator))] (-> JVal)
+  (JObj (box! a
+              (HashMap (slice u8) JVal)
+              (hm-new [(slice u8) JVal] a (str-keyops-borrowed)))))
+
+(defn object-put! [(object (ptr JVal)) (key (slice u8)) (value JVal)] (-> bool)
+  (match (load object)
+    (JObj [map] (do (set! map key value) true))
+    (_ false)))
+
+(defn array-new [(a (dyn Allocator))] (-> JVal)
+  (JArr (box! a (ArrayList JVal) (al-new [JVal] a))))
+
+(defn array-push! [(array (ptr JVal)) (value JVal)] (-> bool)
+  (match (load array)
+    (JArr [items] (do (push! [JVal] items value) true))
+    (_ false)))
+
+;;; A convenient first message for small applications. The result and its
+;;; children live in `a`; callers can use their normal request arena.
+(defn user-messages [(a (dyn Allocator)) (prompt (slice u8))] (-> JVal)
+  (let [(mut messages) (array-new a)
+        (mut message) (object-new a)]
+    (object-put! (mut message) "role" (JStr "user"))
+    (object-put! (mut message) "content" (JStr prompt))
+    (array-push! (mut messages) (load message))
+    (load messages)))
+
+(defn chat [(provider (dyn ChatProvider))
+            (a (dyn Allocator))
+            (request ChatRequest)] (-> ChatResult)
+  (complete provider a request))
+
+(defn chat-stream [(provider (dyn StreamingChatProvider))
+                   (a (dyn Allocator))
+                   (request ChatRequest)
+                   (sink (dyn ChatDeltaSink))] (-> StreamResult)
+  (complete-stream provider a request sink))

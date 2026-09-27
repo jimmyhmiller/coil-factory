@@ -1,0 +1,455 @@
+(module factory.hub)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.http.client" :as http)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.sync" :as sync)
+(import "coil.thread" :as thread)
+(import "durable.atomic" :as atomic)
+(import "http_app.router" :as app)
+(import "ssh.target" :as target)
+(import "ssh.tunnel" :as tunnel)
+(import "agent.fail" :use *)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+
+;;; The hub is the site on your own machine, plus the other sites it reaches.
+;;; For each remote site it keeps an SSH tunnel to that site's daemon, polls
+;;; its overview every two seconds, and forwards requests about the remote's
+;;; runs through the tunnel. The CLI and the dashboard only ever talk to the
+;;; hub, so every machine looks like one place.
+;;;
+;;; `~/.factory/sites.json` (0600):
+;;;     {"sites": [{"name": "box2", "ssh": "me@box2", "token": "…", "port": 7788}]}
+
+(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+
+(defstruct Remote
+  [(name (slice u8))
+   (ssh (slice u8))
+   (token (slice u8))
+   (port i64)
+   (tunnel (ptr tunnel/Tunnel))
+   (local-port i64)
+   ;;; connecting | up | unreachable
+   (status (slice u8))
+   (error (slice u8))
+   ;;; The last `/v1/overview?scope=local` body, owned by the hub.
+   (overview (slice u8))
+   (updated-t i64)])
+
+(defstruct Hub
+  [(allocator (dyn Allocator))
+   (home (slice u8))
+   (mutex sync/Mutex)
+   (remotes (ArrayList (ptr Remote)))])
+
+(defn hub-lock! [(hub (ptr Hub))] (-> i64)
+  (match (sync/mutex-lock! (field hub mutex))
+    (Ok [held] 0)
+    (Err [failure] (fail [i64] "factory: the hub mutex could not be locked"))))
+
+(defn hub-unlock! [(hub (ptr Hub))] (-> i64)
+  (match (sync/mutex-unlock! (field hub mutex))
+    (Ok [released] 0)
+    (Err [failure] (fail [i64] "factory: the hub mutex could not be unlocked"))))
+
+(defn text-join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn sites-path [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "sites.json"))
+
+(defsum RemoteMade
+  (RemoteOk [(remote (ptr Remote))])
+  (RemoteBad [(message (slice u8))]))
+
+(defn remote-new [(a (dyn Allocator)) (name (slice u8)) (given-ssh (slice u8)) (token (slice u8)) (port i64)] (-> RemoteMade)
+  ;; The tunnel keeps slices of the parsed target for its lifetime, so parse
+  ;; the hub's own copy, never the caller's (often a request's arena).
+  (let [ssh (copy-bytes a given-ssh)]
+  (match (target/parse-target ssh)
+    (Err [message] (RemoteBad (text-join a ["bad ssh target \"" ssh "\": " message])))
+    (Ok [parsed]
+        (let [remote (box! a Remote (primitive/zeroed Remote))]
+          (set! (.name remote) (copy-bytes a name))
+          (set! (.ssh remote) ssh)
+          (set! (.token remote) (copy-bytes a token))
+          (set! (.port remote) port)
+          (set! (.tunnel remote) (box! a tunnel/Tunnel (tunnel/tunnel-new a (tunnel/tunnel-spec parsed port))))
+          (set! (.status remote) "connecting")
+          (set! (.error remote) "")
+          (set! (.overview remote) "")
+          (RemoteOk remote))))))
+
+(defn hub-open [(a (dyn Allocator)) (home (slice u8))] (-> (ptr Hub))
+  (let [hub (box! a Hub (primitive/zeroed Hub))]
+    (set! (.allocator hub) a)
+    (set! (.home hub) home)
+    (set! (.remotes hub) (al-new [(ptr Remote)] a))
+    (match (sync/mutex-init (field hub mutex))
+      (Ok [m] 0)
+      (Err [failure] (fail [i64] "factory: cannot initialize the hub mutex")))
+    (match (atomic/read-file-if-exists a (sites-path a home))
+      (Ok [found]
+          (match found
+            (None [] 0)
+            (Some [text]
+                  (match (jv-parse a text)
+                    (None [] (do (println "factory daemon: sites.json is not valid JSON; no remote sites loaded") 0))
+                    (Some [root]
+                          (let [sites (jv-get root "sites")
+                                n (jv-count sites)
+                                (mut i) 0]
+                            (loop (if (>= (load i) n)
+                                      (break)
+                                      (let [entry (jv-nth sites (load i))]
+                                        (match (remote-new a (jv-string-or (jv-get entry "name") "")
+                                                           (jv-string-or (jv-get entry "ssh") "")
+                                                           (jv-string-or (jv-get entry "token") "")
+                                                           (let [p (jv-int (jv-get entry "port"))] (if (> p 0) p 7788)))
+                                          (RemoteOk [remote] (push! [(ptr Remote)] (mut (.remotes hub)) remote))
+                                          (RemoteBad [message] (do (println "factory daemon: {s}" message) 0)))
+                                        (set! i (+ (load i) 1)))))
+                            0))))))
+      (Err [failure] 0))
+    hub))
+
+(defn save-sites! [(hub (ptr Hub))] (-> bool)
+  (let [a (.allocator hub)
+        root (jv-object a)
+        sites (jv-array a)]
+    (for remote (iter (.remotes hub))
+      (let [entry (jv-object a)]
+        (jv-put! entry "name" (JStr (.name remote)))
+        (jv-put! entry "ssh" (JStr (.ssh remote)))
+        (jv-put! entry "token" (JStr (.token remote)))
+        (jv-put! entry "port" (JInt (.port remote)))
+        (jv-push! sites entry)))
+    (jv-put! root "sites" sites)
+    (match (atomic/write-file-atomic! a (sites-path a (.home hub)) (jv-encode a root) 384)
+      (Ok [written] true)
+      (Err [failure] false))))
+
+(defn find-remote [(hub (ptr Hub)) (name (slice u8))] (-> (ptr Remote))
+  (let [(mut found) (cast (ptr Remote) 0)]
+    (for remote (iter (.remotes hub))
+      (when (= (.name remote) name) (set! found remote) 0))
+    (load found)))
+
+;;; Register (or replace) a remote site and persist it. Call without the lock.
+(defn add-remote! [(hub (ptr Hub)) (name (slice u8)) (ssh (slice u8)) (token (slice u8)) (port i64)] (-> (slice u8))
+  (let [a (.allocator hub)]
+    (match (remote-new a name ssh token port)
+      (RemoteBad [message] message)
+      (RemoteOk [remote]
+                (do (hub-lock! hub)
+                    (let [(mut kept) (al-new [(ptr Remote)] a)]
+                      (for existing (iter (.remotes hub))
+                        (if (= (.name existing) name)
+                            (do (tunnel/tunnel-close! (.tunnel existing)) 0)
+                            (do (push! [(ptr Remote)] (mut kept) existing) 0)))
+                      (push! [(ptr Remote)] (mut kept) remote)
+                      (set! (.remotes hub) (load kept)))
+                    (let [saved (save-sites! hub)]
+                      (hub-unlock! hub)
+                      (if saved "" "could not write sites.json")))))))
+
+(defn remove-remote! [(hub (ptr Hub)) (name (slice u8))] (-> bool)
+  (let [a (.allocator hub)
+        (mut removed) false]
+    (hub-lock! hub)
+    (let [(mut kept) (al-new [(ptr Remote)] a)]
+      (for existing (iter (.remotes hub))
+        (if (= (.name existing) name)
+            (do (tunnel/tunnel-close! (.tunnel existing)) (set! removed true) 0)
+            (do (push! [(ptr Remote)] (mut kept) existing) 0)))
+      (set! (.remotes hub) (load kept)))
+    (save-sites! hub)
+    (hub-unlock! hub)
+    (load removed)))
+
+;; ---------------------------------------------------------------------------
+;; Talking to a remote daemon through its tunnel
+
+(defstruct Forwarded [(status i64) (body (slice u8)) (error (slice u8))])
+
+(defn remote-request [(a (dyn Allocator)) (port i64) (token (slice u8)) (method (slice u8))
+                      (path (slice u8)) (body (slice u8)) (timeout-ms i64)] (-> Forwarded)
+  (let [headers (box! a (array http/Header 2) (primitive/zeroed (array http/Header 2)))
+        hp (cast (ptr http/Header) headers)
+        request (box! a http/Request (primitive/zeroed http/Request))
+        (mut url) (sb-new a)]
+    (sb-push-str! (mut url) "http://127.0.0.1:")
+    (sb-push-i64! (mut url) port)
+    (sb-push-str! (mut url) path)
+    (set! (primitive/index hp 0) (http/Header :name "Content-Type" :value "application/json"))
+    (set! (primitive/index hp 1) (http/Header :name "Authorization" :value (text-join a ["Bearer " token])))
+    (set! (.method request) method)
+    (set! (.url request) (sb-finish! (mut url)))
+    (set! (.headers request) (slice-new [http/Header] hp 2))
+    (set! (.body request) body)
+    (set! (.connect-timeout-ms request) 3000)
+    (set! (.timeout-ms request) timeout-ms)
+    (set! (.follow-redirects request) false)
+    (set! (.ca-info request) "")
+    (match (http/request a request)
+      (Err [failure] (Forwarded :status 0 :body "" :error "the remote site did not answer"))
+      (Ok [response]
+          (let [status (http/response-status response)
+                text (copy-bytes a (http/response-body response))]
+            (http/response-free a response)
+            (Forwarded :status status :body text :error ""))))))
+
+;;; Replace an owned string: the old value (if any) is freed and the new one
+;;; copied. Every non-empty string held in a Remote went through here.
+(defn set-owned! [(a (dyn Allocator)) (slot (ptr (slice u8))) (value (slice u8))] (-> i64)
+  (let [old (load slot)]
+    (when (> (len old) 0) (free [u8] a old) 0)
+    (store! slot (copy-bytes a value))))
+
+;;; Keep one remote's tunnel up and its overview fresh. Called by the poller
+;;; thread only, without the hub lock; `t` is scratch for this poll. Results
+;;; are published under the lock.
+(defn poll-remote! [(hub (ptr Hub)) (remote (ptr Remote)) (t (dyn Allocator))] (-> i64)
+  (let [a (.allocator hub)
+        status (tunnel/tunnel-ensure! (.tunnel remote))]
+    (match status
+      (tunnel/TunnelFailed [message]
+                           (do (hub-lock! hub)
+                               (set! (.status remote) "unreachable")
+                               (set-owned! a (field remote error) message)
+                               (set! (.local-port remote) 0)
+                               (hub-unlock! hub)
+                               0))
+      (tunnel/TunnelReady [port]
+                          (let [reply (remote-request t port (.token remote) "GET" "/v1/overview?scope=local" "" 5000)]
+                            (hub-lock! hub)
+                            (set! (.local-port remote) port)
+                            (if (and (= (.status reply) 200) (= (len (.error reply)) 0))
+                                (do (set! (.status remote) "up")
+                                    (set-owned! a (field remote error) "")
+                                    (set-owned! a (field remote overview) (.body reply))
+                                    (set! (.updated-t remote) (wall-ms)))
+                                (do (set! (.status remote) "unreachable")
+                                    (set-owned! a (field remote error)
+                                                (cond (> (len (.error reply)) 0) (.error reply)
+                                                      (= (.status reply) 401) "the remote rejected this hub's token; run `factory site add` again"
+                                                      :else "the remote daemon answered with an error"))))
+                            (hub-unlock! hub)
+                            0)))))
+
+;;; A snapshot of the remotes to poll, taken under the lock.
+(defn remotes-snapshot [(hub (ptr Hub)) (a (dyn Allocator))] (-> (ArrayList (ptr Remote)))
+  (let [(mut out) (al-new [(ptr Remote)] a)]
+    (hub-lock! hub)
+    (for remote (iter (.remotes hub)) (push! [(ptr Remote)] (mut out) remote))
+    (hub-unlock! hub)
+    (load out)))
+
+;;; Remote sites and runs for the overview. Call with the hub lock held.
+(defn remote-sites-json [(hub (ptr Hub)) (a (dyn Allocator)) (sites JVal) (runs JVal)] (-> i64)
+  (do
+    (for remote (iter (.remotes hub))
+      (let [overview (if (> (len (.overview remote)) 0) (jv-parse a (.overview remote)) (None [JVal]))
+            site (match overview
+                   (Some [o] (let [s (jv-nth (jv-get o "sites") 0)]
+                               (if (jv-null? s) (jv-object a) (jv-clone a s))))
+                   (None [] (jv-object a)))]
+        (jv-put! site "name" (JStr (.name remote)))
+        (jv-put! site "kind" (JStr "ssh"))
+        (jv-put! site "ssh" (JStr (.ssh remote)))
+        (jv-put! site "status" (JStr (.status remote)))
+        (jv-put! site "error" (JStr (.error remote)))
+        (jv-put! site "updated" (JInt (.updated-t remote)))
+        (jv-push! sites site)
+        (match overview
+          (Some [o] (let [remote-runs (jv-get o "runs")
+                          (mut i) 0]
+                      (loop (if (>= (load i) (jv-count remote-runs))
+                                (break)
+                                (let [run (jv-clone a (jv-nth remote-runs (load i)))]
+                                  (jv-put! run "site" (JStr (.name remote)))
+                                  (jv-put! run "stale" (JBool (not (= (.status remote) "up"))))
+                                  (jv-push! runs run)
+                                  (set! i (+ (load i) 1)))))
+                      0))
+          (None [] 0))))
+    0))
+
+;;; The remote whose cached overview has exactly one run matching `reference`
+;;; (an id or unique prefix), and that run's full id. Call with the lock held.
+(defstruct RemoteRun [(remote (ptr Remote)) (id (slice u8)) (matches i64)])
+
+(defn find-remote-run [(hub (ptr Hub)) (a (dyn Allocator)) (reference (slice u8))] (-> RemoteRun)
+  (let [(mut result) (RemoteRun :remote (cast (ptr Remote) 0) :id "" :matches 0)]
+    (for remote (iter (.remotes hub))
+      (when (> (len (.overview remote)) 0)
+        (match (jv-parse a (.overview remote))
+          (None [] 0)
+          (Some [o] (let [runs (jv-get o "runs")
+                          (mut i) 0]
+                      (loop (if (>= (load i) (jv-count runs))
+                                (break)
+                                (let [id (jv-string-or (jv-get (jv-nth runs (load i)) "id") "")]
+                                  (when (or (= id reference) (starts-with id reference))
+                                    (set! result (RemoteRun :remote remote :id id :matches (+ (.matches result) 1)))
+                                    0)
+                                  (set! i (+ (load i) 1)))))
+                      0)))
+        0))
+    (load result)))
+
+;;; Forward a request for a remote run: the same method, the path with the
+;;; full run id, the same query and body. Call WITHOUT the hub lock.
+(defn forward! [(hub (ptr Hub)) (a (dyn Allocator)) (remote (ptr Remote)) (method (slice u8))
+                (path (slice u8)) (body (slice u8))] (-> app/Response)
+  (hub-lock! hub)
+  (let [port (.local-port remote)
+        token (copy-bytes a (.token remote))
+        name (copy-bytes a (.name remote))]
+    (hub-unlock! hub)
+    (if (= port 0)
+        (app/response 502 "application/json"
+                      (text-join a ["{\"error\":{\"code\":\"site_unreachable\",\"message\":\"site " name " is not reachable right now\"}}"]))
+        (let [reply (remote-request a port token method path body 120000)]
+          (if (> (len (.error reply)) 0)
+              (app/response 502 "application/json"
+                            (text-join a ["{\"error\":{\"code\":\"site_unreachable\",\"message\":\"site " name " did not answer\"}}"]))
+              (app/response (.status reply) "application/json" (.body reply)))))))
+
+;; ---------------------------------------------------------------------------
+;; Streaming a remote run's events through the hub
+
+;;; Shared between the thread reading the remote stream and the response
+;;; stream the hub's server pulls from; freed by whichever lets go last.
+(defstruct Relay
+  [(mutex sync/Mutex)
+   (queue (ArrayList u8))
+   (done bool)
+   (failed bool)
+   (cancelled bool)
+   (holders i64)
+   (request (ptr http/Request))
+   (thread thread/Thread)])
+
+(defn relay-release! [(relay (ptr Relay))] (-> i64)
+  (sync/mutex-lock! (field relay mutex))
+  (set! (.holders relay) (- (.holders relay) 1))
+  (let [last (= (.holders relay) 0)]
+    (sync/mutex-unlock! (field relay mutex))
+    (when last
+      (al-free! [u8] (mut (.queue relay)))
+      (sync/mutex-destroy! (field relay mutex))
+      0)
+    0))
+
+(defn relay-chunk [(data (ptr u8)) (length i64) (context (ptr i8))] (-> i64)
+  (let [relay (cast (ptr Relay) context)]
+    (sync/mutex-lock! (field relay mutex))
+    (let [stop (.cancelled relay)]
+      (when (not stop) (al-extend! [u8] (mut (.queue relay)) data length) 0)
+      (sync/mutex-unlock! (field relay mutex))
+      (if stop http/BODY-STOP http/BODY-CONTINUE))))
+
+(defn relay-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [relay (cast (ptr Relay) arg)
+        a (malloc-allocator)
+        (mut sink) (primitive/zeroed http/BodySink)]
+    (set! (.context sink) arg)
+    (set! (.consume sink) (fnptr-of relay-chunk))
+    (let [ok (match (http/request-stream a (.request relay) (load sink))
+               (Err [failure] false)
+               (Ok [response] (let [status (http/streaming-response-status response)]
+                                (http/streaming-response-free a response)
+                                (and (>= status 200) (< status 300)))))]
+      (sync/mutex-lock! (field relay mutex))
+      (set! (.done relay) true)
+      (set! (.failed relay) (and (not ok) (not (.cancelled relay))))
+      (sync/mutex-unlock! (field relay mutex))
+      (relay-release! relay)
+      (cast (ptr i8) 0))))
+
+(impl app/ResponseStream Relay
+  (stream-next [(self (ptr Relay)) (allocator (dyn Allocator)) (idle-ms i64)] (-> app/StreamStep)
+               (do (sync/mutex-lock! (field self mutex))
+                   (let [n (len (.queue self))
+                         step (cond (> n 0)
+                                      (let [bytes (copy-bytes allocator (al-slice [u8] (.queue self)))]
+                                        (al-clear! [u8] (mut (.queue self)))
+                                        (app/StreamChunk bytes))
+                                    (.done self) (if (.failed self) (app/StreamFailed) (app/StreamDone))
+                                    :else (app/StreamIdle))]
+                     (sync/mutex-unlock! (field self mutex))
+                     step)))
+  (stream-release [(self (ptr Relay)) (reason app/StreamEndReason)] (-> i64)
+                  (do (sync/mutex-lock! (field self mutex))
+                      (set! (.cancelled self) true)
+                      (sync/mutex-unlock! (field self mutex))
+                      (relay-release! self))))
+
+;;; An SSE response relaying a remote site's event stream. Call WITHOUT the lock.
+(defn relay-stream! [(hub (ptr Hub)) (a (dyn Allocator)) (remote (ptr Remote)) (path (slice u8)) (last-event-id (slice u8))] (-> app/Response)
+  (hub-lock! hub)
+  (let [port (.local-port remote)
+        heap (malloc-allocator)
+        token (copy-bytes heap (.token remote))]
+    (hub-unlock! hub)
+    (if (= port 0)
+        (app/response 502 "application/json" "{\"error\":{\"code\":\"site_unreachable\",\"message\":\"the site is not reachable right now\"}}")
+        (let [relay (box! heap Relay (primitive/zeroed Relay))
+              headers (box! heap (array http/Header 2) (primitive/zeroed (array http/Header 2)))
+              hp (cast (ptr http/Header) headers)
+              request (box! heap http/Request (primitive/zeroed http/Request))
+              (mut url) (sb-new heap)]
+          (sb-push-str! (mut url) "http://127.0.0.1:")
+          (sb-push-i64! (mut url) port)
+          (sb-push-str! (mut url) path)
+          (set! (primitive/index hp 0) (http/Header :name "Authorization" :value (text-join heap ["Bearer " token])))
+          (set! (primitive/index hp 1) (http/Header :name "Last-Event-ID" :value (copy-bytes heap last-event-id)))
+          (set! (.method request) "GET")
+          (set! (.url request) (sb-finish! (mut url)))
+          (set! (.headers request) (slice-new [http/Header] hp (if (> (len last-event-id) 0) 2 1)))
+          (set! (.body request) "")
+          (set! (.connect-timeout-ms request) 3000)
+          (set! (.timeout-ms request) 0)
+          (set! (.follow-redirects request) false)
+          (set! (.ca-info request) "")
+          (sync/mutex-init (field relay mutex))
+          (set! (.queue relay) (al-new [u8] heap))
+          (set! (.holders relay) 2)
+          (set! (.request relay) request)
+          (if (!= (thread/thread-spawn (field relay thread) (fnptr-of relay-main) (cast (ptr i8) relay)) 0)
+              (app/response 500 "application/json" "{\"error\":{\"code\":\"internal\",\"message\":\"could not start the relay\"}}")
+              (do (pthread_detach (.handle (field relay thread)))
+                  (let [(mut hs) (al-new [app/ResponseHeader] a)]
+                    (push! [app/ResponseHeader] (mut hs) (app/ResponseHeader :name "Cache-Control" :value "no-cache"))
+                    (app/stream-response 200 "text/event-stream; charset=utf-8" (al-slice hs) relay))))))))
+
+;;; Ask each reachable remote site whether it has a run matching `reference`.
+;;; Call WITHOUT the lock.
+(defn ask-remotes-for-run [(hub (ptr Hub)) (a (dyn Allocator)) (reference (slice u8))] (-> RemoteRun)
+  (let [(mut result) (RemoteRun :remote (cast (ptr Remote) 0) :id "" :matches 0)]
+    (for remote (iter (remotes-snapshot hub a))
+      (hub-lock! hub)
+      (let [port (.local-port remote)
+            token (copy-bytes a (.token remote))]
+        (hub-unlock! hub)
+        (when (> port 0)
+          (let [reply (remote-request a port token "GET" (text-join a ["/v1/runs/" reference]) "" 5000)]
+            (when (= (.status reply) 200)
+              (match (jv-parse a (.body reply))
+                (Some [run] (set! result (RemoteRun :remote remote
+                                                    :id (copy-bytes a (jv-string-or (jv-get run "id") ""))
+                                                    :matches (+ (.matches result) 1))))
+                (None [] 0))
+              0)
+            0)
+          0)))
+    (load result)))

@@ -1,0 +1,227 @@
+;; SSH destinations: parse the spellings people write, render them back as ssh
+;; arguments.
+;;
+;; Accepted: `host`, `user@host`, `host:port`, `user@host:port`,
+;; `ssh://[user@]host[:port][/]`, bracketed IPv6 (`[::1]:2222`), and a bare IPv6
+;; address without a port (`::1`). A host may be an ssh_config alias; its
+;; settings still apply because the host is passed to ssh as written.
+;;
+;; A user or host that starts with `-` is rejected: ssh would read it as an
+;; option (`-oProxyCommand=...`), which turns a destination into command
+;; execution.
+(module ssh.target)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+(export Target
+        target
+        parse-target
+        target-destination
+        target-display
+        target-ssh-args)
+
+;;; `port` 0 means "not specified": ssh uses its configured or default port.
+(defstruct Target [(user (slice u8)) (host (slice u8)) (port i64)])
+
+;;; A target from parts. No validation; prefer `parse-target` for user input.
+(defn target [(user (slice u8)) (host (slice u8)) (port i64)] (-> Target)
+  (Target
+    :user user
+    :host host
+    :port port))
+
+(defn find-byte [(text (slice u8)) (byte i64)] (-> i64)
+  (let [(mut found) -1
+        (mut k) 0]
+    (loop (if (>= (load k) (len text))
+              (break)
+              (if (= (cast i64 (get text (load k))) byte)
+                  (do (set! found (load k)) (break))
+                  (set! k (+ (load k) 1)))))
+    (load found)))
+
+(defn count-byte [(text (slice u8)) (byte i64)] (-> i64)
+  (let [(mut count) 0
+        (mut k) 0]
+    (loop (if (>= (load k) (len text))
+              (break)
+              (do
+                (when (= (cast i64 (get text (load k))) byte)
+                  (set! count (+ (load count) 1))
+                  0)
+                (set! k (+ (load k) 1)))))
+    (load count)))
+
+;; No whitespace, control bytes, or the delimiters that would change meaning.
+(defn clean-part? [(text (slice u8))] (-> bool)
+  (let [(mut ok) true
+        (mut k) 0]
+    (loop (if (>= (load k) (len text))
+              (break)
+              (let [b (cast i64 (get text (load k)))]
+                (if (or (<= b 32) (= b 127) (= b 47) (= b 64) (= b 91) (= b 93))
+                    (do (set! ok false) (break))
+                    (set! k (+ (load k) 1))))))
+    (load ok)))
+
+(defn parse-port [(text (slice u8))] (-> (Result i64 (slice u8)))
+  (let [(mut value) 0
+        (mut valid) (and (> (len text) 0) (<= (len text) 5))
+        (mut k) 0]
+    (loop (if (or (not (load valid)) (>= (load k) (len text)))
+              (break)
+              (let [b (cast i64 (get text (load k)))]
+                (if (and (>= b 48) (<= b 57))
+                    (do
+                      (set! value (+ (* (load value) 10) (- b 48)))
+                      (set! k (+ (load k) 1)))
+                    (set! valid false)))))
+    (cond (not (load valid)) (Err "the port must be a number")
+          (or (< (load value) 1) (> (load value) 65535))
+            (Err "the port must be between 1 and 65535")
+          :else (Ok (load value)))))
+
+(defn check-host [(host (slice u8)) (ipv6 bool)] (-> (Option (slice u8)))
+  (cond (= (len host) 0) (Some "the host is empty")
+        (= (cast i64 (get host 0)) 45) (Some "the host must not start with '-'")
+        (not (clean-part? host))
+          (Some "the host contains a character that is not allowed")
+        (and (not ipv6) (> (count-byte host 58) 0))
+          (Some "the host contains ':'")
+        :else (None [(slice u8)])))
+
+;; Split `host[:port]` or `[v6]:port`; `url` rejects unbracketed IPv6.
+(defn parse-host-port [(user (slice u8)) (text (slice u8)) (url bool)] (-> (Result Target
+                                                                                   (slice u8)))
+  (if (and (> (len text) 0) (= (cast i64 (get text 0)) 91))
+      (let [close (find-byte text 93)]
+        (if (< close 0)
+            (Err "an IPv6 address is missing its closing ']'")
+            (let [host (subslice text 1 close)
+                  rest (subslice text (+ close 1) (len text))]
+              (match (check-host host true)
+                (Some [problem] (Err problem))
+                (None []
+                      (cond (= (len rest) 0)
+                              (Ok (Target
+                                    :user user
+                                    :host host
+                                    :port 0))
+                            (= (cast i64 (get rest 0)) 58)
+                              (match (parse-port (subslice rest 1 (len rest)))
+                                (Ok [port]
+                                    (Ok (Target
+                                          :user user
+                                          :host host
+                                          :port port)))
+                                (Err [problem] (Err problem)))
+                            :else (Err "unexpected text after ']'")))))))
+      (let [colons (count-byte text 58)]
+        (cond (= colons 0)
+                (match (check-host text false)
+                  (Some [problem] (Err problem))
+                  (None []
+                        (Ok (Target
+                              :user user
+                              :host text
+                              :port 0))))
+              (= colons 1)
+                (let [at (find-byte text 58)
+                      host (subslice text 0 at)]
+                  (match (check-host host false)
+                    (Some [problem] (Err problem))
+                    (None []
+                          (match (parse-port (subslice text (+ at 1) (len text)))
+                            (Ok [port]
+                                (Ok (Target
+                                      :user user
+                                      :host host
+                                      :port port)))
+                            (Err [problem] (Err problem))))))
+              url (Err "an IPv6 address in an ssh:// URL needs brackets")
+              :else
+                (match (check-host text true)
+                  (Some [problem] (Err problem))
+                  (None []
+                        (Ok (Target
+                              :user user
+                              :host text
+                              :port 0))))))))
+
+;;; Parse a destination. The result borrows from `text`. Errors are short
+;;; explanations suitable after "invalid ssh target 'X': ".
+(defn parse-target [(text (slice u8))] (-> (Result Target (slice u8)))
+  (let [url (starts-with text "ssh://")
+        body (if url (subslice text 6 (len text)) text)
+        slash (find-byte body 47)
+        trimmed
+          (if (and url (= slash (- (len body) 1)) (> (len body) 0))
+              (subslice body 0 slash)
+              body)]
+    (cond (= (len text) 0) (Err "the target is empty")
+          (and url (>= (find-byte trimmed 47) 0))
+            (Err "an ssh:// URL cannot have a path")
+          (> (count-byte trimmed 64) 1)
+            (Err "the target contains more than one '@'")
+          :else
+            (let [at (find-byte trimmed 64)]
+              (if (< at 0)
+                  (parse-host-port "" trimmed url)
+                  (let [user (subslice trimmed 0 at)]
+                    (cond (= (len user) 0) (Err "the user before '@' is empty")
+                          (= (cast i64 (get user 0)) 45)
+                            (Err "the user must not start with '-'")
+                          (or (not (clean-part? user))
+                              (> (count-byte user 58) 0))
+                            (Err "the user contains a character that is not allowed")
+                          :else
+                            (parse-host-port user
+                                             (subslice trimmed
+                                                       (+ at 1)
+                                                       (len trimmed))
+                                             url))))))))
+
+;;; `user@host`, or `host` when there is no user: ssh's destination argument.
+(defn target-destination [(a (dyn Allocator)) (t Target)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (when (> (len (.user t)) 0)
+      (sb-push-str! (mut out) (.user t))
+      (sb-push-byte! (mut out) 64)
+      0)
+    (sb-push-str! (mut out) (.host t))
+    (sb-finish! (mut out))))
+
+;;; The target as a person would write it: `user@host:port`, bracketing an IPv6
+;;; host when a port follows.
+(defn target-display [(a (dyn Allocator)) (t Target)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        bracket (and (> (.port t) 0) (> (count-byte (.host t) 58) 0))]
+    (when (> (len (.user t)) 0)
+      (sb-push-str! (mut out) (.user t))
+      (sb-push-byte! (mut out) 64)
+      0)
+    (when bracket (sb-push-byte! (mut out) 91) 0)
+    (sb-push-str! (mut out) (.host t))
+    (when bracket (sb-push-byte! (mut out) 93) 0)
+    (when (> (.port t) 0)
+      (sb-push-byte! (mut out) 58)
+      (sb-push-i64! (mut out) (.port t))
+      0)
+    (sb-finish! (mut out))))
+
+;;; The ssh arguments naming this target: `-p PORT` when a port is set, then the
+;;; destination, which must be the last option-position argument (a remote
+;;; command may follow it).
+(defn target-ssh-args [(a (dyn Allocator)) (t Target)] (-> (slice (slice u8)))
+  (let [(mut args) (al-new [(slice u8)] a)]
+    (when (> (.port t) 0)
+      (push! (mut args) "-p")
+      (let [(mut port) (sb-new a)]
+        (sb-push-i64! (mut port) (.port t))
+        (push! (mut args) (sb-finish! (mut port))))
+      0)
+    (push! (mut args) (target-destination a t))
+    (al-into-slice (mut args))))

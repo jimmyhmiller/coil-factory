@@ -1,0 +1,370 @@
+(module ai.openai)
+(import "coil.alloc" :use *)
+(import "coil.http.client" :as http)
+(import "coil.match" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "sse.core" :as sse)
+(import "ai.chat" :use *)
+
+(defstruct HttpReply [(status i64) (body (slice u8)) (error (slice u8))])
+
+(deftrait ChatHttpTransport [Self]
+  (send-chat-http [(self (ptr Self))
+                   (a (dyn Allocator))
+                   (url (slice u8))
+                   (authorization (slice u8))
+                   (body (slice u8))
+                   (timeout-ms i64)]
+                  (-> HttpReply))
+  (send-chat-http-stream [(self (ptr Self))
+                          (a (dyn Allocator))
+                          (url (slice u8))
+                          (authorization (slice u8))
+                          (body (slice u8))
+                          (timeout-ms i64)
+                          (decoder (ptr sse/SseDecoder))]
+                         (-> HttpReply)))
+
+(defstruct NativeChatHttp [(reserved u8)])
+
+(defn chat-stream-chunk [(data (ptr u8)) (length i64) (context (ptr i8))] (-> i64)
+  (if (sse/sse-decoder-feed! (cast (ptr sse/SseDecoder) context)
+                             (slice-new [u8] data length))
+      http/BODY-CONTINUE
+      http/BODY-STOP))
+
+(impl ChatHttpTransport NativeChatHttp
+  (send-chat-http [(self (ptr NativeChatHttp))
+                   (a (dyn Allocator))
+                   (url (slice u8))
+                   (authorization (slice u8))
+                   (body (slice u8))
+                   (timeout-ms i64)]
+                  (-> HttpReply)
+                  (let [headers (primitive/alloc-stack (array http/Header 2))
+                        first (primitive/alloc-stack http/Header)
+                        second (primitive/alloc-stack http/Header)
+                        request (primitive/alloc-stack http/Request)
+                        (mut reply) (primitive/zeroed HttpReply)]
+                    (set! (.name first) "Content-Type")
+                    (set! (.value first) "application/json")
+                    (set! (.name second) "Authorization")
+                    (set! (.value second) authorization)
+                    (set! (primitive/index (primitive/cast (ptr http/Header)
+                                                           headers)
+                                           0)
+                          (load first))
+                    (set! (primitive/index (primitive/cast (ptr http/Header)
+                                                           headers)
+                                           1)
+                          (load second))
+                    (set! (.method request) "POST")
+                    (set! (.url request) url)
+                    (set! (.headers request)
+                          (slice-new [http/Header]
+                                     (primitive/cast (ptr http/Header) headers)
+                                     2))
+                    (set! (.body request) body)
+                    (set! (.connect-timeout-ms request) timeout-ms)
+                    (set! (.timeout-ms request) timeout-ms)
+                    (set! (.follow-redirects request) false)
+                    (set! (.ca-info request) "")
+                    (match (http/request a request)
+                      (Err [failure]
+                           (do
+                             (set! (.status reply) 0)
+                             (set! (.error reply) "HTTP transport failed")))
+                      (Ok [response]
+                          (do
+                            (set! (.status reply)
+                                  (http/response-status response))
+                            (match (str-concat a
+                                               ""
+                                               (http/response-body response))
+                              (Some [owned] (set! (.body reply) owned))
+                              (None [] (set! (.error reply) "out of memory")))
+                            (http/response-free a response))))
+                    (load reply)))
+  (send-chat-http-stream [(self (ptr NativeChatHttp))
+                          (a (dyn Allocator))
+                          (url (slice u8))
+                          (authorization (slice u8))
+                          (body (slice u8))
+                          (timeout-ms i64)
+                          (decoder (ptr sse/SseDecoder))]
+                         (-> HttpReply)
+                         (let [headers
+                                 (primitive/alloc-stack (array http/Header 2))
+                               first (primitive/alloc-stack http/Header)
+                               second (primitive/alloc-stack http/Header)
+                               request (primitive/alloc-stack http/Request)
+                               sink (primitive/alloc-stack http/BodySink)
+                               (mut reply) (primitive/zeroed HttpReply)]
+                           (set! (.name first) "Content-Type")
+                           (set! (.value first) "application/json")
+                           (set! (.name second) "Authorization")
+                           (set! (.value second) authorization)
+                           (set! (primitive/index (primitive/cast (ptr http/Header)
+                                                                  headers)
+                                                  0)
+                                 (load first))
+                           (set! (primitive/index (primitive/cast (ptr http/Header)
+                                                                  headers)
+                                                  1)
+                                 (load second))
+                           (set! (.method request) "POST")
+                           (set! (.url request) url)
+                           (set! (.headers request)
+                                 (slice-new [http/Header]
+                                            (primitive/cast (ptr http/Header)
+                                                            headers)
+                                            2))
+                           (set! (.body request) body)
+                           (set! (.connect-timeout-ms request) timeout-ms)
+                           (set! (.timeout-ms request) timeout-ms)
+                           (set! (.follow-redirects request) false)
+                           (set! (.ca-info request) "")
+                           (set! (.context sink) (cast (ptr i8) decoder))
+                           (set! (.consume sink) (fnptr-of chat-stream-chunk))
+                           (match (http/request-stream a request (load sink))
+                             (Err [failure]
+                                  (do
+                                    (set! (.status reply) 0)
+                                    (set! (.error reply)
+                                          "HTTP transport failed")))
+                             (Ok [response]
+                                 (do
+                                   (set! (.status reply)
+                                         (http/streaming-response-status response))
+                                   (http/streaming-response-free a response))))
+                           (load reply))))
+
+(defstruct OpenAiChat
+  [(url (slice u8))
+   (api-key (slice u8))
+   (transport (dyn ChatHttpTransport))])
+
+(defn json-string [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
+  (match (to-json-str a value)
+    (Ok [encoded] encoded)
+    (Err [failure] "")))
+
+(defn decode-response [(a (dyn Allocator)) (body (slice u8))] (-> ChatResult)
+  (match (from-json [JVal] a body)
+    (Err [failure]
+         (ChatFailed (chat-error "protocol"
+                                 0
+                                 "model response is not valid JSON")))
+    (Ok [root]
+        (let [choice (jv-nth (jv-get root "choices") 0)
+              message (jv-get choice "message")
+              text (jv-str (jv-get message "content"))
+              tool-calls (jv-get message "tool_calls")
+              reason (jv-str (jv-get choice "finish_reason"))
+              usage (jv-get root "usage")
+              (mut response) (primitive/zeroed ChatResponse)]
+          (if (jv-null? choice)
+              (ChatFailed (chat-error "protocol"
+                                      0
+                                      "model response has no choice"))
+              (do
+                (set! (.text response) text)
+                (set! (.tool-calls response) tool-calls)
+                (set! (.finish-reason response) reason)
+                (set! (.input-tokens response)
+                      (jv-int (jv-get usage "prompt_tokens")))
+                (set! (.output-tokens response)
+                      (jv-int (jv-get usage "completion_tokens")))
+                (set! (.raw response) root)
+                (ChatOk (load response))))))))
+
+(defstruct OpenAiDeltaDecoder
+  [(allocator (dyn Allocator))
+   (sink (dyn ChatDeltaSink))
+   (done bool)
+   (invalid bool)])
+
+(impl sse/SseEventSink OpenAiDeltaDecoder
+  (consume-sse-event [(self (ptr OpenAiDeltaDecoder)) (event sse/SseEvent)]
+                     (-> bool)
+                     (if (= (.data event) "[DONE]")
+                         (do (set! (.done self) true) true)
+                         (match (str-concat (.allocator self) "" (.data event))
+                           (None [] (do (set! (.invalid self) true) false))
+                           (Some [owned]
+                                 (match (from-json [JVal]
+                                                   (.allocator self)
+                                                   owned)
+                                   (Err [failure]
+                                        (do (set! (.invalid self) true) false))
+                                   (Ok [root]
+                                       (let [choice
+                                               (jv-nth (jv-get root "choices")
+                                                       0)
+                                             part (jv-get choice "delta")
+                                             (mut delta)
+                                               (primitive/zeroed ChatDelta)]
+                                         (if (jv-null? choice)
+                                             (do
+                                               (set! (.invalid self) true)
+                                               false)
+                                             (do
+                                               (set! (.text delta)
+                                                     (jv-str (jv-get part
+                                                                     "content")))
+                                               (set! (.tool-calls delta)
+                                                     (jv-get part "tool_calls"))
+                                               (set! (.finish-reason delta)
+                                                     (jv-str (jv-get choice
+                                                                     "finish_reason")))
+                                               (set! (.raw delta) root)
+                                               (on-chat-delta (.sink self)
+                                                              (load delta))))))))))))
+
+(defn openai-payload [(a (dyn Allocator)) (request ChatRequest) (stream bool)] (-> (slice u8))
+  (let [(mut payload) (object-new a)]
+    (object-put! (mut payload) "model" (JStr (.model request)))
+    (object-put! (mut payload) "messages" (.messages request))
+    (when (not (jv-null? (.tools request)))
+      (object-put! (mut payload) "tools" (.tools request))
+      0)
+    (object-put! (mut payload) "stream" (JBool stream))
+    (json-string a (load payload))))
+
+(defn openai-authorization [(a (dyn Allocator)) (key (slice u8))] (-> (slice u8))
+  (let [(mut auth) (sb-new a)]
+    (sb-push-str! (mut auth) "Bearer ")
+    (sb-push-str! (mut auth) key)
+    (sb-finish! (mut auth))))
+
+(defn openai-config-valid? [(provider (ptr OpenAiChat))] (-> bool)
+  (and (> (len (.url provider)) 0)
+       (> (len (.api-key provider)) 0)))
+
+(impl ChatProvider OpenAiChat
+  (complete [(self (ptr OpenAiChat))
+             (a (dyn Allocator))
+             (request ChatRequest)]
+            (-> ChatResult)
+            (block :complete
+                   (if (not (openai-config-valid? self))
+                       (return-from :complete
+                                      (ChatFailed (chat-error "configuration"
+                                                              0
+                                                              "Chat Completions URL and API key are required")))
+                       0)
+                   (if (or (= (.model request) "")
+                           (not (match (.messages request)
+                                  (JArr [items] true)
+                                  (_ false))))
+                       (return-from :complete
+                                      (ChatFailed (chat-error "invalid_request"
+                                                              0
+                                                              "model and message array are required")))
+                       0)
+                   (let [body (openai-payload a request false)]
+                     (if (= body "")
+                         (return-from :complete
+                                        (ChatFailed (chat-error "encoding"
+                                                                0
+                                                                "could not encode request")))
+                         0)
+                     (let [reply
+                             (send-chat-http (.transport self)
+                                             a
+                                             (.url self)
+                                             (openai-authorization a
+                                                                   (.api-key self))
+                                             body
+                                             (.timeout-ms request))]
+                       (cond (> (slice-len [u8] (.error reply)) 0)
+                               (ChatFailed (chat-error "transport"
+                                                       0
+                                                       (.error reply)))
+                             (or (< (.status reply) 200)
+                                 (>= (.status reply) 300))
+                               (ChatFailed (chat-error "provider"
+                                                       (.status reply)
+                                                       (.body reply)))
+                             :else (decode-response a (.body reply))))))))
+
+(impl StreamingChatProvider OpenAiChat
+  (complete-stream [(self (ptr OpenAiChat))
+                    (a (dyn Allocator))
+                    (request ChatRequest)
+                    (sink (dyn ChatDeltaSink))]
+                   (-> StreamResult)
+                   (block :stream
+                          (if (not (openai-config-valid? self))
+                              (return-from :stream
+                                             (StreamFailed (chat-error "configuration"
+                                                                       0
+                                                                       "Chat Completions URL and API key are required")))
+                              0)
+                          (if (or (= (.model request) "")
+                                  (not (match (.messages request)
+                                         (JArr [items] true)
+                                         (_ false))))
+                              (return-from :stream
+                                             (StreamFailed (chat-error "invalid_request"
+                                                                       0
+                                                                       "model and message array are required")))
+                              0)
+                          (let [body (openai-payload a request true)
+                                decoder-context
+                                  (primitive/alloc-stack OpenAiDeltaDecoder)
+                                decoder (primitive/alloc-stack sse/SseDecoder)]
+                            (if (= body "")
+                                (return-from :stream
+                                               (StreamFailed (chat-error "encoding"
+                                                                         0
+                                                                         "could not encode request")))
+                                0)
+                            (set! (.allocator decoder-context) a)
+                            (set! (.sink decoder-context) sink)
+                            (set! (.done decoder-context) false)
+                            (set! (.invalid decoder-context) false)
+                            (set! decoder
+                                  (sse/sse-decoder-new a
+                                                       decoder-context
+                                                       1048576))
+                            (let [reply
+                                    (send-chat-http-stream (.transport self)
+                                                           a
+                                                           (.url self)
+                                                           (openai-authorization a
+                                                                                 (.api-key self))
+                                                           body
+                                                           (.timeout-ms request)
+                                                           decoder)
+                                  failed (sse/sse-decoder-failed? decoder)
+                                  done (.done decoder-context)
+                                  invalid (.invalid decoder-context)]
+                              (sse/sse-decoder-free! decoder)
+                              (cond (> (slice-len [u8] (.error reply)) 0)
+                                      (StreamFailed (chat-error "transport"
+                                                                0
+                                                                (.error reply)))
+                                    (or (< (.status reply) 200)
+                                        (>= (.status reply) 300))
+                                      (StreamFailed (chat-error "provider"
+                                                                (.status reply)
+                                                                (.body reply)))
+                                    invalid
+                                      (StreamFailed (chat-error "protocol"
+                                                                0
+                                                                "invalid model SSE event"))
+                                    failed
+                                      (StreamFailed (chat-error "consumer"
+                                                                0
+                                                                "stream consumer stopped"))
+                                    (not done)
+                                      (StreamFailed (chat-error "protocol"
+                                                                0
+                                                                "model stream ended before DONE"))
+                                    :else (StreamFinished)))))))

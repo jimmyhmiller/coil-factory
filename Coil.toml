@@ -1,0 +1,21 @@
+[package]
+name = "factory"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+
+[dependencies]
+agent = { path = "libraries/agent" }
+ai = { path = "libraries/ai" }
+json_schema = { path = "libraries/json-schema" }
+durable = { path = "libraries/durable" }
+mddoc = { path = "libraries/mddoc" }
+sse = { path = "libraries/sse" }
+agent_tools = { path = "libraries/agent-tools" }
+http_app = { path = "libraries/http-app" }
+ssh = { path = "libraries/ssh" }
+cli = { path = "libraries/cli" }
+tui = { path = "libraries/tui" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

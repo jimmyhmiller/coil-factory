@@ -1,0 +1,444 @@
+(module durable.jsonl)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.try" :use *)
+(import "durable.error" :use *)
+(import "durable.fdio" :use *)
+(import "durable.sys" :use *)
+
+;;; One complete journal record. `offset` is the byte offset of its first byte,
+;;; `next-offset` the offset just past its terminating newline (the cursor to resume
+;;; from), and `line` its bytes without the newline, borrowed from the batch.
+(defstruct JournalRecord
+  [(offset i64)
+   (next-offset i64)
+   (line (slice u8))])
+
+;;; The result of one `journal-read`. `records` borrow `buffer`; both are released
+;;; together by `journal-batch-free!`. `start` is the offset the read began at and
+;;; `next-offset` the cursor for the following read (equal to `start` when no
+;;; complete record was available).
+(defstruct JournalBatch
+  [(records (ArrayList JournalRecord))
+   (buffer (ArrayList u8))
+   (start i64)
+   (next-offset i64)])
+
+;;; Default permission bits for a journal created by `journal-append!`.
+(const JOURNAL-DEFAULT-MODE 384)
+
+;; Bytes requested from the kernel per read.
+(const JOURNAL-READ-CHUNK 65536)
+
+(defn journal-batch-empty [(a (dyn Allocator)) (offset i64)] (-> JournalBatch)
+  (JournalBatch
+    :records (al-new [JournalRecord] a)
+    :buffer (al-new [u8] a)
+    :start offset
+    :next-offset offset))
+
+;;; Release a batch's records and buffer. Every `line` it handed out dies with it.
+(defn journal-batch-free! [(batch (mut JournalBatch))] (-> i64)
+  (al-free! [JournalRecord] (mut (.records batch)))
+  (al-free! [u8] (mut (.buffer batch))))
+
+;;; The records of a batch, in file order.
+(defn batch-records [(batch JournalBatch)] (-> (slice JournalRecord))
+  (al-slice [JournalRecord] (.records batch)))
+
+(defn batch-count [(batch JournalBatch)] (-> i64)
+  (len (.records batch)))
+
+(defn batch-next-offset [(batch JournalBatch)] (-> i64)
+  (.next-offset batch))
+
+;;; Validate a record before it is appended: nonempty and free of newlines, so it
+;;; occupies exactly one line.
+(defn journal-line-check [(line (slice u8))] (-> (Result i64 DurableError))
+  (try (ensure! (> (len line) 0) (Err (Invalid "journal record is empty")))
+       (let [(mut i) 0]
+         (loop (if (>= (load i) (len line))
+                   (break)
+                   (do
+                     (ensure! (!= (cast i64 (get line (load i))) 10)
+                              (Err (Invalid "journal record contains a newline")))
+                     (set! i (+ (load i) 1))))))
+       (Ok 0)))
+
+;;; The offset just past the last newline in the first `size` bytes of the file
+;;; (0 when there is none), scanning backwards in chunks.
+(defn journal-complete-end [(fd i32) (size i64)] (-> (Result i64 DurableError))
+  (try (let [chunk-cap 4096
+             buf (primitive/alloc-stack (array u8 4096))
+             (mut hi) size
+             (mut found) -1]
+         (loop (if (or (<= (load hi) 0) (>= (load found) 0))
+                   (break)
+                   (let [lo
+                           (if (> (load hi) chunk-cap)
+                               (- (load hi) chunk-cap)
+                               0)
+                         want (- (load hi) lo)
+                         got (try! (pread-some fd (cast (ptr u8) buf) want lo))]
+                     (ensure! (= got want)
+                              (Err (Corrupt "journal shrank while it was locked")))
+                     (let [(mut i) (- want 1)]
+                       (loop (if (< (load i) 0)
+                                 (break)
+                                 (if (= (cast i64
+                                              (load (index (cast (ptr u8) buf)
+                                                           (load i))))
+                                        10)
+                                     (do
+                                       (set! found (+ (+ lo (load i)) 1))
+                                       (break))
+                                     (set! i (- (load i) 1))))))
+                     (set! hi lo))))
+         (Ok (if (>= (load found) 0) (load found) 0)))))
+
+;; With the exclusive lock held: discard an incomplete final line left by a writer
+;; that died mid-record, write the record, and optionally fsync. Returns the offset
+;; the record starts at.
+(defn journal-append-locked [(a (dyn Allocator))
+                             (fd i32)
+                             (record (slice u8))
+                             (sync bool)] (-> (Result i64 DurableError))
+  (try (let [size (try! (fd-size fd))
+             (mut start) size]
+         (when (> size 0)
+           (let [last (primitive/alloc-stack u8)
+                 got (try! (pread-some fd last 1 (- size 1)))]
+             (ensure! (= got 1)
+                      (Err (Corrupt "journal shrank while it was locked")))
+             (when (!= (cast i64 (load last)) 10)
+               (let [end (try! (journal-complete-end fd size))]
+                 (try! (truncate-fd fd end))
+                 (set! start end)
+                 0)
+               0)
+             0)
+           0)
+         (match (write-all-fd fd record)
+           (Err [e]
+                (do
+                  ;; Roll back a partially written record; the original failure is what
+                  ;; the caller needs to see even if the rollback fails too.
+                  (truncate-fd fd (load start))
+                  (Err e)))
+           (Ok [written]
+               (do
+                 (when sync (try! (fsync-fd fd)) 0)
+                 (Ok (load start))))))))
+
+;;; Append `line` plus a newline to the journal at `path` and return the byte offset
+;;; where the record starts. Creates the file with `mode` when missing.
+;;;
+;;; Safe with any number of concurrent writers in any number of processes, provided
+;;; they all append through this function: the file is opened O_APPEND and the write
+;;; happens under `flock(LOCK_EX)` on a descriptor private to this call (so threads
+;;; of one process exclude each other too). While locked, an incomplete final line
+;;; — left only by a writer that died mid-record, because a live writer holds the
+;;; lock until its record is complete — is truncated away before appending; readers
+;;; never returned it. With `sync`, the record is fsync'd before the lock is released,
+;;; and the parent directory is fsync'd after the first record so that a newly
+;;; created journal survives a crash.
+(defn journal-append-with-mode! [(a (dyn Allocator))
+                                 (path (slice u8))
+                                 (line (slice u8))
+                                 (sync bool)
+                                 (mode i64)] (-> (Result i64 DurableError))
+  (try (try! (journal-line-check line))
+       (let [n (len line)
+             record
+               (match (alloc-bytes a (+ n 1) 1)
+                 (Some [m] m)
+                 (None [] (return-from :try (Err (OutOfMemory)))))]
+         (mem-copy [u8] (slice-data record) (slice-data line) n)
+         (slice-set! record n (cast u8 10))
+         (let [opened
+                 (open-path a
+                            path
+                            (| SYS-O-RDWR
+                               (| SYS-O-APPEND (| SYS-O-CREAT SYS-O-CLOEXEC)))
+                            mode)
+               result
+                 (match opened
+                   (Err [e] (Err [i64 DurableError] e))
+                   (Ok [fd]
+                       (close-after fd
+                                    (match (flock-fd fd SYS-LOCK-EX)
+                                      (Err [e] (Err [i64 DurableError] e))
+                                      (Ok [locked]
+                                          (journal-append-locked a
+                                                                 fd
+                                                                 record
+                                                                 sync))))))]
+           (free-bytes a record 1)
+           (let [offset (try! result)]
+             (when (and sync (= offset 0))
+               (try! (fsync-dir a (parent-dir path)))
+               0)
+             (Ok offset))))))
+
+;;; `journal-append-with-mode!` with mode 0600.
+(defn journal-append! [(a (dyn Allocator))
+                       (path (slice u8))
+                       (line (slice u8))
+                       (sync bool)] (-> (Result i64 DurableError))
+  (journal-append-with-mode! a path line sync JOURNAL-DEFAULT-MODE))
+
+;; Validate `from` against the open journal: it must be 0, or within the file and
+;; directly after a newline.
+(defn journal-check-cursor [(fd i32) (from i64)] (-> (Result i64 DurableError))
+  (try (ensure! (>= from 0) (Err (BadCursor from "offset is negative")))
+       (let [size (try! (fd-size fd))]
+         (ensure! (<= from size)
+                  (Err (BadCursor from "offset is past the end of the journal")))
+         (when (> from 0)
+           (let [prev (primitive/alloc-stack u8)
+                 got (try! (pread-some fd prev 1 (- from 1)))]
+             (ensure! (= got 1)
+                      (Err (BadCursor from
+                                      "offset is past the end of the journal")))
+             (ensure! (= (cast i64 (load prev)) 10)
+                      (Err (BadCursor from "offset is not on a record boundary")))
+             0)
+           0)
+         (Ok size))))
+
+;; Scan newly read bytes [scan-from, have) of the buffer for record ends, appending
+;; records until the batch is full. Record `line`s are filled in once the buffer has
+;; stopped growing. Returns true when the batch is full.
+(defn journal-scan! [(buffer (ArrayList u8))
+                     (records (mut (ArrayList JournalRecord)))
+                     (line-start (mut i64))
+                     (scan-from i64)
+                     (from i64)
+                     (max-records i64)
+                     (max-bytes i64)] (-> bool)
+  (let [have (len buffer)
+        data (.data buffer)
+        (mut i) scan-from
+        (mut full) false]
+    (loop (if (>= (load i) have)
+              (break)
+              (do
+                (when (= (cast i64 (load (index data (load i)))) 10)
+                  (let [record-end (+ (load i) 1)]
+                    (if (and (> (len (load records)) 0)
+                             (> record-end max-bytes))
+                        (do
+                          (set! full true)
+                          (break))
+                        (do
+                          (push! [JournalRecord]
+                                 (mut records)
+                                 (JournalRecord
+                                   :offset (+ from (load line-start))
+                                   :next-offset (+ from record-end)
+                                   :line ""))
+                          (set! line-start record-end)
+                          (when (>= (len (load records))
+                                    max-records)
+                            (set! full true)
+                            (break))
+                          0)))
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load full)))
+
+(defn journal-read-fd [(a (dyn Allocator))
+                       (fd i32)
+                       (from i64)
+                       (max-records i64)
+                       (max-bytes i64)] (-> (Result JournalBatch DurableError))
+  (try (try! (journal-check-cursor fd from))
+       (let [(mut buffer) (al-new [u8] a)
+             (mut records) (al-new [JournalRecord] a)
+             (mut line-start) 0
+             (mut failure) (None [DurableError])]
+         (loop (let [have (len (load buffer))
+                     want
+                       (if (< have max-bytes)
+                           (if (< (- max-bytes have) JOURNAL-READ-CHUNK)
+                               (- max-bytes have)
+                               JOURNAL-READ-CHUNK)
+                           JOURNAL-READ-CHUNK)]
+                 (when (< (- (al-cap [u8] (load buffer)) have) want)
+                   (al-reserve! [u8]
+                                (mut buffer)
+                                (if (> (* (al-cap [u8] (load buffer)) 2)
+                                       (+ have want))
+                                    (* (al-cap [u8] (load buffer)) 2)
+                                    (+ have want)))
+                   0)
+                 (match (pread-some fd
+                                    (index (.data buffer) have)
+                                    want
+                                    (+ from have))
+                   (Err [e]
+                        (do
+                          (set! failure (Some e))
+                          (break)))
+                   (Ok [got]
+                       (if (= got 0)
+                           (break)
+                           (do
+                             (set! (.len buffer) (+ have got))
+                             (when (journal-scan! (load buffer)
+                                                  (mut records)
+                                                  (mut line-start)
+                                                  have
+                                                  from
+                                                  max-records
+                                                  max-bytes)
+                               (break)
+                               0)
+                             (when (and (> (len (load records)) 0)
+                                        (>= (+ have got) max-bytes))
+                               (break)
+                               0)
+                             0))))))
+         (match (load failure)
+           (Some [e]
+                 (do
+                   (al-free! [JournalRecord] (mut records))
+                   (al-free! [u8] (mut buffer))
+                   (Err e)))
+           (None []
+                 (let [count (len (load records))
+                       data (.data buffer)
+                       (mut i) 0]
+                   (loop (if (>= (load i) count)
+                             (break)
+                             (let [r
+                                     (al-elem [JournalRecord]
+                                              (mut records)
+                                              (load i))
+                                   lo (- (.offset r) from)
+                                   hi (- (- (.next-offset r) from) 1)]
+                               (set! (.line r)
+                                     (slice-new [u8] (index data lo) (- hi lo)))
+                               (set! i (+ (load i) 1)))))
+                   (Ok (JournalBatch
+                         :records (load records)
+                         :buffer (load buffer)
+                         :start from
+                         :next-offset
+                           (if (> count 0)
+                               (.next-offset (al-elem [JournalRecord]
+                                                      (mut records)
+                                                      (- count 1)))
+                               from)))))))))
+
+;;; Read up to `max-records` complete records starting at byte offset `from`.
+;;;
+;;; `from` must be 0 or an offset returned as a record's `next-offset` (or by
+;;; `journal-append!`): the read fails with `BadCursor` when it is negative, past the
+;;; end of the file, or not directly after a newline. A missing journal is an empty
+;;; batch at offset 0 (any other offset into a missing journal is a `BadCursor`).
+;;; An incomplete final line — a record still being written, or left by a writer
+;;; that died — is never returned; the batch's `next-offset` stops before it.
+;;;
+;;; `max-bytes` bounds the bytes of the records in one batch, but the first record is
+;;; always returned whole even when it alone is larger, so a reader can always make
+;;; progress. Reads use pread(2) from `from`; the rest of the file is not read.
+(defn journal-read [(a (dyn Allocator))
+                    (path (slice u8))
+                    (from i64)
+                    (max-records i64)
+                    (max-bytes i64)] (-> (Result JournalBatch DurableError))
+  (try (ensure! (> max-records 0)
+                (Err (Invalid "max-records must be positive")))
+       (ensure! (> max-bytes 0) (Err (Invalid "max-bytes must be positive")))
+       (ensure! (>= from 0) (Err (BadCursor from "offset is negative")))
+       (match (open-path a path (| SYS-O-RDONLY SYS-O-CLOEXEC) 0)
+         (Err [e]
+              (match (error-os-code e)
+                (Some [code]
+                      (if (= code SYS-ENOENT)
+                          (if (= from 0)
+                              (Ok (journal-batch-empty a 0))
+                              (Err (BadCursor from "the journal does not exist")))
+                          (Err e)))
+                (None [] (Err e))))
+         (Ok [fd]
+             (close-after fd (journal-read-fd a fd from max-records max-bytes))))))
+
+;;; The journal's size in bytes, including any incomplete final line; 0 when the
+;;; journal does not exist.
+(defn journal-size [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64
+                                                                       DurableError))
+  (match (open-path a path (| SYS-O-RDONLY SYS-O-CLOEXEC) 0)
+    (Err [e]
+         (match (error-os-code e)
+           (Some [code] (if (= code SYS-ENOENT) (Ok 0) (Err e)))
+           (None [] (Err e))))
+    (Ok [fd] (close-after fd (fd-size fd)))))
+
+;;; A reader that tails one journal: it remembers its cursor between polls.
+;;; `path` is an `allocator`-owned copy; release it with `follower-free!`.
+(defstruct Follower
+  [(allocator (dyn Allocator))
+   (path (slice u8))
+   (cursor i64)
+   (max-records i64)
+   (max-bytes i64)])
+
+;;; A follower for the journal at `path`, starting at `cursor` (0 for the beginning,
+;;; or a saved `next-offset`). Each poll returns at most `max-records` records and
+;;; about `max-bytes` bytes (see `journal-read`).
+(defn follower-new [(a (dyn Allocator))
+                    (path (slice u8))
+                    (cursor i64)
+                    (max-records i64)
+                    (max-bytes i64)] (-> (Result Follower DurableError))
+  (try (ensure! (> (len path) 0) (Err (Invalid "empty path")))
+       (ensure! (> max-records 0)
+                (Err (Invalid "max-records must be positive")))
+       (ensure! (> max-bytes 0) (Err (Invalid "max-bytes must be positive")))
+       (ensure! (>= cursor 0) (Err (BadCursor cursor "offset is negative")))
+       (let [copy
+               (match (alloc-bytes a (len path) 1)
+                 (Some [m] m)
+                 (None [] (return-from :try (Err (OutOfMemory)))))]
+         (mem-copy [u8] (slice-data copy) (slice-data path) (len path))
+         (Ok (Follower
+               :allocator a
+               :path copy
+               :cursor cursor
+               :max-records max-records
+               :max-bytes max-bytes)))))
+
+;;; Records appended since the previous poll (or since the starting cursor). The
+;;; cursor advances past the returned records; an empty batch means nothing new is
+;;; complete yet. A full batch may leave more to read, so drain by polling until a
+;;; batch is empty. The caller frees each batch with `journal-batch-free!`.
+(defn follower-poll! [(follower (mut Follower))] (-> (Result JournalBatch
+                                                             DurableError))
+  (match (journal-read (.allocator follower)
+                       (.path follower)
+                       (.cursor follower)
+                       (.max-records follower)
+                       (.max-bytes follower))
+    (Err [e] (Err e))
+    (Ok [batch]
+        (do
+          (set! (.cursor follower) (batch-next-offset batch))
+          (Ok batch)))))
+
+;;; The follower's cursor: the offset its next poll starts from. Persist it to resume
+;;; later with `follower-new`.
+(defn follower-cursor [(follower Follower)] (-> i64)
+  (.cursor follower))
+
+(defn follower-free! [(follower (mut Follower))] (-> i64)
+  (when (> (len (.path follower)) 0)
+    (free-bytes (.allocator follower) (.path follower) 1)
+    (set! (.path follower) "")
+    0)
+  0)

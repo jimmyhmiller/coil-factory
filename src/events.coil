@@ -1,0 +1,89 @@
+(module factory.events)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "agent.json" :use *)
+
+;;; Journal records. Each is one JSON object on one line of `events.jsonl`:
+;;; `{"t": <wall ms>, "kind": "...", ...}`. The kinds and their fields are the
+;;; table in DESIGN.md; `factory.runstate` is the one place that reads them
+;;; back into meaning.
+
+(defn wall-ms [] (-> i64)
+  (match (time/wall-now-ms)
+    (Ok [ms] ms)
+    (Err [failure] 0)))
+
+;;; A new record of `kind`, stamped now. Keys added later are borrowed, so
+;;; use literals; values are copied only by `ev-text!`.
+(defn ev [(a (dyn Allocator)) (kind (slice u8))] (-> JVal)
+  (let [record (jv-object a)]
+    (jv-put! record "t" (JInt (wall-ms)))
+    (jv-put! record "kind" (JStr kind))
+    record))
+
+;;; The same, attributed to an agent (a station name).
+(defn ev-agent [(a (dyn Allocator)) (kind (slice u8)) (agent (slice u8))] (-> JVal)
+  (let [record (ev a kind)]
+    (jv-put! record "agent" (JStr (copy-bytes a agent)))
+    record))
+
+(defn ev-str! [(record JVal) (key (slice u8)) (value (slice u8))] (-> JVal)
+  (do (jv-put! record key (JStr value)) record))
+
+;;; A string field copied into `a`, bounded to `limit` bytes on a UTF-8
+;;; boundary with an ellipsis. Tool output and prose go through here so a
+;;; journal line never carries a whole file.
+(defn ev-text! [(a (dyn Allocator)) (record JVal) (key (slice u8)) (value (slice u8)) (limit i64)] (-> JVal)
+  (do (jv-put! record key (JStr (preview a value limit))) record))
+
+(defn ev-int! [(record JVal) (key (slice u8)) (value i64)] (-> JVal)
+  (do (jv-put! record key (JInt value)) record))
+
+(defn ev-bool! [(record JVal) (key (slice u8)) (value bool)] (-> JVal)
+  (do (jv-put! record key (JBool value)) record))
+
+(defn ev-put! [(record JVal) (key (slice u8)) (value JVal)] (-> JVal)
+  (do (jv-put! record key value) record))
+
+;;; The record as one journal line (no newline).
+(defn ev-line [(a (dyn Allocator)) (record JVal)] (-> (slice u8))
+  (jv-encode a record))
+
+(defn utf8-continuation? [(byte u8)] (-> bool)
+  (= (& (cast i64 byte) 192) 128))
+
+;;; `text` cut to at most `limit` bytes without splitting a UTF-8 sequence,
+;;; with "…" appended when anything was cut. Always a copy in `a`.
+(defn preview [(a (dyn Allocator)) (text (slice u8)) (limit i64)] (-> (slice u8))
+  (if (<= (len text) limit)
+      (copy-bytes a text)
+      (let [(mut end) limit]
+        (loop (if (or (<= (load end) 0)
+                      (not (utf8-continuation? (get text (load end)))))
+                  (break)
+                  (set! end (- (load end) 1))))
+        (let [(mut out) (sb-new a)]
+          (sb-push-str! (mut out) (subslice [u8] text 0 (load end)))
+          (sb-push-str! (mut out) "…")
+          (sb-finish! (mut out))))))
+
+;;; The first nonblank line of `text`, trimmed, bounded like `preview`.
+(defn first-line [(a (dyn Allocator)) (text (slice u8)) (limit i64)] (-> (slice u8))
+  (let [n (len text)
+        (mut start) 0
+        (mut result) ""]
+    (loop (if (>= (load start) n)
+              (break)
+              (let [(mut end) (load start)]
+                (loop (if (or (>= (load end) n) (= (cast i64 (get text (load end))) 10))
+                          (break)
+                          (set! end (+ (load end) 1))))
+                (let [line (str-trim (subslice [u8] text (load start) (load end)))]
+                  (if (> (len line) 0)
+                      (do (set! result line) (break))
+                      (set! start (+ (load end) 1)))))))
+    (preview a (load result) limit)))

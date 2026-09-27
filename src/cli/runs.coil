@@ -1,0 +1,409 @@
+(module factory.cli.runs)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.style" :as style)
+(import "agent.json" :use *)
+(import "agent.loop" :as loop)
+(import "factory.events" :use *)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use *)
+
+;;; Looking at runs and talking to their agents.
+
+(defn run-path [(a (dyn Allocator)) (run (slice u8)) (rest (slice u8))] (-> (slice u8))
+  (join a ["/v1/runs/" run rest]))
+
+;; ---------------------------------------------------------------------------
+;; factory ps
+
+(defn cmd-ps [(ctx (ptr Ctx)) (all bool)] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (get-json ctx "/v1/overview")
+      (FetchedFailed [code] code)
+      (FetchedOk [overview]
+                 (let [runs (jv-get overview "runs")
+                       n (jv-count runs)
+                       (mut table) (style/table-new a ["" "RUN" "FACTORY" "SITE" "STATUS" "STATION" "NOW" "AGE"])
+                       (mut shown) 0
+                       (mut hidden) 0
+                       (mut attention) 0
+                       (mut i) 0]
+                   (loop (if (>= (load i) n)
+                             (break)
+                             (let [run (jv-nth runs (load i))
+                                   status (str-field run "status")
+                                   active (or (= status "running") (= status "paused") (= status "queued") (= status "blocked"))]
+                               (when (= status "blocked") (set! attention (+ (load attention) 1)) 0)
+                               (if (or all active (< (load shown) 10))
+                                   (do (style/table-row! (mut table)
+                                                         [(status-glyph a term status)
+                                                          (style/strong a term (str-field run "id"))
+                                                          (str-field run "factory")
+                                                          (style/muted a term (str-field run "site"))
+                                                          (status-word a term status)
+                                                          (station-progress a run)
+                                                          (truncate a (run-now a run) 56)
+                                                          (style/muted a term (age a (int-field run "created")))])
+                                       (set! shown (+ (load shown) 1)))
+                                   (set! hidden (+ (load hidden) 1)))
+                               (set! i (+ (load i) 1)))))
+                   (if (= n 0)
+                       (do (say (style/muted a term "No runs yet."))
+                           (say (join a ["Start one:  " (style/accent a term "factory start haiku --brief \"a lighthouse in fog\"")]))
+                           0)
+                       (do (io-write (style/table-render a term (load table)))
+                           (when (> (load hidden) 0)
+                             (say (style/muted a term (join a [(int-text a (load hidden)) " older finished runs hidden; `factory ps --all` shows them"])))
+                             0)
+                           (when (> (load attention) 0)
+                             (say (paint-bold a term (amber) (join a [(int-text a (load attention)) (if (= (load attention) 1) " run needs you" " runs need you")
+                                                                      " — `factory show RUN` says what it is waiting for"])))
+                             0)
+                           0)))))))
+
+(defn io-write [(text (slice u8))] (-> i64)
+  (do (print "{s}" text) 0))
+
+;; ---------------------------------------------------------------------------
+;; factory show
+
+(defn duration-text [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (let [s (/ ms 1000)]
+    (cond (< s 60) (join a [(int-text a s) "s"])
+          (< s 3600) (join a [(int-text a (/ s 60)) "m" (two a (% s 60)) "s"])
+          :else (join a [(int-text a (/ s 3600)) "h" (two a (% (/ s 60) 60)) "m"]))))
+
+(defn cmd-show [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (get-json ctx (run-path a reference ""))
+      (FetchedFailed [code] code)
+      (FetchedOk [run]
+                 (let [status (str-field run "status")
+                       id (str-field run "id")
+                       started (int-field run "started")
+                       finished (int-field run "finished")
+                       elapsed (cond (= started 0) 0
+                                     (> finished started) (- finished started)
+                                     :else (- (now-wall-ms) started))]
+                   (say (join a [(paint-bold a term (violet) (str-field run "factory")) (style/muted a term " · ") (style/strong a term id)
+                                 "   " (status-glyph a term status) " " (status-word a term status)
+                                 (if (> elapsed 0) (style/muted a term (join a ["  " (duration-text a elapsed)])) "")]))
+                   (when (> (len (str-field run "brief")) 0) (say (str-field run "brief")) 0)
+                   (say (style/muted a term
+                                     (join a [(str-field run "site") " · "
+                                              (if (> (len (str-field run "project")) 0) (str-field run "project") "empty workspace")
+                                              " → " (str-field run "branch")
+                                              (if (> (len (str-field run "base")) 0) (join a [" (from " (preview a (str-field run "base") 8) ")"]) "")
+                                              " · " (str-field run "model")
+                                              " · " (tokens a run) " tokens"])))
+                   (when (and (> (len (str-field run "reason")) 0) (not (= status "succeeded")))
+                     (say "")
+                     (say (join a [(if (= status "blocked") (paint-bold a term (amber) "Waiting for you: ") (style/warn a term "Reason: "))
+                                   (str-field run "reason")]))
+                     0)
+                   (say "")
+                   (let [stations (jv-get run "stations")
+                         agents (jv-get run "agents")
+                         (mut table) (style/table-new-headless a 5)
+                         (mut i) 0]
+                     (loop (if (>= (load i) (jv-count stations))
+                               (break)
+                               (let [station (jv-nth stations (load i))
+                                     name (str-field station "name")
+                                     sstatus (str-field station "status")
+                                     (mut activity) ""
+                                     (mut j) 0]
+                                 (loop (if (>= (load j) (jv-count agents))
+                                           (break)
+                                           (do (when (= (str-field (jv-nth agents (load j)) "name") name)
+                                                 (set! activity (str-field (jv-nth agents (load j)) "activity"))
+                                                 0)
+                                               (set! j (+ (load j) 1)))))
+                                 (style/table-row! (mut table)
+                                                   [(join a ["  " (status-glyph a term sstatus)])
+                                                    (style/strong a term name)
+                                                    (paint-fg a term (status-color sstatus) sstatus)
+                                                    (let [gf (int-field station "gate_failures")]
+                                                      (if (> gf 0) (style/warn a term (join a ["gate ✗" (int-text a gf)])) ""))
+                                                    (truncate a (cond (or (= sstatus "running") (= sstatus "gate")) (load activity)
+                                                                      (> (len (str-field station "summary")) 0) (first-line a (str-field station "summary") 100)
+                                                                      :else "")
+                                                              70)])
+                                 (set! i (+ (load i) 1)))))
+                     (io-write (style/table-render a term (load table))))
+                   (let [findings (jv-get run "findings")
+                         n (jv-count findings)]
+                     (when (> n 0)
+                       (say "")
+                       (say (style/strong a term "Overseer"))
+                       (let [(mut i) (if (> n 6) (- n 6) 0)]
+                         (loop (if (>= (load i) n)
+                                   (break)
+                                   (let [f (jv-nth findings (load i))
+                                         severity (str-field f "severity")]
+                                     (say (join a ["  " (if (= severity "alert") (style/err a term "✗") (style/warn a term "⚠")) " "
+                                                   (style/muted a term (age a (int-field f "t"))) "  "
+                                                   (str-field f "agent") "  " (paint-bold a term (amber) (str-field f "code")) "  "
+                                                   (str-field f "message")]))
+                                     (set! i (+ (load i) 1))))))
+                       0)
+                     (when (and (= n 0) (> (len (str-field run "verdict")) 0))
+                       (say "")
+                       (say (join a [(style/strong a term "Overseer  ")
+                                     (if (= (str-field run "verdict") "on_track") (style/ok a term "✓ on track") (style/warn a term (str-field run "verdict")))
+                                     (style/muted a term (join a ["  " (str-field run "verdict_reason")]))]))
+                       0))
+                   (let [pending (jv-get run "pending_messages")]
+                     (when (> (jv-count pending) 0)
+                       (say "")
+                       (say (join a [(style/strong a term "Undelivered messages") (style/muted a term " (the agent reads them at its next turn)")]))
+                       (let [(mut i) 0]
+                         (loop (if (>= (load i) (jv-count pending))
+                                   (break)
+                                   (let [m (jv-nth pending (load i))]
+                                     (say (join a ["  ✉ " (str-field m "from") " → " (str-field m "agent") ": " (first-line a (str-field m "text") 100)]))
+                                     (set! i (+ (load i) 1))))))
+                       0))
+                   (say "")
+                   (let [current (if (> (len (str-field run "current")) 0) (str-field run "current")
+                                     (str-field (jv-nth (jv-get run "stations") 0) "name"))]
+                     (say (style/muted a term (join a ["talk  factory chat " id "/" current "     watch  factory watch " id
+                                                       "     changes  factory diff " id]))))
+                   0)))))
+
+;; ---------------------------------------------------------------------------
+;; factory watch
+
+;;; Print journal records as they arrive. Ends when the run has finished and
+;;; nothing is working on it, unless `follow`.
+(defn cmd-watch [(ctx (ptr Ctx)) (reference (slice u8)) (verbose bool) (follow bool)] (-> i64)
+  (let [(mut arena) (primitive/zeroed scratch/ScratchArena)
+        (mut result) 0]
+    (scratch/scratch-init (mut arena) (.allocator ctx))
+    (block :watch
+           (let [a (scratch/scratch-allocator (mut arena))
+                 term (.out ctx)
+                 run (match (get-json ctx (run-path a reference ""))
+                       (FetchedFailed [code] (do (set! result code) (return-from :watch 0)))
+                       (FetchedOk [value] value))
+                 id (copy-bytes (.allocator ctx) (str-field run "id"))
+                 (mut cursor) 0
+                 (mut quiet) 0]
+             (say (join a [(style/muted a term "watching ") (style/strong a term id) (style/muted a term "  (Ctrl-C stops watching; the run keeps going)")]))
+             (match (get-json ctx (run-path a id "/events?tail=20"))
+               (FetchedFailed [code] (do (set! result code) (return-from :watch 0)))
+               (FetchedOk [page] (do (print-records a term (jv-get page "records") verbose)
+                                     (set! cursor (int-field page "cursor")))))
+             (loop
+               (scratch/scratch-reset! (mut arena))
+               (let [a (scratch/scratch-allocator (mut arena))]
+                 (match (get-json ctx (run-path a id (join a ["/events?after=" (int-text a (load cursor)) "&limit=500"])))
+                   (FetchedFailed [code] (do (set! result code) (break)))
+                   (FetchedOk [page]
+                              (let [records (jv-get page "records")]
+                                (print-records a term records verbose)
+                                (set! cursor (int-field page "cursor"))
+                                (if (> (jv-count records) 0)
+                                    (set! quiet 0)
+                                    (set! quiet (+ (load quiet) 1)))
+                                (when (and (not follow) (>= (load quiet) 4))
+                                  (match (get-json ctx (run-path a id ""))
+                                    (FetchedFailed [code] (break))
+                                    (FetchedOk [state]
+                                               (let [status (str-field state "status")]
+                                                 (when (and (not (bool-field state "alive"))
+                                                            (= (jv-count (jv-get state "pending_messages")) 0)
+                                                            (or (= status "succeeded") (= status "failed") (= status "cancelled")
+                                                                (= status "blocked") (= status "lost")))
+                                                   (say "")
+                                                   (cmd-hint-after a term state)
+                                                   (break))
+                                                 0))))
+                                0)))
+                 (loop/sleep-ms 500)))))
+    (scratch/scratch-close! (mut arena))
+    (load result)))
+
+(defn cmd-hint-after [(a (dyn Allocator)) (term style/Term) (run JVal)] (-> i64)
+  (let [status (str-field run "status")
+        id (str-field run "id")]
+    (cond (= status "blocked")
+            (say (join a [(paint-bold a term (amber) "It is waiting for you. ") "Answer with  "
+                          (style/accent a term (join a ["factory say " id "/" (str-field run "current") " \"...\""]))]))
+          (= status "succeeded")
+            (say (join a [(style/ok a term "Done. ") "The work is on " (style/strong a term (str-field run "branch"))
+                          (style/muted a term (join a ["   factory diff " id "   factory pull " id]))]))
+          (or (= status "failed") (= status "lost"))
+            (say (join a [(style/err a term "Stopped. ") (str-field run "reason")
+                          (style/muted a term (join a ["   factory resume " id]))]))
+          :else 0)))
+
+(defn print-records [(a (dyn Allocator)) (term style/Term) (records JVal) (verbose bool)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (jv-count records))
+              (break)
+              (let [line (event-line a term (jv-nth records (load i)) verbose)]
+                (when (> (len line) 0) (say line) 0)
+                (set! i (+ (load i) 1)))))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; factory transcript / diff
+
+(defn cmd-transcript [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        ref (agent-ref reference)]
+    (if (= (len (.agent ref)) 0)
+        (fail-with ctx "name an agent: factory transcript RUN/STATION")
+        (match (get-json ctx (run-path a (.run ref) (join a ["/agents/" (.agent ref)])))
+          (FetchedFailed [code] code)
+          (FetchedOk [body]
+                     (let [messages (jv-get body "transcript")
+                           (mut i) 0]
+                       (loop (if (>= (load i) (jv-count messages))
+                                 (break)
+                                 (let [m (jv-nth messages (load i))
+                                       role (str-field m "role")
+                                       content (str-field m "content")]
+                                   (cond (= role "system")
+                                           (do (say (paint-bold a term (slate) "── system prompt ──"))
+                                               (say (style/muted a term content)))
+                                         (= role "user")
+                                           (do (say (paint-bold a term (amber) "── ✉ ──")) (say content))
+                                         (= role "assistant")
+                                           (do (say (paint-bold a term (soft-blue) (join a ["── " (.agent ref) " ──"])))
+                                               (let [thought (str-field m "reasoning_content")]
+                                                 (when (> (len thought) 0) (say (style/muted a term (join a ["💭 " thought]))) 0))
+                                               (when (> (len content) 0) (say content) 0)
+                                               (let [calls (jv-get m "tool_calls")
+                                                     (mut j) 0]
+                                                 (loop (if (>= (load j) (jv-count calls))
+                                                           (break)
+                                                           (let [f (jv-get (jv-nth calls (load j)) "function")]
+                                                             (say (style/accent a term (join a ["→ " (str-field f "name") " " (preview a (str-field f "arguments") 300)])))
+                                                             (set! j (+ (load j) 1)))))
+                                                 0))
+                                         (= role "tool")
+                                           (say (style/muted a term (preview a content 1200)))
+                                         :else (say content))
+                                   (set! i (+ (load i) 1)))))
+                       0))))))
+
+(defn cmd-diff [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (get-json ctx (run-path a reference "/diff"))
+      (FetchedFailed [code] code)
+      (FetchedOk [body]
+                 (do (say (join a [(style/strong a term (str-field body "branch")) (style/muted a term (join a ["  since " (preview a (str-field body "base") 10)]))]))
+                     (say (str-field body "stat"))
+                     (for line (iter (str-split a (str-field body "diff") "\n"))
+                       (say (cond (starts-with line "+++") (style/strong a term line)
+                                  (starts-with line "---") (style/strong a term line)
+                                  (starts-with line "+") (style/ok a term line)
+                                  (starts-with line "-") (style/err a term line)
+                                  (starts-with line "@@") (paint-fg a term (violet) line)
+                                  :else line)))
+                     0)))))
+
+;; ---------------------------------------------------------------------------
+;; Talking: say and ask
+
+(defn post-message [(ctx (ptr Ctx)) (ref AgentRef) (text (slice u8))] (-> Fetched)
+  (let [a (.allocator ctx)
+        body (jv-object a)]
+    (jv-put! body "text" (JStr text))
+    (post-json ctx (run-path a (.run ref) (join a ["/agents/" (.agent ref) "/messages"])) body)))
+
+(defn cmd-say [(ctx (ptr Ctx)) (reference (slice u8)) (text (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        ref (agent-ref reference)]
+    (cond (= (len (.agent ref)) 0) (fail-with ctx "name an agent: factory say RUN/STATION \"message\"")
+          (= (len (str-trim text)) 0) (fail-with ctx "say what? factory say RUN/STATION \"message\"")
+          :else
+            (match (post-message ctx ref text)
+              (FetchedFailed [code] code)
+              (FetchedOk [reply]
+                         (let [status (str-field reply "status")]
+                           (say (join a [(style/ok a term "✉ sent") " to " (style/strong a term (join a [(str-field reply "run") "/" (str-field reply "agent")]))
+                                         (style/muted a term (cond (or (= status "running") (= status "paused")) "  (read at its next turn)"
+                                                                   (= status "blocked") "  (the station resumes with your answer)"
+                                                                   :else "  (it will answer in its workspace)"))]))
+                           0))))))
+
+;;; Send a message and print the agent's reply: the first thing it says after
+;;; reading the message, or the reply that ends a conversation.
+(defn cmd-ask [(ctx (ptr Ctx)) (reference (slice u8)) (text (slice u8)) (timeout-s i64)] (-> i64)
+  (let [ref (agent-ref reference)]
+    (cond (= (len (.agent ref)) 0) (fail-with ctx "name an agent: factory ask RUN/STATION \"question\"")
+          (= (len (str-trim text)) 0) (fail-with ctx "ask what? factory ask RUN/STATION \"question\"")
+          :else
+            (match (post-message ctx ref text)
+              (FetchedFailed [code] code)
+              (FetchedOk [reply] (await-reply ctx (copy-bytes (.allocator ctx) (str-field reply "run"))
+                                              (copy-bytes (.allocator ctx) (str-field reply "agent"))
+                                              (int-field reply "ref") timeout-s))))))
+
+(defn await-reply [(ctx (ptr Ctx)) (run (slice u8)) (agent (slice u8)) (ref i64) (timeout-s i64)] (-> i64)
+  (let [(mut arena) (primitive/zeroed scratch/ScratchArena)
+        deadline (+ (now-wall-ms) (* 1000 timeout-s))
+        (mut cursor) ref
+        (mut received) false
+        (mut result) -1]
+    (scratch/scratch-init (mut arena) (.allocator ctx))
+    (loop
+      (scratch/scratch-reset! (mut arena))
+      (when (> (now-wall-ms) deadline)
+        (set! result (fail-with ctx "no reply before the timeout; the agent may still answer (`factory watch` shows it)"))
+        (break))
+      (let [a (scratch/scratch-allocator (mut arena))]
+        (match (get-json ctx (run-path a run (join a ["/events?after=" (int-text a (load cursor)) "&limit=500"])))
+          (FetchedFailed [code] (do (set! result code) (break)))
+          (FetchedOk [page]
+                     (let [records (jv-get page "records")
+                           (mut i) 0]
+                       (set! cursor (int-field page "cursor"))
+                       (loop (if (or (>= (load i) (jv-count records)) (>= (load result) 0))
+                                 (break)
+                                 (let [record (jv-nth records (load i))
+                                       kind (str-field record "kind")
+                                       mine (= (str-field record "agent") agent)]
+                                   (cond (and mine (= kind "message.received") (= (int-field record "ref") ref))
+                                           (do (set! received true) 0)
+                                         (and mine (load received) (= kind "agent.text"))
+                                           (do (say (str-field record "text")) (set! result 0) 0)
+                                         (and mine (= kind "conversation.finished"))
+                                           (do (say (str-field record "reply")) (set! result 0) 0)
+                                         (and mine (load received) (= kind "station.finished"))
+                                           (do (say (str-field record "summary")) (set! result 0) 0)
+                                         :else 0)
+                                   (set! i (+ (load i) 1)))))
+                       (when (>= (load result) 0) (break))
+                       0))))
+      (loop/sleep-ms 700))
+    (scratch/scratch-close! (mut arena))
+    (load result)))
+
+;; ---------------------------------------------------------------------------
+;; Control
+
+(defn cmd-control [(ctx (ptr Ctx)) (reference (slice u8)) (action (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (post-json ctx (run-path a reference (join a ["/" action])) (jv-object a))
+      (FetchedFailed [code] code)
+      (FetchedOk [run]
+                 (do (say (join a [(status-glyph a term (str-field run "status")) " " (style/strong a term (str-field run "id")) "  "
+                                   (cond (= action "pause") "pausing at the next turn boundary"
+                                         (= action "cancel") "stopping; running commands are killed"
+                                         :else "resuming")]))
+                     0)))))

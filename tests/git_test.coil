@@ -1,0 +1,52 @@
+(module factory.git-test)
+(import "coil.alloc" :use *)
+(import "coil.fs" :as fs)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "factory.git" :use *)
+(import "factory.proc" :use *)
+
+(defn temp-dir [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut path) (sb-new a)]
+    (sb-push-str! (mut path) "/tmp/factory-git-test-")
+    (sb-push-i64! (mut path) (pid))
+    (sb-push-str! (mut path) "-")
+    (sb-push-str! (mut path) name)
+    (let [p (sb-finish! (mut path))]
+      (capture a "rm" ["-rf" p] "" 10000)
+      (capture a "mkdir" ["-p" p] "" 10000)
+      p)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(deftest a-run-worktree-commits-on-its-own-branch
+  (let [a (malloc-allocator)
+        repo (temp-dir a "repo")
+        (mut wt) (sb-new a)]
+    (sb-push-str! (mut wt) repo)
+    (sb-push-str! (mut wt) "-wt")
+    (let [worktree (sb-finish! (mut wt))]
+      (capture a "rm" ["-rf" worktree] "" 10000)
+      (assert (git-ok? (git-init-scratch a repo)))
+      (let [base (match (git-head a repo) (Some [h] h) (None [] ""))]
+        (assert (= (len base) 40))
+        (assert (git-ok? (git-worktree-add a repo worktree "factory/test-run" base)))
+        (assert (not (git-dirty? a worktree)))
+        (fs/write-file a (str-concat-or a worktree "/hello.txt") "hi\n")
+        (assert (git-dirty? a worktree))
+        (assert (contains? (git-diff-stat a worktree base) "hello.txt"))
+        (let [commit (git-commit-all a worktree "implement: say hi")]
+          (assert (git-ok? commit))
+          (assert (= (git-output commit) "committed")))
+        (assert (not (git-dirty? a worktree)))
+        ;; Nothing left to commit is still ok.
+        (assert (= (git-output (git-commit-all a worktree "again")) ""))
+        ;; The branch exists in the original repository.
+        (let [log (git a repo ["log" "--oneline" "factory/test-run"])]
+          (assert (contains? (git-output log) "implement: say hi")))
+        ;; The original checkout is untouched.
+        (assert (not (git-dirty? a repo)))))))
+
+(defn str-concat-or [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (match (str-concat a x y) (Some [s] s) (None [] "")))

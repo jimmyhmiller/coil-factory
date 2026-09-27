@@ -1,0 +1,11 @@
+[package]
+name = "agent"
+source-roots = ["src", "tests"]
+
+[dependencies]
+ai = { path = "../ai" }
+json_schema = { path = "../json-schema" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

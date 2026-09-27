@@ -1,0 +1,64 @@
+(module tui.width-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "tui.width" :use *)
+
+(deftest decodes-utf8-scalars
+         (let [d (utf8-decode "é" 0)]
+           (assert-eq (.rune d) 0xE9)
+           (assert-eq (.len d) 2)
+           (assert (.valid d)))
+         (let [d (utf8-decode "😀" 0)]
+           (assert-eq (.rune d) 0x1F600)
+           (assert-eq (.len d) 4))
+         (let [d (utf8-decode "\xC0;" 0)]
+           (assert (.valid d)))
+         (let [bad (utf8-decode (subslice "é" 0 1) 0)]
+           (assert (not (.valid bad)))
+           (assert-eq (.rune bad) REPLACEMENT-RUNE)
+           (assert-eq (.len bad) 1)))
+
+(deftest encodes-utf8
+         (let [(mut out) (al-new [u8] (malloc-allocator))]
+           (utf8-encode! (mut out) 0x41)
+           (utf8-encode! (mut out) 0xE9)
+           (utf8-encode! (mut out) 0x2500)
+           (utf8-encode! (mut out) 0x1F600)
+           (assert (= (al-slice out) "Aé─😀"))))
+
+(deftest rune-widths
+         (assert-eq (rune-width #\a) 1)
+         (assert-eq (rune-width 0x7) 0)
+         (assert-eq (rune-width 0x0301) 0)
+         (assert-eq (rune-width 0x200D) 0)
+         (assert-eq (rune-width 0x4E2D) 2)
+         (assert-eq (rune-width 0x1F600) 2)
+         (assert-eq (rune-width 0x2500) 1)
+         (assert-eq (rune-width 0xFF21) 2))
+
+(deftest text-widths-are-grapheme-aware
+         (assert-eq (text-width "hello") 5)
+         (assert-eq (text-width "中文") 4)
+         (assert-eq (text-width "e\x301;") 1)
+         (assert-eq (text-width "é") 1)
+         (assert-eq (text-width "a\tb") 2)
+         (assert-eq (text-width "👨‍👩‍👧") 2)
+         (assert-eq (text-width "🇺🇸") 2)
+         (assert-eq (text-width "❤️") 2)
+         (assert-eq (text-width "╭─╮") 3))
+
+(deftest truncates-and-pads
+         (let [a (malloc-allocator)]
+           (assert (= (truncate-to-width a "hello world" 20 true) "hello world"))
+           (assert (= (truncate-to-width a "hello world" 5 false) "hello"))
+           (assert (= (truncate-to-width a "hello world" 5 true) "hell…"))
+           (assert (= (truncate-to-width a "中文字" 5 true) "中文…"))
+           (assert (= (truncate-to-width a "中文字" 3 false) "中"))
+           (assert (= (truncate-to-width a "abc" 0 true) ""))
+           (assert (= (pad-to-width a "ab" 4) "ab  "))
+           (assert (= (pad-left-to-width a "ab" 4) "  ab"))
+           (assert (= (pad-to-width a "abcdef" 4) "abc…"))
+           (assert-eq (text-width (pad-to-width a "中" 3)) 3)))

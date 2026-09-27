@@ -1,0 +1,17 @@
+;; Internal: the one way this package reports a programming error. A misuse such
+;; as a table row with the wrong number of cells is a bug in the calling program,
+;; so it stops the process with a message naming the problem instead of rendering
+;; something plausible but wrong.
+(module cli.fail)
+(import "coil.alloc" :as alloc)
+(import "coil.io" :as io)
+
+(export cli-fail!)
+
+;;; Write `cli: MESSAGE` to stderr and abort. Never returns.
+(defn cli-fail! [(message (slice u8))] (-> i64)
+  (io/print-str (io/stderr) "cli: ")
+  (io/print-str (io/stderr) message)
+  (io/print-str (io/stderr) "\n")
+  (alloc/abort)
+  0)

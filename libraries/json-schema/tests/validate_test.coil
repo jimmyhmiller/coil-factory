@@ -1,0 +1,71 @@
+(module json-schema-validate-test)
+(import "coil.alloc" :use *)
+(import "coil.json" :as json)
+(import "coil.match" :use *)
+(import "json_schema.validate" :use *)
+
+(deftest validates-unrelated-application-configuration
+         (let [a (malloc-allocator)
+               schema-text
+                 "{\"type\":\"object\",\"properties\":{\"port\":{\"type\":\"integer\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"port\"],\"additionalProperties\":false}"
+               good-text "{\"port\":8080,\"tags\":[\"dev\",\"local\"]}"
+               bad-text "{\"port\":8080,\"tags\":[\"dev\",12]}"
+               schema-parsed (json/parse a schema-text)
+               good-parsed (json/parse a good-text)
+               bad-parsed (json/parse a bad-text)]
+           (match schema-parsed
+             (Err [failure] (assert false))
+             (Ok [schema]
+                 (match good-parsed
+                   (Err [failure] (assert false))
+                   (Ok [good]
+                       (let [result (validate a schema good)]
+                         (assert (.ok result)))))
+                 (match bad-parsed
+                   (Err [failure] (assert false))
+                   (Ok [bad]
+                       (let [result (validate a schema bad)]
+                         (assert (not (.ok result)))
+                         (assert (= (.path result) "$.tags[1]")))))))))
+
+(deftest rejects-unknown-keywords-and-checks-enum
+         (let [a (malloc-allocator)
+               schema (json/parse a "{\"enum\":[\"red\",\"blue\"]}")
+               invalid-schema (json/parse a "{\"minimum\":1}")
+               red (json/parse a "\"red\"")
+               green (json/parse a "\"green\"")]
+           (match schema
+             (Err [failure] (assert false))
+             (Ok [s]
+                 (match red
+                   (Err [failure] (assert false))
+                   (Ok [v]
+                       (let [result (validate a s v)]
+                         (assert (.ok result)))))
+                 (match green
+                   (Err [failure] (assert false))
+                   (Ok [v]
+                       (let [result (validate a s v)]
+                         (assert (not (.ok result))))))
+                 (match invalid-schema
+                   (Err [failure] (assert false))
+                   (Ok [bad]
+                       (let [result (validate a bad s)]
+                         (assert (not (.ok result))))))))))
+
+(deftest checks-unused-schema-branches-before-validating
+         (let [a (malloc-allocator)
+               schema
+                 (json/parse a
+                             "{\"type\":\"object\",\"properties\":{\"absent\":{\"minimum\":1}}}")
+               data (json/parse a "{}")]
+           (match schema
+             (Err [failure] (assert false))
+             (Ok [definition]
+                 (match data
+                   (Err [failure] (assert false))
+                   (Ok [value]
+                       (let [result (validate a definition value)]
+                         (assert (not (.ok result)))
+                         (assert (= (.path result)
+                                    "$.properties.absent.minimum")))))))))

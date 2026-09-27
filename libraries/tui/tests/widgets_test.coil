@@ -1,0 +1,261 @@
+(module tui.widgets-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-eq])
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+
+(defn line [(lines (ptr (ArrayList (slice u8)))) (i i64)] (-> (slice u8))
+  (get (load lines) i))
+
+(deftest wraps-words-and-preserves-newlines
+         (let [(mut lines)
+                 (wrap-text (malloc-allocator) "the quick brown fox jumps" 10)]
+           (assert-eq (len lines) 3)
+           (assert (= (line (mut lines) 0) "the quick"))
+           (assert (= (line (mut lines) 1) "brown fox"))
+           (assert (= (line (mut lines) 2) "jumps")))
+         (let [(mut lines)
+                 (wrap-text (malloc-allocator) "one\n\ntwo  three\r\n" 20)]
+           (assert-eq (len lines) 4)
+           (assert (= (line (mut lines) 0) "one"))
+           (assert (= (line (mut lines) 1) ""))
+           (assert (= (line (mut lines) 2) "two  three"))
+           (assert (= (line (mut lines) 3) ""))))
+
+(deftest wraps-hard-breaking-long-words-and-wide-text
+         (let [(mut lines) (wrap-text (malloc-allocator) "a abcdefghijkl b" 5)]
+           (assert-eq (len lines) 4)
+           (assert (= (line (mut lines) 0) "a"))
+           (assert (= (line (mut lines) 1) "abcde"))
+           (assert (= (line (mut lines) 2) "fghij"))
+           (assert (= (line (mut lines) 3) "kl b")))
+         (let [(mut lines) (wrap-text (malloc-allocator) "中文字符串" 4)]
+           (assert-eq (len lines) 3)
+           (assert (= (line (mut lines) 0) "中文"))
+           (assert (= (line (mut lines) 2) "串")))
+         (let [(mut lines) (wrap-text (malloc-allocator) "word    " 4)]
+           (assert-eq (len lines) 1)
+           (assert (= (line (mut lines) 0) "word")))
+         (assert-eq (len (wrap-text (malloc-allocator) "abc" 0)) 0))
+
+(defn cols [] (-> (array Column 3))
+  [(Column
+     :title "NAME"
+     :width (Fill 1)
+     :align (AlignLeft))
+   (Column
+     :title "STATE"
+     :width (Fixed 7)
+     :align (AlignLeft))
+   (Column
+     :title "N"
+     :width (Fixed 3)
+     :align (AlignRight))])
+
+(deftest draws-a-table-with-truncation-and-alignment
+         (let [a (malloc-allocator)
+               theme (theme-default)
+               (mut c) (canvas-new a 24 4)
+               (mut lv) (list-view-new)
+               s (style-default)
+               columns (cols)
+               cells
+                 [(table-cell "alpha-machine" s)
+                  (table-cell "running" s)
+                  (table-cell "3" s)
+                  (table-cell "beta" s)
+                  (table-cell "queued" s)
+                  (table-cell "12" s)]]
+           (assert-eq (draw-table! (mut c)
+                                   (rect 0 0 24 4)
+                                   columns
+                                   cells
+                                   (mut lv)
+                                   1
+                                   theme
+                                   true)
+                      2)
+           (assert (= (render-plain a (mut c))
+                      "  NAME      STATE     N\n▎ alpha-ma… running   3\n  beta      queued   12\n\n"))))
+
+(deftest list-view-keeps-the-selection-visible
+         (let [(mut lv) (list-view-new)]
+           (list-set-count! (mut lv) 10)
+           (list-handle-key! (mut lv) (End) 3)
+           (list-scroll-into-view! (mut lv) 4)
+           (assert-eq (.selected lv) 9)
+           (assert-eq (.offset lv) 6)
+           (list-handle-key! (mut lv) (PageUp) 4)
+           (list-scroll-into-view! (mut lv) 4)
+           (assert-eq (.selected lv) 5)
+           (assert-eq (.offset lv) 5)
+           (list-handle-key! (mut lv) (Home) 4)
+           (list-handle-key! (mut lv) (Up) 4)
+           (assert-eq (.selected lv) 0)
+           (list-set-count! (mut lv) 0)
+           (assert-eq (.selected lv) 0)))
+
+(defn typed [(input (ptr TextInput)) (text (slice u8))] (-> i64)
+  (input-insert-text! input text))
+
+(deftest input-editing-operations
+         (let [(mut in) (text-input-new (malloc-allocator) false)]
+           (typed (mut in) "hello world")
+           (assert-eq (.cursor in) 11)
+           (input-handle-key! (mut in) (Ctrl #\w))
+           (assert (= (input-text (mut in)) "hello "))
+           (input-handle-key! (mut in) (Char 0x4E2D))
+           (assert (= (input-text (mut in)) "hello 中"))
+           (input-handle-key! (mut in) (Left))
+           (assert-eq (.cursor in) 6)
+           (input-handle-key! (mut in) (Backspace))
+           (assert (= (input-text (mut in)) "hello中"))
+           (input-handle-key! (mut in) (Home))
+           (input-handle-key! (mut in) (Delete))
+           (assert (= (input-text (mut in)) "ello中"))
+           (input-handle-key! (mut in) (End))
+           (input-handle-key! (mut in) (WordLeft))
+           (assert-eq (.cursor in) 0)
+           (input-handle-key! (mut in) (Alt #\f))
+           (assert-eq (.cursor in) 7)
+           (input-handle-key! (mut in) (Ctrl #\a))
+           (input-handle-key! (mut in) (Right))
+           (input-handle-key! (mut in) (Ctrl #\k))
+           (assert (= (input-text (mut in)) "e"))
+           (typed (mut in) "x\ty\r\nz")
+           (assert (= (input-text (mut in)) "ex    y z"))
+           (input-handle-key! (mut in) (Left))
+           (input-handle-key! (mut in) (Ctrl #\u))
+           (assert (= (input-text (mut in)) "z"))
+           (assert-eq (.cursor in) 0)
+           (input-handle-key! (mut in) (Enter))
+           (assert (match (input-handle-key! (mut in) (Enter))
+                     (InputSubmitted [] true)
+                     (_ false)))))
+
+(deftest input-history-and-multiline
+         (let [a (malloc-allocator)
+               (mut in) (text-input-new a true)]
+           (typed (mut in) "first")
+           (input-submit! (mut in) a)
+           (typed (mut in) "second")
+           (input-submit! (mut in) a)
+           (typed (mut in) "draft")
+           (input-handle-key! (mut in) (Up))
+           (assert (= (input-text (mut in)) "second"))
+           (input-handle-key! (mut in) (Up))
+           (assert (= (input-text (mut in)) "first"))
+           (assert (match (input-handle-key! (mut in) (Up))
+                     (InputIgnored [] true)
+                     (_ false)))
+           (input-handle-key! (mut in) (Down))
+           (input-handle-key! (mut in) (Down))
+           (assert (= (input-text (mut in)) "draft"))
+           (input-handle-key! (mut in) (ShiftEnter))
+           (typed (mut in) "ab")
+           (assert (= (input-text (mut in)) "draft\nab"))
+           (input-handle-key! (mut in) (Up))
+           (assert-eq (.cursor in) 2)
+           (input-handle-key! (mut in) (Down))
+           (assert-eq (.cursor in) 8)
+           (assert-eq (input-visual-rows (mut in) 20) 2)))
+
+(deftest draws-input-with-wrapping-and-cursor
+         (let [a (malloc-allocator)
+               (mut c) (canvas-new a 6 3)
+               (mut in) (text-input-new a true)]
+           (draw-input! (mut c)
+                        (rect 0 0 6 3)
+                        (mut in)
+                        (style-default)
+                        "Ask…"
+                        (style-default)
+                        true)
+           (assert (= (render-plain a (mut c)) "Ask…\n\n\n"))
+           (assert-eq (.cursor-x c) 0)
+           (typed (mut in) "abcdefgh")
+           (canvas-clear! (mut c))
+           (draw-input! (mut c)
+                        (rect 0 0 6 3)
+                        (mut in)
+                        (style-default)
+                        ""
+                        (style-default)
+                        true)
+           (assert (= (render-plain a (mut c)) "abcde\nfgh\n\n"))
+           (assert (.cursor-visible c))
+           (assert-eq (.cursor-x c) 3)
+           (assert-eq (.cursor-y c) 1)
+           (typed (mut in) "ij\n")
+           (canvas-clear! (mut c))
+           (draw-input! (mut c)
+                        (rect 0 0 6 2)
+                        (mut in)
+                        (style-default)
+                        ""
+                        (style-default)
+                        true)
+           (assert (= (render-plain a (mut c)) "fghij\n\n\n"))
+           (assert-eq (.cursor-y c) 1)
+           (assert-eq (.cursor-x c) 0)))
+
+(deftest scroll-view-sticks-to-the-bottom
+         (let [a (malloc-allocator)
+               (mut c) (canvas-new a 10 2)
+               (mut sv) (scroll-view-new)
+               (mut lines) (al-new [StyledLine] a)]
+           (push-wrapped! (mut lines)
+                          a
+                          "one two three four"
+                          10
+                          (style-default)
+                          "│ "
+                          (style-default))
+           (assert-eq (len lines) 3)
+           (draw-scroll-view! (mut c) (rect 0 0 10 2) (mut sv) (al-slice lines))
+           (assert (= (render-plain a (mut c)) "│ three\n│ four\n"))
+           (scroll-up! (mut sv) 1)
+           (assert (not (.stick-bottom sv)))
+           (canvas-clear! (mut c))
+           (draw-scroll-view! (mut c) (rect 0 0 10 2) (mut sv) (al-slice lines))
+           (assert (= (render-plain a (mut c)) "│ one two\n│ three\n"))
+           (push-wrapped! (mut lines)
+                          a
+                          "five"
+                          10
+                          (style-default)
+                          "│ "
+                          (style-default))
+           (canvas-clear! (mut c))
+           (draw-scroll-view! (mut c) (rect 0 0 10 2) (mut sv) (al-slice lines))
+           (assert (= (render-plain a (mut c)) "│ one two\n│ three\n"))
+           (scroll-down! (mut sv) 5)
+           (assert (.stick-bottom sv))))
+
+(deftest small-widgets
+         (let [a (malloc-allocator)
+               theme (theme-default)
+               (mut c) (canvas-new a 12 3)]
+           (assert (= (spinner-frame 0) "⠋"))
+           (assert (= (spinner-frame 11) "⠙"))
+           (assert (= (spinner-frame -1) "⠏"))
+           (draw-progress-bar! (mut c)
+                               (rect 0 0 10 1)
+                               5
+                               20
+                               (style-default)
+                               (style-default))
+           (assert-eq (draw-badge! (mut c)
+                                   (canvas-rect (mut c))
+                                   0
+                                   1
+                                   "OK"
+                                   (badge-style theme (hex 0x9ECE6A)))
+                      4)
+           (draw-sparkline! (mut c) (rect 0 2 4 1) [0 1 4 8] 0 (style-default))
+           (assert (= (render-plain a (mut c))
+                      "━━╸━━━━━━━\n OK\n▁▁▄█\n"))))

@@ -1,0 +1,84 @@
+(module factory.overseer-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.overseer" :as overseer)
+(import "factory.proc" :use *)
+
+(defn temp-home [(a (dyn Allocator))] (-> (slice u8))
+  (let [(mut path) (sb-new a)]
+    (sb-push-str! (mut path) "/tmp/factory-overseer-test-")
+    (sb-push-i64! (mut path) (pid))
+    (let [home (sb-finish! (mut path))]
+      (capture a "rm" ["-rf" home] "" 10000)
+      (atomic/ensure-dir! a (path-join a home "runs/r-1") 448)
+      home)))
+
+(defn feed! [(w (ptr overseer/Watch)) (a (dyn Allocator)) (line (slice u8))] (-> i64)
+  (match (jv-parse a line)
+    (Some [record] (overseer/observe-record! w a record))
+    (None [] (do (assert false) 0))))
+
+(defn journal [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (match (atomic/read-file-if-exists a (path-join a home "runs/r-1/events.jsonl"))
+    (Ok [found] (match found (Some [t] t) (None [] "")))
+    (Err [e] "")))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(defn count-of [(hay (slice u8)) (needle (slice u8))] (-> i64)
+  (let [(mut n) 0
+        (mut from) 0]
+    (loop (match (str-find-from hay needle (load from))
+            (Some [at] (do (set! n (+ (load n) 1)) (set! from (+ at 1))))
+            (None [] (break))))
+    (load n)))
+
+(deftest flags-loops-failure-streaks-and-shared-git-once-each
+  (let [a (malloc-allocator)
+        home (temp-home a)
+        config (match (load-site-config a home) (SiteConfigOk [c] c) (SiteConfigBad [m] (do (assert false) (primitive-zero))))
+        o (overseer/overseer-new a home config)
+        w (overseer/watch-for o "r-1")
+        now 1000000]
+    (for i (range 0 5)
+      (feed! w a "{\"t\":1000,\"kind\":\"tool.started\",\"agent\":\"build\",\"summary\":\"$ coil test\"}")
+      (feed! w a "{\"t\":1001,\"kind\":\"tool.finished\",\"agent\":\"build\",\"tool\":\"shell\",\"summary\":\"$ coil test\",\"ok\":false,\"output\":\"boom\"}"))
+    (feed! w a "{\"t\":1002,\"kind\":\"tool.finished\",\"agent\":\"build\",\"tool\":\"read_file\",\"summary\":\"read x\",\"ok\":false,\"output\":\"no\"}")
+    (feed! w a "{\"t\":1003,\"kind\":\"tool.started\",\"agent\":\"build\",\"summary\":\"$ git stash push -m tmp\"}")
+    (overseer/check-patterns! o w a 1004)
+    ;; Checking again right away issues nothing new: findings are quiet for ten minutes.
+    (overseer/check-patterns! o w a 1005)
+    (let [text (journal a home)]
+      (assert-eq (count-of text "\"code\":\"looping\"") 1)
+      (assert-eq (count-of text "\"code\":\"flailing\"") 1)
+      (assert-eq (count-of text "\"code\":\"shared-git\"") 1)
+      (assert (contains? text "git stash push"))
+      ;; The default policy is nudge: each finding with advice also messages the agent.
+      (assert (>= (count-of text "\"kind\":\"message.sent\"") 3))
+      (assert (contains? text "\"from\":\"overseer\"")))
+    (capture a "rm" ["-rf" home] "" 10000)))
+
+(defn primitive-zero [] (-> SiteConfig)
+  (let [(mut c) (zeroed SiteConfig)] (load c)))
+
+(deftest distinct-commands-with-a-shared-long-prefix-are-not-a-loop
+  (let [a (malloc-allocator)
+        home (temp-home a)
+        config (match (load-site-config a home) (SiteConfigOk [c] c) (SiteConfigBad [m] (do (assert false) (primitive-zero))))
+        o (overseer/overseer-new a home config)
+        w (overseer/watch-for o "r-1")]
+    (for i (range 0 6)
+      (let [(mut started) (sb-new a)]
+        (sb-push-str! (mut started) "{\"t\":1000,\"kind\":\"tool.started\",\"agent\":\"plan\",\"summary\":\"$ cd /a/very/long/workspace/path/that/fills/the/summary/entirely && …\",\"args\":\"{\\\"command\\\": \\\"cd /a/very/long/workspace/path && step ")
+        (sb-push-i64! (mut started) i)
+        (sb-push-str! (mut started) "\\\"}\"}")
+        (feed! w a (sb-finish! (mut started)))
+        (feed! w a "{\"t\":1001,\"kind\":\"tool.finished\",\"agent\":\"plan\",\"tool\":\"shell\",\"summary\":\"$ cd /a/very/long/workspace/path/that/fills/the/summary/entirely && …\",\"ok\":true,\"output\":\"\"}")))
+    (overseer/check-patterns! o w a 1002)
+    (assert-eq (count-of (journal a home) "\"code\":\"looping\"") 0)
+    (capture a "rm" ["-rf" home] "" 10000)))

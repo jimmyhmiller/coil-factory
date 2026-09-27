@@ -1,0 +1,652 @@
+(module factory.api)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "sse.core" :as ssecore)
+(import "durable.atomic" :as atomic)
+(import "durable.jsonl" :as jsonl)
+(import "http_app.router" :as app)
+(import "http_app.json" :as hjson)
+(import "http_app.sse" :as hsse)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.create" :use *)
+(import "factory.events" :use *)
+(import "factory.git" :use *)
+(import "factory.hub" :as hub)
+(import "factory.journal" :use *)
+(import "factory.library" :use *)
+(import "factory.proc" :use *)
+(import "factory.runstate" :use *)
+(import "factory.site" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+
+;;; The site API. JSON over HTTP on loopback; every `/v1` route needs the
+;;; site's bearer token. `GET /` describes the API for a person or an agent
+;;; with no other context.
+
+(defsum Op
+  (GetGuide) (GetSite) (GetOverview)
+  (ListFactories) (GetFactory) (CheckFactory)
+  (ListRuns) (CreateRun) (GetRun)
+  (GetEvents) (StreamEvents)
+  (PauseRun) (ResumeRun) (CancelRun)
+  (GetAgent) (PostMessage) (GetDiff)
+  (ListSites) (AddSite) (RemoveSite))
+
+(defstruct Api [(site (ptr Site)) (hub (ptr hub/Hub)) (op Op)])
+
+(defn json-reply [(a (dyn Allocator)) (status i64) (value JVal)] (-> app/Response)
+  (hjson/json-response status (jv-encode a value)))
+
+(defn problem-reply [(a (dyn Allocator)) (status i64) (code (slice u8)) (message (slice u8))] (-> app/Response)
+  (hjson/json-error a status code message))
+
+(defn authorized? [(site (ptr Site)) (ctx app/RequestContext)] (-> bool)
+  (match (app/bearer-token ctx)
+    (Some [token] (and (> (len (.token site)) 0) (app/constant-time-equal? token (.token site))))
+    (None [] false)))
+
+(defsum RunRef
+  (RunFound [(entry (ptr RunEntry))])
+  (RunMissing)
+  (RunAmbiguous [(names (slice u8))]))
+
+;;; A run by id or unique prefix. Call with the site lock held.
+(defn resolve-run [(site (ptr Site)) (a (dyn Allocator)) (reference (slice u8))] (-> RunRef)
+  (let [exact (find-entry site reference)]
+    (if (!= (cast i64 exact) 0)
+        (RunFound exact)
+        (let [matches (find-by-prefix site a reference)]
+          (cond (= (len matches) 0) (RunMissing)
+                (= (len matches) 1) (RunFound (get matches 0))
+                :else (let [(mut names) (sb-new a)]
+                        (for entry (iter matches)
+                          (when (> (len (sb-str (load names))) 0) (sb-push-str! (mut names) ", ") 0)
+                          (sb-push-str! (mut names) (.id entry)))
+                        (RunAmbiguous (sb-finish! (mut names)))))))))
+
+(defn run-state-json [(site (ptr Site)) (a (dyn Allocator)) (entry (ptr RunEntry))] (-> JVal)
+  (let [value (runstate-json a (field entry state))]
+    (jv-put! value "alive" (JBool (entry-alive? site entry)))
+    value))
+
+(defn site-json [(site (ptr Site)) (a (dyn Allocator))] (-> JVal)
+  (let [config (field site config)
+        out (jv-object a)]
+    (jv-put! out "name" (JStr (.name config)))
+    (jv-put! out "kind" (JStr "local"))
+    (jv-put! out "status" (JStr "up"))
+    (jv-put! out "max_runs" (JInt (.max-runs config)))
+    (jv-put! out "running" (JInt (running-count site)))
+    (jv-put! out "runs" (JInt (len (.runs site))))
+    (jv-put! out "isolation" (JStr (.isolation config)))
+    (jv-put! out "default_model" (JStr (.default-model config)))
+    (jv-put! out "overseer_policy" (JStr (.overseer-policy config)))
+    (jv-put! out "home" (JStr (.home site)))
+    (jv-put! out "started" (JInt (.started-t site)))
+    (jv-put! out "version" (JStr "1"))
+    out))
+
+;;; Runs newest first.
+(defn sorted-entries [(site (ptr Site)) (a (dyn Allocator))] (-> (ArrayList (ptr RunEntry)))
+  (let [(mut out) (al-new [(ptr RunEntry)] a)]
+    (for entry (iter (.runs site))
+      (push! [(ptr RunEntry)] (mut out) entry)
+      (let [(mut i) (- (len out) 1)]
+        (loop (if (<= (load i) 0)
+                  (break)
+                  (let [previous (get out (- (load i) 1))
+                        current (get out (load i))]
+                    (if (< (.created-t (field previous state)) (.created-t (field current state)))
+                        (do (set! (mut out) (- (load i) 1) current)
+                            (set! (mut out) (load i) previous)
+                            (set! i (- (load i) 1)))
+                        (break)))))))
+    (load out)))
+
+(defn runs-json [(site (ptr Site)) (a (dyn Allocator))] (-> JVal)
+  (let [runs (jv-array a)]
+    (for entry (iter (sorted-entries site a))
+      (jv-push! runs (run-state-json site a entry)))
+    runs))
+
+(defn json-body [(a (dyn Allocator)) (ctx app/RequestContext)] (-> JVal)
+  (match (jv-parse a (app/body ctx))
+    (Some [value] value)
+    (None [] (JNull))))
+
+(defn query-or [(a (dyn Allocator)) (ctx app/RequestContext) (name (slice u8)) (fallback (slice u8))] (-> (slice u8))
+  (match (app/query-param a ctx name)
+    (app/QueryFound [value] value)
+    (_ fallback)))
+
+(defn query-int [(a (dyn Allocator)) (ctx app/RequestContext) (name (slice u8)) (fallback i64)] (-> i64)
+  (match (str-parse-int (query-or a ctx name "")) (Some [n] n) (None [] fallback)))
+
+(defn run-not-found [(a (dyn Allocator)) (ref (slice u8))] (-> app/Response)
+  (problem-reply a 404 "run_not_found" (join a ["no run matches \"" ref "\""])))
+
+;;; Resolve `{run}` and call `body` with the entry, under the site lock.
+(defn with-run [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [site (.site self)
+        hub (.hub self)
+        reference (app/param ctx "run")]
+    (site-lock! site)
+    (let [local (resolve-run site a reference)
+          reply (match local
+                  (RunMissing [] (app/response 0 "" ""))
+                  (RunAmbiguous [names] (problem-reply a 409 "ambiguous_run" (join a ["\"" reference "\" matches several runs: " names])))
+                  (RunFound [entry] (do (entry-refresh! site entry) (run-op self a ctx entry))))]
+      (site-unlock! site)
+      (match local
+        (RunMissing [] (forward-remote-run self a ctx reference))
+        (_ reply)))))
+
+;;; A run this site does not have may live on a remote site the hub reaches:
+;;; forward the request there with the run's full id.
+(defn forward-remote-run [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (reference (slice u8))] (-> app/Response)
+  (let [hub (.hub self)]
+    (hub/hub-lock! hub)
+    (let [cached (hub/find-remote-run hub a reference)]
+      (hub/hub-unlock! hub)
+      (let [found (if (= (.matches cached) 0)
+                      ;; The cache refreshes every two seconds; a run started
+                      ;; just now is found by asking the sites themselves.
+                      (hub/ask-remotes-for-run hub a reference)
+                      (load cached))]
+      (cond (= (.matches found) 0) (run-not-found a reference)
+            (> (.matches found) 1) (problem-reply a 409 "ambiguous_run" (join a ["\"" reference "\" matches several runs on other sites"]))
+            :else
+              (let [prefix (join a ["/v1/runs/" reference])
+                    path (.path ctx)
+                    rest (if (starts-with path prefix) (subslice [u8] path (len prefix) (len path)) "")
+                    target (join a ["/v1/runs/" (.id found) rest
+                                    (if (> (len (.query ctx)) 0) "?" "") (.query ctx)])]
+                (match (.op self)
+                  (StreamEvents [] (hub/relay-stream! hub a (.remote found) target (hsse/last-event-id ctx)))
+                  (_ (hub/forward! hub a (.remote found) (app/request-method ctx) target (app/body ctx))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Handlers
+
+(defn get-site [(self (ptr Api)) (a (dyn Allocator))] (-> app/Response)
+  (let [site (.site self)]
+    (site-lock! site)
+    (let [value (site-json site a)]
+      (site-unlock! site)
+      (json-reply a 200 value))))
+
+(defn get-overview [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [site (.site self)
+        out (jv-object a)
+        sites (jv-array a)]
+    (site-lock! site)
+    (jv-push! sites (site-json site a))
+    (let [runs (runs-json site a)]
+      (site-unlock! site)
+      (when (not (= (query-or a ctx "scope" "") "local"))
+        (hub/hub-lock! (.hub self))
+        (hub/remote-sites-json (.hub self) a sites runs)
+        (hub/hub-unlock! (.hub self))
+        0)
+      (jv-put! out "sites" sites)
+      (jv-put! out "runs" runs)
+      (jv-put! out "now" (JInt (wall-ms)))
+      (json-reply a 200 out))))
+
+(defn stations-json [(a (dyn Allocator)) (spec (ptr FactorySpec))] (-> JVal)
+  (let [out (jv-array a)]
+    (for index (range 0 (station-count spec))
+      (let [s (station-spec spec index)
+            entry (jv-object a)]
+        (jv-put! entry "name" (JStr (.name s)))
+        (jv-put! entry "gate" (JStr (.gate s)))
+        (jv-put! entry "tools" (JStr (station-tools spec s)))
+        (jv-put! entry "attempts" (JInt (station-attempts spec s)))
+        (jv-push! out entry)))
+    out))
+
+(defn problems-json [(a (dyn Allocator)) (problems (ArrayList SpecProblem))] (-> JVal)
+  (let [out (jv-array a)]
+    (for problem (iter problems)
+      (let [p problem
+            entry (jv-object a)]
+        (jv-put! entry "line" (JInt (.line p)))
+        (jv-put! entry "message" (JStr (.message p)))
+        (jv-push! out entry)))
+    out))
+
+(defn factory-json [(a (dyn Allocator)) (name (slice u8)) (origin (slice u8)) (text (slice u8)) (include-text bool)] (-> JVal)
+  (let [out (jv-object a)]
+    (jv-put! out "name" (JStr name))
+    (jv-put! out "origin" (JStr origin))
+    (match (parse-factory a text)
+      (SpecOk [parsed]
+              (let [(mut spec) parsed]
+                (jv-put! out "ok" (JBool true))
+                (jv-put! out "description" (JStr (.description spec)))
+                (jv-put! out "input" (JStr (.input spec)))
+                (jv-put! out "model" (JStr (.model spec)))
+                (jv-put! out "stations" (stations-json a (mut spec)))
+                0))
+      (SpecBad [problems]
+               (do (jv-put! out "ok" (JBool false))
+                   (jv-put! out "problems" (problems-json a problems))
+                   0)))
+    (when include-text (jv-put! out "text" (JStr text)) 0)
+    out))
+
+(defn list-factories-reply [(self (ptr Api)) (a (dyn Allocator))] (-> app/Response)
+  (let [out (jv-array a)]
+    (for entry (iter (list-factories a (.home (.site self))))
+      (let [e entry]
+        (jv-push! out (factory-json a (.name e) (.origin e) (.text e) false))))
+    (json-reply a 200 out)))
+
+(defn get-factory-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (match (resolve-factory a (.home (.site self)) (app/param ctx "name"))
+    (NotFound [message] (problem-reply a 404 "unknown_factory" message))
+    (Found [found] (let [e found] (json-reply a 200 (factory-json a (.name e) (.origin e) (.text e) true))))))
+
+(defn check-factory-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [body (json-body a ctx)
+        text (jv-string-or (jv-get body "text") "")]
+    (if (= (len text) 0)
+        (problem-reply a 400 "missing_text" "send {\"text\": \"<the factory's Markdown>\"}")
+        (json-reply a 200 (factory-json a "" "check" text false)))))
+
+(defn list-runs-reply [(self (ptr Api)) (a (dyn Allocator))] (-> app/Response)
+  (let [site (.site self)
+        ignored (jv-array a)]
+    (site-lock! site)
+    (let [runs (runs-json site a)]
+      (site-unlock! site)
+      (hub/hub-lock! (.hub self))
+      (hub/remote-sites-json (.hub self) a ignored runs)
+      (hub/hub-unlock! (.hub self))
+      (json-reply a 200 runs))))
+
+(defn create-run-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [target (jv-string-or (jv-get (json-body a ctx) "site") "")]
+    (if (or (= (len target) 0) (= target (.name (field (.site self) config))))
+        (create-local-run self a ctx)
+        (let [hub (.hub self)]
+          (hub/hub-lock! hub)
+          (let [remote (hub/find-remote hub target)]
+            (hub/hub-unlock! hub)
+            (if (= (cast i64 remote) 0)
+                (problem-reply a 404 "site_not_found" (join a ["no site named \"" target "\"; `factory sites` lists them"]))
+                (hub/forward! hub a remote "POST" "/v1/runs" (app/body ctx))))))))
+
+(defn create-local-run [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [site (.site self)
+        body (json-body a ctx)
+        request (NewRun :factory (jv-string-or (jv-get body "factory") "")
+                        :factory-text (jv-string-or (jv-get body "factory_text") "")
+                        :brief (jv-string-or (jv-get body "brief") "")
+                        :project (jv-string-or (jv-get body "project") "")
+                        :base (jv-string-or (jv-get body "base") "")
+                        :model (jv-string-or (jv-get body "model") ""))]
+    (if (and (= (len (.factory request)) 0) (= (len (.factory-text request)) 0))
+        (problem-reply a 400 "missing_factory" "send \"factory\" (a name or path on this site) or \"factory_text\" (the Markdown)")
+        (match (create-run! a (field site config) request)
+          (CreateRejected [code message] (problem-reply a 422 code message))
+          (CreatedRun [id]
+                      (do (site-lock! site)
+                          (let [entry (adopt-run! site id)
+                                value (run-state-json site a entry)]
+                            (supervise! site)
+                            (site-unlock! site)
+                            (json-reply a 201 value))))))))
+
+(defn get-run-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (json-reply a 200 (run-state-json (.site self) a entry)))
+
+(defn events-page [(site (ptr Site)) (a (dyn Allocator)) (id (slice u8)) (after i64) (limit i64) (tail i64)] (-> app/Response)
+  (let [path (events-path a (.home site) id)]
+    (if (> tail 0)
+        ;; The last `tail` records: page through, keeping a window.
+        (let [(mut cursor) 0
+              (mut window) (al-new [(slice u8)] a)
+              (mut failed) false]
+          (loop
+            (match (jsonl/journal-read a path (load cursor) 1000 8388608)
+              (Err [e] (do (set! failed true) (break)))
+              (Ok [read]
+                  (let [batch read
+                        n (jsonl/batch-count batch)]
+                    (for record (iter (jsonl/batch-records batch))
+                      (let [r record]
+                        (push! [(slice u8)] (mut window) (.line r))
+                        (when (> (len window) tail)
+                          ;; Drop the oldest by shifting.
+                          (let [(mut i) 0]
+                            (loop (if (>= (load i) (- (len window) 1))
+                                      (break)
+                                      (do (set! (mut window) (load i) (get window (+ (load i) 1)))
+                                          (set! i (+ (load i) 1)))))
+                            (pop! (mut window)))
+                          0)))
+                    (set! cursor (jsonl/batch-next-offset batch))
+                    (when (= n 0) (break))
+                    0))))
+          (if (load failed)
+              (problem-reply a 500 "journal_unreadable" "the run journal could not be read")
+              (hjson/json-response 200 (records-body a (load cursor) (al-slice window)))))
+        (match (jsonl/journal-read a path after (if (and (> limit 0) (<= limit 1000)) limit 200) 8388608)
+          (Err [e] (problem-reply a 400 "bad_cursor" "`after` must be a cursor this API returned"))
+          (Ok [read]
+              (let [batch read
+                    (mut lines) (al-new [(slice u8)] a)]
+                (for record (iter (jsonl/batch-records batch))
+                  (let [r record] (push! [(slice u8)] (mut lines) (.line r))))
+                (hjson/json-response 200 (records-body a (jsonl/batch-next-offset batch) (al-slice lines)))))))))
+
+;;; `{"cursor": N, "records": [...]}` with the journal lines spliced in as-is.
+(defn records-body [(a (dyn Allocator)) (cursor i64) (lines (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut first) true]
+    (sb-push-str! (mut out) "{\"cursor\":")
+    (sb-push-i64! (mut out) cursor)
+    (sb-push-str! (mut out) ",\"records\":[")
+    (for line (iter lines)
+      (when (not (load first)) (sb-push-str! (mut out) ",") 0)
+      (sb-push-str! (mut out) line)
+      (set! first false))
+    (sb-push-str! (mut out) "]}")
+    (sb-finish! (mut out))))
+
+(defn get-events-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (events-page (.site self) a (.id entry)
+               (query-int a ctx "after" 0) (query-int a ctx "limit" 200) (query-int a ctx "tail" 0)))
+
+;;; A run's journal as Server-Sent Events. The event id is the byte cursor
+;;; after the record, so `Last-Event-ID` resumes exactly. Unless `follow=1`,
+;;; the stream ends once the run is finished and nothing is working on it.
+(defstruct RunEvents
+  [(site (ptr Site))
+   (id (slice u8))
+   (path (slice u8))
+   (follow bool)])
+
+(impl hsse/SseSource RunEvents
+  (sse-next [(self (ptr RunEvents)) (a (dyn Allocator)) (cursor (slice u8))] (-> hsse/SseBatch)
+            (let [from (match (str-parse-int cursor) (Some [n] n) (None [] 0))]
+              (match (jsonl/journal-read a (.path self) from 200 4194304)
+                (Err [e] (hsse/SseError))
+                (Ok [read]
+                    (let [batch read
+                          n (jsonl/batch-count batch)]
+                      (if (> n 0)
+                          (let [(mut events) (al-new [ssecore/SseEvent] a)]
+                            (for record (iter (jsonl/batch-records batch))
+                              (let [r record
+                                    (mut id) (sb-new a)]
+                                (sb-push-i64! (mut id) (.next-offset r))
+                                (push! [ssecore/SseEvent] (mut events)
+                                       (hsse/sse-event "" (sb-finish! (mut id)) (.line r)))))
+                            (hsse/SseEvents (al-slice events)))
+                          (if (.follow self)
+                              (hsse/SseNothing)
+                              (let [site (.site self)]
+                                (site-lock! site)
+                                (let [entry (find-entry site (.id self))
+                                      finished (if (= (cast i64 entry) 0)
+                                                   true
+                                                   (do (entry-refresh! site entry)
+                                                       (let [st (field entry state)]
+                                                         (and (terminal-status? (.status st))
+                                                              (= (len (.pending st)) 0)
+                                                              (>= (.cursor st) from)
+                                                              (not (entry-alive? site entry))))))]
+                                  (site-unlock! site)
+                                  (if finished (hsse/SseEnd) (hsse/SseNothing)))))))))))
+  (sse-release [(self (ptr RunEvents)) (reason app/StreamEndReason)] (-> i64) 0))
+
+(defn stream-events-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [site (.site self)
+        resume (hsse/last-event-id ctx)
+        start (if (> (len resume) 0) resume (query-or a ctx "after" "0"))
+        source (box! a RunEvents (RunEvents :site site
+                                            :id (copy-bytes a (.id entry))
+                                            :path (events-path a (.home site) (.id entry))
+                                            :follow (= (query-or a ctx "follow" "") "1")))]
+    (hsse/sse-response a source start (hsse/sse-options))))
+
+(defn append-or-fail [(site (ptr Site)) (a (dyn Allocator)) (id (slice u8)) (record JVal) (value JVal)] (-> app/Response)
+  (if (append! site id record)
+      (do (entry-refresh! site (find-entry site id))
+          (json-reply a 200 value))
+      (problem-reply a 500 "journal_unwritable" "the run journal could not be written")))
+
+(defn pause-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [status (.status (field entry state))]
+    (if (not (= status "running"))
+        (problem-reply a 409 "not_running" (join a ["the run is " status "; only a running run can be paused"]))
+        (append-or-fail (.site self) a (.id entry) (ev-str! (ev-str! (ev a "control") "action" "pause") "by" "operator")
+                        (run-state-json (.site self) a entry)))))
+
+(defn resume-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [site (.site self)
+        status (.status (field entry state))]
+    (cond (= status "paused")
+            (append-or-fail site a (.id entry) (ev-str! (ev-str! (ev a "control") "action" "resume") "by" "operator")
+                            (run-state-json site a entry))
+          (or (= status "lost") (= status "failed"))
+            (let [result (append-or-fail site a (.id entry) (ev a "run.requeued") (JNull))]
+              (supervise! site)
+              (json-reply a 200 (run-state-json site a entry)))
+          (= status "blocked")
+            (problem-reply a 409 "blocked" (join a ["the run is waiting for an answer: factory say " (.id entry) "/"
+                                                    (.current (field entry state)) " \"...\""]))
+          :else (problem-reply a 409 "not_resumable" (join a ["the run is " status])))))
+
+(defn cancel-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [site (.site self)
+        status (.status (field entry state))]
+    (cond (or (= status "running") (= status "paused"))
+            (append-or-fail site a (.id entry) (ev-str! (ev-str! (ev a "control") "action" "cancel") "by" "operator")
+                            (run-state-json site a entry))
+          (or (= status "queued") (= status "blocked") (= status "lost") (= status "failed"))
+            (append-or-fail site a (.id entry)
+                            (ev-str! (ev-str! (ev a "run.finished") "status" "cancelled") "reason" "stopped by an operator")
+                            (run-state-json site a entry))
+          :else (problem-reply a 409 "not_cancellable" (join a ["the run is already " status])))))
+
+(defn station-known? [(entry (ptr RunEntry)) (name (slice u8))] (-> bool)
+  (>= (station-index (field entry state) name) 0))
+
+(defn get-agent-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [name (app/param ctx "agent")
+        site (.site self)]
+    (if (not (station-known? entry name))
+        (problem-reply a 404 "agent_not_found" (join a ["run " (.id entry) " has no station named \"" name "\""]))
+        (let [out (jv-object a)
+              state (runstate-json a (field entry state))
+              agents (jv-get state "agents")
+              (mut agent) (JNull)
+              (mut i) 0]
+          (loop (if (>= (load i) (jv-count agents))
+                    (break)
+                    (do (when (= (jv-string-or (jv-get (jv-nth agents (load i)) "name") "") name)
+                          (set! agent (jv-nth agents (load i)))
+                          0)
+                        (set! i (+ (load i) 1)))))
+          (jv-put! out "run" (JStr (.id entry)))
+          (jv-put! out "name" (JStr name))
+          (jv-put! out "state" (load agent))
+          (jv-put! out "transcript_cursor"
+                   (match (atomic/read-file-if-exists a (join a [(transcript-path a (.home site) (.id entry) name) ".cursor"]))
+                     (Ok [found] (match found
+                                   (Some [text] (match (str-parse-int (str-trim text)) (Some [n] (JInt n)) (None [] (JInt 0))))
+                                   (None [] (JInt 0))))
+                     (Err [failure] (JInt 0))))
+          (jv-put! out "transcript"
+                   (match (atomic/read-file-if-exists a (transcript-path a (.home site) (.id entry) name))
+                     (Ok [found] (match found
+                                   (Some [text] (match (jv-parse a text) (Some [v] v) (None [] (JNull))))
+                                   (None [] (jv-array a))))
+                     (Err [failure] (JNull))))
+          (json-reply a 200 out)))))
+
+(defn post-message-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [name (app/param ctx "agent")
+        site (.site self)
+        body (json-body a ctx)
+        text (jv-string-or (jv-get body "text") "")
+        from (jv-string-or (jv-get body "from") "operator")]
+    (cond (not (station-known? entry name))
+            (problem-reply a 404 "agent_not_found" (join a ["run " (.id entry) " has no station named \"" name "\""]))
+          (= (len (str-trim text)) 0)
+            (problem-reply a 400 "missing_text" "send {\"text\": \"...\"}")
+          :else
+            (match (append-run-event! a (.home site) (.id entry)
+                                      (ev-text! a (ev-str! (ev-agent a "message.sent" name) "from" from) "text" text 16000))
+              (AppendFailed [message] (problem-reply a 500 "journal_unwritable" message))
+              (AppendedAt [offset]
+                          (let [out (jv-object a)]
+                            (entry-refresh! site entry)
+                            (supervise! site)
+                            (jv-put! out "ref" (JInt offset))
+                            (jv-put! out "run" (JStr (.id entry)))
+                            (jv-put! out "agent" (JStr name))
+                            (jv-put! out "status" (JStr (.status (field entry state))))
+                            (json-reply a 202 out)))))))
+
+(defn get-diff-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (let [site (.site self)
+        st (field entry state)
+        workspace (workspace-path a (.home site) (.id entry))
+        out (jv-object a)]
+    (if (= (len (.base st)) 0)
+        (problem-reply a 409 "no_workspace" "the run has not started its workspace yet")
+        (do (jv-put! out "run" (JStr (.id entry)))
+            (jv-put! out "base" (JStr (.base st)))
+            (jv-put! out "branch" (JStr (.branch st)))
+            (jv-put! out "workspace" (JStr workspace))
+            (jv-put! out "stat" (JStr (git-diff-stat a workspace (.base st))))
+            (jv-put! out "diff" (JStr (preview a (git-diff a workspace (.base st)) 400000)))
+            (json-reply a 200 out)))))
+
+(defn guide-reply [(a (dyn Allocator))] (-> app/Response)
+  (app/response 200 "text/plain; charset=utf-8" (guide-text)))
+
+(defn guide-text [] (-> (slice u8))
+  "FACTORY SITE API\n\nThis is a factory site: it runs software factories (Markdown recipes of agent stations) in isolated git worktrees and records everything they do in a journal per run.\n\nAuthenticate every /v1 request with `Authorization: Bearer <token>`; the token is in ~/.factory/token on this machine. Bodies are JSON. Errors are {\"error\": {\"code\", \"message\"}}. Run ids accept a unique prefix.\n\nGET  /v1/site                              this site: name, capacity, isolation, default model\nGET  /v1/overview                          every run's folded state, newest first\nGET  /v1/factories                         the factory library\nGET  /v1/factories/{name}                  one factory, with its Markdown\nPOST /v1/factories/check  {text}           validate a factory's Markdown\nGET  /v1/runs                              runs, newest first\nPOST /v1/runs  {factory | factory_text, brief, project, base, model}\n                                           start a run; project is a repository path on this site\nGET  /v1/runs/{run}                        stations, agents (what each is doing now), findings, pending messages\nGET  /v1/runs/{run}/events?after=&limit=   journal page; ?tail=N for the last N records\nGET  /v1/runs/{run}/events/stream          Server-Sent Events; id is the cursor; Last-Event-ID resumes; ?follow=1 never ends\nPOST /v1/runs/{run}/pause | resume | cancel\nGET  /v1/runs/{run}/agents/{station}       one agent's state and full transcript\nPOST /v1/runs/{run}/agents/{station}/messages  {text}\n                                           talk to an agent: running agents read it at their next turn, blocked\n                                           ones resume with it as the answer, finished ones reply in their workspace\nGET  /v1/runs/{run}/diff                   the run branch's changes\n\nRun status: queued, running, paused, blocked (waiting for a person), succeeded, failed, cancelled, lost.\nJournal records: {t, kind, agent?, ...}; kinds include run.*, station.*, gate.*, agent.turn, agent.text, agent.thought, agent.usage, tool.started, tool.finished, message.sent, message.received, control, finding, oversight.\n")
+
+(defn dispatch-op [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (match (.op self)
+    (GetGuide [] (guide-reply a))
+    (GetSite [] (get-site self a))
+    (GetOverview [] (get-overview self a ctx))
+    (ListFactories [] (list-factories-reply self a))
+    (GetFactory [] (get-factory-reply self a ctx))
+    (CheckFactory [] (check-factory-reply self a ctx))
+    (ListRuns [] (list-runs-reply self a))
+    (CreateRun [] (create-run-reply self a ctx))
+    (GetRun [] (with-run self a ctx))
+    (GetEvents [] (with-run self a ctx))
+    (StreamEvents [] (with-run self a ctx))
+    (PauseRun [] (with-run self a ctx))
+    (ResumeRun [] (with-run self a ctx))
+    (CancelRun [] (with-run self a ctx))
+    (GetAgent [] (with-run self a ctx))
+    (PostMessage [] (with-run self a ctx))
+    (GetDiff [] (with-run self a ctx))
+    (ListSites [] (list-sites-reply self a))
+    (AddSite [] (add-site-reply self a ctx))
+    (RemoveSite [] (remove-site-reply self a ctx))))
+
+(impl app/Handler Api
+  (handle [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+          (match (.op self)
+            (GetGuide [] (guide-reply a))
+            (_ (if (authorized? (.site self) ctx)
+                   (dispatch-op self a ctx)
+                   (problem-reply a 401 "unauthorized" "send Authorization: Bearer <the token in ~/.factory/token>"))))))
+
+(defn route! [(a (dyn Allocator)) (router (ptr app/Router)) (site (ptr Site)) (hub (ptr hub/Hub)) (method (slice u8)) (pattern (slice u8)) (op Op)] (-> i64)
+  (if (app/route-add! router method pattern (box! a Api (Api :site site :hub hub :op op)))
+      0
+      (fail-route pattern)))
+
+(defn fail-route [(pattern (slice u8))] (-> i64)
+  (do (println "factory: could not register route {s}" pattern) 0))
+
+(defn build-router [(a (dyn Allocator)) (site (ptr Site)) (hub (ptr hub/Hub))] (-> (ptr app/Router))
+  (let [router (box! a app/Router (app/router-new a))]
+    (app/router-set-errors! router (box! a hjson/JsonErrors (hjson/JsonErrors :reserved (cast u8 0))))
+    (route! a router site hub "GET" "/" (GetGuide))
+    (route! a router site hub "GET" "/v1/site" (GetSite))
+    (route! a router site hub "GET" "/v1/overview" (GetOverview))
+    (route! a router site hub "GET" "/v1/factories" (ListFactories))
+    (route! a router site hub "GET" "/v1/factories/{name}" (GetFactory))
+    (route! a router site hub "POST" "/v1/factories/check" (CheckFactory))
+    (route! a router site hub "GET" "/v1/runs" (ListRuns))
+    (route! a router site hub "POST" "/v1/runs" (CreateRun))
+    (route! a router site hub "GET" "/v1/runs/{run}" (GetRun))
+    (route! a router site hub "GET" "/v1/runs/{run}/events" (GetEvents))
+    (route! a router site hub "GET" "/v1/runs/{run}/events/stream" (StreamEvents))
+    (route! a router site hub "POST" "/v1/runs/{run}/pause" (PauseRun))
+    (route! a router site hub "POST" "/v1/runs/{run}/resume" (ResumeRun))
+    (route! a router site hub "POST" "/v1/runs/{run}/cancel" (CancelRun))
+    (route! a router site hub "GET" "/v1/runs/{run}/agents/{agent}" (GetAgent))
+    (route! a router site hub "POST" "/v1/runs/{run}/agents/{agent}/messages" (PostMessage))
+    (route! a router site hub "GET" "/v1/runs/{run}/diff" (GetDiff))
+    (route! a router site hub "GET" "/v1/sites" (ListSites))
+    (route! a router site hub "POST" "/v1/sites" (AddSite))
+    (route! a router site hub "POST" "/v1/sites/{name}/remove" (RemoveSite))
+    router))
+
+(defn run-op [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
+  (match (.op self)
+    (GetRun [] (get-run-body self a ctx entry))
+    (GetEvents [] (get-events-body self a ctx entry))
+    (StreamEvents [] (stream-events-body self a ctx entry))
+    (PauseRun [] (pause-body self a ctx entry))
+    (ResumeRun [] (resume-body self a ctx entry))
+    (CancelRun [] (cancel-body self a ctx entry))
+    (GetAgent [] (get-agent-body self a ctx entry))
+    (PostMessage [] (post-message-body self a ctx entry))
+    (GetDiff [] (get-diff-body self a ctx entry))
+    (_ (problem-reply a 500 "internal" "not a run operation"))))
+
+(defn list-sites-reply [(self (ptr Api)) (a (dyn Allocator))] (-> app/Response)
+  (let [site (.site self)
+        sites (jv-array a)
+        ignored (jv-array a)]
+    (site-lock! site)
+    (jv-push! sites (site-json site a))
+    (site-unlock! site)
+    (hub/hub-lock! (.hub self))
+    (hub/remote-sites-json (.hub self) a sites ignored)
+    (hub/hub-unlock! (.hub self))
+    (json-reply a 200 sites)))
+
+(defn add-site-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (let [body (json-body a ctx)
+        name (jv-string-or (jv-get body "name") "")
+        ssh (jv-string-or (jv-get body "ssh") "")
+        token (jv-string-or (jv-get body "token") "")
+        port (let [p (jv-int (jv-get body "port"))] (if (> p 0) p 7788))]
+    (cond (not (kebab-name? name))
+            (problem-reply a 400 "bad_name" "a site name is lowercase letters, digits, and dashes")
+          (= name (.name (field (.site self) config)))
+            (problem-reply a 409 "name_taken" "that is this site's own name")
+          (or (= (len ssh) 0) (= (len token) 0))
+            (problem-reply a 400 "missing_fields" "send {\"name\", \"ssh\", \"token\", \"port\"}")
+          :else
+            (let [problem (hub/add-remote! (.hub self) name ssh token port)]
+              (if (> (len problem) 0)
+                  (problem-reply a 400 "bad_site" problem)
+                  (list-sites-reply self a))))))
+
+(defn remove-site-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
+  (if (hub/remove-remote! (.hub self) (app/param ctx "name"))
+      (list-sites-reply self a)
+      (problem-reply a 404 "site_not_found" (join a ["no remote site named \"" (app/param ctx "name") "\""]))))

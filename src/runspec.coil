@@ -1,0 +1,77 @@
+(module factory.runspec)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+
+;;; `run.json`: everything a run needs to start or restart, fixed when it is
+;;; created. The factory's full text is copied in, so editing a factory never
+;;; changes a run already made from it.
+
+(defstruct RunSpec
+  [(id (slice u8))
+   (factory-name (slice u8))
+   (factory-text (slice u8))
+   (brief (slice u8))
+   ;;; A repository path on this site, or "" for an empty workspace.
+   (project (slice u8))
+   ;;; The commit to start from; "" means the project's HEAD at start.
+   (base (slice u8))
+   (branch (slice u8))
+   (model (slice u8))
+   (site (slice u8))
+   (created i64)])
+
+(defsum RunSpecResult
+  (RunSpecOk [(spec RunSpec)])
+  (RunSpecBad [(message (slice u8))]))
+
+(defn run-spec-json [(a (dyn Allocator)) (spec (ptr RunSpec))] (-> JVal)
+  (let [out (jv-object a)]
+    (jv-put! out "version" (JInt 1))
+    (jv-put! out "id" (JStr (.id spec)))
+    (jv-put! out "factory" (JStr (.factory-name spec)))
+    (jv-put! out "factory_text" (JStr (.factory-text spec)))
+    (jv-put! out "brief" (JStr (.brief spec)))
+    (jv-put! out "project" (JStr (.project spec)))
+    (jv-put! out "base" (JStr (.base spec)))
+    (jv-put! out "branch" (JStr (.branch spec)))
+    (jv-put! out "model" (JStr (.model spec)))
+    (jv-put! out "site" (JStr (.site spec)))
+    (jv-put! out "created" (JInt (.created spec)))
+    out))
+
+(defn save-run-spec! [(a (dyn Allocator)) (home (slice u8)) (spec (ptr RunSpec))] (-> bool)
+  (match (atomic/write-file-atomic! a (run-file a home (.id spec) "run.json")
+                                    (jv-encode a (run-spec-json a spec)) 384)
+    (Ok [written] true)
+    (Err [failure] false)))
+
+(defn load-run-spec [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> RunSpecResult)
+  (match (atomic/read-file-if-exists a (run-file a home run-id "run.json"))
+    (Err [failure] (RunSpecBad "run.json could not be read"))
+    (Ok [found]
+        (match found
+          (None [] (RunSpecBad "run.json is missing"))
+          (Some [text]
+                (match (jv-parse a text)
+                  (None [] (RunSpecBad "run.json is not valid JSON"))
+                  (Some [root]
+                        (let [(mut spec) (primitive/zeroed RunSpec)]
+                          (set! (.id spec) (jv-string-or (jv-get root "id") ""))
+                          (set! (.factory-name spec) (jv-string-or (jv-get root "factory") ""))
+                          (set! (.factory-text spec) (jv-string-or (jv-get root "factory_text") ""))
+                          (set! (.brief spec) (jv-string-or (jv-get root "brief") ""))
+                          (set! (.project spec) (jv-string-or (jv-get root "project") ""))
+                          (set! (.base spec) (jv-string-or (jv-get root "base") ""))
+                          (set! (.branch spec) (jv-string-or (jv-get root "branch") ""))
+                          (set! (.model spec) (jv-string-or (jv-get root "model") ""))
+                          (set! (.site spec) (jv-string-or (jv-get root "site") ""))
+                          (set! (.created spec) (jv-int (jv-get root "created")))
+                          (if (or (not (= (.id spec) run-id)) (= (len (.factory-text spec)) 0))
+                              (RunSpecBad "run.json does not describe this run")
+                              (RunSpecOk (load spec)))))))))))

@@ -1,0 +1,559 @@
+;; Run a command on a remote machine over ssh and capture what it did.
+;;
+;; `ssh-run` spawns the system `ssh` non-interactively (`BatchMode=yes`, no
+;; tty, no escape character), optionally streams bytes to the remote command's
+;; stdin, captures stdout and stderr concurrently, and enforces an overall
+;; deadline by terminating the whole ssh process group. Exit status 255 is
+;; ssh's own failure (unreachable host, refused key); anything else is the
+;; remote command's status.
+;;
+;; The remote side runs the command through the user's login shell, so build
+;; command strings from untrusted words with `shell-quote`/`shell-join`.
+(module ssh.exec)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.selectors" :as selectors)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "coil.time" :as time)
+(import "ssh.sys" :use *)
+(import "ssh.target" :use *)
+
+(export SshOptions
+        ssh-options
+        ssh-common-args
+        ssh-exec-args
+        SshResult
+        ssh-result-ok?
+        ssh-connection-failed?
+        ssh-result-free!
+        SshError
+        SshInvalidRequest
+        SshSpawnFailed
+        SshIoFailed
+        SshOutOfMemory
+        ssh-error-message
+        ssh-run
+        ssh-reachable?
+        shell-quote
+        shell-join)
+
+;;; How to invoke ssh. `strict-host-key-checking` is passed through as
+;;; `StrictHostKeyChecking` (`accept-new` trusts a first contact but still
+;;; refuses a changed key). `extra` options are inserted before the destination
+;;; verbatim, e.g. `["-o" "ProxyJump=bastion"]`. `max-output-bytes` bounds each
+;;; of stdout and stderr in memory; output beyond it is dropped and flagged.
+(defstruct SshOptions
+  [(ssh-binary (slice u8))
+   (connect-timeout-seconds i64)
+   (identity-file (slice u8))
+   (strict-host-key-checking (slice u8))
+   (max-output-bytes i64)
+   (extra (slice (slice u8)))])
+
+(defn ssh-options [] (-> SshOptions)
+  (SshOptions
+    :ssh-binary "ssh"
+    :connect-timeout-seconds 10
+    :identity-file ""
+    :strict-host-key-checking "accept-new"
+    :max-output-bytes 16777216
+    :extra (slice-new (cast (ptr (slice u8)) 0) 0)))
+
+(defn option-number [(a (dyn Allocator)) (name (slice u8)) (value i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) name)
+    (sb-push-i64! (mut out) value)
+    (sb-finish! (mut out))))
+
+(defn option-text [(a (dyn Allocator)) (name (slice u8)) (value (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) name)
+    (sb-push-str! (mut out) value)
+    (sb-finish! (mut out))))
+
+;;; The options every non-interactive ssh invocation shares, appended to `args`:
+;;; batch mode (never prompt), connect timeout, host key policy, error-only
+;;; logging (so stderr carries only real problems), identity, extras.
+(defn ssh-common-args [(a (dyn Allocator))
+                       (args (mut (ArrayList (slice u8))))
+                       (opts SshOptions)] (-> i64)
+  (push! (mut args) "-o")
+  (push! (mut args) "BatchMode=yes")
+  (push! (mut args) "-o")
+  (push! (mut args)
+         (option-number a "ConnectTimeout=" (.connect-timeout-seconds opts)))
+  (push! (mut args) "-o")
+  (push! (mut args)
+         (option-text a
+                      "StrictHostKeyChecking="
+                      (.strict-host-key-checking opts)))
+  (push! (mut args) "-o")
+  (push! (mut args) "LogLevel=ERROR")
+  (when (> (len (.identity-file opts)) 0)
+    (push! (mut args) "-i")
+    (push! (mut args) (.identity-file opts))
+    0)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) (len (.extra opts)))
+              (break)
+              (do
+                (push! (mut args) (get (.extra opts) (load k)))
+                (set! k (+ (load k) 1))))))
+  0)
+
+;;; The complete argument vector (without the program name) for running
+;;; `command` on `target`.
+(defn ssh-exec-args [(a (dyn Allocator))
+                     (target Target)
+                     (opts SshOptions)
+                     (command (slice u8))] (-> (slice (slice u8)))
+  (let [(mut args) (al-new [(slice u8)] a)]
+    (ssh-common-args a (mut args) opts)
+    (push! (mut args) "-T")
+    (push! (mut args) "-e")
+    (push! (mut args) "none")
+    (let [destination (target-ssh-args a target)
+          (mut k) 0]
+      (loop (if (>= (load k) (len destination))
+                (break)
+                (do
+                  (push! (mut args) (get destination (load k)))
+                  (set! k (+ (load k) 1))))))
+    (push! (mut args) command)
+    (al-into-slice (mut args))))
+
+;;; What happened. `exit-code` is the remote command's status (255 when ssh
+;;; itself failed), or -1 if ssh was killed by `signal`. `timed-out` means the
+;;; deadline passed and ssh was terminated. Output slices are owned; release
+;;; them with `ssh-result-free!`.
+(defstruct SshResult
+  [(stdout (slice u8))
+   (stderr (slice u8))
+   (exit-code i64)
+   (signal i64)
+   (timed-out bool)
+   (stdout-truncated bool)
+   (stderr-truncated bool)])
+
+;;; The remote command ran and exited 0 within the deadline.
+(defn ssh-result-ok? [(result SshResult)] (-> bool)
+  (and (not (.timed-out result)) (= (.exit-code result) 0)))
+
+;;; ssh itself failed (exit 255): no connection, authentication refused, etc.
+;;; The reason is in `stderr`.
+(defn ssh-connection-failed? [(result SshResult)] (-> bool)
+  (and (not (.timed-out result)) (= (.exit-code result) 255)))
+
+(defn ssh-result-free! [(a (dyn Allocator)) (result (mut SshResult))] (-> i64)
+  (when (> (len (.stdout result)) 0) (alloc/free a (.stdout result)) 0)
+  (when (> (len (.stderr result)) 0) (alloc/free a (.stderr result)) 0)
+  (set! (.stdout result) "")
+  (set! (.stderr result) "")
+  0)
+
+(defsum SshError
+  (SshInvalidRequest [(message (slice u8))])
+  (SshSpawnFailed [(code i64)])
+  (SshIoFailed [(code i64)])
+  (SshOutOfMemory))
+
+;;; A one-line description of an `SshError`.
+(defn ssh-error-message [(a (dyn Allocator)) (error SshError)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (match error
+      (SshInvalidRequest [message] (sb-push-str! (mut out) message))
+      (SshSpawnFailed [code]
+                      (do
+                        (sb-push-str! (mut out) "could not start ssh (errno ")
+                        (sb-push-i64! (mut out) code)
+                        (sb-push-str! (mut out)
+                                      "); is it installed and on PATH?")))
+      (SshIoFailed [code]
+                   (do
+                     (sb-push-str! (mut out)
+                                   "i/o with the ssh process failed (errno ")
+                     (sb-push-i64! (mut out) code)
+                     (sb-push-str! (mut out) ")")))
+      (SshOutOfMemory []
+                      (sb-push-str! (mut out)
+                                    "out of memory while capturing ssh output")))
+    (sb-finish! (mut out))))
+
+(defn subprocess-error [(error subprocess/SubprocessError)] (-> SshError)
+  (match error
+    (subprocess/InvalidCommand []
+                               (SshInvalidRequest "an ssh argument contains a NUL byte"))
+    (subprocess/OutOfMemory [] (SshOutOfMemory))
+    (subprocess/PipeFailed [code] (SshSpawnFailed code))
+    (subprocess/SpawnFailed [code] (SshSpawnFailed code))
+    (subprocess/WaitFailed [code] (SshIoFailed code))
+    (subprocess/SignalFailed [code] (SshIoFailed code))
+    (subprocess/Timeout [] (SshIoFailed 60))
+    (subprocess/StillRunning [] (SshIoFailed 16))
+    (subprocess/AlreadyClosed [] (SshIoFailed 9))))
+
+(const TOKEN_STDOUT 1)
+
+(const TOKEN_STDERR 2)
+
+(const TOKEN_STDIN 3)
+
+(const CHUNK 65536)
+
+;; A bounded output capture: bytes beyond `limit` are dropped and flagged.
+(defstruct Capture [(bytes (ArrayList u8)) (limit i64) (truncated bool)])
+
+(defn capture-new [(a (dyn Allocator)) (limit i64)] (-> Capture)
+  (Capture
+    :bytes (al-new [u8] a)
+    :limit limit
+    :truncated false))
+
+;; Move the captured bytes out as an exactly-sized owned slice.
+(defn capture-take! [(capture (mut Capture))] (-> (slice u8))
+  (al-into-slice (mut (.bytes capture))))
+
+(defn capture-append! [(capture (mut Capture)) (data (ptr u8)) (count i64)] (-> i64)
+  (let [room (- (.limit capture) (len (.bytes capture)))
+        kept (if (< count room) count room)]
+    (when (> kept 0) (al-extend! (mut (.bytes capture)) data kept) 0)
+    (when (> count kept) (set! (.truncated capture) true) 0)
+    0))
+
+;; Everything the run loop owns, so every exit path can release it.
+(defstruct Run
+  [(child subprocess/Child)
+   (stdout Capture)
+   (stderr Capture)
+   (input (slice u8))
+   (written i64)
+   (timed-out bool)
+   (failure i64)])
+
+;; Write the next chunk of stdin. Returns false on an unrecoverable error
+;; (recorded in `failure`). A reader that has gone away is not an error: the
+;; remote command simply did not want the rest, and its exit status says so.
+(defn feed-stdin! [(run (mut Run))] (-> bool)
+  (let [fd (.stdin-fd (.child run))
+        remaining (- (len (.input run)) (.written run))
+        count (if (> remaining CHUNK) CHUNK remaining)
+        n
+          (write-without-sigpipe fd
+                                 (cast (ptr i8)
+                                       (index (slice-data (.input run))
+                                              (.written run)))
+                                 count)]
+    (cond (> n 0)
+            (do
+              (set! (.written run) (+ (.written run) n))
+              (when (>= (.written run) (len (.input run)))
+                (subprocess/child-close-stdin (field run child))
+                0)
+              true)
+          (or (= n (- 0 EAGAIN)) (= n (- 0 EINTR)) (= n 0)) true
+          (= n (- 0 EPIPE))
+            (do (subprocess/child-close-stdin (field run child)) true)
+          :else (do (set! (.failure run) (- 0 n)) false))))
+
+;; Read what is available on one output stream into its capture, closing the
+;; stream at end of file. Returns false on a read error (recorded in `failure`).
+(defn drain-output! [(run (mut Run)) (stdout bool) (chunk (ptr u8))] (-> bool)
+  (let [fd (if stdout (.stdout-fd (.child run)) (.stderr-fd (.child run)))
+        n (cast i64 (io/read fd (cast (ptr i8) chunk) (cast isize CHUNK)))]
+    (cond (> n 0)
+            (do
+              (if stdout
+                  (capture-append! (mut (.stdout run)) chunk n)
+                  (capture-append! (mut (.stderr run)) chunk n))
+              true)
+          (= n 0)
+            (do
+              (os/close fd)
+              (if stdout
+                  (set! (.stdout-fd (.child run)) -1)
+                  (set! (.stderr-fd (.child run)) -1))
+              true)
+          (or (= (os/os-errno) EINTR) (= (os/os-errno) EAGAIN)) true
+          :else (do (set! (.failure run) (os/os-errno)) false))))
+
+;; Multiplex stdin, stdout, and stderr until all three are closed, the deadline
+;; passes, or an i/o error occurs.
+(defn pump! [(a (dyn Allocator)) (run (mut Run)) (deadline time/Instant)] (-> i64)
+  (let [watches (primitive/alloc-stack (array selectors/Watch 3))
+        chunk (primitive/alloc-stack (array u8 65536))]
+    (loop (let [(mut count) 0]
+            (when (>= (.stdin-fd (.child run)) 0)
+              (set! (index watches (load count))
+                    (selectors/watch (.stdin-fd (.child run))
+                                     (selectors/interest-writable)
+                                     TOKEN_STDIN))
+              (set! count (+ (load count) 1))
+              0)
+            (when (>= (.stdout-fd (.child run)) 0)
+              (set! (index watches (load count))
+                    (selectors/watch (.stdout-fd (.child run))
+                                     (selectors/interest-readable)
+                                     TOKEN_STDOUT))
+              (set! count (+ (load count) 1))
+              0)
+            (when (>= (.stderr-fd (.child run)) 0)
+              (set! (index watches (load count))
+                    (selectors/watch (.stderr-fd (.child run))
+                                     (selectors/interest-readable)
+                                     TOKEN_STDERR))
+              (set! count (+ (load count) 1))
+              0)
+            (if (= (load count) 0)
+                (break)
+                (match (selectors/wait-many-until a
+                                                  (slice-new (cast (ptr selectors/Watch)
+                                                                   watches)
+                                                             (load count))
+                                                  deadline)
+                  (Err [error]
+                       (match error
+                         (selectors/Timeout []
+                                            (do
+                                              (set! (.timed-out run) true)
+                                              (break)))
+                         (selectors/InvalidFd []
+                                              (do
+                                                (set! (.failure run) 9)
+                                                (break)))
+                         (selectors/Syscall [code]
+                                            (do
+                                              (set! (.failure run) code)
+                                              (break)))))
+                  (Ok [selection]
+                      (let [chosen selection
+                            token (.token chosen)
+                            progressed
+                              (cond (= token TOKEN_STDIN)
+                                      (feed-stdin! (mut run))
+                                    (= token TOKEN_STDOUT)
+                                      (drain-output! (mut run)
+                                                     true
+                                                     (cast (ptr u8) chunk))
+                                    :else
+                                      (drain-output! (mut run)
+                                                     false
+                                                     (cast (ptr u8) chunk)))]
+                        (when (not progressed) (break) 0)
+                        0))))))
+    0))
+
+;; SIGTERM the process group, give it `grace-ms` to exit, then SIGKILL.
+(defn stop-child! [(child (ptr subprocess/Child)) (grace-ms i64)] (-> (Result subprocess/ExitStatus
+                                                                              subprocess/SubprocessError))
+  (subprocess/child-terminate child)
+  (try (let [grace
+               (try-or! (time/duration-millis grace-ms)
+                        (subprocess/child-kill-and-wait child))]
+         (match (time/deadline-after grace)
+           (Ok [deadline]
+               (match (subprocess/child-wait-until child deadline)
+                 (Ok [status] (Ok status))
+                 (Err [_] (subprocess/child-kill-and-wait child))))
+           (Err [_] (subprocess/child-kill-and-wait child))))))
+
+;; The finished result, taking ownership of the captured output.
+(defn run-result [(run (mut Run)) (exit-code i64) (signal i64)] (-> SshResult)
+  ; Taken in a let: a (mut (.field p)) argument is rejected inside named
+  ; constructor arguments (a Coil checker bug).
+  (let [stdout (capture-take! (mut (.stdout run)))
+        stderr (capture-take! (mut (.stderr run)))]
+    (SshResult
+      :stdout stdout
+      :stderr stderr
+      :exit-code exit-code
+      :signal signal
+      :timed-out (.timed-out run)
+      :stdout-truncated (.truncated (.stdout run))
+      :stderr-truncated (.truncated (.stderr run)))))
+
+(defn run-free! [(run (mut Run))] (-> i64)
+  (al-free! (mut (.bytes (.stdout run))))
+  (al-free! (mut (.bytes (.stderr run)))))
+
+;;; Run `command` on `target`. `stdin`, when present, is written to the remote
+;;; command's standard input and then closed; when absent the remote command
+;;; reads end of file. `timeout-ms` bounds the whole exchange, connection
+;;; included; on expiry ssh's process group is terminated and the result has
+;;; `timed-out` set with whatever output arrived.
+;;;
+;;; `Err` means ssh could not be run or supervised at all; everything the
+;;; remote side did, including ssh's own connection failures, is in the result.
+(defn ssh-run [(a (dyn Allocator))
+               (target Target)
+               (opts SshOptions)
+               (command (slice u8))
+               (stdin (Option (slice u8)))
+               (timeout-ms i64)] (-> (Result SshResult SshError))
+  (block :done
+         (when (= (len (str-trim command)) 0)
+           (return-from :done
+                          (Err (SshInvalidRequest "the remote command is empty")))
+           0)
+         (when (<= timeout-ms 0)
+           (return-from :done
+                          (Err (SshInvalidRequest "the timeout must be positive")))
+           0)
+         (when (< (.max-output-bytes opts) 0)
+           (return-from :done
+                          (Err (SshInvalidRequest "max-output-bytes must not be negative")))
+           0)
+         (let [deadline
+                 (try (let [duration
+                              (try-or! (time/duration-millis timeout-ms)
+                                       (return-from :done
+                                                      (Err (SshInvalidRequest "the timeout is out of range"))))]
+                        (match (time/deadline-after duration)
+                          (Ok [instant] instant)
+                          (Err [_]
+                               (return-from :done
+                                              (Err (SshInvalidRequest "the timeout is out of range")))))))
+               has-input
+                 (match stdin
+                   (Some [_] true)
+                   (None [] false))
+               (mut run)
+                 (Run
+                   :child (zeroed subprocess/Child)
+                   :stdout (capture-new a (.max-output-bytes opts))
+                   :stderr (capture-new a (.max-output-bytes opts))
+                   :input
+                     (match stdin
+                       (Some [bytes] bytes)
+                       (None [] ""))
+                   :written 0
+                   :timed-out false
+                   :failure 0)
+               (mut settings) (subprocess/spawn-options)]
+           (set! (.new-process-group settings) true)
+           (match (subprocess/spawn-with-options a
+                                                 (field run child)
+                                                 (.ssh-binary opts)
+                                                 (ssh-exec-args a
+                                                                target
+                                                                opts
+                                                                command)
+                                                 (if has-input
+                                                     (subprocess/pipe-stdio)
+                                                     (subprocess/null-stdio))
+                                                 (subprocess/pipe-stdio)
+                                                 (subprocess/pipe-stdio)
+                                                 (load settings))
+             (Err [error]
+                  (do
+                    (run-free! (mut run))
+                    (return-from :done (Err (subprocess-error error)))))
+             (Ok [_] 0))
+           (when has-input
+             (if (= (len (.input run)) 0)
+                 (subprocess/child-close-stdin (field run child))
+                 (let [problem (set-nonblocking! (.stdin-fd (.child run)))]
+                   (when (!= problem 0) (set! (.failure run) problem) 0)
+                   0))
+             0)
+           (when (= (.failure run) 0) (pump! a (mut run) deadline) 0)
+           (subprocess/child-close-stdin (field run child))
+           (let [status
+                   (if (or (.timed-out run) (!= (.failure run) 0))
+                       (stop-child! (field run child) 2000)
+                       (subprocess/child-wait (field run child)))]
+             (subprocess/child-close (field run child))
+             (cond (!= (.failure run) 0)
+                     (do
+                       (run-free! (mut run))
+                       (Err (SshIoFailed (.failure run))))
+                   :else
+                     (match status
+                       (Err [error]
+                            (do
+                              (run-free! (mut run))
+                              (Err (subprocess-error error))))
+                       (Ok [exit]
+                           (let [(mut exit-code) -1
+                                 (mut signal) 0]
+                             (match exit
+                               (subprocess/Exited [code] (set! exit-code code))
+                               (subprocess/Signaled [number]
+                                                    (set! signal number)))
+                             (Ok (run-result (mut run)
+                                             (load exit-code)
+                                             (load signal)))))))))))
+
+;;; Whether `target` accepts a non-interactive login within `timeout-ms`: runs
+;;; `true` remotely and checks for exit status 0. `Err` only when ssh itself
+;;; could not be run.
+(defn ssh-reachable? [(a (dyn Allocator))
+                      (target Target)
+                      (opts SshOptions)
+                      (timeout-ms i64)] (-> (Result bool SshError))
+  (match (ssh-run a target opts "true" (None [(slice u8)]) timeout-ms)
+    (Ok [result]
+        (let [(mut owned) result
+              ok (ssh-result-ok? result)]
+          (ssh-result-free! a (mut owned))
+          (Ok ok)))
+    (Err [error] (Err error))))
+
+(defn shell-safe-byte? [(b i64)] (-> bool)
+  (or (and (>= b 97) (<= b 122))
+      (and (>= b 65) (<= b 90))
+      (and (>= b 48) (<= b 57))
+      (= b 64)
+      (= b 37)
+      (= b 43)
+      (= b 61)
+      (= b 58)
+      (= b 44)
+      (= b 46)
+      (= b 47)
+      (= b 45)
+      (= b 95)))
+
+;;; Quote one word for a POSIX shell so it arrives as exactly those bytes:
+;;; words made only of `[A-Za-z0-9@%+=:,./_-]` are left alone, anything else is
+;;; single-quoted with embedded `'` written as `'\''`; the empty word is `''`.
+(defn shell-quote [(a (dyn Allocator)) (word (slice u8))] (-> (slice u8))
+  (let [(mut safe) (> (len word) 0)
+        (mut k) 0
+        (mut out) (sb-new a)]
+    (loop (if (or (not (load safe)) (>= (load k) (len word)))
+              (break)
+              (if (shell-safe-byte? (cast i64 (get word (load k))))
+                  (set! k (+ (load k) 1))
+                  (set! safe false))))
+    (if (load safe)
+        (sb-push-str! (mut out) word)
+        (do
+          (sb-push-byte! (mut out) 39)
+          (set! k 0)
+          (loop (if (>= (load k) (len word))
+                    (break)
+                    (let [b (get word (load k))]
+                      (if (= (cast i64 b) 39)
+                          (sb-push-str! (mut out) "'\\''")
+                          (sb-push-byte! (mut out) b))
+                      (set! k (+ (load k) 1)))))
+          (sb-push-byte! (mut out) 39)))
+    (sb-finish! (mut out))))
+
+;;; Quote each word and join them with spaces: a command line whose words the
+;;; remote shell splits back exactly.
+(defn shell-join [(a (dyn Allocator)) (words (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut k) 0]
+    (loop (if (>= (load k) (len words))
+              (break)
+              (do
+                (when (> (load k) 0) (sb-push-byte! (mut out) 32) 0)
+                (sb-push-str! (mut out) (shell-quote a (get words (load k))))
+                (set! k (+ (load k) 1)))))
+    (sb-finish! (mut out))))

@@ -1,0 +1,565 @@
+(module agent.loop)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.json" :as json)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "ai.chat" :as chat)
+(import "json_schema.validate" :as schema)
+(import "agent.fail" :use *)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+
+;;; An agent is one conversation with a model that can call tools. The loop
+;;; runs model turns and tool calls until one of four things happens: the model
+;;; calls the designated stop tool, the model replies without calling a tool,
+;;; the agent is cancelled, or the model fails for good. The caller decides
+;;; what each of those means and may call `agent-run!` again to continue.
+;;;
+;;; Everything outside the conversation reaches it through `AgentControl`:
+;;; messages from people or other agents are delivered at the start of a turn,
+;;; and pause/cancel are checked at every turn boundary and while tools run.
+;;; Everything the agent does is reported to an `AgentObserver` as it happens.
+
+;;; A message from outside the conversation. `ref` is an opaque identifier the
+;;; control can use to acknowledge delivery.
+(defstruct Inbound [(from (slice u8)) (text (slice u8)) (ref i64)])
+
+(defsum Control (Proceed) (Pause) (Cancel))
+
+(deftrait AgentControl [Self]
+  (control-check [(self (ptr Self))] (-> Control))
+  ;;; Messages waiting for this agent, oldest first. Returned messages are
+  ;;; delivered exactly once; allocate them in `a`.
+  (control-inbox [(self (ptr Self)) (a (dyn Allocator))]
+                 (-> (ArrayList Inbound)))
+  ;;; Called repeatedly while paused. Block briefly (for example 250 ms).
+  (control-idle [(self (ptr Self))] (-> i64)))
+
+;;; Every slice in an event is valid only for the duration of `observe`.
+(defsum AgentEvent
+  (TurnStarted [(turn i64)])
+  (MessageDelivered [(message Inbound)])
+  (Thought [(text (slice u8))])
+  (Said [(text (slice u8))])
+  (UsageReported [(input-tokens i64) (output-tokens i64)])
+  (ToolStarted [(call ToolCall) (summary (slice u8))])
+  (ToolEnded [(call ToolCall)
+              (summary (slice u8))
+              (ok bool)
+              (output (slice u8))
+              (elapsed-ms i64)])
+  (ModelRetrying [(attempt i64) (error chat/ChatError) (delay-ms i64)])
+  (PausedEvent [])
+  (ResumedEvent [])
+  ;;; Older tool output and reasoning were elided to fit the context budget.
+  (Compacted [(messages i64) (bytes i64)]))
+
+(deftrait AgentObserver [Self]
+  (observe [(self (ptr Self)) (event AgentEvent)] (-> i64)))
+
+;;; Why `agent-run!` returned. `Finished` carries the stop-tool call (arguments
+;;; copied into the agent's allocator) and the text the tool returned.
+(defsum AgentStop
+  (Finished [(call ToolCall) (result (slice u8))])
+  (Replied [(text (slice u8))])
+  (Cancelled [])
+  (Failed [(error chat/ChatError)]))
+
+(defstruct AgentConfig
+  [(model (slice u8))
+   ;;; Name of the tool that ends a run of the loop, or "" for none.
+   (stop-tool (slice u8))
+   (timeout-ms i64)
+   ;;; How many times a transient model failure is retried before `Failed`.
+   (max-retries i64)
+   ;;; When the conversation's text passes this many bytes, older tool output
+   ;;; and reasoning are elided before the next request (see
+   ;;; `compact-transcript!`). 0 disables compaction.
+   (context-budget-bytes i64)
+   ;;; The most recent messages compaction never touches.
+   (keep-recent i64)])
+
+(defn agent-config [(model (slice u8)) (stop-tool (slice u8))] (-> AgentConfig)
+  (let [(mut config) (primitive/zeroed AgentConfig)]
+    (set! (.model config) model)
+    (set! (.stop-tool config) stop-tool)
+    (set! (.timeout-ms config) 600000)
+    (set! (.max-retries config) 6)
+    (set! (.context-budget-bytes config) 360000)
+    (set! (.keep-recent config) 12)
+    (load config)))
+
+(defstruct Agent
+  [(allocator (dyn Allocator))
+   (provider (dyn chat/ChatProvider))
+   (config AgentConfig)
+   (messages JVal)
+   (tools (ptr ToolRegistry))
+   (tool-schemas JVal)
+   (observer (dyn AgentObserver))
+   (control (dyn AgentControl))
+   (turns i64)
+   (input-tokens i64)
+   (output-tokens i64)])
+
+;;; The OpenAI-style `tools` array for a registry. A tool whose schema is not
+;;; valid JSON is a programming error and stops the process.
+(defn tool-schemas-for [(a (dyn Allocator)) (tools (ptr ToolRegistry))] (-> JVal)
+  (let [result (jv-array a)
+        n (registry-count tools)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [spec (tool-spec (registry-at tools (load i)))
+                    parameters
+                      (match (jv-parse a (.parameters spec))
+                        (Some [value] value)
+                        (None []
+                              (fail [JVal]
+                                    "agent.loop: a tool's parameter schema is not valid JSON")))
+                    function (jv-object a)
+                    entry (jv-object a)]
+                (jv-put! function "name" (JStr (.name spec)))
+                (jv-put! function "description" (JStr (.description spec)))
+                (jv-put! function "parameters" parameters)
+                (jv-put! entry "type" (JStr "function"))
+                (jv-put! entry "function" function)
+                (jv-push! result entry)
+                (set! i (+ (load i) 1)))))
+    result))
+
+;;; A new, empty conversation. The agent borrows the provider, registry,
+;;; observer, and control; keep them alive as long as the agent.
+(defn agent-new [(a (dyn Allocator))
+                 (provider (dyn chat/ChatProvider))
+                 (config AgentConfig)
+                 (tools (ptr ToolRegistry))
+                 (observer (dyn AgentObserver))
+                 (control (dyn AgentControl))] (-> Agent)
+  (let [(mut agent) (primitive/zeroed Agent)]
+    (set! (.allocator agent) a)
+    (set! (.provider agent) provider)
+    (set! (.config agent) config)
+    (set! (.messages agent) (jv-array a))
+    (set! (.tools agent) tools)
+    (set! (.tool-schemas agent)
+          (if (> (registry-count tools) 0) (tool-schemas-for a tools) (JNull)))
+    (set! (.observer agent) observer)
+    (set! (.control agent) control)
+    (load agent)))
+
+(defn agent-add-message! [(agent (ptr Agent)) (role (slice u8)) (text (slice u8))] (-> i64)
+  (jv-push! (.messages agent) (chat-message (.allocator agent) role text)))
+
+(defn agent-add-system! [(agent (ptr Agent)) (text (slice u8))] (-> i64)
+  (agent-add-message! agent "system" text))
+
+(defn agent-add-user! [(agent (ptr Agent)) (text (slice u8))] (-> i64)
+  (agent-add-message! agent "user" text))
+
+;;; The whole conversation as JSON text, for a checkpoint.
+(defn agent-transcript-json [(agent (ptr Agent)) (a (dyn Allocator))] (-> (slice u8))
+  (jv-encode a (.messages agent)))
+
+;;; Replace the conversation with one saved by `agent-transcript-json`.
+;;; Returns false, leaving the agent unchanged, when the text is not a JSON
+;;; array of messages.
+(defn agent-restore! [(agent (ptr Agent)) (transcript (slice u8))] (-> bool)
+  (match (jv-parse (.allocator agent) transcript)
+    (Some [value]
+          (match value
+            (JArr [items]
+                  (do (set! (.messages agent) (jv-clone (.allocator agent) value))
+                      true))
+            (_ false)))
+    (None [] false)))
+
+(defn agent-message-count [(agent (ptr Agent))] (-> i64)
+  (jv-count (.messages agent)))
+
+;; ----------------------------------------------------------------------------
+;; Keeping the conversation within the model's context
+
+(defn text-bytes [(value JVal)] (-> i64)
+  (match value
+    (JStr [s] (len s))
+    (JArr [items] (let [(mut n) 0]
+                    (for item (iter items) (set! n (+ (load n) (text-bytes item))))
+                    (load n)))
+    (JObj [map] (let [(mut n) 0]
+                  (hm-for [k v map] (set! n (+ (load n) (text-bytes v))))
+                  (load n)))
+    (_ 0)))
+
+(defn elided [(a (dyn Allocator)) (text (slice u8)) (keep i64) (what (slice u8))] (-> (slice u8))
+  (let [(mut end) (if (< keep (len text)) keep (len text))]
+    ;; Never cut inside a UTF-8 sequence.
+    (loop (if (or (<= (load end) 0) (>= (load end) (len text))
+                  (!= (& (cast i64 (get text (load end))) 192) 128))
+              (break)
+              (set! end (- (load end) 1))))
+    (let [(mut out) (sb-new a)]
+      (sb-push-str! (mut out) (subslice [u8] text 0 (load end)))
+      (sb-push-str! (mut out) "\n[… ")
+      (sb-push-i64! (mut out) (- (len text) (load end)))
+      (sb-push-str! (mut out) " more bytes of ")
+      (sb-push-str! (mut out) what)
+      (sb-push-str! (mut out) " elided to keep the conversation within the model's context; run the tool again if you need them]")
+      (sb-finish! (mut out)))))
+
+;;; When the conversation's text is over budget, shorten the oldest tool
+;;; results and reasoning (never the system prompt, user messages, or the
+;;; newest `keep-recent` messages) until it fits or nothing is left to shorten.
+;;; Returns the number of messages shortened. Elision is recorded in the
+;;; message text itself, so the model knows what it no longer sees.
+(defn compact-transcript! [(agent (ptr Agent))] (-> i64)
+  (let [budget (.context-budget-bytes (.config agent))
+        a (.allocator agent)
+        messages (.messages agent)
+        n (jv-count messages)
+        last-old (- n (.keep-recent (.config agent)))
+        (mut total) (text-bytes messages)
+        (mut shortened) 0
+        (mut i) 1]
+    (if (or (<= budget 0) (<= (load total) budget))
+        0
+        (do
+          (loop (if (or (>= (load i) last-old) (<= (load total) budget))
+                    (break)
+                    (let [message (jv-nth messages (load i))
+                          role (jv-string-or (jv-get message "role") "")]
+                      (when (= role "tool")
+                        (let [content (jv-string-or (jv-get message "content") "")]
+                          (when (> (len content) 600)
+                            (let [short (elided a content 400 "tool output")]
+                              (set! total (- (load total) (- (len content) (len short))))
+                              (jv-put! message "content" (JStr short))
+                              (set! shortened (+ (load shortened) 1))
+                              0)
+                            0))
+                        0)
+                      (when (= role "assistant")
+                        (let [thought (jv-string-or (jv-get message "reasoning_content") "")]
+                          (when (> (len thought) 400)
+                            (let [short (elided a thought 200 "earlier reasoning")]
+                              (set! total (- (load total) (- (len thought) (len short))))
+                              (jv-put! message "reasoning_content" (JStr short))
+                              (set! shortened (+ (load shortened) 1))
+                              0)
+                            0))
+                        0)
+                      (set! i (+ (load i) 1)))))
+          (load shortened)))))
+
+;; ----------------------------------------------------------------------------
+;; Turn mechanics
+
+(defn now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [failure] 0)))
+
+(defn sleep-ms [(ms i64)] (-> i64)
+  (match (time/duration-millis ms)
+    (Ok [duration] (match (time/sleep duration)
+                     (Ok [done] 0)
+                     (Err [failure] 0)))
+    (Err [failure] 0)))
+
+;;; The loop's view of pause and cancel. Returns false when cancelled.
+(defn await-proceed! [(agent (ptr Agent))] (-> bool)
+  (block :await
+         (match (control-check (.control agent))
+           (Proceed [] (return-from :await true))
+           (Cancel [] (return-from :await false))
+           (Pause [] 0))
+         (observe (.observer agent) (PausedEvent))
+         (loop
+           (control-idle (.control agent))
+           (match (control-check (.control agent))
+             (Proceed [] (do (observe (.observer agent) (ResumedEvent))
+                             (return-from :await true)))
+             (Cancel [] (return-from :await false))
+             (Pause [] 0)))
+         true))
+
+(defn deliver-inbox! [(agent (ptr Agent)) (turn-allocator (dyn Allocator))] (-> i64)
+  (let [(mut messages) (control-inbox (.control agent) turn-allocator)
+        n (len messages)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [message (get messages (load i))
+                    (mut text) (sb-new turn-allocator)]
+                (sb-push-str! (mut text) "[")
+                (sb-push-str! (mut text) (.from message))
+                (sb-push-str! (mut text) "] ")
+                (sb-push-str! (mut text) (.text message))
+                (agent-add-user! agent (sb-finish! (mut text)))
+                (observe (.observer agent) (MessageDelivered message))
+                (set! i (+ (load i) 1)))))
+    (al-free! [Inbound] (mut messages))
+    n))
+
+(defn mentions? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find text needle) (Some [at] true) (None [] false)))
+
+;;; Failures worth trying again. A request body cut off in transit reaches the
+;;; provider as a 400 "EOF while parsing" even though the body we sent was
+;;; whole; replaying the identical request succeeds, so that one 400 counts.
+(defn transient-failure? [(error chat/ChatError)] (-> bool)
+  (let [kind (.kind error)
+        status (.status error)]
+    (or (= kind "transport")
+        (= kind "protocol")
+        (and (= kind "provider")
+             (or (= status 408) (= status 409) (= status 425) (= status 429)
+                 (>= status 500)
+                 (and (= status 400) (mentions? (.message error) "EOF while parsing")))))))
+
+;;; One model call with retries for transient failures. Cancellation during a
+;;; retry wait ends it. The returned response lives in `turn-allocator`.
+(defn complete-with-retries [(agent (ptr Agent))
+                             (turn-allocator (dyn Allocator))] (-> chat/ChatResult)
+  (let [(mut request) (primitive/zeroed chat/ChatRequest)
+        (mut attempt) 0]
+    (set! (.model request) (.model (.config agent)))
+    (set! (.messages request) (.messages agent))
+    (set! (.tools request) (.tool-schemas agent))
+    (set! (.timeout-ms request) (.timeout-ms (.config agent)))
+    (block :call
+           (loop
+             (let [result (chat/complete (.provider agent)
+                                         turn-allocator
+                                         (load request))]
+               (match result
+                 (chat/ChatOk [response] (return-from :call result))
+                 (chat/ChatFailed [error]
+                             (if (or (not (transient-failure? error))
+                                     (>= (load attempt) (.max-retries (.config agent))))
+                                 (return-from :call result)
+                                 (let [delay (* 2000 (<< 1 (load attempt)))]
+                                   (set! attempt (+ (load attempt) 1))
+                                   (observe (.observer agent)
+                                            (ModelRetrying (load attempt) error delay))
+                                   (let [(mut waited) 0]
+                                     (loop (if (>= (load waited) delay)
+                                               (break)
+                                               (match (control-check (.control agent))
+                                                 (Cancel [] (return-from :call result))
+                                                 (_ (do (sleep-ms 250)
+                                                        (set! waited (+ (load waited) 250))))))))
+                                   0))))))
+           (load request)
+           (fail [chat/ChatResult] "agent.loop: unreachable after model retries"))))
+
+;;; The tool context handed to tools: cancelled when the agent is.
+(defstruct ControlledContext [(control (dyn AgentControl))])
+
+(impl ToolContext ControlledContext
+  (tool-cancelled? [(self (ptr ControlledContext))] (-> bool)
+                   (match (control-check (.control self))
+                     (Cancel [] true)
+                     (_ false))))
+
+(defn validation-failure [(a (dyn Allocator))
+                          (schema-text (slice u8))
+                          (arguments-text (slice u8))] (-> (slice u8))
+  (match (json/parse a schema-text)
+    (Err [failure] "the tool's schema could not be parsed")
+    (Ok [schema-doc]
+        (match (json/parse a arguments-text)
+          (Err [failure] "the arguments are not valid JSON")
+          (Ok [value-doc]
+              (let [result (schema/validate a schema-doc value-doc)]
+                (if (.ok result)
+                    ""
+                    (let [(mut text) (sb-new a)]
+                      (sb-push-str! (mut text) "invalid arguments at ")
+                      (sb-push-str! (mut text) (.path result))
+                      (sb-push-str! (mut text) ": ")
+                      (sb-push-str! (mut text) (.message result))
+                      (sb-finish! (mut text))))))))))
+
+(defstruct ToolRun [(ok bool) (output (slice u8))])
+
+;;; Execute one call from the model. The returned text lives in `turn-allocator`.
+(defn run-one-tool [(agent (ptr Agent))
+                    (turn-allocator (dyn Allocator))
+                    (call ToolCall)
+                    (context (ptr ControlledContext))] (-> ToolRun)
+  (match (registry-find (.tools agent) (.name call))
+    (None []
+          (let [(mut text) (sb-new turn-allocator)]
+            (sb-push-str! (mut text) "error: there is no tool named ")
+            (sb-push-str! (mut text) (.name call))
+            (let [output (sb-finish! (mut text))]
+              (ToolRun :ok false :output output))))
+    (Some [tool]
+          (let [spec (tool-spec tool)
+                problem (validation-failure turn-allocator
+                                            (.parameters spec)
+                                            (.arguments-json call))]
+            (if (> (len problem) 0)
+                (ToolRun :ok false :output problem)
+                (match (tool-run tool turn-allocator call context)
+                  (ToolOk [output] (ToolRun :ok true :output output))
+                  (ToolFailed [message]
+                              (let [(mut text) (sb-new turn-allocator)]
+                                (sb-push-str! (mut text) "error: ")
+                                (sb-push-str! (mut text) message)
+                                (let [output (sb-finish! (mut text))]
+                                  (ToolRun :ok false :output output))))))))))
+
+(defn tool-summary-for [(agent (ptr Agent)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+  (match (registry-find (.tools agent) (.name call))
+    (Some [tool] (tool-summary tool a call))
+    (None [] (.name call))))
+
+;;; Decode one entry of a message's `tool_calls`.
+(defn decode-call [(a (dyn Allocator)) (entry JVal)] (-> ToolCall)
+  (let [function (jv-get entry "function")
+        raw (jv-string-or (jv-get function "arguments") "")
+        text (if (= (len (str-trim raw)) 0) "{}" raw)
+        arguments (match (jv-parse a text)
+                    (Some [value] value)
+                    (None [] (JNull)))]
+    (tool-call (jv-string-or (jv-get entry "id") "")
+               (jv-string-or (jv-get function "name") "")
+               arguments
+               text)))
+
+(defn tool-result-message [(a (dyn Allocator)) (call-id (slice u8)) (output (slice u8))] (-> JVal)
+  (let [message (jv-object a)]
+    (jv-put! message "role" (JStr "tool"))
+    (jv-put! message "tool_call_id" (JStr (copy-bytes a call-id)))
+    (jv-put! message "content" (JStr (copy-bytes a output)))
+    message))
+
+(defn clone-call [(a (dyn Allocator)) (call ToolCall)] (-> ToolCall)
+  (tool-call (copy-bytes a (.id call))
+             (copy-bytes a (.name call))
+             (jv-clone a (.arguments call))
+             (copy-bytes a (.arguments-json call))))
+
+;;; The assistant message to keep: the provider's own message object, so that
+;;; provider fields such as `reasoning_content` survive into the next request.
+(defn assistant-message [(a (dyn Allocator)) (response chat/ChatResponse)] (-> JVal)
+  (let [raw (jv-get (jv-nth (jv-get (.raw response) "choices") 0) "message")]
+    (if (jv-null? raw)
+        (chat-message a "assistant" (.text response))
+        (jv-clone a raw))))
+
+(defsum TurnOutcome
+  (Continue [])
+  (Stop [(stop AgentStop)]))
+
+;;; One model turn plus the tools it called.
+(defn agent-turn! [(agent (ptr Agent)) (turn-allocator (dyn Allocator))] (-> TurnOutcome)
+  (block :turn
+         (set! (.turns agent) (+ (.turns agent) 1))
+         (observe (.observer agent) (TurnStarted (.turns agent)))
+         (let [shortened (compact-transcript! agent)]
+           (when (> shortened 0)
+             (observe (.observer agent) (Compacted shortened (text-bytes (.messages agent))))
+             0))
+         (match (complete-with-retries agent turn-allocator)
+           (chat/ChatFailed [error]
+                            (return-from :turn
+                                           (match (control-check (.control agent))
+                                             (Cancel [] (Stop (Cancelled)))
+                                             (_ (Stop (Failed error))))))
+           (chat/ChatOk [reply]
+                   (let [response reply
+                         a (.allocator agent)
+                         kept (assistant-message a response)
+                         thought (jv-string-or (jv-get kept "reasoning_content") "")
+                         calls (.tool-calls response)
+                         call-count (jv-count calls)]
+                     (jv-push! (.messages agent) kept)
+                     (set! (.input-tokens agent)
+                           (+ (.input-tokens agent) (.input-tokens response)))
+                     (set! (.output-tokens agent)
+                           (+ (.output-tokens agent) (.output-tokens response)))
+                     (observe (.observer agent)
+                              (UsageReported (.input-tokens response)
+                                             (.output-tokens response)))
+                     (when (> (len thought) 0)
+                       (observe (.observer agent) (Thought thought))
+                       0)
+                     (when (> (len (str-trim (.text response))) 0)
+                       (observe (.observer agent) (Said (.text response)))
+                       0)
+                     (if (= call-count 0)
+                         (return-from :turn
+                                        (Stop (Replied (copy-bytes a (.text response)))))
+                         0)
+                     (let [context (primitive/alloc-stack ControlledContext)
+                           (mut stop) (: (None) (Option AgentStop))
+                           (mut i) 0]
+                       (set! (.control context) (.control agent))
+                       (loop (if (>= (load i) call-count)
+                                 (break)
+                                 (let [call (decode-call turn-allocator
+                                                         (jv-nth calls (load i)))
+                                       summary (tool-summary-for agent turn-allocator call)
+                                       started (now-ms)]
+                                   (observe (.observer agent) (ToolStarted call summary))
+                                   (let [run (run-one-tool agent turn-allocator call context)]
+                                     (observe (.observer agent)
+                                              (ToolEnded call
+                                                         summary
+                                                         (.ok run)
+                                                         (.output run)
+                                                         (- (now-ms) started)))
+                                     (jv-push! (.messages agent)
+                                               (tool-result-message a (.id call) (.output run)))
+                                     (when (and (.ok run)
+                                                (> (len (.stop-tool (.config agent))) 0)
+                                                (= (.name call) (.stop-tool (.config agent))))
+                                       (set! stop
+                                             (Some (Finished (clone-call a call)
+                                                             (copy-bytes a (.output run)))))
+                                       0))
+                                   (set! i (+ (load i) 1)))))
+                       (match (load stop)
+                         (Some [finished] (return-from :turn (Stop finished)))
+                         (None [] (Continue)))))))))
+
+;;; Run turns until the model stops, replies without tools, is cancelled, or
+;;; fails. Pending messages are delivered before each turn.
+(defn agent-run! [(agent (ptr Agent))] (-> AgentStop)
+  (let [(mut arena) (primitive/zeroed scratch/ScratchArena)
+        (mut outcome) (: (Cancelled) AgentStop)]
+    (scratch/scratch-init (mut arena) (.allocator agent))
+    (let [turn-allocator (scratch/scratch-allocator (mut arena))]
+      (loop (if (not (await-proceed! agent))
+                (do (set! outcome (Cancelled)) (break))
+                (do
+                  (deliver-inbox! agent turn-allocator)
+                  (match (agent-turn! agent turn-allocator)
+                    (Continue [] (do (scratch/scratch-reset! (mut arena)) 0))
+                    (Stop [stop]
+                          (do
+                            (set! outcome (copy-stop (.allocator agent) stop))
+                            (break))))))))
+    (scratch/scratch-close! (mut arena))
+    (load outcome)))
+
+;;; A stop value whose slices no longer point into the turn arena.
+(defn copy-stop [(a (dyn Allocator)) (stop AgentStop)] (-> AgentStop)
+  (match stop
+    (Finished [call result] (Finished call result))
+    (Replied [text] (Replied text))
+    (Cancelled [] (Cancelled))
+    (Failed [failure]
+            (let [error failure]
+              (Failed (chat/chat-error (copy-bytes a (.kind error))
+                                       (.status error)
+                                       (copy-bytes a (.message error))))))))

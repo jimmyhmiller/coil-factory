@@ -1,0 +1,444 @@
+(module agent_tools.shell)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.selectors" :as selectors)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "coil.time" :as time)
+(import "agent.tool" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(export CommandResult ExecSpec execute run-command command-report ShellTool shell-tool)
+
+(const SHELL_DEFAULT_TIMEOUT_SECONDS 300)
+(const SHELL_MAX_TIMEOUT_SECONDS 3600)
+;;; Tool output becomes model context. The first and last 8 KB of a long
+;;; output carry what matters: the command's start and its final errors.
+(const SHELL_HEAD_BYTES 8192)
+(const SHELL_TAIL_BYTES 8192)
+(const POLL_INTERVAL_MS 100)
+;;; How long a process group gets between SIGTERM and SIGKILL.
+(const TERM_GRACE_MS 2000)
+(const READ_CHUNK_BYTES 16384)
+(const SIGTERM 15)
+(const SIGKILL 9)
+(const ECHILD 10)
+(const EAGAIN_DARWIN 35)
+(const EAGAIN_LINUX 11)
+
+;;; ---------------------------------------------------------------------------
+;;; Bounded output capture
+
+;;; Keeps the first `head-limit` bytes and the last `tail-limit` bytes of a
+;;; stream (the tail in a ring), and counts every byte and newline.
+(defstruct OutputCapture
+  [(head (ArrayList u8))
+   (head-limit i64)
+   (tail (ArrayList u8))
+   (tail-limit i64)
+   (tail-start i64)
+   (total i64)
+   (newlines i64)])
+
+(defn capture-new [(a (dyn Allocator)) (head-limit i64) (tail-limit i64)] (-> OutputCapture)
+  (OutputCapture :head (al-new [u8] a)
+                 :head-limit head-limit
+                 :tail (al-new [u8] a)
+                 :tail-limit tail-limit
+                 :tail-start 0
+                 :total 0
+                 :newlines 0))
+
+(defn capture-push! [(capture (mut OutputCapture)) (bytes (slice u8))] (-> i64)
+  (let [(mut i) 0
+        n (len bytes)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [byte (get bytes (load i))]
+                (when (= byte (primitive/cast u8 #\newline))
+                  (set! (.newlines capture) (+ (.newlines capture) 1))
+                  0)
+                (cond (< (len (.head capture)) (.head-limit capture))
+                        (push! (mut (.head capture)) byte)
+                      (<= (.tail-limit capture) 0) 0
+                      (< (len (.tail capture)) (.tail-limit capture))
+                        (push! (mut (.tail capture)) byte)
+                      :else
+                        (do (set! (mut (.tail capture)) (.tail-start capture) byte)
+                            (set! (.tail-start capture) (% (+ (.tail-start capture) 1) (.tail-limit capture)))))
+                (set! i (+ (load i) 1)))))
+    (set! (.total capture) (+ (.total capture) n))
+    n))
+
+(defn capture-omitted [(capture (ptr OutputCapture))] (-> i64)
+  (- (.total capture) (+ (len (.head capture)) (len (.tail capture)))))
+
+;;; The captured text: head, an "… N bytes omitted …" marker when bytes were
+;;; dropped, and the tail in order. Invalid UTF-8 (including a sequence cut at
+;;; a boundary) is replaced with U+FFFD.
+(defn capture-render [(a (dyn Allocator)) (capture (ptr OutputCapture))] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        omitted (capture-omitted capture)
+        tail (al-slice (.tail capture))
+        start (.tail-start capture)]
+    (sb-push-str! (mut b) (al-slice (.head capture)))
+    (when (> omitted 0)
+      (sb-push-str! (mut b) "\n\x2026; ")
+      (sb-push-i64! (mut b) omitted)
+      (sb-push-str! (mut b) " bytes omitted \x2026;\n")
+      0)
+    (sb-push-str! (mut b) (subslice tail start (len tail)))
+    (sb-push-str! (mut b) (subslice tail 0 start))
+    (let [raw (sb-finish! (mut b))
+          clean (sanitize-utf8 a raw)]
+      (when (!= (slice-data clean) (slice-data raw))
+        (free-bytes a raw 1)
+        0)
+      clean)))
+
+(defn capture-free! [(capture (mut OutputCapture))] (-> i64)
+  (al-free! (mut (.head capture)))
+  (al-free! (mut (.tail capture))))
+
+;;; ---------------------------------------------------------------------------
+;;; Process supervision
+
+;;; How one command ended.
+;;; `exit-code` is the exit status, or 128 + signal when a signal ended it
+;;; (then `signal` is that signal, else 0). `output` is stdout and stderr
+;;; merged, bounded to head + tail, valid UTF-8. `output-bytes` and
+;;; `output-lines` count everything the command wrote (lines = newlines);
+;;; `omitted-bytes` is what was dropped.
+(defstruct CommandResult
+  [(exit-code i64)
+   (signal i64)
+   (timed-out bool)
+   (cancelled bool)
+   (output (slice u8))
+   (output-bytes i64)
+   (output-lines i64)
+   (omitted-bytes i64)])
+
+;;; A program to supervise. `args` excludes argv[0]. The program runs in its
+;;; own process group with stdin from /dev/null and stderr merged into stdout.
+(defstruct ExecSpec
+  [(program (slice u8))
+   (args (slice (slice u8)))
+   (cwd (slice u8))
+   (timeout-ms i64)
+   (head-bytes i64)
+   (tail-bytes i64)])
+
+(defn subprocess-error-text [(a (dyn Allocator)) (error subprocess/SubprocessError)] (-> (slice u8))
+  (match error
+    (subprocess/InvalidCommand [] "invalid command")
+    (subprocess/OutOfMemory [] "out of memory")
+    (subprocess/PipeFailed [code] (join2 a "could not create a pipe: " (sys/errno-text code)))
+    (subprocess/SpawnFailed [code] (sys/errno-text code))
+    (subprocess/WaitFailed [code] (join2 a "wait failed: " (sys/errno-text code)))
+    (subprocess/SignalFailed [code] (join2 a "signal failed: " (sys/errno-text code)))
+    (subprocess/Timeout [] "timed out")
+    (subprocess/StillRunning [] "still running")
+    (subprocess/AlreadyClosed [] "already closed")))
+
+;;; Whether the child has exited, WITHOUT reaping it. While the exited leader
+;;; stays unreaped its pid, and so its process-group id, cannot be reused, so
+;;; signalling the group afterwards can only reach the command's own processes.
+(defn exited-unreaped? [(pid i32) (info (ptr u8))] (-> bool)
+  (let [pid-slot (primitive/cast (ptr i32) (primitive/index info sys/SIGINFO_PID_OFFSET))]
+    (set! pid-slot (primitive/cast i32 0))
+    (let [rc (sys/waitid (primitive/cast i32 sys/P_PID)
+                         (primitive/cast u32 pid)
+                         info
+                         (primitive/cast i32 (| sys/WEXITED (| sys/WNOHANG sys/WNOWAIT))))]
+      (if (= rc (primitive/cast i32 0))
+          (!= (load pid-slot) (primitive/cast i32 0))
+          (= (os/os-errno) ECHILD)))))
+
+(defn signal-group [(pid i32) (signal i64)] (-> i64)
+  (primitive/cast i64 (os/kill (- (primitive/cast i32 0) pid) (primitive/cast i32 signal))))
+
+;;; The parent's end of the output pipe while it is being drained.
+(defstruct Drain
+  [(fd i32)
+   (eof bool)
+   (buffer (slice u8))])
+
+(defn poll-duration [(ms i64)] (-> time/Duration)
+  (sys/millis (if (< ms 0) 0 ms)))
+
+;;; Wait up to `wait-ms` for output and read one chunk of it. Sets `eof` when
+;;; every writer has closed the pipe (or the descriptor failed).
+(defn pump! [(drain (mut Drain)) (capture (mut OutputCapture)) (wait-ms i64)] (-> i64)
+  (if (.eof drain)
+      0
+      (match (selectors/wait-fd-for (.fd drain) (selectors/interest-readable) (poll-duration wait-ms))
+        (Err [error]
+             (match error
+               (selectors/Timeout [] 0)
+               (selectors/Syscall [code] (if (= code sys/EINTR) 0 (do (set! (.eof drain) true) 0)))
+               (selectors/InvalidFd [] (do (set! (.eof drain) true) 0))))
+        (Ok [_]
+            (let [buffer (.buffer drain)
+                  n (primitive/cast i64 (io/read (.fd drain)
+                                                 (primitive/cast (ptr i8) (slice-data buffer))
+                                                 (primitive/cast isize (len buffer))))]
+              (cond (> n 0) (do (capture-push! (mut capture) (subslice buffer 0 n)) 0)
+                    (= n 0) (do (set! (.eof drain) true) 0)
+                    :else (let [code (os/os-errno)]
+                            (if (or (= code sys/EINTR) (= code EAGAIN_DARWIN) (= code EAGAIN_LINUX))
+                                0
+                                (do (set! (.eof drain) true) 0)))))))))
+
+;;; One polling step: read output if the pipe is open, else just sleep.
+(defn step! [(drain (mut Drain)) (capture (mut OutputCapture))] (-> i64)
+  (if (.eof drain)
+      (sys/sleep-ms POLL_INTERVAL_MS)
+      (pump! (mut drain) (mut capture) POLL_INTERVAL_MS)))
+
+;;; Drain output until end-of-file or until `until-ms` (monotonic).
+(defn drain-until! [(drain (mut Drain)) (capture (mut OutputCapture)) (until-ms i64)] (-> i64)
+  (loop (if (.eof drain)
+            (break)
+            (let [now (sys/monotonic-ms)]
+              (if (>= now until-ms)
+                  (break)
+                  (pump! (mut drain) (mut capture) (if (< (- until-ms now) POLL_INTERVAL_MS) (- until-ms now) POLL_INTERVAL_MS))))))
+  0)
+
+;;; Keep draining until the leader exits or `until-ms` passes. True if it exited.
+(defn await-exit! [(pid i32) (info (ptr u8)) (drain (mut Drain)) (capture (mut OutputCapture)) (until-ms i64)] (-> bool)
+  (let [(mut exited) (exited-unreaped? pid info)]
+    (loop (if (or (load exited) (>= (sys/monotonic-ms) until-ms))
+              (break)
+              (do (step! (mut drain) (mut capture))
+                  (set! exited (exited-unreaped? pid info)))))
+    (load exited)))
+
+(defn after-ms [(delta i64)] (-> i64)
+  (+ (sys/monotonic-ms) delta))
+
+(defstruct ExitParts [(code i64) (signal i64)])
+
+;;; The shell convention: a signal-terminated process reports 128 + signal.
+(defn status-parts [(status subprocess/ExitStatus)] (-> ExitParts)
+  (match status
+    (subprocess/Exited [code] (ExitParts :code code :signal 0))
+    (subprocess/Signaled [signal] (ExitParts :code (+ 128 signal) :signal signal))))
+
+;;; Run `spec` to completion, timeout, or cancellation. The program gets its
+;;; own process group. On timeout or cancellation the whole group receives
+;;; SIGTERM, then SIGKILL after a grace period. When the program exits, any
+;;; process it left behind in its group is stopped the same way, so nothing
+;;; outlives the call; output is drained until every writer is gone (bounded
+;;; by the grace periods). Err when the program could not be started or its
+;;; exit status could not be collected; a failing program is an Ok.
+(defn execute [(a (dyn Allocator)) (spec ExecSpec) (context (dyn ToolContext))] (-> (Result CommandResult (slice u8)))
+  (let [cwd (sys/c-string a (.cwd spec))
+        child (primitive/alloc-stack subprocess/Child)
+        spawned (subprocess/spawn-with-options a
+                                               child
+                                               (.program spec)
+                                               (.args spec)
+                                               (subprocess/null-stdio)
+                                               (subprocess/pipe-stdio)
+                                               (subprocess/merge-stderr)
+                                               (subprocess/SpawnOptions :cwd cwd :new-process-group true))]
+    (sys/c-string-free a (.cwd spec) cwd)
+    (match spawned
+      (Err [error]
+           (Err (join3 a
+                       (join3 a "could not start " (quoted a (.program spec)) " in ")
+                       (quoted a (.cwd spec))
+                       (join2 a ": " (subprocess-error-text a error)))))
+      (Ok [_]
+          (match (alloc [u8] a READ_CHUNK_BYTES)
+            (None []
+                  (do (subprocess/child-kill-and-wait child)
+                      (subprocess/child-close child)
+                      (Err "out of memory allocating the output buffer")))
+            (Some [buffer]
+                  (let [pid (.pid child)
+                        info (primitive/alloc-stack (array u8 128))
+                        info-ptr (primitive/cast (ptr u8) info)
+                        (mut capture) (capture-new a (.head-bytes spec) (.tail-bytes spec))
+                        (mut drain) (Drain :fd (.stdout-fd child) :eof false :buffer buffer)
+                        deadline (after-ms (.timeout-ms spec))
+                        (mut exited) false
+                        (mut timed-out) false
+                        (mut cancelled) false]
+                    ;; Run: pump output, and watch for exit, cancellation, deadline.
+                    (loop (if (or (load exited) (load timed-out) (load cancelled))
+                              (break)
+                              (do (step! (mut drain) (mut capture))
+                                  (set! exited (exited-unreaped? pid info-ptr))
+                                  (when (not (load exited))
+                                    (cond (tool-cancelled? context) (set! cancelled true)
+                                          (>= (after-ms 0) deadline) (set! timed-out true)
+                                          :else 0)
+                                    0))))
+                    ;; Stop a command that is still running.
+                    (when (not (load exited))
+                      (signal-group pid SIGTERM)
+                      (set! exited (await-exit! pid info-ptr (mut drain) (mut capture) (after-ms TERM_GRACE_MS)))
+                      (when (not (load exited))
+                        (signal-group pid SIGKILL)
+                        (set! exited (await-exit! pid info-ptr (mut drain) (mut capture) (after-ms TERM_GRACE_MS)))
+                        0)
+                      0)
+                    ;; Stop whatever the command left behind in its group. The
+                    ;; leader is still unreaped here, so the group id is ours.
+                    (signal-group pid SIGTERM)
+                    (drain-until! (mut drain) (mut capture) (after-ms TERM_GRACE_MS))
+                    (signal-group pid SIGKILL)
+                    (drain-until! (mut drain) (mut capture) (after-ms TERM_GRACE_MS))
+                    (match (subprocess/child-wait child)
+                      (Err [error]
+                           (do (subprocess/child-close child)
+                               (capture-free! (mut capture))
+                               (free [u8] a buffer)
+                               (Err (join2 a "could not collect the command's exit status: " (subprocess-error-text a error)))))
+                      (Ok [status]
+                          (let [parts (status-parts status)
+                                output (capture-render a (mut capture))
+                                result (CommandResult :exit-code (.code parts)
+                                                      :signal (.signal parts)
+                                                      :timed-out (load timed-out)
+                                                      :cancelled (load cancelled)
+                                                      :output output
+                                                      :output-bytes (.total capture)
+                                                      :output-lines (.newlines capture)
+                                                      :omitted-bytes (capture-omitted (mut capture)))]
+                            (subprocess/child-close child)
+                            (capture-free! (mut capture))
+                            (free [u8] a buffer)
+                            (Ok result)))))))))))
+
+;;; Run `command` with `/bin/sh -c` in the workspace root under `policy`: the
+;;; same execution the `shell` tool uses, for callers that are not agents
+;;; (such as factory gates). `timeout-ms` must be positive. `context` is
+;;; polled about every 100 ms; pass a `NeverCancelled` when nothing cancels.
+;;; Err when the command could not be started (for example, the sandbox
+;;; program is missing); a failing command is an Ok with its exit code.
+(defn run-command [(a (dyn Allocator))
+                   (workspace Workspace)
+                   (policy SandboxPolicy)
+                   (command (slice u8))
+                   (timeout-ms i64)
+                   (context (dyn ToolContext))] (-> (Result CommandResult (slice u8)))
+  (if (<= timeout-ms 0)
+      (Err "timeout must be positive")
+      (let [root (workspace-root workspace)
+            (mut argv) (sandbox-argv a policy root command)
+            all (al-slice argv)
+            result (execute a
+                            (ExecSpec :program (get all 0)
+                                      :args (subslice all 1 (len all))
+                                      :cwd root
+                                      :timeout-ms timeout-ms
+                                      :head-bytes SHELL_HEAD_BYTES
+                                      :tail-bytes SHELL_TAIL_BYTES)
+                            context)]
+        (al-free! (mut argv))
+        result)))
+
+;;; "5s" for whole seconds, otherwise "1500ms".
+(defn duration-text [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (let [(mut b) (sb-new a)]
+    (if (= (% ms 1000) 0)
+        (do (sb-push-i64! (mut b) (/ ms 1000)) (sb-push-str! (mut b) "s"))
+        (do (sb-push-i64! (mut b) ms) (sb-push-str! (mut b) "ms")))
+    (sb-finish! (mut b))))
+
+;;; The text the model sees: the output, then one status line — `exit N`,
+;;; `exit N (killed by signal S)`, `timed out after Ns …`, or `cancelled …`.
+(defn command-report [(a (dyn Allocator)) (result CommandResult) (timeout-ms i64)] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        output (.output result)]
+    (if (= (len output) 0)
+        (sb-push-str! (mut b) "(no output)\n")
+        (do (sb-push-str! (mut b) output)
+            (when (!= (get output (- (len output) 1)) (primitive/cast u8 #\newline))
+              (sb-push-str! (mut b) "\n")
+              0)
+            0))
+    (cond (.timed-out result)
+            (do (sb-push-str! (mut b) "timed out after ")
+                (sb-push-str! (mut b) (duration-text a timeout-ms))
+                (sb-push-str! (mut b) "; the command and its child processes were stopped"))
+          (.cancelled result)
+            (sb-push-str! (mut b) "cancelled; the command and its child processes were stopped")
+          :else
+            (do (sb-push-str! (mut b) "exit ")
+                (sb-push-i64! (mut b) (.exit-code result))
+                (when (> (.signal result) 0)
+                  (sb-push-str! (mut b) " (killed by signal ")
+                  (sb-push-i64! (mut b) (.signal result))
+                  (sb-push-str! (mut b) ")")
+                  0)
+                0))
+    (sb-finish! (mut b))))
+
+;;; ---------------------------------------------------------------------------
+;;; The `shell` tool
+
+(defstruct ShellTool
+  [(workspace Workspace)
+   (policy SandboxPolicy)])
+
+(defn shell-tool [(workspace Workspace) (policy SandboxPolicy)] (-> ShellTool)
+  (ShellTool :workspace workspace :policy policy))
+
+(const SHELL_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell source for /bin/sh -c. Runs in the workspace root with empty stdin.\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"Seconds before the command and every process it started are stopped. Default 300, maximum 3600.\"}},\"required\":[\"command\"],\"additionalProperties\":false}")
+
+(const SHELL_DESCRIPTION
+       "Run a shell command (/bin/sh -c) in the workspace root. stdout and stderr are merged; long output keeps the first and last 8 KB. The result ends with the exit code. Processes the command leaves running in the background are stopped when it finishes.")
+
+(const SHELL_DESCRIPTION_SANDBOXED
+       "Run a shell command (/bin/sh -c) in the workspace root. stdout and stderr are merged; long output keeps the first and last 8 KB. The result ends with the exit code. Processes the command leaves running in the background are stopped when it finishes. The command is sandboxed: it can write only inside the workspace and temporary directories.")
+
+;;; The first line of `command`, at most about 80 bytes, with "…" when cut.
+(defn command-headline [(a (dyn Allocator)) (command (slice u8))] (-> (slice u8))
+  (let [trimmed (str-trim command)
+        newline (match (str-find trimmed "\n") (Some [i] i) (None [] -1))
+        line (if (>= newline 0) (subslice trimmed 0 newline) trimmed)
+        short (utf8-prefix line 80)]
+    (if (and (= (len short) (len line)) (< newline 0))
+        short
+        (join2 a short " \x2026;"))))
+
+(defn shell-timeout-ms [(call ToolCall)] (-> (Result i64 (slice u8)))
+  (match (jv-get (.arguments call) "timeout_seconds")
+    (JNull [] (Ok (* SHELL_DEFAULT_TIMEOUT_SECONDS 1000)))
+    (JInt [n] (if (or (< n 1) (> n SHELL_MAX_TIMEOUT_SECONDS))
+                  (Err "timeout_seconds must be between 1 and 3600")
+                  (Ok (* n 1000))))
+    (_ (Err "timeout_seconds must be an integer number of seconds"))))
+
+(impl Tool ShellTool
+  (tool-spec [(self (ptr ShellTool))] (-> ToolSpec)
+    (ToolSpec :name "shell"
+              :description (match (.policy self)
+                             (NoSandbox [] SHELL_DESCRIPTION)
+                             (_ SHELL_DESCRIPTION_SANDBOXED))
+              :parameters SHELL_SCHEMA))
+  (tool-summary [(self (ptr ShellTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "$ " (command-headline a (call-string call "command"))))
+  (tool-run [(self (ptr ShellTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (let [command (call-string call "command")]
+      (if (= (len (str-trim command)) 0)
+          (ToolFailed "command is required: pass shell source such as \"ls -la\"")
+          (match (shell-timeout-ms call)
+            (Err [message] (ToolFailed message))
+            (Ok [timeout-ms]
+                (match (run-command a (.workspace self) (.policy self) command timeout-ms context)
+                  (Err [message] (ToolFailed message))
+                  (Ok [result] (ToolOk (command-report a result timeout-ms))))))))))

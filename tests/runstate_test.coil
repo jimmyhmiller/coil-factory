@@ -1,0 +1,80 @@
+(module factory.runstate-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "factory.events" :use *)
+(import "factory.runstate" :use *)
+
+(defn fold-lines! [(st (ptr RunState)) (lines (slice (slice u8)))] (-> i64)
+  (let [(mut offset) 0]
+    (for line (iter lines)
+      (let [next (+ (load offset) (+ (len line) 1))]
+        (match (jv-parse (malloc-allocator) line)
+          (Some [record] (fold-record! st (load offset) next record))
+          (None [] (assert false)))
+        (set! offset next)))
+    (load offset)))
+
+(deftest folds-a-run-through-stations-gates-messages-and-findings
+  (let [a (malloc-allocator)
+        (mut st) (runstate-new a "fixer-7f3a")
+        created "{\"t\":1000,\"kind\":\"run.created\",\"factory\":\"fixer\",\"site\":\"laptop\",\"project\":\"/p\",\"branch\":\"factory/fixer-7f3a\",\"model\":\"deepseek/deepseek-v4-flash\",\"brief\":\"Wrap the snake\\nat walls\",\"stations\":[\"implement\",\"review\"]}"]
+    (fold-lines! (mut st)
+                 [created
+                  "{\"t\":1100,\"kind\":\"run.started\",\"base\":\"abc123\"}"
+                  "{\"t\":1200,\"kind\":\"station.started\",\"agent\":\"implement\"}"
+                  "{\"t\":1300,\"kind\":\"agent.turn\",\"agent\":\"implement\",\"turn\":1}"
+                  "{\"t\":1310,\"kind\":\"agent.usage\",\"agent\":\"implement\",\"input\":100,\"output\":20}"
+                  "{\"t\":1400,\"kind\":\"tool.started\",\"agent\":\"implement\",\"call\":\"c1\",\"tool\":\"shell\",\"summary\":\"$ coil test\"}"])
+    (assert (= (.status st) "running"))
+    (assert (= (.current st) "implement"))
+    (assert (= (.brief st) "Wrap the snake"))
+    (assert-eq (len (.stations st)) 2)
+    (let [agent (agent-at (mut st) "implement")]
+      (assert (= (.phase agent) "tool"))
+      (assert (= (.activity agent) "$ coil test"))
+      (assert-eq (.input-tokens agent) 100))
+    ;; An operator message is pending until the agent receives it.
+    (let [(mut next) 0]
+      (fold-record! (mut st) 5000 5100
+                    (match (jv-parse a "{\"t\":1500,\"kind\":\"message.sent\",\"agent\":\"implement\",\"from\":\"operator\",\"text\":\"keep it small\"}")
+                      (Some [r] r) (None [] (JNull))))
+      (assert-eq (len (.pending st)) 1)
+      (fold-record! (mut st) 5100 5200
+                    (match (jv-parse a "{\"t\":1600,\"kind\":\"message.received\",\"agent\":\"implement\",\"ref\":5000,\"text\":\"keep it small\"}")
+                      (Some [r] r) (None [] (JNull))))
+      (assert-eq (len (.pending st)) 0)
+      (assert (= (.activity (agent-at (mut st) "implement")) "✉ keep it small"))
+      (set! next 0))
+    (fold-lines! (mut st)
+                 ["{\"t\":1700,\"kind\":\"gate.started\",\"agent\":\"implement\",\"command\":\"coil test\"}"
+                  "{\"t\":1800,\"kind\":\"gate.finished\",\"agent\":\"implement\",\"ok\":false,\"exit\":1}"
+                  "{\"t\":1900,\"kind\":\"finding\",\"agent\":\"implement\",\"severity\":\"warn\",\"code\":\"looping\",\"message\":\"same test 4x\"}"
+                  "{\"t\":2000,\"kind\":\"control\",\"action\":\"pause\"}"])
+    (assert (= (.status st) "paused"))
+    (let [station (station-at (mut st) "implement")]
+      (assert (= (.status station) "running"))
+      (assert-eq (.gate-failures station) 1))
+    (assert-eq (len (.findings st)) 1)
+    (fold-lines! (mut st)
+                 ["{\"t\":2100,\"kind\":\"control\",\"action\":\"resume\"}"
+                  "{\"t\":2200,\"kind\":\"station.finished\",\"agent\":\"implement\",\"outcome\":\"passed\",\"summary\":\"Wrapped at walls.\"}"
+                  "{\"t\":2300,\"kind\":\"run.finished\",\"status\":\"succeeded\",\"reason\":\"\"}"])
+    (assert (= (.status st) "succeeded"))
+    (assert (= (.summary (station-at (mut st) "implement")) "Wrapped at walls."))
+    (assert (= (.phase (agent-at (mut st) "implement")) "done"))
+    (let [json (jv-encode a (runstate-json a (mut st)))]
+      (match (str-find json "\"status\":\"succeeded\"")
+        (Some [at] 0)
+        (None [] (assert false))))))
+
+(deftest previews-cut-on-utf8-boundaries
+  (let [a (malloc-allocator)]
+    (assert (= (preview a "hello" 10) "hello"))
+    (assert (= (preview a "hello world" 5) "hello…"))
+    ;; "é" is two bytes; cutting inside it backs off to before it.
+    (assert (= (preview a "aé" 2) "a…"))
+    (assert (= (first-line a "\n\n  first line  \nsecond" 100) "first line"))))

@@ -1,0 +1,48 @@
+(module factory.cli.chat)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.prompt" :as prompt)
+(import "cli.style" :as style)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use *)
+(import "factory.cli.runs" :as runs)
+(import "factory.ui.dashboard" :as dashboard)
+
+;;; The dashboard, and talking with an agent from a terminal.
+
+;;; Without a terminal (a script, an agent), each line read from stdin is
+;;; sent, and the agent's reply is printed when it comes.
+(defn cmd-chat-lines [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut p) (prompt/prompter-new a)
+        (mut result) 0]
+    (loop
+      (match (prompt/ask (mut p) "you" "")
+        (Err [e] (break))
+        (Ok [line]
+            (if (= (len (str-trim line)) 0)
+                (break)
+                (let [code (runs/cmd-ask ctx reference line 900)]
+                  (when (!= code 0) (set! result code) (break))
+                  0)))))
+    (load result)))
+
+(defn interactive? [] (-> bool)
+  (and (style/tty? 0) (style/tty? 1)))
+
+;;; `factory` with no command.
+(defn cmd-dashboard [(ctx (ptr Ctx)) (run (slice u8)) (agent (slice u8))] (-> i64)
+  (if (not (interactive?))
+      (runs/cmd-ps ctx false)
+      (if (hub-up? ctx)
+          (dashboard/run-dashboard (.allocator ctx) (.hub ctx) run agent)
+          (hub-down-message ctx))))
+
+(defn cmd-chat [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [ref (agent-ref reference)]
+    (cond (= (len (.agent ref)) 0) (fail-with ctx "name an agent: factory chat RUN/STATION")
+          (interactive?) (cmd-dashboard ctx (.run ref) (.agent ref))
+          :else (cmd-chat-lines ctx reference))))

@@ -1,0 +1,155 @@
+(module sse-core-test)
+(import "coil.primitive" :as primitive)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.str" :use *)
+(import "sse.core" :use *)
+
+(defstruct RecordingSseSink
+  [(count (ptr i64))
+   (valid (ptr i64))
+   (reject-after i64)])
+
+(impl SseEventSink RecordingSseSink
+  (consume-sse-event [(self (ptr RecordingSseSink))
+                      (event SseEvent)]
+                     (-> bool)
+                     (let [position (load (load (field self count)))]
+                       (if (= position 0)
+                           (when (or (not (str-eq (.name event) "message"))
+                                     (not (str-eq (.data event) "hel\nlo")))
+                             (set! (load (field self valid)) 0)
+                             0)
+                           (when (or (> position 1)
+                                     (not (str-eq (.name event) ""))
+                                     (not (str-eq (.data event) "done")))
+                             (set! (load (field self valid)) 0)
+                             0))
+                       (set! (load (field self count)) (+ position 1))
+                       (or (< (.reject-after self) 0)
+                           (< position (.reject-after self))))))
+
+(deftest decodes-frames-across-arbitrary-chunk-boundaries
+         (let [allocator (malloc-allocator)
+               count (box! allocator i64 0)
+               valid (box! allocator i64 1)
+               sink (primitive/alloc-stack RecordingSseSink)
+               decoder (primitive/alloc-stack SseDecoder)]
+           (set! (.count sink) count)
+           (set! (.valid sink) valid)
+           (set! (.reject-after sink) -1)
+           (set! decoder (sse-decoder-new allocator sink 1024))
+           (assert (sse-decoder-feed! decoder "event: message\ndata: hel"))
+           (assert-eq (load count) 0)
+           (assert (sse-decoder-feed! decoder "\ndata: lo\n"))
+           (assert-eq (load count) 0)
+           (assert (sse-decoder-feed! decoder "\n"))
+           (assert-eq (load count) 1)
+           (assert (sse-decoder-feed! decoder "data: done\n\n"))
+           (assert-eq (load count) 2)
+           (assert-eq (load valid) 1)
+           (sse-decoder-free! decoder)))
+
+(deftest applies-bounded-buffer-and-synchronous-backpressure
+         (let [allocator (malloc-allocator)
+               count (box! allocator i64 0)
+               valid (box! allocator i64 1)
+               sink (primitive/alloc-stack RecordingSseSink)
+               bounded (primitive/alloc-stack SseDecoder)
+               rejected (primitive/alloc-stack SseDecoder)]
+           (set! (.count sink) count)
+           (set! (.valid sink) valid)
+           (set! (.reject-after sink) -1)
+           (set! bounded (sse-decoder-new allocator sink 4))
+           (assert (not (sse-decoder-feed! bounded "12345")))
+           (assert (sse-decoder-failed? bounded))
+           (sse-decoder-free! bounded)
+           (set! (.reject-after sink) 0)
+           (set! rejected (sse-decoder-new allocator sink 1024))
+           (assert (not (sse-decoder-feed! rejected "data: ignored\n\n")))
+           (assert (sse-decoder-failed? rejected))
+           (sse-decoder-free! rejected)))
+
+(defstruct DetailedSink [(count (ptr i64)) (good (ptr bool))])
+
+(impl SseEventSink DetailedSink
+  (consume-sse-event [(self (ptr DetailedSink)) (event SseEvent)]
+                     (-> bool)
+                     (let [at (load (load (field self count)))]
+                       (if (= at 0)
+                           (when (or (not (= (.name event) "update"))
+                                     (not (= (.data event) "first\nline"))
+                                     (not (= (.id event) "42"))
+                                     (!= (.retry-ms event) 1500))
+                             (set! (load (field self good)) false)
+                             0)
+                           (when (or (not (= (.data event) "next"))
+                                     (not (= (.id event) "42")))
+                             (set! (load (field self good)) false)
+                             0))
+                       (set! (load (field self count)) (+ at 1))
+                       true)))
+
+(deftest retains-event-id-and-roundtrips-encoded-events
+         (let [allocator (malloc-allocator)
+               count (box! allocator i64 0)
+               good (box! allocator bool true)
+               sink (primitive/alloc-stack DetailedSink)
+               decoder (primitive/alloc-stack SseDecoder)
+               event (primitive/alloc-stack SseEvent)]
+           (set! (.count sink) count)
+           (set! (.good sink) good)
+           (set! decoder (sse-decoder-new allocator sink 1024))
+           (set! (.name event) "update")
+           (set! (.data event) "first\nline")
+           (set! (.id event) "42")
+           (set! (.retry-ms event) 1500)
+           (assert (sse-decoder-feed! decoder
+                                      (sse-encode allocator (load event))))
+           (assert (sse-decoder-feed! decoder "data: next\n\n"))
+           (assert-eq (load count) 2)
+           (assert (load good))
+           (sse-decoder-free! decoder)))
+
+(defstruct CountSink [(count (ptr i64))])
+
+(impl SseEventSink CountSink
+  (consume-sse-event [(self (ptr CountSink)) (event SseEvent)]
+                     (-> bool)
+                     (set! (load (field self count))
+                           (+ (load (load (field self count))) 1))
+                     true))
+
+(deftest handles-cr-line-endings-and-large-multi-event-chunks
+         (let [a (malloc-allocator)
+               count (box! a i64 0)
+               sink (primitive/alloc-stack CountSink)
+               decoder (primitive/alloc-stack SseDecoder)]
+           (set! (.count sink) count)
+           (set! decoder (sse-decoder-new a sink 10))
+           (assert (sse-decoder-feed! decoder "data: x\n\ndata: y\n\n"))
+           (assert (sse-decoder-feed! decoder "data: z\r"))
+           (assert (sse-decoder-feed! decoder "\rdata: q\r\n\r\n"))
+           (assert-eq (load count) 4)
+           (assert-eq (sse-decoder-buffered-bytes decoder) 0)
+           (sse-decoder-free! decoder)))
+
+(deftest applies-retry-and-id-reset-without-a-data-event
+         (let [a (malloc-allocator)
+               count (box! a i64 0)
+               sink (primitive/alloc-stack CountSink)
+               decoder (primitive/alloc-stack SseDecoder)
+               (mut reset) (primitive/zeroed SseEvent)]
+           (set! (.count sink) count)
+           (set! decoder (sse-decoder-new a sink 128))
+           (assert (sse-decoder-feed! decoder "id: old\nretry: 25\n\n"))
+           (assert (= (sse-decoder-last-id decoder) "old"))
+           (assert-eq (sse-decoder-retry-ms decoder) 25)
+           (set! (.data reset) "next")
+           (set! (.id reset) "")
+           (set! (.id-present reset) true)
+           (set! (.retry-ms reset) -1)
+           (assert (sse-decoder-feed! decoder (sse-encode a (load reset))))
+           (assert (= (sse-decoder-last-id decoder) ""))
+           (assert-eq (load count) 1)
+           (sse-decoder-free! decoder)))

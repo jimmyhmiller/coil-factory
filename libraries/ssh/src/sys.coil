@@ -1,0 +1,118 @@
+;; Internal: the few operating-system details the ssh package needs beyond the
+;; standard library — monotonic time in milliseconds, nonblocking descriptors,
+;; and a pipe write that reports a vanished reader as EPIPE instead of letting
+;; SIGPIPE kill the process.
+(module ssh.sys)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.time" :as time)
+(import "ssh.platform" :use [platform-pick])
+
+(export ssh-fail!
+        now-ms
+        sleep-ms
+        set-nonblocking!
+        EAGAIN
+        EINTR
+        EPIPE
+        write-without-sigpipe)
+
+;;; Write `ssh: MESSAGE` to stderr and abort. For conditions the package cannot
+;;; continue past, such as a failing monotonic clock. Never returns.
+(defn ssh-fail! [(message (slice u8))] (-> i64)
+  (io/print-str (io/stderr) "ssh: ")
+  (io/print-str (io/stderr) message)
+  (io/print-str (io/stderr) "\n")
+  (alloc/abort)
+  0)
+
+(const EAGAIN (platform-pick 11 35))
+
+(const EINTR 4)
+
+(const EPIPE 32)
+
+(const O_NONBLOCK (platform-pick 2048 4))
+
+(const F_GETFL 3)
+
+(const F_SETFL 4)
+
+(const SIG_BLOCK (platform-pick 0 1))
+
+(const SIG_SETMASK (platform-pick 2 3))
+
+(const SIGPIPE 13)
+
+;;; Milliseconds on the monotonic clock. A failing clock is unrecoverable for
+;;; deadline arithmetic, so it aborts.
+(defn now-ms [] (-> i64)
+  (try (let [value
+               (try-or! (time/monotonic-now-ms)
+                        (do (ssh-fail! "the monotonic clock is unavailable") 0))]
+         value)))
+
+(defn sleep-ms [(ms i64)] (-> i64)
+  (try (let [duration
+               (try-or! (time/duration-millis ms)
+                        (ssh-fail! "invalid sleep duration"))]
+         (match (time/sleep duration)
+           (Ok [_] 0)
+           (Err [_] (ssh-fail! "sleep failed"))))))
+
+;;; Put `fd` in nonblocking mode. Returns 0, or the errno of the failure.
+(defn set-nonblocking! [(fd i32)] (-> i64)
+  (let [flags (os/fcntl fd (cast i32 F_GETFL))]
+    (if (< flags 0)
+        (os/os-errno)
+        (if (< (os/fcntl fd (cast i32 F_SETFL) (| flags (cast i32 O_NONBLOCK)))
+               0)
+            (os/os-errno)
+            0))))
+
+(extern sigemptyset :cc c [(ptr u8)] (-> i32))
+
+(extern sigaddset :cc c [(ptr u8) i32] (-> i32))
+
+(extern sigismember :cc c [(ptr u8) i32] (-> i32))
+
+(extern sigpending :cc c [(ptr u8)] (-> i32))
+
+(extern sigwait :cc c [(ptr u8) (ptr i32)] (-> i32))
+
+(extern pthread_sigmask :cc c [i32 (ptr u8) (ptr u8)] (-> i32))
+
+;;; `write(2)` with SIGPIPE blocked on the calling thread. If the reader is gone
+;;; the result is -1 with errno EPIPE, and the SIGPIPE the kernel raised is
+;;; consumed before the previous signal mask is restored, so it is never
+;;; delivered. Returns the byte count or -errno.
+(defn write-without-sigpipe [(fd i32) (data (ptr i8)) (count i64)] (-> i64)
+  (let [block (primitive/alloc-stack (array u8 256))
+        previous (primitive/alloc-stack (array u8 256))
+        pending (primitive/alloc-stack (array u8 256))
+        received (primitive/alloc-stack i32)
+        block-set (cast (ptr u8) block)
+        previous-set (cast (ptr u8) previous)
+        pending-set (cast (ptr u8) pending)]
+    (sigemptyset block-set)
+    (sigaddset block-set (cast i32 SIGPIPE))
+    (when (!= (pthread_sigmask (cast i32 SIG_BLOCK) block-set previous-set) 0)
+      (ssh-fail! "could not block SIGPIPE around a pipe write")
+      0)
+    (let [written (cast i64 (io/write fd data (cast isize count)))
+          error (if (< written 0) (os/os-errno) 0)]
+      (when (= error EPIPE)
+        ; Consume the SIGPIPE this write raised, unless it was already blocked
+        ; by the caller (then it is theirs to handle).
+        (when (= (sigismember previous-set (cast i32 SIGPIPE)) 0)
+          (sigemptyset pending-set)
+          (sigpending pending-set)
+          (when (= (sigismember pending-set (cast i32 SIGPIPE)) 1)
+            (sigwait block-set received)
+            0)
+          0)
+        0)
+      (pthread_sigmask (cast i32 SIG_SETMASK) previous-set (cast (ptr u8) 0))
+      (if (< written 0) (- 0 error) written))))

@@ -1,0 +1,1038 @@
+(module http_app.server)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.cancellation" :as cancel)
+(import "coil.http.server" :as http)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.selectors" :as selectors)
+(import "coil.slice" :use *)
+(import "coil.socket" :as socket)
+(import "coil.str" :use *)
+(import "coil.sync" :as sync)
+(import "coil.thread" :as thread)
+(import "coil.time" :as time)
+(import "http_app.native" :as native)
+(import "http_app.router" :use *)
+
+;;; Listener and connection policy. Build one with `server-config` and adjust
+;;; fields; every field is validated by `server-listen!`.
+;;;
+;;; - `host`: dotted-quad IPv4 address to bind (default "127.0.0.1").
+;;; - `port`: TCP port; 0 asks the kernel for an ephemeral port.
+;;; - `backlog`: listen(2) backlog.
+;;; - `max-request-bytes`: cap on request line + headers + body, 1 KiB..8 MiB+64 KiB
+;;;   (the `coil.http.server` parser's own limits). Larger requests get 413.
+;;; - `read-timeout-ms`: the whole request must arrive within this time, else 408.
+;;; - `write-timeout-ms`: a single write may wait this long for the client to
+;;;   drain its receive window before the connection is dropped.
+;;; - `idle-poll-ms`: how often an idle stream is asked for more data.
+;;; - `max-connections`: concurrent connections; excess connections get 503.
+;;; - `thread-stack-bytes`: stack for each connection thread (0 = platform default).
+(defstruct ServerConfig
+  [(host (slice u8))
+   (port i64)
+   (backlog i64)
+   (max-request-bytes i64)
+   (read-timeout-ms i64)
+   (write-timeout-ms i64)
+   (idle-poll-ms i64)
+   (max-connections i64)
+   (thread-stack-bytes i64)])
+
+(defn server-config [] (-> ServerConfig)
+  (let [(mut config) (primitive/zeroed ServerConfig)]
+    (set! (.host config) "127.0.0.1")
+    (set! (.port config) 0)
+    (set! (.backlog config) 128)
+    (set! (.max-request-bytes config) 1048576)
+    (set! (.read-timeout-ms config) 10000)
+    (set! (.write-timeout-ms config) 30000)
+    (set! (.idle-poll-ms config) 250)
+    (set! (.max-connections config) 256)
+    (set! (.thread-stack-bytes config) 4194304)
+    (load config)))
+
+(defsum ServerError
+  (ServerInvalidConfig [(message (slice u8))])
+  (ServerListenFailed [(code i64)])
+  (ServerSetupFailed [(message (slice u8)) (code i64)])
+  (ServerAcceptFailed [(code i64)]))
+
+;; The limits `coil.http.server/parse-request` enforces (its constants are private).
+(const PARSER-MAX-BODY-BYTES 8388608)
+
+(const PARSER-MAX-HEADER-BYTES 65536)
+
+(const STATE-UNOPENED 0)
+
+(const STATE-LISTENING 1)
+
+(const STATE-SERVING 2)
+
+(const STATE-SERVED 3)
+
+(const STATE-CLOSED 4)
+
+;;; A threaded HTTP/1.1 server. Storage is caller-owned and must not move or be
+;;; freed until `server-close!` returns. Lifecycle: `server-listen!`, then either
+;;; `server-serve!` (blocking) or `server-start!` + `server-wait!`, then
+;;; `server-close!`. `server-stop!` may be called from any thread at any time
+;;; after `server-listen!`.
+(defstruct Server
+  [(config ServerConfig)
+   (router (ptr Router))
+   (listener socket/TcpListener)
+   (port i64)
+   (stop cancel/Cancellation)
+   (lock sync/Mutex)
+   (drained sync/Condition)
+   (active i64)
+   (accepted i64)
+   (state i64)
+   (thread thread/Thread)
+   (thread-started bool)
+   (thread-joined bool)
+   (result (Result i64 ServerError))])
+
+(defn now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [error]
+         (native/fatal [i64] "the monotonic clock is unavailable"))))
+
+(defn millis [(ms i64)] (-> time/Duration)
+  (match (time/duration-millis (if (< ms 0) 0 ms))
+    (Ok [duration] duration)
+    (Err [error]
+         (native/fatal [time/Duration] "invalid duration in http_app.server"))))
+
+(defn lock! [(server (ptr Server))] (-> i64)
+  (match (sync/mutex-lock! (field server lock))
+    (Ok [value] 0)
+    (Err [error] (native/fatal [i64] "http_app.server: mutex lock failed"))))
+
+(defn unlock! [(server (ptr Server))] (-> i64)
+  (match (sync/mutex-unlock! (field server lock))
+    (Ok [value] 0)
+    (Err [error] (native/fatal [i64] "http_app.server: mutex unlock failed"))))
+
+(defn config-problem [(config ServerConfig)] (-> (Option (slice u8)))
+  (cond (= (len (.host config)) 0) (Some "host is empty")
+        (contains-byte? (.host config) 0) (Some "host contains NUL")
+        (or (< (.port config) 0) (> (.port config) 65535))
+          (Some "port must be in 0..65535")
+        (< (.backlog config) 1) (Some "backlog must be positive")
+        (< (.max-request-bytes config) 1024)
+          (Some "max-request-bytes must be at least 1024")
+        (> (.max-request-bytes config)
+           (+ PARSER-MAX-BODY-BYTES PARSER-MAX-HEADER-BYTES))
+          (Some "max-request-bytes exceeds the coil.http.server parser limits")
+        (< (.read-timeout-ms config) 1)
+          (Some "read-timeout-ms must be positive")
+        (< (.write-timeout-ms config) 1)
+          (Some "write-timeout-ms must be positive")
+        (< (.idle-poll-ms config) 1) (Some "idle-poll-ms must be positive")
+        (< (.max-connections config) 1)
+          (Some "max-connections must be positive")
+        (< (.thread-stack-bytes config) 0)
+          (Some "thread-stack-bytes must not be negative")
+        :else (None [(slice u8)])))
+
+;;; Validate `config`, bind a close-on-exec listening socket with SO_REUSEADDR,
+;;; and return the bound port (the kernel's choice when `port` is 0). `router`
+;;; must outlive the server and must not be modified while serving.
+(defn server-listen! [(server (ptr Server))
+                      (config ServerConfig)
+                      (router (ptr Router))] (-> (Result i64 ServerError))
+  (set! server (primitive/zeroed Server))
+  (match (config-problem config)
+    (Some [problem] (Err (ServerInvalidConfig problem)))
+    (None []
+          (block :done
+                 (set! (.config server) config)
+                 (set! (.router server) router)
+                 (set! (.result server) (Ok 0))
+                 (let [fd
+                         (native/listen-ipv4 (malloc-allocator)
+                                             (.host config)
+                                             (.port config)
+                                             (.backlog config))]
+                   (when (< fd 0)
+                     (return-from :done (Err (ServerListenFailed (- 0 fd)))))
+                   (set! (.fd (.listener server)) (cast i32 fd))
+                   (set! (.closed (.listener server)) false))
+                 (match (socket/tcp-listener-port (field server listener))
+                   (Ok [port] (set! (.port server) port))
+                   (Err [error]
+                        (do
+                          (socket/tcp-listener-close! (field server listener))
+                          (return-from :done
+                                         (Err (ServerSetupFailed "getsockname failed"
+                                                                 (socket/socket-error-code error)))))))
+                 (match (cancel/cancellation-init (field server stop))
+                   (Ok [token] 0)
+                   (Err [error]
+                        (do
+                          (socket/tcp-listener-close! (field server listener))
+                          (return-from :done
+                                         (Err (ServerSetupFailed "could not create the stop pipe"
+                                                                 (os/os-errno)))))))
+                 (let [read-flags
+                         (native/set-cloexec! (.read-fd (.stop server)))
+                       write-flags
+                         (native/set-cloexec! (.write-fd (.stop server)))]
+                   (when (or (!= read-flags 0) (!= write-flags 0))
+                     (cancel/cancellation-close! (field server stop))
+                     (socket/tcp-listener-close! (field server listener))
+                     (return-from :done
+                                    (Err (ServerSetupFailed "could not mark the stop pipe close-on-exec"
+                                                            (if (!= read-flags
+                                                                    0)
+                                                                read-flags
+                                                                write-flags))))))
+                 (let [mutex-ok
+                         (match (sync/mutex-init (field server lock))
+                           (Ok [m] true)
+                           (Err [error] false))
+                       condition-ok
+                         (and mutex-ok
+                              (match (sync/condition-init (field server drained))
+                                (Ok [c] true)
+                                (Err [error] false)))]
+                   (when (not condition-ok)
+                     (when mutex-ok (sync/mutex-destroy! (field server lock)) 0)
+                     (cancel/cancellation-close! (field server stop))
+                     (socket/tcp-listener-close! (field server listener))
+                     (return-from :done
+                                    (Err (ServerSetupFailed "could not initialize synchronization"
+                                                            0)))))
+                 (set! (.state server) STATE-LISTENING)
+                 (Ok (.port server))))))
+
+(defn server-port [(server (ptr Server))] (-> i64)
+  (.port server))
+
+;;; The listening socket's descriptor (close-on-exec, non-blocking).
+(defn server-listener-fd [(server (ptr Server))] (-> i32)
+  (.fd (.listener server)))
+
+;;; Connections currently being handled.
+(defn server-active-connections [(server (ptr Server))] (-> i64)
+  (lock! server)
+  (let [active (.active server)]
+    (unlock! server)
+    active))
+
+;;; Connections accepted since `server-listen!`, including rejected ones.
+(defn server-accepted-connections [(server (ptr Server))] (-> i64)
+  (lock! server)
+  (let [accepted (.accepted server)]
+    (unlock! server)
+    accepted))
+
+;;; Ask the server to stop: the accept loop exits, pending request reads are
+;;; abandoned, and every stream is released with `ReleaseStopping` at its next
+;;; step. Thread-safe and idempotent.
+(defn server-stop! [(server (ptr Server))] (-> i64)
+  (cancel/cancellation-request! (field server stop)))
+
+(defn stopping? [(server (ptr Server))] (-> bool)
+  (cancel/cancellation-requested? (field server stop)))
+
+;;; What a readiness wait observed.
+(defsum Readiness
+  (ReadyClient)
+  (ReadyStop)
+  (ReadyTimeout)
+  (ReadyFailed))
+
+;;; Wait for `fd` to satisfy `interest`, for the server to stop, or for
+;;; `timeout-ms` to elapse.
+(defn wait-fd [(server (ptr Server))
+               (fd i32)
+               (interest selectors/Interest)
+               (timeout-ms i64)] (-> Readiness)
+  (let [watches
+          [(selectors/watch fd interest 0)
+           (cancel/cancellation-watch (field server stop) 1)]]
+    (match (selectors/wait-many-for (malloc-allocator)
+                                    watches
+                                    (millis timeout-ms))
+      (Ok [selection]
+          (let [(mut picked) selection]
+            (if (= (.token picked) 0) (ReadyClient) (ReadyStop))))
+      (Err [error]
+           (match error
+             (selectors/Timeout [] (ReadyTimeout))
+             (selectors/InvalidFd [] (ReadyFailed))
+             (selectors/Syscall [code] (ReadyFailed)))))))
+
+;;; One connection's state. Both arenas are released when the connection closes.
+(defstruct Connection
+  [(server (ptr Server))
+   (socket socket/TcpConnection)
+   (allocator (dyn Allocator))
+   (step-arena (ptr scratch/ScratchArena))
+   (step (dyn Allocator))
+   (read-buffer (slice u8))])
+
+(defsum WriteResult
+  (WriteDone)
+  (WriteDisconnected)
+  (WriteTimedOut)
+  (WriteStopped))
+
+(defn io-failure-code [(error socket/SocketError)] (-> i64)
+  (match error
+    (socket/IoFailed [code] code)
+    (_ -1)))
+
+;;; Write every byte, waiting for the client to drain its window for at most the
+;;; configured write timeout per wait. Never raises SIGPIPE.
+(defn write-all [(conn (ptr Connection)) (bytes (slice u8))] (-> WriteResult)
+  (let [server (.server conn)
+        timeout (.write-timeout-ms (.config server))
+        (mut offset) 0
+        (mut result) (WriteDone)]
+    (loop (if (>= (load offset) (len bytes))
+              (break)
+              (match (socket/tcp-write (field conn socket)
+                                       (cast (ptr i8)
+                                             (primitive/index (slice-data bytes)
+                                                              (load offset)))
+                                       (- (len bytes) (load offset)))
+                (Ok [written] (set! offset (+ (load offset) written)))
+                (Err [error]
+                     (let [code (io-failure-code error)]
+                       (cond (= code native/EINTR) 0
+                             (= code native/EAGAIN)
+                               (match (wait-fd server
+                                               (.fd (.socket conn))
+                                               (selectors/interest-writable)
+                                               timeout)
+                                 (ReadyClient [] 0)
+                                 (ReadyTimeout []
+                                               (do
+                                                 (set! result (WriteTimedOut))
+                                                 (break)))
+                                 (ReadyStop []
+                                            (do
+                                              (set! result (WriteStopped))
+                                              (break)))
+                                 (ReadyFailed []
+                                              (do
+                                                (set! result
+                                                      (WriteDisconnected))
+                                                (break))))
+                             :else
+                               (do
+                                 (set! result (WriteDisconnected))
+                                 (break))))))))
+    (load result)))
+
+(defn write-ok? [(result WriteResult)] (-> bool)
+  (match result
+    (WriteDone [] true)
+    (_ false)))
+
+(defsum ReadResult
+  (ReadData [(count i64)])
+  (ReadEof)
+  (ReadAgain)
+  (ReadError))
+
+(defn read-some [(conn (ptr Connection))] (-> ReadResult)
+  (let [buffer (.read-buffer conn)]
+    (match (socket/tcp-read (field conn socket)
+                            (cast (ptr i8) (slice-data buffer))
+                            (len buffer))
+      (Ok [count] (if (= count 0) (ReadEof) (ReadData count)))
+      (Err [error]
+           (let [code (io-failure-code error)]
+             (if (or (= code native/EAGAIN) (= code native/EINTR))
+                 (ReadAgain)
+                 (ReadError)))))))
+
+;;; Half-close and drain what the client is still sending, for at most
+;;; `limit-ms` and 1 MiB, so the kernel does not reset the connection (discarding
+;;; the response) because unread request bytes remained at close.
+(defn linger-close! [(conn (ptr Connection)) (limit-ms i64)] (-> i64)
+  (let [server (.server conn)
+        fd (.fd (.socket conn))
+        deadline (+ (now-ms) limit-ms)
+        (mut discarded) 0]
+    (native/shutdown fd (cast i32 native/SHUT_WR))
+    (loop (let [remaining (- deadline (now-ms))]
+            (if (or (<= remaining 0) (> (load discarded) 1048576))
+                (break)
+                (match (wait-fd server
+                                fd
+                                (selectors/interest-readable)
+                                remaining)
+                  (ReadyClient []
+                               (match (read-some conn)
+                                 (ReadData [count]
+                                           (set! discarded
+                                                 (+ (load discarded) count)))
+                                 (ReadAgain [] 0)
+                                 (ReadEof [] (break))
+                                 (ReadError [] (break))))
+                  (_ (break))))))
+    0))
+
+;; Lingering bounds: a served connection may drain for a second; a connection
+;; rejected on the accept thread only briefly, since it blocks accepting.
+(const LINGER-MS 1000)
+
+(const REJECT-LINGER-MS 100)
+
+;;; Outcome of reading one request.
+(defsum ReadOutcome
+  (RequestReady [(request http/Request)])
+  (RequestRejected [(status i64) (code (slice u8)) (message (slice u8))])
+  (RequestAbandoned))
+
+;;; Framing facts gathered from the raw header block before full parsing.
+(defstruct HeaderHint
+  [(content-length i64)
+   (length-known bool)
+   (expect-continue bool)])
+
+(defn find-header-end [(data (slice u8)) (from i64)] (-> i64)
+  (match (str-find-from data "\r\n\r\n" (if (< from 0) 0 from))
+    (Some [at] (+ at 4))
+    (None [] -1)))
+
+(defn trim-ows [(value (slice u8))] (-> (slice u8))
+  (let [(mut lo) 0
+        (mut hi) (len value)]
+    (loop (if (and (< (load lo) (load hi))
+                   (let [b (cast i64 (get value (load lo)))]
+                     (or (= b 32) (= b 9))))
+              (set! lo (+ (load lo) 1))
+              (break)))
+    (loop (if (and (> (load hi) (load lo))
+                   (let [b (cast i64 (get value (- (load hi) 1)))]
+                     (or (= b 32) (= b 9))))
+              (set! hi (- (load hi) 1))
+              (break)))
+    (subslice [u8] value (load lo) (load hi))))
+
+;;; Parse a Content-Length value; -1 when it is not a plain decimal. Values beyond
+;;; 18 digits saturate to a huge number so the size check rejects them.
+(defn parse-length [(value (slice u8))] (-> i64)
+  (let [(mut total) 0
+        (mut i) 0
+        (mut valid) (> (len value) 0)]
+    (loop (if (or (>= (load i) (len value)) (not (load valid)))
+              (break)
+              (let [b (cast i64 (get value (load i)))]
+                (cond (or (< b 48) (> b 57)) (set! valid false)
+                      (>= (load i) 18) (set! total 1000000000000000000)
+                      :else (set! total (+ (* (load total) 10) (- b 48))))
+                (set! i (+ (load i) 1)))))
+    (if (load valid) (load total) -1)))
+
+;;; Scan the header block for a single Content-Length (and no Transfer-Encoding)
+;;; and for `Expect: 100-continue`. This is only a hint for when to parse and for
+;;; rejecting oversized bodies early; `coil.http.server/parse-request` remains the
+;;; authority on validity.
+(defn header-hint [(block (slice u8))] (-> HeaderHint)
+  (let [(mut hint) (primitive/zeroed HeaderHint)
+        (mut lengths) 0
+        (mut chunked) false
+        (mut http11) false
+        (mut start) 0
+        n (len block)
+        (mut first) true]
+    (loop (if (>= (load start) n)
+              (break)
+              (let [end
+                      (match (str-find-from block "\r\n" (load start))
+                        (Some [at] at)
+                        (None [] n))
+                    line (subslice [u8] block (load start) end)]
+                (if (load first)
+                    (do
+                      (set! http11
+                            (and (>= (len line) 8)
+                                 (= (subslice [u8]
+                                              line
+                                              (- (len line) 8)
+                                              (len line))
+                                    "HTTP/1.1")))
+                      (set! first false))
+                    (match (str-find line ":")
+                      (None [] 0)
+                      (Some [colon]
+                            (let [name (subslice [u8] line 0 colon)
+                                  value
+                                    (trim-ows (subslice [u8]
+                                                        line
+                                                        (+ colon 1)
+                                                        (len line)))]
+                              (cond (ascii-ci-eq name "content-length")
+                                      (do
+                                        (set! lengths (+ (load lengths) 1))
+                                        (set! (.content-length hint)
+                                              (parse-length value)))
+                                    (ascii-ci-eq name "transfer-encoding")
+                                      (set! chunked true)
+                                    (and (ascii-ci-eq name "expect")
+                                         (ascii-ci-eq value "100-continue"))
+                                      (set! (.expect-continue hint) true)
+                                    :else 0)))))
+                (set! start (+ end 2)))))
+    (cond (load chunked) (set! (.length-known hint) false)
+          (= (load lengths) 0)
+            (do
+              (set! (.length-known hint) true)
+              (set! (.content-length hint) 0))
+          (and (= (load lengths) 1) (>= (.content-length hint) 0))
+            (set! (.length-known hint) true)
+          :else (set! (.length-known hint) false))
+    (when (not (load http11)) (set! (.expect-continue hint) false) 0)
+    (load hint)))
+
+(defn rejected [(status i64) (code (slice u8)) (message (slice u8))] (-> ReadOutcome)
+  (RequestRejected
+    :status status
+    :code code
+    :message message))
+
+;;; Read and parse one request within the read timeout and size limit.
+(defn read-request [(conn (ptr Connection))] (-> ReadOutcome)
+  (let [server (.server conn)
+        config (.config server)
+        max-bytes (.max-request-bytes config)
+        deadline (+ (now-ms) (.read-timeout-ms config))
+        (mut data) (al-new [u8] (.allocator conn))
+        (mut header-end) -1
+        (mut expected) -1
+        (mut continue-sent) false]
+    (block :done
+             (loop (let [remaining (- deadline (now-ms))]
+                     (when (<= remaining 0)
+                       (return-from :done
+                                      (rejected 408
+                                                "request_timeout"
+                                                "the request did not arrive in time")))
+                     (match (wait-fd server
+                                     (.fd (.socket conn))
+                                     (selectors/interest-readable)
+                                     remaining)
+                       (ReadyTimeout []
+                                     (return-from :done
+                                                    (rejected 408
+                                                              "request_timeout"
+                                                              "the request did not arrive in time")))
+                       (ReadyStop [] (return-from :done (RequestAbandoned)))
+                       (ReadyFailed [] (return-from :done (RequestAbandoned)))
+                       (ReadyClient [] 0))
+                     (let [previous (len data)]
+                       (match (read-some conn)
+                         (ReadEof [] (return-from :done (RequestAbandoned)))
+                         (ReadError [] (return-from :done (RequestAbandoned)))
+                         (ReadAgain [] 0)
+                         (ReadData [count]
+                                   (al-extend! [u8]
+                                               (mut data)
+                                               (slice-data (.read-buffer conn))
+                                               count)))
+                       (when (> (len data) max-bytes)
+                         (return-from :done
+                                        (rejected 413
+                                                  "payload_too_large"
+                                                  "the request exceeds the size limit")))
+                       (when (and (< (load header-end) 0)
+                                  (> (len data) previous))
+                         (set! header-end
+                               (find-header-end (al-slice [u8] data)
+                                                (- previous 3)))
+                         (if (< (load header-end) 0)
+                             (when (> (len data) PARSER-MAX-HEADER-BYTES)
+                               (return-from :done
+                                              (rejected 431
+                                                        "headers_too_large"
+                                                        "the request headers are too large"))
+                               0)
+                             (let [hint
+                                     (header-hint (subslice [u8]
+                                                            (al-slice [u8] data)
+                                                            0
+                                                            (load header-end)))]
+                               (when (.length-known hint)
+                                 (set! expected
+                                       (+ (load header-end)
+                                          (.content-length hint)))
+                                 (when (> (load expected) max-bytes)
+                                   (return-from :done
+                                                  (rejected 413
+                                                            "payload_too_large"
+                                                            "the request exceeds the size limit")))
+                                 0)
+                               (when (and (.expect-continue hint)
+                                          (not (load continue-sent))
+                                          (or (< (load expected) 0)
+                                              (< (len data) (load expected))))
+                                 (set! continue-sent true)
+                                 (when (not (write-ok? (write-all conn
+                                                                  "HTTP/1.1 100 Continue\r\n\r\n")))
+                                   (return-from :done (RequestAbandoned)))
+                                 0)
+                               0))
+                         0)
+                       (when (and (>= (load header-end) 0)
+                                  (> (len data) previous)
+                                  (or (< (load expected) 0)
+                                      (>= (len data) (load expected))))
+                         (match (http/parse-request (.allocator conn)
+                                                    (al-slice [u8] data))
+                           (Ok [request]
+                               (return-from :done (RequestReady request)))
+                           (Err [failure]
+                                (let [code (http/error-code failure)]
+                                  (cond (= code 14)
+                                        ;; Truncated: the hint was wrong (or absent);
+                                        ;; parse again after every read from now on.
+                                        (set! expected -1) (= code 1000)
+                                        (return-from :done
+                                                       (rejected 413
+                                                                 "payload_too_large"
+                                                                 "the request exceeds a parser limit"))
+                                          (= code 1001)
+                                        (return-from :done
+                                                       (rejected 500
+                                                                 "internal_error"
+                                                                 "out of memory while parsing"))
+                                          :else
+                                        (return-from :done
+                                                       (rejected 400
+                                                                 "bad_request"
+                                                                 "malformed HTTP request"))))))
+                         0)))))))
+
+;;; Send a buffered response (headers only for HEAD requests).
+(defn send-buffered [(conn (ptr Connection)) (reply Response) (head-only bool)] (-> WriteResult)
+  (let [a (.allocator conn)
+        head (encode-response-head a reply (FramingLength (len (.body reply))))]
+    (when (= (len head) 0)
+      (native/fatal [i64]
+                    "http_app.server: an error response from the router's ErrorResponder is invalid")
+      0)
+    (let [first (write-all conn head)]
+      (if (or head-only (not (write-ok? first)) (= (len (.body reply)) 0))
+          first
+          (write-all conn (.body reply))))))
+
+(defn error-reply [(conn (ptr Connection))
+                   (status i64)
+                   (code (slice u8))
+                   (message (slice u8))] (-> Response)
+  (router-error (.router (.server conn)) (.allocator conn) status code message))
+
+(defn hex-into! [(out (mut StrBuf)) (value i64)] (-> i64)
+  (let [digits (primitive/alloc-stack (array u8 16))
+        (mut n) value
+        (mut count) 0]
+    (loop (do
+            (let [d (% (load n) 16)]
+              (set! (index digits (load count))
+                    (cast u8 (if (< d 10) (+ d 48) (+ (- d 10) 97)))))
+            (set! count (+ (load count) 1))
+            (set! n (/ (load n) 16))
+            (if (= (load n) 0) (break) 0)))
+    (loop (if (= (load count) 0)
+              (break)
+              (do
+                (set! count (- (load count) 1))
+                (sb-push-byte! (mut out) (load (index digits (load count)))))))
+    0))
+
+;;; Frame one body chunk for the wire.
+(defn frame-chunk [(conn (ptr Connection)) (bytes (slice u8)) (chunked bool)] (-> (slice u8))
+  (if (not chunked)
+      bytes
+      (let [(mut out) (sb-new (.step conn))]
+        (hex-into! (mut out) (len bytes))
+        (sb-push-str! (mut out) "\r\n")
+        (sb-push-str! (mut out) bytes)
+        (sb-push-str! (mut out) "\r\n")
+        (sb-finish! (mut out)))))
+
+(defn release-for [(result WriteResult)] (-> StreamEndReason)
+  (match result
+    (WriteDone [] (ReleaseCompleted))
+    (WriteStopped [] (ReleaseStopping))
+    (_ (ReleaseDisconnected))))
+
+;;; Terminate a chunked body (no-op for close-delimited bodies).
+(defn finish-body [(conn (ptr Connection)) (chunked bool)] (-> WriteResult)
+  (if chunked (write-all conn "0\r\n\r\n") (WriteDone)))
+
+;;; Wait up to `poll-ms` while a stream has nothing to send, watching for the
+;;; client to disconnect (bytes the client sends are discarded) and for the server
+;;; to stop. `Some reason` ends the stream.
+(defn idle-wait [(conn (ptr Connection)) (poll-ms i64)] (-> (Option StreamEndReason))
+  (match (wait-fd (.server conn)
+                  (.fd (.socket conn))
+                  (selectors/interest-readable)
+                  poll-ms)
+    (ReadyClient []
+                 (match (read-some conn)
+                   (ReadData [count] (None [StreamEndReason]))
+                   (ReadAgain [] (None [StreamEndReason]))
+                   (ReadEof [] (Some (ReleaseDisconnected)))
+                   (ReadError [] (Some (ReleaseDisconnected)))))
+    (ReadyFailed [] (Some (ReleaseDisconnected)))
+    (ReadyStop [] (None [StreamEndReason]))
+    (ReadyTimeout [] (None [StreamEndReason]))))
+
+;;; Pump a stream until it ends, the client disconnects, or the server stops.
+;;; Returns the release reason; the caller releases the stream. An empty chunk
+;;; is treated like `StreamIdle`, so a stream cannot make the pump spin.
+(defn pump-stream [(conn (ptr Connection))
+                   (stream (dyn ResponseStream))
+                   (chunked bool)] (-> StreamEndReason)
+  (let [server (.server conn)
+        poll-ms (.idle-poll-ms (.config server))
+        (mut last-write) (now-ms)
+        (mut reason) (ReleaseCompleted)]
+    (loop (if (stopping? server)
+              (do
+                (finish-body conn chunked)
+                (set! reason (ReleaseStopping))
+                (break))
+              (let [step
+                      (stream-next stream
+                                   (.step conn)
+                                   (- (now-ms) (load last-write)))
+                    ended
+                      (match step
+                        (StreamChunk [chunk]
+                                     (if (= (len chunk) 0)
+                                         (idle-wait conn poll-ms)
+                                         (let [written
+                                                 (write-all conn
+                                                            (frame-chunk conn
+                                                                         chunk
+                                                                         chunked))]
+                                           (if (write-ok? written)
+                                               (do
+                                                 (set! last-write (now-ms))
+                                                 (None [StreamEndReason]))
+                                               (Some (release-for written))))))
+                        (StreamIdle [] (idle-wait conn poll-ms))
+                        (StreamDone []
+                                    (Some (release-for (finish-body conn
+                                                                    chunked))))
+                        (StreamFailed [] (Some (ReleaseFailed))))]
+                ;; Everything the step allocated, including the chunk, dies here.
+                (scratch/scratch-recycle! (.step-arena conn))
+                (match ended
+                  (Some [end] (do (set! reason end) (break)))
+                  (None [] 0)))))
+    (load reason)))
+
+;;; Send a streaming response and release its stream exactly once.
+(defn send-stream [(conn (ptr Connection))
+                   (request http/Request)
+                   (reply Response)
+                   (stream (dyn ResponseStream))] (-> bool)
+  (let [chunked (= (http/version request) "HTTP/1.1")
+        head
+          (encode-response-head (.allocator conn)
+                                reply
+                                (if chunked (FramingChunked) (FramingClose)))]
+    (if (= (len head) 0)
+        (do
+          (stream-release stream (ReleaseFailed))
+          (write-ok? (send-buffered conn
+                                    (error-reply conn
+                                                 500
+                                                 "internal_error"
+                                                 "the handler produced an invalid response")
+                                    false)))
+        (let [written (write-all conn head)]
+          (cond (not (write-ok? written))
+                  (do (stream-release stream (release-for written)) false)
+                (http/method-is request "HEAD")
+                  (do (stream-release stream (ReleaseCompleted)) true)
+                :else
+                  (let [reason (pump-stream conn stream chunked)]
+                    (stream-release stream reason)
+                    (match reason
+                      (ReleaseCompleted [] true)
+                      (ReleaseStopping [] true)
+                      (_ false))))))))
+
+(defn version-supported? [(request http/Request)] (-> bool)
+  (or (= (http/version request) "HTTP/1.1")
+      (= (http/version request) "HTTP/1.0")))
+
+;;; Dispatch one parsed request and write its response. Returns true when the
+;;; response was written completely (so a lingering close is worthwhile).
+(defn respond [(conn (ptr Connection)) (request http/Request)] (-> bool)
+  (if (not (version-supported? request))
+      (write-ok? (send-buffered conn
+                                (error-reply conn
+                                             505
+                                             "http_version_not_supported"
+                                             "only HTTP/1.0 and HTTP/1.1 are supported")
+                                false))
+      (let [reply
+              (dispatch-with (.router (.server conn)) (.allocator conn) request)
+            head-only (http/method-is request "HEAD")]
+        (match (.stream reply)
+          (Some [stream] (send-stream conn request reply stream))
+          (None []
+                (write-ok? (send-buffered conn
+                                          (if (response-valid? reply)
+                                              reply
+                                              (error-reply conn
+                                                           500
+                                                           "internal_error"
+                                                           "the handler produced an invalid response"))
+                                          head-only)))))))
+
+;;; Handle one accepted connection from first byte to close. Every allocation is
+;;; made from the two per-connection arenas, which are released here.
+(defn serve-connection [(server (ptr Server)) (fd i32)] (-> i64)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena)
+        step-arena (primitive/alloc-stack scratch/ScratchArena)
+        conn (primitive/alloc-stack Connection)]
+    (set! arena (primitive/zeroed scratch/ScratchArena))
+    (set! step-arena (primitive/zeroed scratch/ScratchArena))
+    (set! conn (primitive/zeroed Connection))
+    (scratch/scratch-init-with-cap arena (malloc-allocator) 32768)
+    (scratch/scratch-init-with-cap step-arena (malloc-allocator) 16384)
+    (set! (.server conn) server)
+    (set! (.fd (.socket conn)) fd)
+    (set! (.closed (.socket conn)) false)
+    (set! (.allocator conn) (scratch/scratch-allocator arena))
+    (set! (.step-arena conn) step-arena)
+    (set! (.step conn) (scratch/scratch-allocator step-arena))
+    (match (alloc [u8] (.allocator conn) 16384)
+      (Some [buffer] (set! (.read-buffer conn) buffer))
+      (None [] (native/fatal [i64] "http_app.server: out of memory")))
+    (match (read-request conn)
+      (RequestReady [request]
+                    (do
+                      (when (respond conn request)
+                        (linger-close! conn LINGER-MS)
+                        0)
+                      (http/request-free request)))
+      (RequestRejected [status code message]
+                       (when (write-ok? (send-buffered conn
+                                                       (error-reply conn
+                                                                    status
+                                                                    code
+                                                                    message)
+                                                       false))
+                         (linger-close! conn LINGER-MS)
+                         0))
+      (RequestAbandoned [] 0))
+    (socket/tcp-connection-close! (field conn socket))
+    (scratch/scratch-close! step-arena)
+    (scratch/scratch-close! arena)
+    0))
+
+(defstruct ConnectionTask [(server (ptr Server)) (fd i32)])
+
+(defn connection-finished! [(server (ptr Server))] (-> i64)
+  (lock! server)
+  (set! (.active server) (- (.active server) 1))
+  (match (sync/condition-notify-all! (field server drained))
+    (Ok [value] 0)
+    (Err [error]
+         (native/fatal [i64] "http_app.server: condition notify failed")))
+  (unlock! server))
+
+(defn connection-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [task (cast (ptr ConnectionTask) arg)
+        server (.server task)
+        fd (.fd task)]
+    (destroy [ConnectionTask] (malloc-allocator) task)
+    (serve-connection server fd)
+    ;; Nothing may touch `server` after this: serve returns once active is zero.
+    (connection-finished! server)
+    (cast (ptr i8) 0)))
+
+;;; Answer 503 on the accept thread without reading the request.
+(defn reject-overloaded [(server (ptr Server)) (fd i32)] (-> i64)
+  (let [arena (primitive/alloc-stack scratch/ScratchArena)
+        conn (primitive/alloc-stack Connection)]
+    (set! arena (primitive/zeroed scratch/ScratchArena))
+    (set! conn (primitive/zeroed Connection))
+    (scratch/scratch-init-with-cap arena (malloc-allocator) 8192)
+    (set! (.server conn) server)
+    (set! (.fd (.socket conn)) fd)
+    (set! (.closed (.socket conn)) false)
+    (set! (.allocator conn) (scratch/scratch-allocator arena))
+    (set! (.step-arena conn) arena)
+    (set! (.step conn) (scratch/scratch-allocator arena))
+    (match (alloc [u8] (.allocator conn) 4096)
+      (Some [buffer] (set! (.read-buffer conn) buffer))
+      (None [] (native/fatal [i64] "http_app.server: out of memory")))
+    (when (write-ok? (send-buffered conn
+                                    (error-reply conn
+                                                 503
+                                                 "service_unavailable"
+                                                 "too many connections")
+                                    false))
+      (linger-close! conn REJECT-LINGER-MS)
+      0)
+    (socket/tcp-connection-close! (field conn socket))
+    (scratch/scratch-close! arena)
+    0))
+
+(defn spawn-connection! [(server (ptr Server)) (fd i32)] (-> i64)
+  (lock! server)
+  (set! (.accepted server) (+ (.accepted server) 1))
+  (let [admitted (< (.active server) (.max-connections (.config server)))]
+    (when admitted (set! (.active server) (+ (.active server) 1)) 0)
+    (unlock! server)
+    (if (not admitted)
+        (reject-overloaded server fd)
+        (let [(mut task) (primitive/zeroed ConnectionTask)
+              (mut handle) (primitive/zeroed thread/Thread)]
+          (set! (.server task) server)
+          (set! (.fd task) fd)
+          (let [boxed (box! (malloc-allocator) ConnectionTask (load task))
+                status
+                  (thread/thread-spawn-configured (mut handle)
+                                                  (fnptr-of connection-main)
+                                                  (cast (ptr i8) boxed)
+                                                  (thread/thread-config (.thread-stack-bytes (.config server))
+                                                                        -1))]
+            (if (!= status (cast i32 0))
+                (do
+                  (destroy [ConnectionTask] (malloc-allocator) boxed)
+                  (os/close fd)
+                  (connection-finished! server))
+                (do
+                  (when (!= (native/pthread_detach (.handle handle))
+                            (cast i32 0))
+                    (native/fatal [i64]
+                                  "http_app.server: pthread_detach failed")
+                    0)
+                  0)))))))
+
+;;; Run the accept loop on the calling thread until `server-stop!`, one thread per
+;;; connection. Returns once every connection has finished; `Ok n` counts the
+;;; connections accepted. An unrecoverable accept failure stops the server and is
+;;; returned as `ServerAcceptFailed` after the connections drain.
+(defn server-serve! [(server (ptr Server))] (-> (Result i64 ServerError))
+  (when (!= (.state server) STATE-LISTENING)
+    (native/fatal [i64]
+                  "server-serve! requires a listening server that has not served yet")
+    0)
+  (set! (.state server) STATE-SERVING)
+  (let [listener-fd (.fd (.listener server))
+        (mut outcome) (Ok [i64 ServerError] 0)]
+    (loop (if (stopping? server)
+              (break)
+              (match (wait-fd server
+                              listener-fd
+                              (selectors/interest-readable)
+                              3600000)
+                (ReadyStop [] (break))
+                (ReadyTimeout [] 0)
+                (ReadyFailed []
+                             (do
+                               (set! outcome (Err (ServerAcceptFailed 9)))
+                               (break)))
+                (ReadyClient []
+                             (let [fd (native/accept-connection listener-fd)]
+                               (if (>= fd 0)
+                                   (spawn-connection! server (cast i32 fd))
+                                   (let [code (- 0 fd)]
+                                     (cond (native/accept-error-exhausted? code)
+                                           ;; Out of descriptors or memory: back off
+                                           ;; rather than spin until something frees.
+                                           (match (wait-fd server
+                                                           (.read-fd (.stop server))
+                                                           (selectors/interest-readable)
+                                                           100)
+                                             (_ 0))
+                                             (native/accept-error-transient? code)
+                                           0 :else
+                                           (do
+                                             (set! outcome
+                                                   (Err (ServerAcceptFailed code)))
+                                             (break))))))))))
+    (server-stop! server)
+    (lock! server)
+    (loop (if (<= (.active server) 0)
+              (break)
+              (match (sync/condition-wait! (field server drained)
+                                           (field server lock))
+                (Ok [value] 0)
+                (Err [error]
+                     (native/fatal [i64]
+                                   "http_app.server: condition wait failed")))))
+    (let [accepted (.accepted server)]
+      (unlock! server)
+      (set! (.state server) STATE-SERVED)
+      (match (load outcome)
+        (Ok [zero] (Ok accepted))
+        (Err [error] (Err error))))))
+
+(defn serve-thread-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [server (cast (ptr Server) arg)]
+    (set! (.result server) (server-serve! server))
+    (cast (ptr i8) 0)))
+
+;;; Run `server-serve!` on a new thread. Collect its result with `server-wait!`.
+(defn server-start! [(server (ptr Server))] (-> (Result i64 ServerError))
+  (when (or (!= (.state server) STATE-LISTENING) (.thread-started server))
+    (native/fatal [i64]
+                  "server-start! requires a listening server that has not served yet")
+    0)
+  (let [status
+          (thread/thread-spawn-configured (field server thread)
+                                          (fnptr-of serve-thread-main)
+                                          (cast (ptr i8) server)
+                                          (thread/thread-config (.thread-stack-bytes (.config server))
+                                                                -1))]
+    (if (!= status (cast i32 0))
+        (Err (ServerSetupFailed "could not start the server thread"
+                                (cast i64 status)))
+        (do (set! (.thread-started server) true) (Ok 0)))))
+
+;;; Join the thread started by `server-start!` and return `server-serve!`'s result.
+;;; Blocks until the server stops; call `server-stop!` first to stop it.
+(defn server-wait! [(server (ptr Server))] (-> (Result i64 ServerError))
+  (when (not (.thread-started server))
+    (native/fatal [i64] "server-wait! called without server-start!")
+    0)
+  (when (not (.thread-joined server))
+    (when (!= (thread/thread-join (field server thread)) (cast i32 0))
+      (native/fatal [i64] "http_app.server: joining the server thread failed")
+      0)
+    (set! (.thread-joined server) true)
+    0)
+  (.result server))
+
+;;; Stop (if needed), wait for a background serve thread, and release the listener,
+;;; stop pipe, and synchronization state. Serving must be finished, or running on
+;;; the thread started by `server-start!`. Idempotent, and a no-op after a failed
+;;; `server-listen!`.
+(defn server-close! [(server (ptr Server))] (-> i64)
+  (if (or (= (.state server) STATE-CLOSED) (= (.state server) STATE-UNOPENED))
+      0
+      (do
+        (server-stop! server)
+        (when (.thread-started server) (server-wait! server) 0)
+        (when (= (.state server) STATE-SERVING)
+          (native/fatal [i64]
+                        "server-close! called while server-serve! is still running on another thread")
+          0)
+        (socket/tcp-listener-close! (field server listener))
+        (cancel/cancellation-close! (field server stop))
+        (sync/condition-destroy! (field server drained))
+        (sync/mutex-destroy! (field server lock))
+        (set! (.state server) STATE-CLOSED)
+        0)))

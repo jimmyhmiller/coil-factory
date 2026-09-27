@@ -1,0 +1,380 @@
+(module mddoc.doc-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "mddoc.doc" :use *)
+
+(defn parse-ok [(a (dyn Allocator)) (text (slice u8))] (-> Document)
+  (match (parse-document a text)
+    (Ok [d] d)
+    (Err [err]
+         (let [e err]
+           (io/print-str (io/stderr) "unexpected parse error: ")
+           (io/print-str (io/stderr) (.message e))
+           (io/print-str (io/stderr) "\n")
+           (assert false)
+           (primitive/zeroed Document)))))
+
+;; The error line of a failed parse (the message must be nonempty), or -1.
+(defn error-line [(a (dyn Allocator)) (text (slice u8))] (-> i64)
+  (match (parse-document a text)
+    (Ok [d]
+        (let [(mut doc) d]
+          (document-free! (mut doc))
+          -1))
+    (Err [err]
+         (let [e err]
+           (assert (> (len (.message e)) 0))
+           (.line e)))))
+
+(defn error-message [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (parse-document a text)
+    (Ok [d]
+        (let [(mut doc) d]
+          (document-free! (mut doc))
+          ""))
+    (Err [err]
+         (let [e err]
+           (.message e)))))
+
+(defn get-value [(doc Document) (key (slice u8))] (-> (slice u8))
+  (match (front-get doc key)
+    (Ok [o]
+        (match o
+          (Some [v] v)
+          (None []
+                (do
+                  (assert false)
+                  ""))))
+    (Err [e]
+         (do
+           (assert false)
+           ""))))
+
+(defn absent? [(doc Document) (key (slice u8))] (-> bool)
+  (match (front-get doc key)
+    (Ok [o]
+        (match o
+          (Some [v] false)
+          (None [] true)))
+    (Err [e] false)))
+
+(defn list-of [(doc Document) (key (slice u8))] (-> (slice (slice u8)))
+  (match (front-list doc key)
+    (Some [items] items)
+    (None []
+          (do
+            (assert false)
+            (primitive/zeroed (slice (slice u8)))))))
+
+(defn section-at [(doc Document) (i i64)] (-> Section)
+  (get (doc-sections doc) i))
+
+(defn title-at [(doc Document) (i i64)] (-> (slice u8))
+  (let [s (section-at doc i)]
+    (.title s)))
+
+(defn level-at [(doc Document) (i i64)] (-> i64)
+  (let [s (section-at doc i)]
+    (.level s)))
+
+(defn body-at [(doc Document) (i i64)] (-> (slice u8))
+  (let [s (section-at doc i)]
+    (.body s)))
+
+(defn own-body-at [(doc Document) (i i64)] (-> (slice u8))
+  (let [s (section-at doc i)]
+    (.own-body s)))
+
+(defn line-at-section [(doc Document) (i i64)] (-> i64)
+  (let [s (section-at doc i)]
+    (.line s)))
+
+(defn parent-at [(doc Document) (i i64)] (-> i64)
+  (let [s (section-at doc i)]
+    (.parent s)))
+
+(deftest front-matter-scalars-quotes-and-lists
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "---\n# a comment\nname: Build and test\n\nquoted: \"a: b # not a comment\"\nsingle: 'it''s here'\nescapes: \"tab\\tnl\\nq\\\"u\\u00e9\\u4e2d\"\nplain: Issue #42: fix it\ntags: [alpha, \"b c\", 'd,e']\nempty-list: []\nsteps:\n  - one\n  - \"two: 2\"\n\n  # between items\n  - three\nblank:\nafter: done\n---\nBody.\n")]
+           (assert (doc-has-front-matter? (load doc)))
+           (assert (= (get-value (load doc) "name") "Build and test"))
+           (assert (= (get-value (load doc) "quoted") "a: b # not a comment"))
+           (assert (= (get-value (load doc) "single") "it's here"))
+           (assert (= (get-value (load doc) "escapes")
+                      "tab\tnl\nq\"u\xe9;\x4e2d;"))
+           (assert (= (get-value (load doc) "plain") "Issue #42: fix it"))
+           (assert (= (get-value (load doc) "blank") ""))
+           (assert (= (get-value (load doc) "after") "done"))
+           (assert (absent? (load doc) "missing"))
+           ;; lists
+           (let [tags (list-of (load doc) "tags")]
+             (assert-eq (len tags) 3)
+             (assert (= (get tags 0) "alpha"))
+             (assert (= (get tags 1) "b c"))
+             (assert (= (get tags 2) "d,e")))
+           (assert-eq (len (list-of (load doc) "empty-list")) 0)
+           (let [steps (list-of (load doc) "steps")]
+             (assert-eq (len steps) 3)
+             (assert (= (get steps 0) "one"))
+             (assert (= (get steps 1) "two: 2"))
+             (assert (= (get steps 2) "three")))
+           ;; a scalar is a one-element list; an empty `key:` is an empty list
+           (let [one (list-of (load doc) "name")]
+             (assert-eq (len one) 1)
+             (assert (= (get one 0) "Build and test")))
+           (assert-eq (len (list-of (load doc) "blank")) 0)
+           (assert (match (front-list (load doc) "missing")
+                     (None [] true)
+                     (Some [l] false)))
+           ;; front-get on a list is an error at the key's line
+           (assert (match (front-get (load doc) "steps")
+                     (Err [err]
+                          (let [e err]
+                            (= (.line e) 11)))
+                     (Ok [o] false)))
+           ;; keys in order
+           (let [(mut keys) (front-keys a (load doc))]
+             (assert-eq (len (load keys)) 10)
+             (assert (= (get (load keys) 0) "name"))
+             (assert (= (get (load keys) 9) "after"))
+             (al-free! [(slice u8)] (mut keys)))
+           (assert (match (front-entry (load doc) "tags")
+                     (Some [entry]
+                           (let [e entry]
+                             (and (= (.line e) 9) (.is-list e))))
+                     (None [] false)))
+           (assert (= (doc-body (load doc)) "Body.\n"))
+           (assert-eq (doc-body-line (load doc)) 20)
+           (document-free! (mut doc))))
+
+(deftest front-csv-splits-scalars-on-commas
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "---\ntools: read, write ,, bash,\nlisted: [x, y]\n---\n")]
+           (match (front-csv a (load doc) "tools")
+             (Some [found]
+                   (let [(mut tools) found]
+                     (assert-eq (len (load tools)) 3)
+                     (assert (= (get (load tools) 0) "read"))
+                     (assert (= (get (load tools) 1) "write"))
+                     (assert (= (get (load tools) 2) "bash"))
+                     (al-free! [(slice u8)] (mut tools))))
+             (None [] (assert false)))
+           (match (front-csv a (load doc) "listed")
+             (Some [found]
+                   (let [(mut listed) found]
+                     (assert-eq (len (load listed)) 2)
+                     (assert (= (get (load listed) 1) "y"))
+                     (al-free! [(slice u8)] (mut listed))))
+             (None [] (assert false)))
+           (assert (match (front-csv a (load doc) "nope")
+                     (None [] true)
+                     (Some [l] false)))
+           (document-free! (mut doc))))
+
+(deftest documents-without-or-with-empty-front-matter
+         (let [a (malloc-allocator)
+               (mut plain) (parse-ok a "# Title\ntext\n")
+               (mut empty) (parse-ok a "---\n---\n# Title\n")
+               (mut rule) (parse-ok a "intro\n---\nnot front matter\n")
+               (mut nothing) (parse-ok a "")]
+           (assert (not (doc-has-front-matter? (load plain))))
+           (assert-eq (len (front-entries (load plain))) 0)
+           (assert (= (doc-body (load plain)) "# Title\ntext\n"))
+           (assert (= (doc-preamble (load plain)) ""))
+           (assert (doc-has-front-matter? (load empty)))
+           (assert-eq (len (front-entries (load empty))) 0)
+           (assert (= (doc-body (load empty)) "# Title\n"))
+           (assert-eq (line-at-section (load empty) 0) 3)
+           (assert (not (doc-has-front-matter? (load rule))))
+           (assert (= (doc-preamble (load rule))
+                      "intro\n---\nnot front matter\n"))
+           (assert-eq (len (doc-sections (load nothing))) 0)
+           (assert (= (doc-preamble (load nothing)) ""))
+           (document-free! (mut plain))
+           (document-free! (mut empty))
+           (document-free! (mut rule))
+           (document-free! (mut nothing))))
+
+(deftest crlf-input-and-byte-order-mark
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "\xfeff;---\r\nname: crlf \r\nlist:\r\n  - a\r\n---\r\n## Station: build\r\nmodel: m1\r\n\r\nDo it.\r\n## Station: test ##\r\n")]
+           (assert (= (get-value (load doc) "name") "crlf"))
+           (assert (= (get (list-of (load doc) "list") 0) "a"))
+           (assert-eq (len (doc-sections (load doc))) 2)
+           (assert (= (title-at (load doc) 0) "Station: build"))
+           (assert (= (title-at (load doc) 1) "Station: test"))
+           (assert-eq (line-at-section (load doc) 0) 6)
+           (assert (= (body-at (load doc) 0) "model: m1\r\n\r\nDo it.\r\n"))
+           (match (section-settings a (section-at (load doc) 0))
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert (match (attr-get (load sa) "model")
+                             (Some [v] (= v "m1"))
+                             (None [] false)))
+                   (assert (= (.rest sa) "Do it.\r\n"))
+                   (assert-eq (.rest-line sa) 9)
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           (document-free! (mut doc))))
+
+(deftest code-fences-hide-headings
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "# Real\n```sh\n## not a heading\n```\n~~~~\n# also not\n```\nstill fenced\n~~~~\n  ```\n# inside indented fence\n   ```\n## After\n````\nunclosed fence\n# hidden to the end\n")]
+           (assert-eq (len (doc-headings (load doc))) 2)
+           (assert (= (title-at (load doc) 0) "Real"))
+           (assert (= (title-at (load doc) 1) "After"))
+           (assert-eq (line-at-section (load doc) 1) 13)
+           (document-free! (mut doc))))
+
+(deftest heading-syntax
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "#NoSpace\n####### seven\n    # indented code\n   ### three spaces ###\n#\n## Trailing # not closing#\n##\tTab\n# Closing \\#\n###### Six ######   \n")]
+           (assert-eq (len (doc-headings (load doc))) 6)
+           (assert (= (title-at (load doc) 0) "three spaces"))
+           (assert-eq (level-at (load doc) 0) 3)
+           (assert (= (title-at (load doc) 1) ""))
+           (assert-eq (level-at (load doc) 1) 1)
+           (assert (= (title-at (load doc) 2) "Trailing # not closing#"))
+           (assert (= (title-at (load doc) 3) "Tab"))
+           (assert (= (title-at (load doc) 4) "Closing \\#"))
+           (assert (= (title-at (load doc) 5) "Six"))
+           (assert-eq (level-at (load doc) 5) 6)
+           (assert (= (doc-preamble (load doc))
+                      "#NoSpace\n####### seven\n    # indented code\n"))
+           (document-free! (mut doc))))
+
+(deftest nested-levels-bodies-and-parents
+         (let [a (malloc-allocator)
+               (mut doc)
+                 (parse-ok a
+                           "preamble\n# A\na text\n## A.1\na1\n### A.1.a\ndeep\n## A.2\na2\n# B\nb text\n### B.x\nbx\n")]
+           (assert (= (doc-preamble (load doc)) "preamble\n"))
+           (assert-eq (len (doc-sections (load doc))) 6)
+           (assert (= (body-at (load doc) 0)
+                      "a text\n## A.1\na1\n### A.1.a\ndeep\n## A.2\na2\n"))
+           (assert (= (own-body-at (load doc) 0) "a text\n"))
+           (assert (= (body-at (load doc) 1) "a1\n### A.1.a\ndeep\n"))
+           (assert (= (body-at (load doc) 2) "deep\n"))
+           (assert (= (body-at (load doc) 3) "a2\n"))
+           (assert (= (body-at (load doc) 4) "b text\n### B.x\nbx\n"))
+           (assert (= (body-at (load doc) 5) "bx\n"))
+           (assert-eq (parent-at (load doc) 0) -1)
+           (assert-eq (parent-at (load doc) 1) 0)
+           (assert-eq (parent-at (load doc) 2) 1)
+           (assert-eq (parent-at (load doc) 3) 0)
+           (assert-eq (parent-at (load doc) 4) -1)
+           (assert-eq (parent-at (load doc) 5) 4)
+           (assert-eq (line-at-section (load doc) 5) 12)
+           (let [s (section-at (load doc) 5)]
+             (assert-eq (.body-line s) 13))
+           (assert (match (find-section (load doc) "A.2")
+                     (Some [i] (= i 3))
+                     (None [] false)))
+           (assert (match (find-section (load doc) "C")
+                     (None [] true)
+                     (Some [i] false)))
+           (document-free! (mut doc))))
+
+(deftest section-attributes-block
+         (let [a (malloc-allocator)]
+           (match (section-attributes a
+                                      "\n\nmodel: gpt-5\ngate: make test && echo \"ok\"\nmax-turns: 40\n\n\nWrite the code.\nnote: this line is prose\n"
+                                      10)
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert-eq (len (.attrs sa)) 3)
+                   (assert (match (attr-get (load sa) "gate")
+                             (Some [v] (= v "make test && echo \"ok\""))
+                             (None [] false)))
+                   (assert (match (attr-get (load sa) "max-turns")
+                             (Some [v] (= v "40"))
+                             (None [] false)))
+                   (assert (match (attr-get (load sa) "missing")
+                             (None [] true)
+                             (Some [v] false)))
+                   (let [first (get (.attrs sa) 0)]
+                     (assert-eq (.line first) 12))
+                   (assert (= (.rest sa)
+                              "Write the code.\nnote: this line is prose\n"))
+                   (assert-eq (.rest-line sa) 17)
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           ;; a non-matching first line means no attributes
+           (match (section-attributes a "Prose first.\nkey: value\n" 1)
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert-eq (len (.attrs sa)) 0)
+                   (assert (= (.rest sa) "Prose first.\nkey: value\n"))
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           ;; a URL is not a setting (no blank after the colon); keys start with a letter
+           (match (section-attributes a "http://example.com\n" 1)
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert-eq (len (.attrs sa)) 0)
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           (match (section-attributes a "_x: 1\n" 1)
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert-eq (len (.attrs sa)) 0)
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           ;; empty value, and a body that is only settings
+           (match (section-attributes a "flag:\nother: x" 1)
+             (Ok [found]
+                 (let [(mut sa) found]
+                   (assert-eq (len (.attrs sa)) 2)
+                   (assert (match (attr-get (load sa) "flag")
+                             (Some [v] (= v ""))
+                             (None [] false)))
+                   (assert (= (.rest sa) ""))
+                   (section-attributes-free! (mut sa))))
+             (Err [e] (assert false)))
+           ;; duplicates are an error at the repeated line
+           (assert (match (section-attributes a "a: 1\nb: 2\na: 3\n" 7)
+                     (Err [err]
+                          (let [e err]
+                            (= (.line e) 9)))
+                     (Ok [sa] false)))))
+
+(deftest error-line-numbers
+         (let [a (malloc-allocator)]
+           (assert-eq (error-line a "---\nname: x\n") 1)
+           (assert (= (error-message a "---\nname: x\n")
+                      "front matter is not closed (expected a line containing only ---)"))
+           (assert-eq (error-line a "---\na: 1\nnot a pair\n---\n") 3)
+           (assert-eq (error-line a "---\na: 1\n\nb: 2\na: 3\n---\n") 5)
+           (assert (= (error-message a "---\na: 1\na: 3\n---\n")
+                      "duplicate front matter key"))
+           (assert-eq (error-line a "---\n- orphan\n---\n") 2)
+           (assert-eq (error-line a "---\na: 1\n- item\n---\n") 3)
+           (assert-eq (error-line a "---\na:\n  - ok\n  nested: no\n---\n") 4)
+           (assert-eq (error-line a "---\na: \"open\n---\n") 2)
+           (assert-eq (error-line a "---\n\n\na: 'x' y\n---\n") 4)
+           (assert-eq (error-line a "---\na: [1, 2\n---\n") 2)
+           (assert-eq (error-line a "---\na: [1, , 2]\n---\n") 2)
+           (assert-eq (error-line a "---\na: [1, [2]]\n---\n") 2)
+           (assert-eq (error-line a "---\na: \"bad \\q escape\"\n---\n") 2)
+           (assert-eq (error-line a "---\na: \"\\ud800\"\n---\n") 2)
+           (assert-eq (error-line a "---\ntext: |\n  block\n---\n") 2)
+           (assert-eq (error-line a "---\nref: *anchor\n---\n") 2)
+           (assert-eq (error-line a "---\nmap: {a: 1}\n---\n") 2)
+           (assert-eq (error-line a "---\nkey:value\n---\n") 2)
+           (assert-eq (error-line a "---\n9lives: x\n---\n") 2)
+           (assert-eq (error-line a "---\na:\n  -\n---\n") 3)
+           (assert-eq (error-line a "---\r\na: 1\r\nb c\r\n---\r\n") 3)))

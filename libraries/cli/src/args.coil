@@ -1,0 +1,1461 @@
+;; Declarative subcommands and flags.
+;;
+;; A program is a table of `Command`s, each with positional argument names and
+;; `Flag`s, plus program-wide flags. `parse` turns argv into a `Parsed`: a ready
+;; `Invocation`, a request for help or the version, or an `ArgError` that knows
+;; how to explain itself (with a "did you mean" suggestion for typos).
+;; `render-help` and `render-error` produce the text; `parse-standard` does the
+;; conventional thing with all of it so `main` only sees real invocations.
+;;
+;; Command names may have several words ("site add"): the longest command whose
+;; words match the leading arguments wins, and a bare group word ("site") asks
+;; for a subcommand. A command named "" is the root command, run when no
+;; command word is given.
+;;
+;; Positional argument names follow the usual conventions: `NAME` is required,
+;; `[NAME]` optional, and a final `NAME...` or `[NAME...]` takes the rest.
+;;
+;; Flags: `--flag value`, `--flag=value`, `-f value`, `-fvalue`, bundled short
+;; switches (`-ab`), a `--` terminator after which everything is positional, and
+;; `-` as an ordinary positional (conventionally stdin). `--help`/`-h` is always
+;; available; `--version` when the program has a version. Program-wide flags are
+;; accepted before or after the command words.
+;;
+;; Argument strings are borrowed from argv; the command table is borrowed from
+;; the caller. Keep both alive while an Invocation is in use.
+(module cli.args)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.fail" :use [cli-fail!])
+(import "cli.style" :as style)
+
+(export Flag
+        flag
+        switch
+        Command
+        Program
+        no-args
+        no-flags
+        FlagValue
+        Invocation
+        HelpTarget
+        ProgramHelp
+        GroupHelp
+        CommandHelp
+        ArgError
+        UnknownCommand
+        MissingSubcommand
+        UnknownFlag
+        MissingValue
+        UnexpectedValue
+        MissingArgument
+        UnexpectedArgument
+        Parsed
+        Run
+        Help
+        Version
+        Failed
+        argv-from-main
+        parse
+        command-is?
+        flag?
+        flag-value
+        flag-value-or
+        flag-values
+        positional
+        positional-count
+        positionals
+        edit-distance
+        render-help
+        render-program-help
+        render-group-help
+        render-command-help
+        render-error
+        handle-parsed
+        parse-standard)
+
+;;; One flag. `long` is the name without dashes ("project"); `short` is a single
+;;; ASCII letter or 0 for none. A flag that `takes-value` shows `value-name` in
+;;; help (`--project PATH`); otherwise it is a boolean switch.
+(defstruct Flag
+  [(long (slice u8))
+   (short u8)
+   (takes-value bool)
+   (value-name (slice u8))
+   (help (slice u8))])
+
+;;; A flag taking a value: `(flag "project" #\p "PATH" "Project directory")`.
+;;; Pass 0 for no short form.
+(defn flag [(long (slice u8))
+            (short i64)
+            (value-name (slice u8))
+            (help (slice u8))] (-> Flag)
+  (Flag
+    :long long
+    :short (short-letter short)
+    :takes-value true
+    :value-name value-name
+    :help help))
+
+;;; A boolean switch: `(switch "sandbox" 0 "Sandbox every shell command")`.
+(defn switch [(long (slice u8)) (short i64) (help (slice u8))] (-> Flag)
+  (Flag
+    :long long
+    :short (short-letter short)
+    :takes-value false
+    :value-name ""
+    :help help))
+
+(defn short-letter [(short i64)] (-> u8)
+  (if (or (= short 0)
+          (and (>= short 65) (<= short 90))
+          (and (>= short 97) (<= short 122))
+          (and (>= short 48) (<= short 57)))
+      (cast u8 short)
+      (do
+        (cli-fail! "flag: a short flag must be an ASCII letter or digit, or 0 for none")
+        (cast u8 0))))
+
+;;; One subcommand. `name` may be several words ("site add") or "" for the root
+;;; command. `group` titles the section that lists it in program help (empty
+;;; means "Commands"). `usage` replaces the synthesized usage line when
+;;; non-empty; it is written without the program name ("start FACTORY [flags]").
+(defstruct Command
+  [(name (slice u8))
+   (group (slice u8))
+   (summary (slice u8))
+   (usage (slice u8))
+   (args (slice (slice u8)))
+   (flags (slice Flag))])
+
+;;; The whole command-line interface. `flags` are program-wide flags accepted
+;;; with every command. An empty `version` disables `--version`.
+(defstruct Program
+  [(name (slice u8))
+   (summary (slice u8))
+   (version (slice u8))
+   (commands (slice Command))
+   (flags (slice Flag))])
+
+;;; An empty positional-name list, for commands that take no arguments.
+(defn no-args [] (-> (slice (slice u8)))
+  (slice-new (cast (ptr (slice u8)) 0) 0))
+
+;;; An empty flag list.
+(defn no-flags [] (-> (slice Flag))
+  (slice-new (cast (ptr Flag) 0) 0))
+
+;;; A flag as given: its long name and its value ("" for a switch).
+(defstruct FlagValue [(long (slice u8)) (value (slice u8))])
+
+;;; A parsed command line. `command` indexes `Program.commands`; `name` is that
+;;; command's name. Flag values include program-wide flags.
+(defstruct Invocation
+  [(command i64)
+   (name (slice u8))
+   (positionals (ArrayList (slice u8)))
+   (flags (ArrayList FlagValue))
+   (command-flags (slice Flag))
+   (global-flags (slice Flag))])
+
+(defsum HelpTarget
+  (ProgramHelp)
+  (GroupHelp [(prefix (slice u8))])
+  (CommandHelp [(command i64)]))
+
+;;; Why argv could not be parsed. `command` is the command index, or -1 when the
+;;; error arose before a command was identified. A suggestion is "" when there
+;;; is none close enough.
+(defsum ArgError
+  (UnknownCommand [(input (slice u8)) (suggestion (slice u8))])
+  (MissingSubcommand [(prefix (slice u8))])
+  (UnknownFlag [(command i64) (given (slice u8)) (suggestion (slice u8))])
+  (MissingValue [(command i64) (given (slice u8))])
+  (UnexpectedValue [(command i64) (given (slice u8))])
+  (MissingArgument [(command i64) (name (slice u8))])
+  (UnexpectedArgument [(command i64) (value (slice u8))]))
+
+(defsum Parsed
+  (Run [(invocation Invocation)])
+  (Help [(target HelpTarget)])
+  (Version)
+  (Failed [(error ArgError)]))
+
+;;; Convert `main`'s `argc`/`argv` to byte slices, argv[0] included. The strings
+;;; are borrowed from the process; only the outer slice is allocated.
+(defn argv-from-main [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> (slice (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)
+        count (cast i64 argc)
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (push! (mut out) (cstr->str (load (index argv (load i)))))
+                (set! i (+ (load i) 1)))))
+    (al-into-slice (mut out))))
+
+; ---- words -------------------------------------------------------------------
+(defn word-count [(name (slice u8))] (-> i64)
+  (if (= (len name) 0)
+      0
+      (let [(mut count) 1
+            (mut i) 0]
+        (loop (if (>= (load i) (len name))
+                  (break)
+                  (do
+                    (when (= (cast i64 (get name (load i))) 32)
+                      (set! count (+ (load count) 1))
+                      0)
+                    (set! i (+ (load i) 1)))))
+        (load count))))
+
+;; Word `k` (0-based) of a space-separated command name.
+(defn word-at [(name (slice u8)) (k i64)] (-> (slice u8))
+  (let [(mut word) 0
+        (mut start) 0
+        (mut i) 0
+        (mut result) ""]
+    (loop (if (> (load i) (len name))
+              (break)
+              (if (or (= (load i) (len name))
+                      (= (cast i64 (get name (load i))) 32))
+                  (if (= (load word) k)
+                      (do
+                        (set! result (subslice name (load start) (load i)))
+                        (break))
+                      (do
+                        (set! word (+ (load word) 1))
+                        (set! start (+ (load i) 1))
+                        (set! i (+ (load i) 1))))
+                  (set! i (+ (load i) 1)))))
+    (load result)))
+
+(defn word-token? [(token (slice u8))] (-> bool)
+  (or (= (len token) 0) (!= (cast i64 (get token 0)) 45) (= token "-")))
+
+;; How many leading words of `name` equal tokens[at..], stopping at `limit`.
+(defn matching-words [(name (slice u8))
+                      (tokens (slice (slice u8)))
+                      (at i64)
+                      (limit i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (or (>= (load k) limit)
+                  (>= (+ at (load k)) (len tokens))
+                  (not (= (word-at name (load k)) (get tokens (+ at (load k))))))
+              (break)
+              (set! k (+ (load k) 1))))
+    (load k)))
+
+(defn join-words [(a (dyn Allocator))
+                  (tokens (slice (slice u8)))
+                  (from i64)
+                  (to i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut i) from]
+    (loop (if (>= (load i) to)
+              (break)
+              (do
+                (when (> (load i) from) (sb-push-byte! (mut out) 32) 0)
+                (sb-push-str! (mut out) (get tokens (load i)))
+                (set! i (+ (load i) 1)))))
+    (sb-finish! (mut out))))
+
+(defn prefix-words [(a (dyn Allocator)) (name (slice u8)) (count i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut k) 0]
+    (loop (if (>= (load k) count)
+              (break)
+              (do
+                (when (> (load k) 0) (sb-push-byte! (mut out) 32) 0)
+                (sb-push-str! (mut out) (word-at name (load k)))
+                (set! k (+ (load k) 1)))))
+    (sb-finish! (mut out))))
+
+(defn root-command [(prog Program)] (-> i64)
+  (let [(mut found) -1
+        (mut c) 0]
+    (loop (if (>= (load c) (len (.commands prog)))
+              (break)
+              (let [command (get (.commands prog) (load c))]
+                (if (= (len (.name command)) 0)
+                    (do (set! found (load c)) (break))
+                    (set! c (+ (load c) 1))))))
+    (load found)))
+
+; ---- suggestions -------------------------------------------------------------
+
+;;; Optimal string alignment distance: insertions, deletions, substitutions, and
+;;; transpositions of adjacent bytes each cost one.
+(defn edit-distance [(a (dyn Allocator)) (left (slice u8)) (right (slice u8))] (-> i64)
+  (let [n (len left)
+        m (len right)
+        width (+ m 1)
+        (mut table) (al-new [i64] a)
+        (mut i) 0]
+    (al-reserve! (mut table) (* (+ n 1) width))
+    (loop (if (> (load i) n)
+              (break)
+              (let [(mut j) 0]
+                (loop (if (> (load j) m)
+                          (break)
+                          (do
+                            (push! (mut table)
+                                   (cond (= (load i) 0) (load j)
+                                         (= (load j) 0) (load i)
+                                         :else 0))
+                            (set! j (+ (load j) 1)))))
+                (set! i (+ (load i) 1)))))
+    (set! i 1)
+    (loop (if (> (load i) n)
+              (break)
+              (let [(mut j) 1]
+                (loop (if (> (load j) m)
+                          (break)
+                          (let [li (get left (- (load i) 1))
+                                rj (get right (- (load j) 1))
+                                cost (if (= li rj) 0 1)
+                                deletion
+                                  (+ (get table
+                                          (+ (* (- (load i) 1) width) (load j)))
+                                     1)
+                                insertion
+                                  (+ (get table
+                                          (+ (* (load i) width) (- (load j) 1)))
+                                     1)
+                                substitution
+                                  (+ (get table
+                                          (+ (* (- (load i) 1) width)
+                                             (- (load j) 1)))
+                                     cost)
+                                (mut best) deletion]
+                            (when (< insertion (load best))
+                              (set! best insertion)
+                              0)
+                            (when (< substitution (load best))
+                              (set! best substitution)
+                              0)
+                            (when (and (> (load i) 1)
+                                       (> (load j) 1)
+                                       (= li (get right (- (load j) 2)))
+                                       (= (get left (- (load i) 2)) rj))
+                              (let [transposition
+                                      (+ (get table
+                                              (+ (* (- (load i) 2) width)
+                                                 (- (load j) 2)))
+                                         1)]
+                                (when (< transposition (load best))
+                                  (set! best transposition)
+                                  0)
+                                0)
+                              0)
+                            (set! (mut table)
+                                  (+ (* (load i) width) (load j))
+                                  (load best))
+                            (set! j (+ (load j) 1)))))
+                (set! i (+ (load i) 1)))))
+    (let [result (get table (+ (* n width) m))]
+      (al-free! (mut table))
+      result)))
+
+;; Tracks the closest candidate seen so far.
+(defstruct Suggester
+  [(allocator (dyn Allocator))
+   (typed (slice u8))
+   (best (slice u8))
+   (best-distance i64)
+   (prefix-match (slice u8))])
+
+(defn suggester-new [(a (dyn Allocator)) (typed (slice u8))] (-> Suggester)
+  (Suggester
+    :allocator a
+    :typed typed
+    :best ""
+    :best-distance 1000000
+    :prefix-match ""))
+
+(defn suggester-offer! [(s (mut Suggester))
+                        (candidate (slice u8))
+                        (shown (slice u8))] (-> i64)
+  (let [distance (edit-distance (.allocator s) (.typed s) candidate)]
+    (when (< distance (.best-distance s))
+      (set! (.best-distance s) distance)
+      (set! (.best s) shown)
+      0)
+    (when (and (= (len (.prefix-match s)) 0)
+               (>= (len (.typed s)) 2)
+               (starts-with candidate (.typed s)))
+      (set! (.prefix-match s) shown)
+      0)
+    0))
+
+;; Close enough to be the likely intent: within a third of the typed length
+;; (at least one edit), else a candidate the input is a prefix of.
+(defn suggester-result [(s Suggester)] (-> (slice u8))
+  (let [limit (/ (+ (len (.typed s)) 2) 3)]
+    (cond (and (> (len (.best s)) 0) (<= (.best-distance s) limit)) (.best s)
+          :else (.prefix-match s))))
+
+; ---- flags -------------------------------------------------------------------
+(defn find-long [(flags (slice Flag)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1
+        (mut k) 0]
+    (loop (if (>= (load k) (len flags))
+              (break)
+              (let [candidate (get flags (load k))]
+                (if (= (.long candidate) name)
+                    (do (set! found (load k)) (break))
+                    (set! k (+ (load k) 1))))))
+    (load found)))
+
+(defn find-short [(flags (slice Flag)) (letter u8)] (-> i64)
+  (let [(mut found) -1
+        (mut k) 0]
+    (loop (if (>= (load k) (len flags))
+              (break)
+              (let [candidate (get flags (load k))]
+                (if (and (!= (.short candidate) 0)
+                         (= (.short candidate) letter))
+                    (do (set! found (load k)) (break))
+                    (set! k (+ (load k) 1))))))
+    (load found)))
+
+;; A flag resolved against the command's flags, then the program's.
+(defstruct FoundFlag [(found bool) (flag Flag)])
+
+(defn lookup-long [(command-flags (slice Flag))
+                   (global-flags (slice Flag))
+                   (name (slice u8))] (-> FoundFlag)
+  (let [local (find-long command-flags name)]
+    (if (>= local 0)
+        (FoundFlag :found true :flag (get command-flags local))
+        (let [global (find-long global-flags name)]
+          (if (>= global 0)
+              (FoundFlag :found true :flag (get global-flags global))
+              (FoundFlag :found false :flag (switch "" 0 "")))))))
+
+(defn lookup-short [(command-flags (slice Flag))
+                    (global-flags (slice Flag))
+                    (letter u8)] (-> FoundFlag)
+  (let [local (find-short command-flags letter)]
+    (if (>= local 0)
+        (FoundFlag :found true :flag (get command-flags local))
+        (let [global (find-short global-flags letter)]
+          (if (>= global 0)
+              (FoundFlag :found true :flag (get global-flags global))
+              (FoundFlag :found false :flag (switch "" 0 "")))))))
+
+(defn flag-suggestion [(a (dyn Allocator))
+                       (command-flags (slice Flag))
+                       (global-flags (slice Flag))
+                       (typed (slice u8))] (-> (slice u8))
+  (let [(mut s) (suggester-new a typed)
+        (mut k) 0]
+    (loop (if (>= (load k) (len command-flags))
+              (break)
+              (let [candidate (get command-flags (load k))]
+                (suggester-offer! (mut s) (.long candidate) (.long candidate))
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (>= (load k) (len global-flags))
+              (break)
+              (let [candidate (get global-flags (load k))]
+                (suggester-offer! (mut s) (.long candidate) (.long candidate))
+                (set! k (+ (load k) 1)))))
+    (suggester-offer! (mut s) "help" "help")
+    (let [found (suggester-result (load s))]
+      (if (= (len found) 0)
+          ""
+          (let [(mut out) (sb-new a)]
+            (sb-push-str! (mut out) "--")
+            (sb-push-str! (mut out) found)
+            (sb-finish! (mut out)))))))
+
+(defn short-text [(a (dyn Allocator)) (letter u8)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-byte! (mut out) 45)
+    (sb-push-byte! (mut out) letter)
+    (sb-finish! (mut out))))
+
+(defn long-text [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "--")
+    (sb-push-str! (mut out) name)
+    (sb-finish! (mut out))))
+
+; ---- positional specs --------------------------------------------------------
+(defstruct ArgSpec [(name (slice u8)) (optional bool) (variadic bool)])
+
+(defn arg-spec [(raw (slice u8))] (-> ArgSpec)
+  (let [n (len raw)
+        optional
+          (and (>= n 2)
+               (= (cast i64 (get raw 0)) 91)
+               (= (cast i64 (get raw (- n 1))) 93))
+        inner (if optional (subslice raw 1 (- n 1)) raw)
+        m (len inner)
+        variadic
+          (and (>= m 3)
+               (= (subslice inner (- m 3) m) "..."))
+        name (if variadic (subslice inner 0 (- m 3)) inner)]
+    (when (= (len name) 0)
+      (cli-fail! "command: a positional argument name is empty")
+      0)
+    (ArgSpec
+      :name name
+      :optional optional
+      :variadic variadic)))
+
+(defn arg-name [(raw (slice u8))] (-> (slice u8))
+  (let [spec (arg-spec raw)]
+    (.name spec)))
+
+(defn command-takes-args? [(prog Program) (index i64)] (-> bool)
+  (let [command (get (.commands prog) index)]
+    (> (len (.args command)) 0)))
+
+;; Check positionals against the spec, returning the first problem if any.
+(defn check-positionals [(command-index i64)
+                         (specs (slice (slice u8)))
+                         (given (slice (slice u8)))] (-> (Option ArgError))
+  (let [(mut required) 0
+        (mut variadic) false
+        (mut k) 0
+        (mut problem) (None [ArgError])]
+    (loop (if (>= (load k) (len specs))
+              (break)
+              (let [spec (arg-spec (get specs (load k)))]
+                (when (load variadic)
+                  (cli-fail! "command: a variadic argument must be the last one")
+                  0)
+                (when (.variadic spec) (set! variadic true) 0)
+                (when (not (.optional spec)) (set! required (+ (load k) 1)) 0)
+                (set! k (+ (load k) 1)))))
+    (cond (< (len given) (load required))
+            (set! problem
+                  (Some (MissingArgument command-index
+                                         (arg-name (get specs (len given))))))
+          (and (not (load variadic)) (> (len given) (len specs)))
+            (set! problem
+                  (Some (UnexpectedArgument command-index
+                                            (get given (len specs)))))
+          :else 0)
+    (load problem)))
+
+; ---- parsing -----------------------------------------------------------------
+
+;; Mutable parse state shared by the flag scanner.
+(defstruct Scan
+  [(allocator (dyn Allocator))
+   (tokens (slice (slice u8)))
+   (at i64)
+   (command i64)
+   (command-flags (slice Flag))
+   (global-flags (slice Flag))
+   (flags (ArrayList FlagValue))
+   (help bool)
+   (version bool)
+   (version-enabled bool)
+   (failed bool)
+   (error ArgError)])
+
+(defn scan-fail! [(scan (mut Scan)) (error ArgError)] (-> i64)
+  (when (not (.failed scan))
+    (set! (.failed scan) true)
+    (set! (.error scan) error)
+    0)
+  0)
+
+(defn record-flag! [(scan (mut Scan)) (long (slice u8)) (value (slice u8))] (-> i64)
+  (push! (mut (.flags scan)) (FlagValue :long long :value value)))
+
+;; Scan the flag token at `at` ("--x", "--x=v", "-abc"), consuming a following
+;; value token when the flag needs one. Advances `at` past everything consumed.
+(defn scan-flag! [(scan (mut Scan))] (-> i64)
+  (let [a (.allocator scan)
+        token (get (.tokens scan) (.at scan))]
+    (set! (.at scan) (+ (.at scan) 1))
+    (if (starts-with token "--")
+        (let [body (subslice token 2 (len token))
+              eq (str-find body "=")
+              name
+                (match eq
+                  (Some [p] (subslice body 0 p))
+                  (None [] body))
+              inline
+                (match eq
+                  (Some [p] (Some (subslice body (+ p 1) (len body))))
+                  (None [] (None [(slice u8)])))
+              has-inline
+                (match inline
+                  (Some [_] true)
+                  (None [] false))
+              found
+                (lookup-long (.command-flags scan) (.global-flags scan) name)]
+          (cond (.found found)
+                  (let [f (.flag found)]
+                    (if (.takes-value f)
+                        (match inline
+                          (Some [value]
+                                (record-flag! (mut scan) (.long f) value))
+                          (None []
+                                (if (< (.at scan) (len (.tokens scan)))
+                                    (do
+                                      (record-flag! (mut scan)
+                                                    (.long f)
+                                                    (get (.tokens scan)
+                                                         (.at scan)))
+                                      (set! (.at scan) (+ (.at scan) 1)))
+                                    (scan-fail! (mut scan)
+                                                (MissingValue (.command scan)
+                                                              (long-text a name))))))
+                        (if has-inline
+                            (scan-fail! (mut scan)
+                                        (UnexpectedValue (.command scan)
+                                                         (long-text a name)))
+                            (record-flag! (mut scan) (.long f) ""))))
+                (= name "help")
+                  (if has-inline
+                      (scan-fail! (mut scan)
+                                  (UnexpectedValue (.command scan) "--help"))
+                      (set! (.help scan) true))
+                (and (= name "version") (.version-enabled scan))
+                  (if has-inline
+                      (scan-fail! (mut scan)
+                                  (UnexpectedValue (.command scan) "--version"))
+                      (set! (.version scan) true))
+                :else
+                  (scan-fail! (mut scan)
+                              (UnknownFlag
+                                :command (.command scan)
+                                :given (long-text a name)
+                                :suggestion
+                                  (flag-suggestion a
+                                                   (.command-flags scan)
+                                                   (.global-flags scan)
+                                                   name)))))
+        (let [(mut k) 1]
+          (loop (if (>= (load k) (len token))
+                    (break)
+                    (let [letter (get token (load k))
+                          found
+                            (lookup-short (.command-flags scan)
+                                          (.global-flags scan)
+                                          letter)]
+                      (cond (.found found)
+                              (let [f (.flag found)]
+                                (if (.takes-value f)
+                                    (do
+                                      (if (< (+ (load k) 1) (len token))
+                                          (record-flag! (mut scan)
+                                                        (.long f)
+                                                        (subslice token
+                                                                  (+ (load k) 1)
+                                                                  (len token)))
+                                          (if (< (.at scan)
+                                                 (len (.tokens scan)))
+                                              (do
+                                                (record-flag! (mut scan)
+                                                              (.long f)
+                                                              (get (.tokens scan)
+                                                                   (.at scan)))
+                                                (set! (.at scan)
+                                                      (+ (.at scan) 1)))
+                                              (scan-fail! (mut scan)
+                                                          (MissingValue (.command scan)
+                                                                        (short-text a
+                                                                                    letter)))))
+                                      (break))
+                                    (do
+                                      (record-flag! (mut scan) (.long f) "")
+                                      (set! k (+ (load k) 1)))))
+                            (= (cast i64 letter) 104)
+                              (do
+                                (set! (.help scan) true)
+                                (set! k (+ (load k) 1)))
+                            :else
+                              (do
+                                (scan-fail! (mut scan)
+                                            (UnknownFlag
+                                              :command (.command scan)
+                                              :given (short-text a letter)
+                                              :suggestion ""))
+                                (break))))))
+          0))))
+
+(defn flag-declared? [(command-flags (slice Flag))
+                      (global-flags (slice Flag))
+                      (long (slice u8))] (-> bool)
+  (let [found (lookup-long command-flags global-flags long)]
+    (.found found)))
+
+;; The first given flag declared by neither `command-flags` nor `global-flags`.
+(defn first-foreign-flag [(given (slice FlagValue))
+                          (command-flags (slice Flag))
+                          (global-flags (slice Flag))] (-> (Option (slice u8)))
+  (let [(mut found) (None [(slice u8)])
+        (mut k) 0]
+    (loop (if (>= (load k) (len given))
+              (break)
+              (let [value (get given (load k))]
+                (if (flag-declared? command-flags global-flags (.long value))
+                    (set! k (+ (load k) 1))
+                    (do (set! found (Some (.long value))) (break))))))
+    (load found)))
+
+(defn flag-token? [(token (slice u8))] (-> bool)
+  (not (word-token? token)))
+
+;; The longest command whose words match tokens[at..], or -1.
+(defn match-command [(prog Program) (tokens (slice (slice u8))) (at i64)] (-> i64)
+  (let [(mut best) -1
+        (mut best-words) 0
+        (mut c) 0]
+    (loop (if (>= (load c) (len (.commands prog)))
+              (break)
+              (let [command (get (.commands prog) (load c))
+                    words (word-count (.name command))]
+                (when (and (> words (load best-words))
+                           (= (matching-words (.name command) tokens at words)
+                              words))
+                  (set! best (load c))
+                  (set! best-words words)
+                  0)
+                (set! c (+ (load c) 1)))))
+    (load best)))
+
+;; The longest proper prefix of some multi-word command matched by tokens[at..].
+(defn match-group [(prog Program) (tokens (slice (slice u8))) (at i64)] (-> i64)
+  (let [(mut best) 0
+        (mut c) 0]
+    (loop (if (>= (load c) (len (.commands prog)))
+              (break)
+              (let [command (get (.commands prog) (load c))
+                    words (word-count (.name command))
+                    matched
+                      (matching-words (.name command) tokens at (- words 1))]
+                (when (> matched (load best)) (set! best matched) 0)
+                (set! c (+ (load c) 1)))))
+    (load best)))
+
+;; A suggestion for an unknown word following the first `depth` words
+;; (`group`); offers the next word of every command under that group, shown as
+;; the command path up to and including that word.
+(defn command-suggestion [(a (dyn Allocator))
+                          (prog Program)
+                          (tokens (slice (slice u8)))
+                          (at i64)
+                          (depth i64)
+                          (typed (slice u8))] (-> (slice u8))
+  (let [(mut s) (suggester-new a typed)
+        (mut c) 0]
+    (loop (if (>= (load c) (len (.commands prog)))
+              (break)
+              (let [command (get (.commands prog) (load c))
+                    words (word-count (.name command))]
+                (when (and (> words depth)
+                           (= (matching-words (.name command) tokens at depth)
+                              depth))
+                  (suggester-offer! (mut s)
+                                    (word-at (.name command) depth)
+                                    (prefix-words a (.name command) (+ depth 1)))
+                  0)
+                (set! c (+ (load c) 1)))))
+    (suggester-result (load s))))
+
+(defn scan-new [(a (dyn Allocator)) (prog Program) (tokens (slice (slice u8)))] (-> Scan)
+  (Scan
+    :allocator a
+    :tokens tokens
+    :at 0
+    :command -1
+    :command-flags (no-flags)
+    :global-flags (.flags prog)
+    :flags (al-new [FlagValue] a)
+    :help false
+    :version false
+    :version-enabled (> (len (.version prog)) 0)
+    :failed false
+    :error (MissingSubcommand "")))
+
+;;; Parse `argv` (argv[0] is the program path and is skipped) against `prog`.
+(defn parse [(a (dyn Allocator)) (prog Program) (argv (slice (slice u8)))] (-> Parsed)
+  (let [tokens (if (> (len argv) 0) (subslice argv 1 (len argv)) argv)
+        root (root-command prog)
+        (mut scan) (scan-new a prog tokens)
+        (mut terminated) false]
+    ; Flags before the command words: program-wide flags, and the root
+    ; command's flags when there is a root command.
+    (when (>= root 0)
+      (let [root-command (get (.commands prog) root)]
+        (set! (.command-flags scan) (.flags root-command)))
+      0)
+    (loop (if (or (>= (.at scan) (len tokens))
+                  (not (flag-token? (get tokens (.at scan)))))
+              (break)
+              (if (= (get tokens (.at scan)) "--")
+                  (do
+                    (set! (.at scan) (+ (.at scan) 1))
+                    (set! terminated true)
+                    (break))
+                  (scan-flag! (mut scan)))))
+    (block :parsed
+           (when (.version scan) (return-from :parsed (Version)) 0)
+           (when (.failed scan)
+             (return-from :parsed
+                            (if (.help scan)
+                                (Help (ProgramHelp))
+                                (Failed (.error scan))))
+             0)
+           (let [at (.at scan)
+                 found (match-command prog tokens at)
+                 word-next
+                   (and (< at (len tokens)) (word-token? (get tokens at)))
+                 group (match-group prog tokens at)]
+             (cond (>= found 0)
+                     (let [command (get (.commands prog) found)]
+                       (set! (.command scan) found)
+                       (set! (.at scan) (+ at (word-count (.name command))))
+                       ; A root-only flag given before another command's words.
+                       (match (first-foreign-flag (al-slice (.flags scan))
+                                                  (.flags command)
+                                                  (.flags prog))
+                         (Some [long]
+                               (return-from :parsed
+                                              (Failed (UnknownFlag
+                                                        :command found
+                                                        :given
+                                                          (long-text a long)
+                                                        :suggestion
+                                                          (flag-suggestion a
+                                                                           (.flags command)
+                                                                           (.flags prog)
+                                                                           long)))))
+                         (None [] 0)))
+                   (> group 0)
+                     (let [next (+ at group)]
+                       (cond (and (< next (len tokens))
+                                  (word-token? (get tokens next)))
+                               (return-from :parsed
+                                              (Failed (UnknownCommand (join-words a
+                                                                                  tokens
+                                                                                  at
+                                                                                  (+ next
+                                                                                     1))
+                                                                      (command-suggestion a
+                                                                                          prog
+                                                                                          tokens
+                                                                                          at
+                                                                                          group
+                                                                                          (get tokens
+                                                                                               next)))))
+                             :else
+                               (let [prefix (join-words a tokens at next)]
+                                 (set! (.at scan) next)
+                                 (loop (if (>= (.at scan) (len tokens))
+                                           (break)
+                                           (if (flag-token? (get tokens
+                                                                 (.at scan)))
+                                               (scan-flag! (mut scan))
+                                               (set! (.at scan)
+                                                     (+ (.at scan) 1)))))
+                                 (return-from :parsed
+                                                (if (.help scan)
+                                                    (Help (GroupHelp prefix))
+                                                    (Failed (MissingSubcommand prefix)))))))
+                   (and (>= root 0)
+                        (or (not word-next)
+                            (command-takes-args? prog root)))
+                     (set! (.command scan) root)
+                   word-next
+                     (return-from :parsed
+                                    (Failed (UnknownCommand (get tokens at)
+                                                            (command-suggestion a
+                                                                                prog
+                                                                                tokens
+                                                                                at
+                                                                                0
+                                                                                (get tokens
+                                                                                     at)))))
+                   :else (return-from :parsed (Help (ProgramHelp)))))
+           ; The command's own flags and its positionals.
+           (let [command (get (.commands prog) (.command scan))
+                 (mut given) (al-new [(slice u8)] a)]
+             (set! (.command-flags scan) (.flags command))
+             (loop (if (>= (.at scan) (len tokens))
+                       (break)
+                       (let [token (get tokens (.at scan))]
+                         (cond (load terminated)
+                                 (do
+                                   (push! (mut given) token)
+                                   (set! (.at scan) (+ (.at scan) 1)))
+                               (= token "--")
+                                 (do
+                                   (set! terminated true)
+                                   (set! (.at scan) (+ (.at scan) 1)))
+                               (flag-token? token) (scan-flag! (mut scan))
+                               :else
+                                 (do
+                                   (push! (mut given) token)
+                                   (set! (.at scan) (+ (.at scan) 1)))))))
+             (cond (.help scan)
+                     (if (= (.command scan) root)
+                         (Help (ProgramHelp))
+                         (Help (CommandHelp (.command scan))))
+                   (.version scan) (Version)
+                   (.failed scan) (Failed (.error scan))
+                   :else
+                     (match (check-positionals (.command scan)
+                                               (.args command)
+                                               (al-slice given))
+                       (Some [problem] (Failed problem))
+                       (None []
+                             (Run (Invocation
+                                    :command (.command scan)
+                                    :name (.name command)
+                                    :positionals (load given)
+                                    :flags (.flags scan)
+                                    :command-flags (.flags command)
+                                    :global-flags (.flags prog))))))))))
+
+; ---- invocation accessors ------------------------------------------------------
+
+;;; True when the invocation runs the command named `name`.
+(defn command-is? [(inv Invocation) (name (slice u8))] (-> bool)
+  (= (.name inv) name))
+
+(defn declared-flag [(inv Invocation) (long (slice u8)) (caller (slice u8))] (-> Flag)
+  (let [found (lookup-long (.command-flags inv) (.global-flags inv) long)]
+    (if (.found found)
+        (.flag found)
+        (do
+          (io/print-str (io/stderr) caller)
+          (io/print-str (io/stderr) ": --")
+          (io/print-str (io/stderr) long)
+          (io/print-str (io/stderr) " is not declared by command '")
+          (io/print-str (io/stderr) (.name inv))
+          (io/print-str (io/stderr) "'\n")
+          (cli-fail! "undeclared flag lookup")
+          (.flag found)))))
+
+;;; True when flag `long` was given at least once. The flag must be declared by
+;;; the command or the program: asking about an undeclared flag is a bug and
+;;; aborts rather than quietly answering false.
+(defn flag? [(inv Invocation) (long (slice u8))] (-> bool)
+  (declared-flag inv long "flag?")
+  (let [(mut found) false
+        (mut k) 0]
+    (loop (if (>= (load k) (len (.flags inv)))
+              (break)
+              (let [given (get (.flags inv) (load k))]
+                (if (= (.long given) long)
+                    (do (set! found true) (break))
+                    (set! k (+ (load k) 1))))))
+    (load found)))
+
+;;; The value of the last occurrence of value flag `long`, if given.
+(defn flag-value [(inv Invocation) (long (slice u8))] (-> (Option (slice u8)))
+  (let [declared (declared-flag inv long "flag-value")]
+    (when (not (.takes-value declared))
+      (cli-fail! "flag-value: the flag is a switch; use flag?")
+      0)
+    (let [(mut found) (None [(slice u8)])
+          (mut k) 0]
+      (loop (if (>= (load k) (len (.flags inv)))
+                (break)
+                (let [given (get (.flags inv) (load k))]
+                  (when (= (.long given) long)
+                    (set! found (Some (.value given)))
+                    0)
+                  (set! k (+ (load k) 1)))))
+      (load found))))
+
+;;; The value of value flag `long`, or `fallback` when it was not given.
+(defn flag-value-or [(inv Invocation) (long (slice u8)) (fallback (slice u8))] (-> (slice u8))
+  (match (flag-value inv long)
+    (Some [value] value)
+    (None [] fallback)))
+
+;;; Every value given for flag `long`, in order (for repeatable flags).
+(defn flag-values [(a (dyn Allocator)) (inv Invocation) (long (slice u8))] (-> (slice (slice u8)))
+  (let [declared (declared-flag inv long "flag-values")]
+    (when (not (.takes-value declared))
+      (cli-fail! "flag-values: the flag is a switch; use flag?")
+      0)
+    (let [(mut out) (al-new [(slice u8)] a)
+          (mut k) 0]
+      (loop (if (>= (load k) (len (.flags inv)))
+                (break)
+                (let [given (get (.flags inv) (load k))]
+                  (when (= (.long given) long)
+                    (push! (mut out) (.value given))
+                    0)
+                  (set! k (+ (load k) 1)))))
+      (al-into-slice (mut out)))))
+
+(defn positional-count [(inv Invocation)] (-> i64)
+  (len (.positionals inv)))
+
+;;; Positional `i`, if present.
+(defn positional [(inv Invocation) (i i64)] (-> (Option (slice u8)))
+  (if (and (>= i 0) (< i (len (.positionals inv))))
+      (Some (get (.positionals inv) i))
+      (None)))
+
+(defn positionals [(inv Invocation)] (-> (slice (slice u8)))
+  (al-slice (.positionals inv)))
+
+; ---- help --------------------------------------------------------------------
+(defn heading! [(out (mut StrBuf)) (term style/Term) (title (slice u8))] (-> i64)
+  (style/paint-into! (mut out) term (style/strong-style) title)
+  (sb-push-str! (mut out) ":\n"))
+
+(defn flag-label [(a (dyn Allocator)) (f Flag)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (if (!= (.short f) 0)
+        (do
+          (sb-push-byte! (mut out) 45)
+          (sb-push-byte! (mut out) (.short f))
+          (sb-push-str! (mut out) ", "))
+        (sb-push-str! (mut out) "    "))
+    (sb-push-str! (mut out) "--")
+    (sb-push-str! (mut out) (.long f))
+    (when (.takes-value f)
+      (sb-push-byte! (mut out) 32)
+      (sb-push-str! (mut out) (.value-name f))
+      0)
+    (sb-finish! (mut out))))
+
+;; A two-column listing ("  left  right") aligned on the widest left cell.
+(defn listing! [(out (mut StrBuf))
+                (lefts (slice (slice u8)))
+                (rights (slice (slice u8)))] (-> i64)
+  (let [(mut width) 0
+        (mut k) 0]
+    (loop (if (>= (load k) (len lefts))
+              (break)
+              (do
+                (when (> (style/display-width (get lefts (load k)))
+                         (load width))
+                  (set! width (style/display-width (get lefts (load k))))
+                  0)
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (>= (load k) (len lefts))
+              (break)
+              (let [left (get lefts (load k))
+                    right (get rights (load k))]
+                (sb-push-str! (mut out) "  ")
+                (sb-push-str! (mut out) left)
+                (when (> (len right) 0)
+                  (style/push-spaces! (mut out)
+                                      (+ (- (load width)
+                                            (style/display-width left))
+                                         3))
+                  (sb-push-str! (mut out) right)
+                  0)
+                (sb-push-byte! (mut out) 10)
+                (set! k (+ (load k) 1)))))
+    0))
+
+(defn flags-section! [(a (dyn Allocator))
+                      (out (mut StrBuf))
+                      (term style/Term)
+                      (title (slice u8))
+                      (flags (slice Flag))
+                      (help-line (slice u8))
+                      (version-line bool)] (-> i64)
+  (let [(mut lefts) (al-new [(slice u8)] a)
+        (mut rights) (al-new [(slice u8)] a)
+        (mut k) 0]
+    (loop (if (>= (load k) (len flags))
+              (break)
+              (let [f (get flags (load k))]
+                (push! (mut lefts) (flag-label a f))
+                (push! (mut rights) (.help f))
+                (set! k (+ (load k) 1)))))
+    (when (> (len help-line) 0)
+      (push! (mut lefts) "-h, --help")
+      (push! (mut rights) help-line)
+      0)
+    (when version-line
+      (push! (mut lefts) "    --version")
+      (push! (mut rights) "Show the version")
+      0)
+    (when (> (len lefts) 0)
+      (sb-push-byte! (mut out) 10)
+      (heading! (mut out) term title)
+      (listing! (mut out) (al-slice lefts) (al-slice rights))
+      0)
+    (al-free! (mut lefts))
+    (al-free! (mut rights))
+    0))
+
+;; "NAME [FILE...]" from the positional names.
+(defn args-text [(a (dyn Allocator)) (args (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut k) 0]
+    (loop (if (>= (load k) (len args))
+              (break)
+              (do
+                (when (> (load k) 0) (sb-push-byte! (mut out) 32) 0)
+                (sb-push-str! (mut out) (get args (load k)))
+                (set! k (+ (load k) 1)))))
+    (sb-finish! (mut out))))
+
+(defn usage-line! [(a (dyn Allocator))
+                   (out (mut StrBuf))
+                   (prog Program)
+                   (command Command)] (-> i64)
+  (sb-push-str! (mut out) "  ")
+  (sb-push-str! (mut out) (.name prog))
+  (if (> (len (.usage command)) 0)
+      (do
+        (sb-push-byte! (mut out) 32)
+        (sb-push-str! (mut out) (.usage command)))
+      (do
+        (when (> (len (.name command)) 0)
+          (sb-push-byte! (mut out) 32)
+          (sb-push-str! (mut out) (.name command))
+          0)
+        (when (> (len (.args command)) 0)
+          (sb-push-byte! (mut out) 32)
+          (sb-push-str! (mut out) (args-text a (.args command)))
+          0)
+        (sb-push-str! (mut out) " [flags]")))
+  (sb-push-byte! (mut out) 10))
+
+;; Command rows under `prefix` (every non-root command when `prefix` is ""),
+;; grouped by `group` in order of first appearance, or one "Commands" section.
+(defn commands-section! [(a (dyn Allocator))
+                         (out (mut StrBuf))
+                         (term style/Term)
+                         (prog Program)
+                         (prefix (slice u8))
+                         (grouped bool)] (-> i64)
+  (let [depth (word-count prefix)
+        (mut groups) (al-new [(slice u8)] a)
+        (mut width) 0
+        (mut c) 0]
+    ; The name column is aligned across every section.
+    (loop (if (>= (load c) (len (.commands prog)))
+              (break)
+              (let [command (get (.commands prog) (load c))
+                    name (.name command)]
+                (when (and (> (word-count name) depth)
+                           (= (matching-prefix-words name prefix) depth))
+                  (let [shown (display-name name depth)]
+                    (when (> (style/display-width shown) (load width))
+                      (set! width (style/display-width shown))
+                      0)
+                    (let [title (if grouped (.group command) "")
+                          (mut seen) false
+                          (mut g) 0]
+                      (loop (if (>= (load g) (len groups))
+                                (break)
+                                (if (= (get groups (load g)) title)
+                                    (do (set! seen true) (break))
+                                    (set! g (+ (load g) 1)))))
+                      (when (not (load seen)) (push! (mut groups) title) 0)
+                      0))
+                  0)
+                (set! c (+ (load c) 1)))))
+    (let [(mut g) 0]
+      (loop (if (>= (load g) (len groups))
+                (break)
+                (let [title (get groups (load g))]
+                  (sb-push-byte! (mut out) 10)
+                  (heading! (mut out)
+                            term
+                            (if (= (len title) 0) "Commands" title))
+                  (set! c 0)
+                  (loop (if (>= (load c) (len (.commands prog)))
+                            (break)
+                            (let [command (get (.commands prog) (load c))
+                                  name (.name command)]
+                              (when (and (> (word-count name) depth)
+                                         (= (matching-prefix-words name prefix)
+                                            depth)
+                                         (= (if grouped (.group command) "")
+                                            title))
+                                (let [shown (display-name name depth)]
+                                  (sb-push-str! (mut out) "  ")
+                                  (sb-push-str! (mut out) shown)
+                                  (style/push-spaces! (mut out)
+                                                      (+ (- (load width)
+                                                            (style/display-width shown))
+                                                         3))
+                                  (sb-push-str! (mut out) (.summary command))
+                                  (sb-push-byte! (mut out) 10)
+                                  0)
+                                0)
+                              (set! c (+ (load c) 1)))))
+                  (set! g (+ (load g) 1))))))
+    (al-free! (mut groups))
+    0))
+
+;; How many leading words of `name` equal the words of `prefix`.
+(defn matching-prefix-words [(name (slice u8)) (prefix (slice u8))] (-> i64)
+  (let [depth (word-count prefix)
+        (mut k) 0]
+    (loop (if (or (>= (load k) depth)
+                  (not (= (word-at name (load k)) (word-at prefix (load k)))))
+              (break)
+              (set! k (+ (load k) 1))))
+    (load k)))
+
+;; The words of `name` after the first `depth`.
+(defn display-name [(name (slice u8)) (depth i64)] (-> (slice u8))
+  (let [(mut i) 0
+        (mut skipped) 0]
+    (loop (if (or (>= (load skipped) depth) (>= (load i) (len name)))
+              (break)
+              (do
+                (when (= (cast i64 (get name (load i))) 32)
+                  (set! skipped (+ (load skipped) 1))
+                  0)
+                (set! i (+ (load i) 1)))))
+    (subslice name (load i) (len name))))
+
+;;; Help for the whole program: summary, usage, grouped commands, flags.
+(defn render-program-help [(a (dyn Allocator)) (term style/Term) (prog Program)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        root (root-command prog)]
+    (when (> (len (.summary prog)) 0)
+      (sb-push-str! (mut out) (.summary prog))
+      (sb-push-str! (mut out) "\n\n")
+      0)
+    (heading! (mut out) term "Usage")
+    (when (>= root 0)
+      (usage-line! a (mut out) prog (get (.commands prog) root))
+      0)
+    (sb-push-str! (mut out) "  ")
+    (sb-push-str! (mut out) (.name prog))
+    (sb-push-str! (mut out) " <command> [flags]\n")
+    (commands-section! a (mut out) term prog "" true)
+    (flags-section! a
+                    (mut out)
+                    term
+                    "Flags"
+                    (.flags prog)
+                    "Show help"
+                    (> (len (.version prog)) 0))
+    (sb-push-str! (mut out) "\nRun '")
+    (sb-push-str! (mut out) (.name prog))
+    (sb-push-str! (mut out) " <command> --help' for more about a command.\n")
+    (sb-finish! (mut out))))
+
+;;; Help for a command group such as "site": its subcommands.
+(defn render-group-help [(a (dyn Allocator))
+                         (term style/Term)
+                         (prog Program)
+                         (prefix (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (heading! (mut out) term "Usage")
+    (sb-push-str! (mut out) "  ")
+    (sb-push-str! (mut out) (.name prog))
+    (sb-push-byte! (mut out) 32)
+    (sb-push-str! (mut out) prefix)
+    (sb-push-str! (mut out) " <command> [flags]\n")
+    (commands-section! a (mut out) term prog prefix false)
+    (sb-push-str! (mut out) "\nRun '")
+    (sb-push-str! (mut out) (.name prog))
+    (sb-push-byte! (mut out) 32)
+    (sb-push-str! (mut out) prefix)
+    (sb-push-str! (mut out) " <command> --help' for more about a command.\n")
+    (sb-finish! (mut out))))
+
+;;; Help for one command: summary, usage, its flags, then program-wide flags.
+(defn render-command-help [(a (dyn Allocator))
+                           (term style/Term)
+                           (prog Program)
+                           (index i64)] (-> (slice u8))
+  (when (or (< index 0) (>= index (len (.commands prog))))
+    (cli-fail! "render-command-help: command index out of range")
+    0)
+  (let [command (get (.commands prog) index)
+        (mut out) (sb-new a)]
+    (when (> (len (.summary command)) 0)
+      (sb-push-str! (mut out) (.summary command))
+      (sb-push-str! (mut out) "\n\n")
+      0)
+    (heading! (mut out) term "Usage")
+    (usage-line! a (mut out) prog command)
+    (flags-section! a
+                    (mut out)
+                    term
+                    "Flags"
+                    (.flags command)
+                    "Show help for this command"
+                    false)
+    (flags-section! a
+                    (mut out)
+                    term
+                    "Global flags"
+                    (.flags prog)
+                    ""
+                    (> (len (.version prog)) 0))
+    (sb-finish! (mut out))))
+
+;;; Help text for a `HelpTarget` from `parse`.
+(defn render-help [(a (dyn Allocator))
+                   (term style/Term)
+                   (prog Program)
+                   (target HelpTarget)] (-> (slice u8))
+  (match target
+    (ProgramHelp [] (render-program-help a term prog))
+    (GroupHelp [prefix] (render-group-help a term prog prefix))
+    (CommandHelp [command] (render-command-help a term prog command))))
+
+(defn command-path! [(out (mut StrBuf)) (prog Program) (command i64)] (-> i64)
+  (sb-push-str! (mut out) (.name prog))
+  (when (>= command 0)
+    (let [c (get (.commands prog) command)]
+      (when (> (len (.name c)) 0)
+        (sb-push-byte! (mut out) 32)
+        (sb-push-str! (mut out) (.name c))
+        0)
+      0)
+    0)
+  0)
+
+(defn quoted! [(out (mut StrBuf)) (term style/Term) (text (slice u8))] (-> i64)
+  (sb-push-byte! (mut out) 39)
+  (style/paint-into! (mut out) term (style/accent-style) text)
+  (sb-push-byte! (mut out) 39))
+
+(defn suggestion! [(out (mut StrBuf)) (term style/Term) (suggestion (slice u8))] (-> i64)
+  (sb-push-str! (mut out) "\n  Did you mean ")
+  (quoted! (mut out) term suggestion)
+  (sb-push-str! (mut out) "?\n"))
+
+(defn usage-footer! [(out (mut StrBuf)) (prog Program) (command i64)] (-> i64)
+  (sb-push-str! (mut out) "\nRun '")
+  (command-path! (mut out) prog command)
+  (sb-push-str! (mut out) " --help' for usage.\n"))
+
+;;; Explain a parse error: an `error:` line, a suggestion when one is close, and
+;;; where to find usage. For a missing subcommand, the subcommands are listed.
+(defn render-error [(a (dyn Allocator))
+                    (term style/Term)
+                    (prog Program)
+                    (error ArgError)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (style/paint-into! (mut out) term (style/err-style) "error:")
+    (sb-push-byte! (mut out) 32)
+    (match error
+      (UnknownCommand [input suggestion]
+                      (do
+                        (sb-push-str! (mut out) "unknown command ")
+                        (quoted! (mut out) term input)
+                        (sb-push-str! (mut out) " for ")
+                        (quoted! (mut out) term (.name prog))
+                        (sb-push-byte! (mut out) 10)
+                        (when (> (len suggestion) 0)
+                          (let [(mut shown) (sb-new a)]
+                            (sb-push-str! (mut shown) (.name prog))
+                            (sb-push-byte! (mut shown) 32)
+                            (sb-push-str! (mut shown) suggestion)
+                            (suggestion! (mut out) term (sb-str (load shown)))
+                            (sb-free! (mut shown)))
+                          0)
+                        (usage-footer! (mut out) prog -1)))
+      (MissingSubcommand [prefix]
+                         (do
+                           (let [(mut path) (sb-new a)]
+                             (sb-push-str! (mut path) (.name prog))
+                             (sb-push-byte! (mut path) 32)
+                             (sb-push-str! (mut path) prefix)
+                             (quoted! (mut out) term (sb-str (load path)))
+                             (sb-free! (mut path)))
+                           (sb-push-str! (mut out) " requires a subcommand\n\n")
+                           (sb-push-str! (mut out)
+                                         (render-group-help a term prog prefix))))
+      (UnknownFlag [command given suggestion]
+                   (do
+                     (sb-push-str! (mut out) "unknown flag ")
+                     (quoted! (mut out) term given)
+                     (when (>= command 0)
+                       (sb-push-str! (mut out) " for ")
+                       (let [(mut path) (sb-new a)]
+                         (command-path! (mut path) prog command)
+                         (quoted! (mut out) term (sb-str (load path)))
+                         (sb-free! (mut path)))
+                       0)
+                     (sb-push-byte! (mut out) 10)
+                     (when (> (len suggestion) 0)
+                       (suggestion! (mut out) term suggestion)
+                       0)
+                     (usage-footer! (mut out) prog command)))
+      (MissingValue [command given]
+                    (do
+                      (sb-push-str! (mut out) "flag ")
+                      (quoted! (mut out) term given)
+                      (sb-push-str! (mut out) " needs a value\n")
+                      (usage-footer! (mut out) prog command)))
+      (UnexpectedValue [command given]
+                       (do
+                         (sb-push-str! (mut out) "flag ")
+                         (quoted! (mut out) term given)
+                         (sb-push-str! (mut out) " does not take a value\n")
+                         (usage-footer! (mut out) prog command)))
+      (MissingArgument [command name]
+                       (do
+                         (sb-push-str! (mut out) "missing argument ")
+                         (style/paint-into! (mut out)
+                                            term
+                                            (style/accent-style)
+                                            name)
+                         (sb-push-str! (mut out) " for ")
+                         (let [(mut path) (sb-new a)]
+                           (command-path! (mut path) prog command)
+                           (quoted! (mut out) term (sb-str (load path)))
+                           (sb-free! (mut path)))
+                         (sb-push-byte! (mut out) 10)
+                         (usage-footer! (mut out) prog command)))
+      (UnexpectedArgument [command value]
+                          (do
+                            (sb-push-str! (mut out) "unexpected argument ")
+                            (quoted! (mut out) term value)
+                            (sb-push-str! (mut out) " for ")
+                            (let [(mut path) (sb-new a)]
+                              (command-path! (mut path) prog command)
+                              (quoted! (mut out) term (sb-str (load path)))
+                              (sb-free! (mut path)))
+                            (sb-push-byte! (mut out) 10)
+                            (usage-footer! (mut out) prog command))))
+    (sb-finish! (mut out))))
+
+;;; The conventional handling of a parse result: help and the version go to
+;;; stdout (exit 0), errors to stderr (exit 2). Returns the invocation to run,
+;;; or `Err` with the exit code the program should return.
+(defn handle-parsed [(a (dyn Allocator)) (prog Program) (parsed Parsed)] (-> (Result Invocation
+                                                                                     i64))
+  (match parsed
+    (Run [invocation] (Ok invocation))
+    (Help [target]
+          (do
+            (io/print-str (io/stdout)
+                          (render-help a (style/term-stdout) prog target))
+            (Err 0)))
+    (Version []
+             (do
+               (io/print-str (io/stdout) (.name prog))
+               (io/print-str (io/stdout) " ")
+               (io/print-str (io/stdout) (.version prog))
+               (io/print-str (io/stdout) "\n")
+               (Err 0)))
+    (Failed [error]
+            (do
+              (io/print-str (io/stderr)
+                            (render-error a (style/term-stderr) prog error))
+              (Err 2)))))
+
+;;; `parse` followed by `handle-parsed`.
+(defn parse-standard [(a (dyn Allocator))
+                      (prog Program)
+                      (argv (slice (slice u8)))] (-> (Result Invocation i64))
+  (handle-parsed a prog (parse a prog argv)))

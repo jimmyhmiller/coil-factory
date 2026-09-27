@@ -1,0 +1,213 @@
+(module durable.atomic-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :use *)
+(import "durable.error" :use *)
+(import "durable.fdio" :use *)
+(import "durable.sys" :use *)
+(import "durable.test-support" :use *)
+
+(defn read-some [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (expect-ok a "read-file-if-exists" (read-file-if-exists a path))
+    (Some [bytes] bytes)
+    (None []
+          (do
+            (assert false)
+            ""))))
+
+(defn is-invalid? [T] [(r (Result T DurableError))] (-> bool)
+  (match r
+    (Err [e]
+         (match e
+           (Invalid [reason] true)
+           (_ false)))
+    (Ok [v] false)))
+
+(defn is-os-error? [T] [(r (Result T DurableError)) (code i64)] (-> bool)
+  (match r
+    (Err [e]
+         (match (error-os-code e)
+           (Some [c] (= c code))
+           (None [] false)))
+    (Ok [v] false)))
+
+(defn make-symlink [(a (dyn Allocator)) (target (slice u8)) (link (slice u8))] (-> i64)
+  (let [ct (expect-ok a "cstr" (path-cstr a target))
+        cl (expect-ok a "cstr" (path-cstr a link))]
+    (assert-eq (cast i64 (symlink ct cl)) 0)
+    (path-cstr-free a target ct)
+    (path-cstr-free a link cl)))
+
+(deftest atomic-write-creates-and-replaces-leaving-no-temporaries
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "atomic")
+               path (join a dir "run.json")]
+           (assert-eq (expect-ok a
+                                 "write"
+                                 (write-file-atomic! a path "{\"v\":1}" 420))
+                      7)
+           (assert (= (read-some a path) "{\"v\":1}"))
+           (assert-eq (expect-ok a
+                                 "write"
+                                 (write-file-atomic! a
+                                                     path
+                                                     "{\"version\":2}"
+                                                     420))
+                      13)
+           (assert (= (read-some a path) "{\"version\":2}"))
+           (assert-eq (expect-ok a "write" (write-file-atomic! a path "" 420))
+                      0)
+           (assert (= (read-some a path) ""))
+           (let [(mut names) (expect-ok a "list-dir" (list-dir a dir))]
+             (assert-eq (len (load names)) 1)
+             (assert (= (get (load names) 0) "run.json"))
+             (list-dir-free! a (mut names)))
+           ;; a directory path cannot be the target
+           (assert (is-invalid? (write-file-atomic! a
+                                                    (join a dir "sub/")
+                                                    "x"
+                                                    420)))
+           ;; the parent must exist
+           (assert (is-os-error? (write-file-atomic! a
+                                                     (join a dir "no/such/file")
+                                                     "x"
+                                                     420)
+                                 SYS-ENOENT))
+           (cleanup a dir)))
+
+(deftest read-file-if-exists-distinguishes-missing-from-errors
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "readfile")]
+           (assert (match (expect-ok a
+                                     "read"
+                                     (read-file-if-exists a
+                                                          (join a dir "absent")))
+                     (None [] true)
+                     (Some [b] false)))
+           ;; reading a directory is an error, not "missing"
+           (assert (match (read-file-if-exists a dir)
+                     (Err [e] true)
+                     (Ok [v] false)))
+           (cleanup a dir)))
+
+(deftest ensure-dir-creates-parents-and-is-idempotent
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "mkdir")
+               deep (join a dir "a/b//c/d/")]
+           (expect-ok a "ensure-dir!" (ensure-dir! a deep 493))
+           (assert (expect-ok a
+                              "dir-exists?"
+                              (dir-exists? a (join a dir "a/b/c/d"))))
+           (expect-ok a "ensure-dir! again" (ensure-dir! a deep 493))
+           (expect-ok a
+                      "write"
+                      (write-file-atomic! a (join a dir "a/file") "x" 420))
+           (assert (is-os-error? (ensure-dir! a (join a dir "a/file/sub") 493)
+                                 SYS-ENOTDIR))
+           (assert (is-os-error? (ensure-dir! a (join a dir "a/file") 493)
+                                 SYS-EEXIST))
+           (cleanup a dir)))
+
+(deftest path-kind-reports-files-directories-and-missing
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "kind")
+               file (join a dir "f.txt")]
+           (expect-ok a "write" (write-file-atomic! a file "hi" 420))
+           (assert (expect-ok a "file-exists?" (file-exists? a file)))
+           (assert (not (expect-ok a "dir-exists?" (dir-exists? a file))))
+           (assert (expect-ok a "dir-exists?" (dir-exists? a dir)))
+           (assert (not (expect-ok a "file-exists?" (file-exists? a dir))))
+           (assert (not (expect-ok a
+                                   "file-exists?"
+                                   (file-exists? a (join a dir "nope")))))
+           (assert (not (expect-ok a
+                                   "dir-exists?"
+                                   (dir-exists? a (join a dir "nope")))))
+           (assert (match (expect-ok a "kind" (path-kind a (join a dir "nope")))
+                     (Missing [] true)
+                     (_ false)))
+           (cleanup a dir)))
+
+(deftest list-dir-sorts-names
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "list")]
+           (expect-ok a "w" (write-file-atomic! a (join a dir "zeta") "" 420))
+           (expect-ok a "w" (write-file-atomic! a (join a dir "Alpha") "" 420))
+           (expect-ok a "w" (write-file-atomic! a (join a dir "beta") "" 420))
+           (expect-ok a "d" (ensure-dir! a (join a dir "alpha2") 493))
+           (let [(mut names) (expect-ok a "list-dir" (list-dir a dir))]
+             (assert-eq (len (load names)) 4)
+             (assert (= (get (load names) 0) "Alpha"))
+             (assert (= (get (load names) 1) "alpha2"))
+             (assert (= (get (load names) 2) "beta"))
+             (assert (= (get (load names) 3) "zeta"))
+             (list-dir-free! a (mut names)))
+           (assert (is-os-error? (list-dir a (join a dir "missing")) SYS-ENOENT))
+           (cleanup a dir)))
+
+(deftest remove-tree-deletes-recursively-without-following-links
+         (let [a (malloc-allocator)
+               dir (fresh-dir a "rmtree")
+               outside (fresh-dir a "rmtree-outside")
+               tree (join a dir "tree")]
+           (expect-ok a "d" (ensure-dir! a (join a tree "x/y/z") 493))
+           (expect-ok a
+                      "w"
+                      (write-file-atomic! a (join a tree "top.txt") "1" 420))
+           (expect-ok a
+                      "w"
+                      (write-file-atomic! a (join a tree "x/y/mid.txt") "2" 420))
+           (expect-ok a
+                      "w"
+                      (write-file-atomic! a
+                                          (join a tree "x/y/z/deep.txt")
+                                          "3"
+                                          420))
+           (expect-ok a
+                      "w"
+                      (write-file-atomic! a
+                                          (join a outside "keep.txt")
+                                          "keep"
+                                          420))
+           ;; a link to a directory outside the tree, and a dangling link
+           (make-symlink a outside (join a tree "x/escape"))
+           (make-symlink a (join a dir "nowhere") (join a tree "dangling"))
+           ;; tree, x, y, z, 3 files, 2 links = 9 entries
+           (assert-eq (expect-ok a "remove-tree!" (remove-tree! a tree)) 9)
+           (assert (not (expect-ok a "dir-exists?" (dir-exists? a tree))))
+           (assert (= (read-some a (join a outside "keep.txt")) "keep"))
+           ;; removing what is not there is not an error
+           (assert-eq (expect-ok a "remove-tree!" (remove-tree! a tree)) 0)
+           ;; a symlink given as the root is removed itself, not followed
+           (let [link (join a dir "link-to-outside")]
+             (make-symlink a outside link)
+             (assert-eq (expect-ok a "remove-tree!" (remove-tree! a link)) 1)
+             (assert (expect-ok a "dir-exists?" (dir-exists? a outside))))
+           ;; a plain file
+           (let [file (join a dir "plain.txt")]
+             (expect-ok a "w" (write-file-atomic! a file "x" 420))
+             (assert-eq (expect-ok a "remove-tree!" (remove-tree! a file)) 1))
+           (cleanup a outside)
+           (cleanup a dir)))
+
+(deftest remove-tree-refuses-dangerous-paths
+         (let [a (malloc-allocator)]
+           (assert (is-invalid? (remove-tree! a "")))
+           (assert (is-invalid? (remove-tree! a "/")))
+           (assert (is-invalid? (remove-tree! a "////////")))
+           (assert (is-invalid? (remove-tree! a "/tmp")))
+           (assert (is-invalid? (remove-tree! a "/Users/")))
+           (assert (is-invalid? (remove-tree! a "/home/someone/..")))
+           (assert (is-invalid? (remove-tree! a "./build/output")))
+           (assert (is-invalid? (remove-tree! a "work/../../etc")))
+           (assert (is-invalid? (remove-tree! a "abc/de")))
+           (assert (is-invalid? (remove-tree! a "/tmp/../")))
+           (assert (match (remove-tree-refusal "/tmp/some-dir")
+                     (None [] true)
+                     (Some [r] false)))
+           (assert (match (remove-tree-refusal "build/output")
+                     (None [] true)
+                     (Some [r] false)))))

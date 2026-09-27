@@ -1,0 +1,622 @@
+(module factory.worker)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "durable.atomic" :as atomic)
+(import "durable.jsonl" :as jsonl)
+(import "durable.lock" :as lock)
+(import "agent.fail" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.git" :use *)
+(import "factory.journal" :use *)
+(import "factory.models" :use *)
+(import "factory.proc" :use *)
+(import "factory.prompts" :use *)
+(import "factory.runspec" :use *)
+(import "factory.runstate" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+(import "factory.toolkit" :use *)
+
+;;; The run process: `factory _run RUN-ID`, started by the site daemon. At most
+;;; one runs per run directory (a lock file enforces it). It prepares the
+;;; worktree, walks the stations in order, and exits when the run finishes,
+;;; blocks, is cancelled, or fails. Started again later it continues where the
+;;; journal says the run is: a lost run resumes its station from the last
+;;; checkpoint, a blocked run resumes with the operator's answer, and a finished
+;;; run holds a conversation with whichever agent was spoken to.
+
+;; ---------------------------------------------------------------------------
+;; The journal as the agent's control surface
+
+;;; Reads new journal records at most every 200 ms: `control` records set pause
+;;; and cancel; `message.sent` records for this agent queue a message.
+(defstruct JournalControl
+  [(allocator (dyn Allocator))
+   (path (slice u8))
+   (agent (slice u8))
+   (cursor i64)
+   (paused bool)
+   (cancelled bool)
+   (inbox (ArrayList Inbound))
+   (last-poll i64)])
+
+(defn journal-control-new [(a (dyn Allocator))
+                           (path (slice u8))
+                           (agent (slice u8))
+                           (st (ptr RunState))] (-> (ptr JournalControl))
+  (let [control (box! a JournalControl (primitive/zeroed JournalControl))]
+    (set! (.allocator control) a)
+    (set! (.path control) path)
+    (set! (.agent control) agent)
+    (set! (.cursor control) (.cursor st))
+    (set! (.paused control) (= (.status st) "paused"))
+    (set! (.cancelled control) false)
+    (set! (.inbox control) (al-new [Inbound] a))
+    (set! (.last-poll control) 0)
+    ;; Messages sent before this process started are still owed to the agent.
+    (for pending (iter (.pending st))
+      (let [m pending]
+        (when (= (.agent m) agent)
+          (push! [Inbound] (mut (.inbox control))
+                 (Inbound :from (.from m) :text (.text m) :ref (.ref m)))
+          0)))
+    control))
+
+(defn journal-control-poll! [(control (ptr JournalControl))] (-> i64)
+  (let [now (now-ms)]
+    (if (< (- now (.last-poll control)) 200)
+        0
+        (let [a (.allocator control)]
+          (set! (.last-poll control) now)
+          (match (jsonl/journal-read a (.path control) (.cursor control) 256 1048576)
+            (Err [failure] 0)
+            (Ok [read]
+                (let [(mut batch) read]
+                  (for record (iter (jsonl/batch-records batch))
+                    (let [r record]
+                      (match (jv-parse a (.line r))
+                        (None [] 0)
+                        (Some [value]
+                              (let [kind (jv-string-or (jv-get value "kind") "")]
+                                (cond (= kind "control")
+                                        (let [action (jv-string-or (jv-get value "action") "")]
+                                          (cond (= action "pause") (do (set! (.paused control) true) 0)
+                                                (= action "resume") (do (set! (.paused control) false) 0)
+                                                (= action "cancel") (do (set! (.cancelled control) true) 0)
+                                                :else 0))
+                                      (and (= kind "message.sent")
+                                           (= (jv-string-or (jv-get value "agent") "") (.agent control)))
+                                        (do (push! [Inbound] (mut (.inbox control))
+                                                   (Inbound :from (copy-bytes a (jv-string-or (jv-get value "from") "operator"))
+                                                            :text (copy-bytes a (jv-string-or (jv-get value "text") ""))
+                                                            :ref (.offset r)))
+                                            0)
+                                      :else 0))))))
+                  (set! (.cursor control) (jsonl/batch-next-offset batch))
+                  (jsonl/journal-batch-free! (mut batch))
+                  0)))))))
+
+(impl AgentControl JournalControl
+  (control-check [(self (ptr JournalControl))] (-> Control)
+                 (do (journal-control-poll! self)
+                     (cond (.cancelled self) (Cancel)
+                           (.paused self) (Pause)
+                           :else (Proceed))))
+  (control-inbox [(self (ptr JournalControl)) (a (dyn Allocator))] (-> (ArrayList Inbound))
+                 (do (set! (.last-poll self) 0)
+                     (journal-control-poll! self)
+                     (let [(mut out) (al-new [Inbound] a)]
+                       (for message (iter (.inbox self))
+                         (push! [Inbound] (mut out) message))
+                       (al-clear! [Inbound] (mut (.inbox self)))
+                       (load out))))
+  (control-idle [(self (ptr JournalControl))] (-> i64) (sleep-ms 250)))
+
+;; ---------------------------------------------------------------------------
+;; Everything the agent does, into the journal
+
+(defstruct JournalObserver
+  [(allocator (dyn Allocator))
+   (path (slice u8))
+   (agent-name (slice u8))
+   (agent (ptr Agent))
+   (checkpoint (slice u8))])
+
+(defn save-checkpoint! [(observer (ptr JournalObserver))] (-> i64)
+  (let [a (.allocator observer)
+        agent (.agent observer)]
+    (if (= (cast i64 agent) 0)
+        0
+        (match (atomic/write-file-atomic! a (.checkpoint observer) (agent-transcript-json agent a) 384)
+          (Ok [written]
+              ;; Which part of the journal this checkpoint already reflects, so
+              ;; a reader can merge the transcript with later records exactly.
+              (match (jsonl/journal-size a (.path observer))
+                (Ok [size] (let [(mut text) (sb-new a)]
+                             (sb-push-i64! (mut text) size)
+                             (atomic/write-file-atomic! a (text-join a [(.checkpoint observer) ".cursor"]) (sb-finish! (mut text)) 384)
+                             0))
+                (Err [failure] 0)))
+          (Err [failure] (do (println "factory: could not save the transcript checkpoint") 0))))))
+
+(defn observe-record! [(observer (ptr JournalObserver)) (record JVal)] (-> i64)
+  (match (append-record! (.allocator observer) (.path observer) record)
+    (AppendedAt [offset] 0)
+    (AppendFailed [message]
+                  (fail [i64] "factory: cannot append to the run journal; stopping rather than working unobserved"))))
+
+(impl AgentObserver JournalObserver
+  (observe [(self (ptr JournalObserver)) (event AgentEvent)] (-> i64)
+           (let [a (.allocator self)
+                 name (.agent-name self)]
+             (match event
+               (TurnStarted [turn]
+                            (do (save-checkpoint! self)
+                                (observe-record! self (ev-int! (ev-agent a "agent.turn" name) "turn" turn))))
+               (MessageDelivered [delivered]
+                                 (let [m delivered]
+                                   (observe-record! self
+                                                    (ev-text! a (ev-str! (ev-int! (ev-agent a "message.received" name) "ref" (.ref m))
+                                                                         "from" (.from m))
+                                                              "text" (.text m) 2000))))
+               (Thought [text]
+                        (observe-record! self (ev-text! a (ev-agent a "agent.thought" name) "text" text 1500)))
+               (Said [text]
+                     (observe-record! self (ev-text! a (ev-agent a "agent.text" name) "text" text 4000)))
+               (UsageReported [input output]
+                              (observe-record! self (ev-int! (ev-int! (ev-agent a "agent.usage" name) "input" input)
+                                                             "output" output)))
+               (ToolStarted [started summary]
+                            (let [call started]
+                              (observe-record! self
+                                               (ev-text! a (ev-text! a (ev-str! (ev-str! (ev-agent a "tool.started" name)
+                                                                                         "call" (.id call))
+                                                                                "tool" (.name call))
+                                                                     "summary" summary 200)
+                                                         "args" (.arguments-json call) 600))))
+               (ToolEnded [ended summary ok output elapsed]
+                          (let [call ended]
+                            (observe-record! self
+                                             (ev-text! a (ev-int! (ev-bool! (ev-text! a (ev-str! (ev-str! (ev-agent a "tool.finished" name)
+                                                                                                          "call" (.id call))
+                                                                                                 "tool" (.name call))
+                                                                                      "summary" summary 200)
+                                                                            "ok" ok)
+                                                                  "ms" elapsed)
+                                                       "output" output 1500))))
+               (ModelRetrying [attempt failure delay]
+                              (let [error failure]
+                                (observe-record! self
+                                                 (ev-text! a (ev-int! (ev-int! (ev-agent a "agent.retry" name) "attempt" attempt)
+                                                                      "status" (.status error))
+                                                           "message" (.message error) 400))))
+               (PausedEvent [] (observe-record! self (ev-agent a "agent.paused" name)))
+               (ResumedEvent [] (observe-record! self (ev-agent a "agent.resumed" name)))
+               (Compacted [n bytes] (observe-record! self (ev-int! (ev-int! (ev-agent a "agent.compacted" name) "messages" n) "bytes" bytes)))))))
+
+;; ---------------------------------------------------------------------------
+;; The finish tool
+
+(defstruct FinishTool [(gate (slice u8))])
+
+(impl Tool FinishTool
+  (tool-spec [(self (ptr FinishTool))] (-> ToolSpec)
+             (ToolSpec :name "finish"
+                       :description "End this station. outcome \"done\" when the work is complete and verified (the factory then runs the station's gate, if any); outcome \"blocked\" when you need a person, with your question in the summary."
+                       :parameters "{\"type\":\"object\",\"properties\":{\"outcome\":{\"type\":\"string\",\"enum\":[\"done\",\"blocked\"],\"description\":\"done or blocked\"},\"summary\":{\"type\":\"string\",\"description\":\"What changed and how you verified it; or, when blocked, exactly what you need.\"}},\"required\":[\"outcome\",\"summary\"],\"additionalProperties\":false}"))
+  (tool-summary [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (let [(mut out) (sb-new a)]
+                  (sb-push-str! (mut out) "finish: ")
+                  (sb-push-str! (mut out) (call-string call "outcome"))
+                  (sb-finish! (mut out))))
+  (tool-run [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (if (= (call-string call "outcome") "blocked")
+                (ToolOk "Recorded. The station is waiting for a person; their answer will arrive as a message.")
+                (if (> (len (.gate self)) 0)
+                    (ToolOk "Recorded. The factory is running the gate now.")
+                    (ToolOk "Recorded. The station is complete.")))))
+
+;; ---------------------------------------------------------------------------
+;; A run
+
+(defstruct Worker
+  [(allocator (dyn Allocator))
+   (home (slice u8))
+   (config SiteConfig)
+   (run RunSpec)
+   (factory FactorySpec)
+   (state RunState)
+   (events (slice u8))
+   (workspace (slice u8))
+   (base (slice u8))])
+
+(defsum StationResult
+  (StationPassed [(summary (slice u8))])
+  (StationBlocked [(summary (slice u8))])
+  (StationCancelled [])
+  (StationFailed [(reason (slice u8))]))
+
+(defn emit! [(worker (ptr Worker)) (record JVal)] (-> i64)
+  (match (append-record! (.allocator worker) (.events worker) record)
+    (AppendedAt [offset] 0)
+    (AppendFailed [message]
+                  (fail [i64] "factory: cannot append to the run journal; stopping rather than working unobserved"))))
+
+(defn finish-run! [(worker (ptr Worker)) (status (slice u8)) (reason (slice u8))] (-> i64)
+  (let [a (.allocator worker)]
+    (emit! worker (ev-text! a (ev-str! (ev a "run.finished") "status" status) "reason" reason 2000))))
+
+(defn text-join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+;;; Make the run's worktree if it does not exist yet. Returns "" on success or
+;;; the reason it could not be made.
+(defn prepare-workspace! [(worker (ptr Worker))] (-> (slice u8))
+  (let [a (.allocator worker)
+        run (field worker run)
+        workspace (.workspace worker)]
+    (match (atomic/dir-exists? a workspace)
+      (Ok [exists]
+          (if exists
+              (do (set! (.base worker) (.base (field worker state))) "")
+              (if (= (len (.project run)) 0)
+                  (match (atomic/ensure-dir! a workspace 493)
+                    (Err [failure] "could not create the workspace directory")
+                    (Ok [made]
+                        (let [init (git-init-scratch a workspace)
+                              branched (if (git-ok? init)
+                                           (git a workspace ["checkout" "-q" "-b" (.branch run)])
+                                           (load init))]
+                          (if (not (git-ok? branched))
+                              (git-message branched)
+                              (match (git-head a workspace)
+                                (Some [head] (do (set! (.base worker) head) ""))
+                                (None [] "the new repository has no commit"))))))
+                  (let [base (if (> (len (.base run)) 0)
+                                 (.base run)
+                                 (match (git-head a (.project run))
+                                   (Some [head] head)
+                                   (None [] "")))]
+                    (if (= (len base) 0)
+                        (text-join a ["project " (.project run) " is not a git repository with a commit"])
+                        (let [made (git-worktree-add a (.project run) workspace (.branch run) base)]
+                          (if (git-ok? made)
+                              (do (set! (.base worker) base) "")
+                              (text-join a ["could not create the worktree: " (git-message made)]))))))))
+      (Err [failure] "could not inspect the workspace directory"))))
+
+(defn handoffs-before [(worker (ptr Worker)) (index i64)] (-> (ArrayList Handoff))
+  (let [a (.allocator worker)
+        (mut out) (al-new [Handoff] a)
+        spec (field worker factory)
+        st (field worker state)
+        (mut i) 0]
+    (loop (if (>= (load i) index)
+              (break)
+              (let [station (station-spec spec (load i))
+                    known (station-at st (.name station))]
+                (when (= (.status known) "passed")
+                  (push! [Handoff] (mut out) (Handoff :station (.name station) :summary (.summary known)))
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load out)))
+
+(defn short-summary [(a (dyn Allocator)) (station (slice u8)) (summary (slice u8))] (-> (slice u8))
+  (text-join a [station ": " (first-line a summary 72)]))
+
+;;; Run one station to an outcome.
+(defn run-station! [(worker (ptr Worker)) (index i64)] (-> StationResult)
+  (let [a (.allocator worker)
+        spec (field worker factory)
+        station (station-spec spec index)
+        name (.name station)
+        st (field worker state)
+        known (station-at st name)
+        model-name (model-for worker station)
+        gate (.gate station)
+        attempts (station-attempts spec station)
+        checkpoint (transcript-path a (.home worker) (.id (field worker run)) name)]
+    (block :station
+           (let [resolved (match (resolve-model a (field worker config) model-name)
+                            (ModelOk [found] found)
+                            (ModelBad [message] (return-from :station (StationFailed message))))
+                 tools-text (station-tools spec station)
+                 (mut registry) (registry-new a)
+                 finish (box! a FinishTool (FinishTool :gate gate))]
+             (match (add-tool-groups! a (mut registry) (.workspace worker) tools-text
+                                      (.isolation (field worker config)))
+               (Some [problem] (return-from :station (StationFailed problem)))
+               (None [] 0))
+             (registry-add! (mut registry) finish)
+             (let [control (journal-control-new a (.events worker) name st)
+                   observer (box! a JournalObserver (primitive/zeroed JournalObserver))
+                   agent (box! a Agent (agent-new a (.provider resolved)
+                                                  (agent-config (.model resolved) "finish")
+                                                  (mut registry) observer control))
+                   (mut gate-failures) (.gate-failures known)
+                   (mut quiet-replies) 0]
+               (set! (.allocator observer) a)
+               (set! (.path observer) (.events worker))
+               (set! (.agent-name observer) name)
+               (set! (.agent observer) agent)
+               (set! (.checkpoint observer) checkpoint)
+               (let [resumed (match (atomic/read-file-if-exists a checkpoint)
+                               (Ok [found] (match found
+                                             (Some [text] (agent-restore! agent text))
+                                             (None [] false)))
+                               (Err [failure] false))]
+                 (if resumed
+                     (agent-add-user! agent "[factory] This station was interrupted and has resumed. The workspace may hold changes from the interrupted turn; check its state before continuing.")
+                     (let [handoffs (handoffs-before worker index)]
+                       (agent-add-system! agent
+                                          (station-system-prompt a
+                                                                 (StationBrief :factory (.name spec)
+                                                                               :station name
+                                                                               :station-number (+ index 1)
+                                                                               :station-count (station-count spec)
+                                                                               :workspace (.workspace worker)
+                                                                               :branch (.branch (field worker run))
+                                                                               :base (.base worker)
+                                                                               :gate gate
+                                                                               :attempts attempts
+                                                                               :tools tools-text
+                                                                               :context (.context spec)
+                                                                               :instructions (.instructions station)
+                                                                               :brief (.brief (field worker run))
+                                                                               :handoffs (al-slice [Handoff] handoffs))))
+                       (agent-add-user! agent (station-kickoff a name))))
+                 (emit! worker (ev-bool! (ev-str! (ev-agent a "station.started" name) "model" (.label resolved))
+                                         "resumed" resumed)))
+               (loop
+                 (let [stop (agent-run! agent)]
+                   (save-checkpoint! observer)
+                   (match stop
+                     (Cancelled [] (return-from :station (StationCancelled)))
+                     (Failed [failure]
+                             (let [error failure]
+                               (return-from :station
+                                              (StationFailed (text-join a ["the model failed (" (.kind error) "): "
+                                                                           (first-line a (.message error) 300)])))))
+                     (Replied [text]
+                              (do (set! quiet-replies (+ (load quiet-replies) 1))
+                                  (if (>= (load quiet-replies) 2)
+                                      (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
+                                                                  "summary" text 4000))
+                                          (return-from :station (StationBlocked text)))
+                                      (agent-add-user! agent (no-tool-nudge)))
+                                  0))
+                     (Finished [called result]
+                               (let [call called
+                                     outcome (call-string call "outcome")
+                                     summary (call-string call "summary")]
+                                 (set! quiet-replies 0)
+                                 (if (= outcome "blocked")
+                                     (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
+                                                                 "summary" summary 4000))
+                                         (return-from :station (StationBlocked summary)))
+                                     0)
+                                 (when (> (len gate) 0)
+                                   (emit! worker (ev-str! (ev-agent a "gate.started" name) "command" gate))
+                                   (let [gate-run (run-gate a (.workspace worker) gate
+                                                            (.isolation (field worker config)) control)]
+                                     (emit! worker (ev-text! a (ev-int! (ev-bool! (ev-str! (ev-agent a "gate.finished" name) "command" gate)
+                                                                                  "ok" (.ok gate-run))
+                                                                        "exit" (.exit gate-run))
+                                                             "output" (.output gate-run) 3000))
+                                     (when (.cancelled gate-run)
+                                       (return-from :station (StationCancelled)))
+                                     (when (not (.ok gate-run))
+                                       (set! gate-failures (+ (load gate-failures) 1))
+                                       (when (>= (load gate-failures) attempts)
+                                         (let [why (text-join a ["The gate `" gate "` failed " (int-text a (load gate-failures))
+                                                                 " times. Last output:\n" (tail-text (.output gate-run) 1500)])]
+                                           (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
+                                                                   "summary" why 4000))
+                                           (return-from :station (StationBlocked why))))
+                                       (agent-add-user! agent
+                                                        (gate-failure-message a gate (.exit gate-run)
+                                                                              (tail-text (.output gate-run) 6000)
+                                                                              (- attempts (load gate-failures))))
+                                       (continue))
+                                     0)
+                                   0)
+                                 (let [commit (git-commit-all a (.workspace worker) (short-summary a name summary))
+                                       head (match (git-head a (.workspace worker)) (Some [h] h) (None [] ""))]
+                                   (emit! worker (ev-text! a (ev-str! (ev-str! (ev-agent a "station.finished" name) "outcome" "passed")
+                                                                      "commit" head)
+                                                           "summary" summary 4000))
+                                   (return-from :station (StationPassed summary)))))))))
+             (StationCancelled)))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+;;; The last `limit` bytes of `text`, starting at a line boundary when possible.
+(defn tail-text [(text (slice u8)) (limit i64)] (-> (slice u8))
+  (if (<= (len text) limit)
+      text
+      (let [(mut start) (- (len text) limit)]
+        (loop (if (or (>= (load start) (len text))
+                      (= (cast i64 (get text (- (load start) 1))) 10))
+                  (break)
+                  (set! start (+ (load start) 1))))
+        (subslice [u8] text (load start) (len text)))))
+
+(defn first-unpassed [(worker (ptr Worker))] (-> i64)
+  (let [spec (field worker factory)
+        st (field worker state)
+        n (station-count spec)
+        (mut i) 0]
+    (loop (if (or (>= (load i) n)
+                  (not (= (.status (station-at st (.name (station-spec spec (load i))))) "passed")))
+              (break)
+              (set! i (+ (load i) 1))))
+    (load i)))
+
+;;; Walk the stations from the first one that has not passed.
+(defn run-stations! [(worker (ptr Worker))] (-> i64)
+  (let [a (.allocator worker)
+        n (station-count (field worker factory))
+        (mut i) (first-unpassed worker)
+        (mut done) false]
+    (loop (if (or (>= (load i) n) (load done))
+              (break)
+              (do
+                (match (run-station! worker (load i))
+                  (StationPassed [summary] (set! i (+ (load i) 1)))
+                  (StationBlocked [summary]
+                                  (do (finish-run! worker "blocked"
+                                                   (text-join a [(.name (station-spec (field worker factory) (load i)))
+                                                                 " is waiting for you: " (first-line a summary 300)]))
+                                      (set! done true)))
+                  (StationCancelled [] (do (emit! worker (ev-str! (ev-agent a "station.finished" (.name (station-spec (field worker factory) (load i)))) "outcome" "cancelled"))
+                                           (finish-run! worker "cancelled" "stopped by an operator")
+                                           (set! done true)))
+                  (StationFailed [reason] (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" (.name (station-spec (field worker factory) (load i)))) "outcome" "failed") "summary" reason 2000))
+                                              (finish-run! worker "failed" reason)
+                                              (set! done true))))
+                0)))
+    (when (not (load done))
+      (git-commit-all a (.workspace worker) "factory: remaining changes")
+      (finish-run! worker "succeeded" "")
+      0)
+    0))
+
+;;; A conversation with the agent of a station after the run has finished.
+(defn converse! [(worker (ptr Worker)) (name (slice u8))] (-> i64)
+  (let [a (.allocator worker)
+        spec (field worker factory)
+        index (find-station spec name)]
+    (block :converse
+           (when (< index 0)
+             (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply"
+                                     "There is no station by that name in this factory." 400))
+             (return-from :converse 0))
+           (let [station (station-spec spec index)
+                 model-name (model-for worker station)
+                 resolved (match (resolve-model a (field worker config) model-name)
+                            (ModelOk [found] found)
+                            (ModelBad [message]
+                                      (do (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply" message 400))
+                                          (return-from :converse 0))))
+                 (mut registry) (registry-new a)
+                 finish (box! a FinishTool (FinishTool :gate ""))]
+             (match (add-tool-groups! a (mut registry) (.workspace worker) (station-tools spec station)
+                                      (.isolation (field worker config)))
+               (Some [problem] (return-from :converse 0))
+               (None [] 0))
+             (registry-add! (mut registry) finish)
+             (let [control (journal-control-new a (.events worker) name (field worker state))
+                   observer (box! a JournalObserver (primitive/zeroed JournalObserver))
+                   agent (box! a Agent (agent-new a (.provider resolved)
+                                                  (agent-config (.model resolved) "finish")
+                                                  (mut registry) observer control))
+                   checkpoint (transcript-path a (.home worker) (.id (field worker run)) name)]
+               (set! (.allocator observer) a)
+               (set! (.path observer) (.events worker))
+               (set! (.agent-name observer) name)
+               (set! (.agent observer) agent)
+               (set! (.checkpoint observer) checkpoint)
+               (match (atomic/read-file-if-exists a checkpoint)
+                 (Ok [found] (match found
+                               (Some [text] (do (agent-restore! agent text) 0))
+                               (None [] 0)))
+                 (Err [failure] 0))
+               (agent-add-user! agent (conversation-note))
+               (emit! worker (ev-agent a "conversation.started" name))
+               (let [stop (agent-run! agent)
+                     reply (match stop
+                             (Replied [text] text)
+                             (Finished [call result] (call-string call "summary"))
+                             (Cancelled [] "(cancelled)")
+                             (Failed [failure] (let [e failure] (.message e))))]
+                 (save-checkpoint! observer)
+                 (git-commit-all a (.workspace worker) (text-join a [name ": follow-up"]))
+                 (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply" reply 4000))
+                 0))))))
+
+(defn now-wall [] (-> i64) (wall-ms))
+
+;;; `factory _run RUN-ID`. Returns the process exit code.
+(defn worker-main [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> i64)
+  (let [dir (run-dir a home run-id)
+        lock-path (path-join a dir "lock")]
+    (block :main
+           (let [(mut run-lock) (match (lock/lock-open! a lock-path)
+                                  (Ok [l] l)
+                                  (Err [failure] (return-from :main 70)))]
+             (match (lock/lock-try! (mut run-lock))
+               (Ok [held] (when (not held)
+                            (println "factory: another process is already running {s}" run-id)
+                            (return-from :main 0)))
+               (Err [failure] (return-from :main 70)))
+             (lock/pid-write! a (path-join a dir "pid") (pid))
+             (let [worker (box! a Worker (primitive/zeroed Worker))
+                   events (events-path a home run-id)]
+               (set! (.allocator worker) a)
+               (set! (.home worker) home)
+               (set! (.events worker) events)
+               (set! (.workspace worker) (workspace-path a home run-id))
+               (set! (.state worker) (load-run-state a home run-id))
+               (let [run (match (load-run-spec a home run-id)
+                           (RunSpecOk [spec] spec)
+                           (RunSpecBad [message]
+                                       (do (finish-run! worker "failed" message)
+                                           (return-from :main 1))))]
+                 (set! (.run worker) run))
+               (match (load-site-config a home)
+                 (SiteConfigOk [config] (set! (.config worker) config))
+                 (SiteConfigBad [message] (do (finish-run! worker "failed" message)
+                                              (return-from :main 1))))
+               (match (parse-factory a (.factory-text (field worker run)))
+                 (SpecOk [spec] (set! (.factory worker) spec))
+                 (SpecBad [problems]
+                          (do (finish-run! worker "failed" (problems-text a problems))
+                              (return-from :main 1))))
+               (let [st (field worker state)
+                     status (.status st)
+                     all-passed (>= (first-unpassed worker) (station-count (field worker factory)))
+                     conversation (or all-passed (= status "cancelled"))]
+                 (if conversation
+                     ;; Answer every agent that has been spoken to.
+                     (let [(mut names) (al-new [(slice u8)] a)]
+                       (for pending (iter (.pending st))
+                         (let [m pending
+                               (mut seen) false]
+                           (for n (iter names) (when (= n (.agent m)) (set! seen true) 0))
+                           (when (not (load seen)) (push! [(slice u8)] (mut names) (.agent m)) 0)))
+                       (for n (iter names) (converse! worker n))
+                       0)
+                     (let [problem (prepare-workspace! worker)]
+                       (if (> (len problem) 0)
+                           (finish-run! worker "failed" problem)
+                           (do (emit! worker (ev-str! (ev-str! (ev-str! (ev a "run.started") "base" (.base worker))
+                                                               "workspace" (.workspace worker))
+                                                      "pid" (int-text a (pid))))
+                               (set! (.state worker) (load-run-state a home run-id))
+                               (run-stations! worker)))
+                       0)))
+               (atomic/unlink-path a (path-join a dir "pid"))
+               (lock/unlock! (mut run-lock))
+               0)))))
+
+;;; The model for a station: the run's explicit choice, then the station's,
+;;; then the factory's, then the site default.
+(defn model-for [(worker (ptr Worker)) (station (ptr StationSpec))] (-> (slice u8))
+  (let [chosen (.model (field worker run))]
+    (if (> (len chosen) 0)
+        chosen
+        (station-model (field worker factory) station (.default-model (field worker config))))))

@@ -1,0 +1,370 @@
+(module factory.ui.feed)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [copy-bytes])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+
+;;; A run's journal as readable one-line items: time, agent, glyph, text, and
+;;; for tool calls the result (✓/✗ and duration) folded into the call's line.
+(defstruct FeedItem
+  [(t i64)
+   (clock (slice u8))
+   (agent (slice u8))
+   (glyph (slice u8))
+   (glyph-tone Tone)
+   (text (slice u8))
+   (tone Tone)
+   (result (slice u8))
+   (result-tone Tone)
+   (call (slice u8))])
+
+;;; The feed and the journal cursor it has read up to.
+(defstruct Feed
+  [(arenas Arenas)
+   (items (ArrayList FeedItem))
+   (cursor i64)
+   (loaded bool)])
+
+(const FEED-LIMIT 2000)
+
+(const FEED-KEEP 1000)
+
+(defn feed-init! [(feed (ptr Feed)) (parent (dyn Allocator))] (-> i64)
+  (arenas-init! (field feed arenas) parent)
+  (set! (.items feed) (al-new [FeedItem] parent))
+  (set! (.cursor feed) 0)
+  (set! (.loaded feed) false)
+  0)
+
+(defn feed-reset! [(feed (ptr Feed))] (-> i64)
+  (al-clear! (mut (.items feed)))
+  (arenas-clear! (field feed arenas))
+  (set! (.cursor feed) 0)
+  (set! (.loaded feed) false)
+  0)
+
+(defn feed-count [(feed (ptr Feed))] (-> i64)
+  (len (.items feed)))
+
+(defn feed-item [(feed (ptr Feed)) (i i64)] (-> (ptr FeedItem))
+  (al-elem (field feed items) i))
+
+(defn feed--copy-item [(a (dyn Allocator)) (item (ptr FeedItem))] (-> FeedItem)
+  (FeedItem
+    :t (.t item)
+    :clock (copy-bytes a (.clock item))
+    :agent (copy-bytes a (.agent item))
+    :glyph (copy-bytes a (.glyph item))
+    :glyph-tone (.glyph-tone item)
+    :text (copy-bytes a (.text item))
+    :tone (.tone item)
+    :result (copy-bytes a (.result item))
+    :result-tone (.result-tone item)
+    :call (copy-bytes a (.call item))))
+
+;;; Keep the newest FEED-KEEP items once there are more than FEED-LIMIT.
+(defn feed--compact! [(feed (ptr Feed))] (-> i64)
+  (let [n (len (.items feed))]
+    (when (> n FEED-LIMIT)
+      (let [a (arenas-spare (field feed arenas))
+            first (- n FEED-KEEP)
+            (mut kept) (al-new [FeedItem] (.alc (.items feed)))
+            (mut i) first]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (push! (mut kept)
+                           (feed--copy-item a (feed-item feed (load i))))
+                    (set! i (+ (load i) 1)))))
+        (al-free! (mut (.items feed)))
+        (set! (.items feed) (load kept))
+        (arenas-flip! (field feed arenas))))
+    0))
+
+(defn feed--push! [(feed (ptr Feed))
+                   (record JVal)
+                   (glyph (slice u8))
+                   (glyph-tone Tone)
+                   (text (slice u8))
+                   (tone Tone)] (-> i64)
+  (let [a (arenas-active (field feed arenas))
+        t (ji record "t")]
+    (push! (mut (.items feed))
+           (FeedItem
+             :t t
+             :clock (fmt-clock a t true)
+             :agent (copy-bytes a (js record "agent"))
+             :glyph glyph
+             :glyph-tone glyph-tone
+             :text (copy-bytes a text)
+             :tone tone
+             :result ""
+             :result-tone (ToneMuted)
+             :call ""))
+    0))
+
+(defn feed--last [(feed (ptr Feed))] (-> (ptr FeedItem))
+  (feed-item feed (- (len (.items feed)) 1)))
+
+;;; A tool result folded into its call: "✓ 120ms" or "✗ 3.4s · first line".
+(defn tool-result-text [(a (dyn Allocator)) (record JVal)] (-> (slice u8))
+  (let [ok (jb record "ok")
+        ms (ji record "ms")
+        took (fmt-ms a ms)]
+    (if ok
+        (concat a ["✓ " took])
+        (concat a ["✗ " took " · " (first-line (js record "output"))]))))
+
+(defn feed--tool-finished! [(feed (ptr Feed)) (record JVal)] (-> i64)
+  (let [a (arenas-active (field feed arenas))
+        call (js record "call")
+        n (len (.items feed))
+        (mut i) (- n 1)
+        (mut found) -1]
+    (loop (if (or (< (load i) 0) (< (load i) (- n 64)))
+              (break)
+              (if (= (.call (feed-item feed (load i))) call)
+                  (do (set! found (load i)) (break))
+                  (set! i (- (load i) 1)))))
+    (when (< (load found) 0)
+      (feed--push! feed
+                   record
+                   (tool-glyph (js record "tool"))
+                   (ToneAccent)
+                   (tool-summary-text (js record "tool") (js record "summary"))
+                   (ToneMuted))
+      (set! found (- (len (.items feed)) 1)))
+    (let [item (feed-item feed (load found))]
+      (set! (.result item) (tool-result-text a record))
+      (set! (.result-tone item) (if (jb record "ok") (ToneSuccess) (ToneError))))
+    0))
+
+(defn feed--message [(a (dyn Allocator)) (record JVal) (verb (slice u8))] (-> (slice u8))
+  (concat a [(js record "from") verb (first-line (js record "text"))]))
+
+;;; Append one journal record as a feed line. Unknown kinds are shown by name.
+(defn feed-ingest! [(feed (ptr Feed)) (record JVal)] (-> i64)
+  (let [a (arenas-active (field feed arenas))
+        kind (js record "kind")]
+    (cond (= kind "agent.usage") 0
+          (= kind "agent.turn")
+            (feed--push! feed
+                         record
+                         "⟳"
+                         (ToneSubtle)
+                         (concat a ["turn " (int-text a (ji record "turn"))])
+                         (ToneSubtle))
+          (= kind "agent.text")
+            (feed--push! feed
+                         record
+                         "💬"
+                         (ToneAccent)
+                         (first-line (js record "text"))
+                         (TonePlain))
+          (= kind "agent.thought")
+            (feed--push! feed
+                         record
+                         "💭"
+                         (ToneSubtle)
+                         (first-line (js record "text"))
+                         (ToneThought))
+          (= kind "tool.started")
+            (do
+              (feed--push! feed
+                           record
+                           (tool-glyph (js record "tool"))
+                           (ToneAccent)
+                           (tool-summary-text (js record "tool")
+                                              (js record "summary"))
+                           (TonePlain))
+              (set! (.call (feed--last feed)) (copy-bytes a (js record "call")))
+              0)
+          (= kind "tool.finished") (feed--tool-finished! feed record)
+          (= kind "station.started")
+            (feed--push! feed
+                         record
+                         "▶"
+                         (ToneAccent)
+                         (concat a
+                                 ["station started"
+                                  (if (jb record "resumed") " (resumed)" "")])
+                         (ToneStrong))
+          (= kind "station.finished")
+            (let [outcome (js record "outcome")
+                  passed (= outcome "passed")]
+              (feed--push! feed
+                           record
+                           (if passed "✓" "▲")
+                           (if passed (ToneSuccess) (ToneWarning))
+                           (concat a
+                                   ["station "
+                                    outcome
+                                    " — "
+                                    (first-line (js record "summary"))])
+                           (if passed (ToneSuccess) (ToneWarning))))
+          (= kind "gate.started")
+            (feed--push! feed
+                         record
+                         "◈"
+                         (ToneAccentAlt)
+                         (concat a ["gate: " (js record "command")])
+                         (TonePlain))
+          (= kind "gate.finished")
+            (if (jb record "ok")
+                (feed--push! feed
+                             record
+                             "◈"
+                             (ToneSuccess)
+                             "gate passed"
+                             (ToneSuccess))
+                (feed--push! feed
+                             record
+                             "◈"
+                             (ToneError)
+                             (concat a
+                                     ["gate failed (exit "
+                                      (int-text a (ji record "exit"))
+                                      ") "
+                                      (first-line (js record "output"))])
+                             (ToneError)))
+          (= kind "message.sent")
+            (feed--push! feed
+                         record
+                         "✉"
+                         (ToneWarning)
+                         (feed--message a record " → ")
+                         (TonePlain))
+          (= kind "message.received")
+            (feed--push! feed
+                         record
+                         "✉"
+                         (ToneSubtle)
+                         (feed--message a record " ✓ read: ")
+                         (ToneSubtle))
+          (= kind "conversation.started")
+            (feed--push! feed
+                         record
+                         "💬"
+                         (ToneAccentAlt)
+                         "conversation started"
+                         (ToneMuted))
+          (= kind "conversation.finished")
+            (feed--push! feed
+                         record
+                         "💬"
+                         (ToneAccentAlt)
+                         (concat a
+                                 ["replied: " (first-line (js record "reply"))])
+                         (TonePlain))
+          (= kind "finding")
+            (let [severity (js record "severity")]
+              (feed--push! feed
+                           record
+                           (severity-glyph severity)
+                           (severity-tone severity)
+                           (concat a
+                                   ["["
+                                    (js record "code")
+                                    "] "
+                                    (first-line (js record "message"))])
+                           (severity-tone severity)))
+          (= kind "oversight")
+            (let [verdict (js record "verdict")]
+              (feed--push! feed
+                           record
+                           "◉"
+                           (verdict-tone verdict)
+                           (concat a
+                                   ["overseer: "
+                                    verdict
+                                    " — "
+                                    (first-line (js record "reason"))])
+                           (verdict-tone verdict)))
+          (= kind "control")
+            (feed--push! feed
+                         record
+                         "‖"
+                         (ToneWarning)
+                         (concat a
+                                 [(js record "action") " by " (js record "by")])
+                         (ToneWarning))
+          (= kind "agent.retry")
+            (feed--push! feed
+                         record
+                         "↻"
+                         (ToneWarning)
+                         (concat a
+                                 ["model retry "
+                                  (int-text a (ji record "attempt"))
+                                  ": "
+                                  (first-line (js record "message"))])
+                         (ToneWarning))
+          (= kind "agent.paused")
+            (feed--push! feed record "‖" (ToneWarning) "paused" (ToneWarning))
+          (= kind "agent.resumed")
+            (feed--push! feed record "▶" (ToneAccent) "resumed" (TonePlain))
+          (= kind "run.created")
+            (feed--push! feed
+                         record
+                         "◆"
+                         (ToneAccent)
+                         "run created"
+                         (ToneMuted))
+          (= kind "run.started")
+            (feed--push! feed
+                         record
+                         "◆"
+                         (ToneAccent)
+                         "run started"
+                         (ToneStrong))
+          (= kind "run.requeued")
+            (feed--push! feed
+                         record
+                         "◆"
+                         (ToneAccent)
+                         "run requeued"
+                         (ToneMuted))
+          (= kind "run.lost")
+            (feed--push! feed
+                         record
+                         "◆"
+                         (ToneError)
+                         "run process lost"
+                         (ToneError))
+          (= kind "run.finished")
+            (let [status (js record "status")
+                  reason (first-line (js record "reason"))]
+              (feed--push! feed
+                           record
+                           "◆"
+                           (if (= status "succeeded")
+                               (ToneSuccess)
+                               (ToneWarning))
+                           (concat a
+                                   ["run "
+                                    status
+                                    (if (> (len reason) 0) " — " "")
+                                    reason])
+                           (if (= status "succeeded")
+                               (ToneSuccess)
+                               (ToneWarning))))
+          :else (feed--push! feed record "·" (ToneSubtle) kind (ToneSubtle)))
+    (feed--compact! feed)))
+
+;;; Ingest `{"cursor": N, "records": [...]}` and advance the cursor.
+(defn feed-ingest-page! [(feed (ptr Feed)) (page JVal)] (-> i64)
+  (let [records (jv-get page "records")
+        n (jv-len records)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (feed-ingest! feed (jv-nth records (load i)))
+                (set! i (+ (load i) 1)))))
+    (set! (.cursor feed) (ji page "cursor"))
+    (set! (.loaded feed) true)
+    n))

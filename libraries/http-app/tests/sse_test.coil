@@ -1,0 +1,121 @@
+(module http-app-sse-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "http_app.router" :use *)
+(import "http_app.sse" :use *)
+(import "sse.core" :as sse)
+
+;;; Replays a fixed script of batches and records every cursor it was asked about.
+(defstruct ScriptedSource
+  [(step i64)
+   (cursors (ArrayList (slice u8)))
+   (released i64)
+   (bad-data bool)])
+
+(impl SseSource ScriptedSource
+  (sse-next [(self (ptr ScriptedSource))
+             (a (dyn Allocator))
+             (cursor (slice u8))]
+            (-> SseBatch)
+            (let [(mut copy) (al-new [u8] (malloc-allocator))
+                  (mut events) (al-new [sse/SseEvent] a)
+                  step (.step self)]
+              (al-extend! [u8] (mut copy) (slice-data cursor) (len cursor))
+              (push! [(slice u8)] (mut (.cursors self)) (al-slice [u8] copy))
+              (set! (.step self) (+ step 1))
+              (cond (= step 0) (SseNothing)
+                    (= step 1)
+                      (do
+                        (push! [sse/SseEvent]
+                               (mut events)
+                               (sse-event "" "7" "first\nsecond"))
+                        (push! [sse/SseEvent]
+                               (mut events)
+                               (sse-event "note" "" "no id"))
+                        (SseEvents (al-slice [sse/SseEvent] events)))
+                    (= step 2)
+                      (if (.bad-data self)
+                          (do
+                            (push! [sse/SseEvent]
+                                   (mut events)
+                                   (sse-event "" "8" "carriage\rreturn"))
+                            (SseEvents (al-slice [sse/SseEvent] events)))
+                          (SseNothing))
+                    :else (SseEnd))))
+  (sse-release [(self (ptr ScriptedSource)) (reason StreamEndReason)]
+               (-> i64)
+               (set! (.released self) (+ (.released self) 1))
+               0))
+
+(defn chunk-of [(step StreamStep)] (-> (slice u8))
+  (match step
+    (StreamChunk [bytes] bytes)
+    (_ "<not a chunk>")))
+
+(defn idle? [(step StreamStep)] (-> bool)
+  (match step
+    (StreamIdle [] true)
+    (_ false)))
+
+(defn stream-of [(reply Response)] (-> (dyn ResponseStream))
+  (match (.stream reply)
+    (Some [stream] stream)
+    (None [] (do (assert false) (primitive/zeroed (dyn ResponseStream))))))
+
+(deftest sse-response-frames-events-tracks-the-cursor-and-keeps-alive
+         (let [a (malloc-allocator)
+               source (primitive/alloc-stack ScriptedSource)
+               (mut options) (sse-options)]
+           (set! source (primitive/zeroed ScriptedSource))
+           (set! (.cursors source) (al-new [(slice u8)] a))
+           (set! (.keep-alive-ms options) 100)
+           (set! (.retry-ms options) 3000)
+           (let [reply (sse-response a source "5" options)
+                 stream (stream-of reply)]
+             (assert-eq (.status reply) 200)
+             (assert (= (.content-type reply)
+                        "text/event-stream; charset=utf-8"))
+             (assert-eq (len (.headers reply)) 2)
+             ;; step 0: nothing yet, but the retry hint is pending.
+             (assert (= (chunk-of (stream-next stream a 0)) "retry: 3000\n\n"))
+             ;; step 1: two events; the second has no id, so the cursor becomes 7.
+             (assert (= (chunk-of (stream-next stream a 0))
+                        "id: 7\ndata: first\ndata: second\n\nevent: note\ndata: no id\n\n"))
+             ;; step 2: nothing new; quiet for less than keep-alive -> idle.
+             (assert (idle? (stream-next stream a 99)))
+             ;; step 3 ends the source.
+             (assert (match (stream-next stream a 0)
+                       (StreamDone [] true)
+                       (_ false)))
+             (assert (= (get (.cursors source) 0) "5"))
+             (assert (= (get (.cursors source) 1) "5"))
+             (assert (= (get (.cursors source) 2) "7"))
+             (assert (= (get (.cursors source) 3) "7"))
+             (stream-release stream (ReleaseCompleted))
+             (assert-eq (.released source) 1))))
+
+(deftest sse-keep-alive-comment-after-quiet-period
+         (let [a (malloc-allocator)
+               source (primitive/alloc-stack ScriptedSource)
+               (mut options) (sse-options)]
+           (set! source (primitive/zeroed ScriptedSource))
+           (set! (.cursors source) (al-new [(slice u8)] a))
+           (set! (.keep-alive-ms options) 100)
+           (let [stream (stream-of (sse-response a source "" options))]
+             (assert (= (chunk-of (stream-next stream a 100))
+                        ": keep-alive\n\n")))))
+
+(deftest sse-events-that-cannot-be-framed-fail-the-stream
+         (let [a (malloc-allocator)
+               source (primitive/alloc-stack ScriptedSource)]
+           (set! source (primitive/zeroed ScriptedSource))
+           (set! (.cursors source) (al-new [(slice u8)] a))
+           (set! (.bad-data source) true)
+           (let [stream (stream-of (sse-response a source "" (sse-options)))]
+             (assert (idle? (stream-next stream a 0)))
+             (stream-next stream a 0)
+             (assert (match (stream-next stream a 0)
+                       (StreamFailed [] true)
+                       (_ false))))))

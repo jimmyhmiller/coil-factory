@@ -1,0 +1,61 @@
+(module tui.fatal)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+
+(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+
+(extern abort :cc c [] (-> void))
+
+;;; The terminal-restoration callback run before a fatal error aborts the process.
+;;; `tui.term` installs it while the terminal is in raw mode so that a failure
+;;; never leaves the user's shell in the alternate screen with echo disabled.
+(defstruct FatalHook [(installed bool) (restore (fnptr c [] i64))])
+
+(defn fatal-hook [] (-> (ptr FatalHook))
+  (primitive/alloc-static FatalHook))
+
+;;; Register `restore` to run (once) before any `fatal` abort.
+(defn fatal-set-restore-hook! [(restore (fnptr c [] i64))] (-> i64)
+  (set! (.restore (fatal-hook)) restore)
+  (set! (.installed (fatal-hook)) true)
+  0)
+
+;;; Remove the restoration callback (the terminal has been restored normally).
+(defn fatal-clear-restore-hook! [] (-> i64)
+  (set! (.installed (fatal-hook)) false)
+  0)
+
+(defn fatal--write-stderr [(text (slice u8))] (-> i64)
+  (let [(mut at) 0
+        n (len text)]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [written
+                      (cast i64
+                            (write (cast i32 2)
+                                   (cast (ptr i8)
+                                         (index (slice-data text) (load at)))
+                                   (cast isize (- n (load at)))))]
+                (if (<= written 0)
+                    (break)
+                    (set! at (+ (load at) written))))))
+    0))
+
+;;; Abort the process with `tui: fatal: MESSAGE` on stderr, after restoring the
+;;; terminal. This is the library's single failure path for states that cannot be
+;;; handled: it never returns.
+(defn fatal [(message (slice u8))] (-> i64)
+  (when (.installed (fatal-hook))
+    (set! (.installed (fatal-hook)) false)
+    (call-ptr (.restore (fatal-hook)))
+    0)
+  (fatal--write-stderr "tui: fatal: ")
+  (fatal--write-stderr message)
+  (fatal--write-stderr "\n")
+  (abort)
+  0)
+
+;;; `fatal` usable in any expression position: aborts, never yields a value.
+(defn fatal-as [T] [(message (slice u8))] (-> T)
+  (fatal message)
+  (zeroed T))

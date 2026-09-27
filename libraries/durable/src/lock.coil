@@ -1,0 +1,129 @@
+(module durable.lock)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.try" :use *)
+(import "durable.atomic" :use *)
+(import "durable.error" :use *)
+(import "durable.fdio" :use *)
+(import "durable.sys" :use *)
+
+;;; An advisory, whole-file, exclusive lock taken with flock(2) on a descriptor this
+;;; value owns.
+;;;
+;;; flock locks belong to the open file description, so two `FileLock`s opened
+;;; separately exclude each other even inside one process, while one `FileLock`
+;;; shared between threads is a single owner. The kernel releases the lock when the
+;;; descriptor is closed, including when the process dies, so a crashed holder never
+;;; leaves a stale lock. Advisory: it only excludes other flock users.
+(defstruct FileLock
+  [(fd i32)
+   (held bool)])
+
+;;; Default permission bits for a lock file created by `lock-open!`.
+(const LOCK-FILE-MODE 384)
+
+;;; Open (creating with mode 0600 if needed) the lock file at `path`. The lock is
+;;; not taken yet; call `lock-try!` or `lock-wait!`.
+(defn lock-open! [(a (dyn Allocator)) (path (slice u8))] (-> (Result FileLock
+                                                                     DurableError))
+  (match (open-path a
+                    path
+                    (| SYS-O-RDWR (| SYS-O-CREAT SYS-O-CLOEXEC))
+                    LOCK-FILE-MODE)
+    (Err [e] (Err e))
+    (Ok [fd] (Ok (FileLock :fd fd :held false)))))
+
+(defn lock-check-open [(lock FileLock)] (-> (Result i64 DurableError))
+  (if (< (.fd lock) (cast i32 0))
+      (Err (Invalid "the lock has been closed"))
+      (Ok 0)))
+
+;;; Take the lock without blocking: `true` when this lock now holds it, `false` when
+;;; another holder has it.
+(defn lock-try! [(lock (mut FileLock))] (-> (Result bool DurableError))
+  (try (try! (lock-check-open (load lock)))
+       (let [got (try! (flock-fd (.fd lock) (| SYS-LOCK-EX SYS-LOCK-NB)))]
+         (when got (set! (.held lock) true) 0)
+         (Ok got))))
+
+;;; Block until the lock is taken.
+(defn lock-wait! [(lock (mut FileLock))] (-> (Result i64 DurableError))
+  (try (try! (lock-check-open (load lock)))
+       (try! (flock-fd (.fd lock) SYS-LOCK-EX))
+       (set! (.held lock) true)
+       (Ok 0)))
+
+;;; Release the lock; the file stays open for a later `lock-try!`/`lock-wait!`.
+(defn unlock! [(lock (mut FileLock))] (-> (Result i64 DurableError))
+  (try (try! (lock-check-open (load lock)))
+       (try! (flock-fd (.fd lock) SYS-LOCK-UN))
+       (set! (.held lock) false)
+       (Ok 0)))
+
+(defn lock-held? [(lock FileLock)] (-> bool)
+  (.held lock))
+
+;;; Close the lock file, releasing the lock if held. Closing twice is an error.
+(defn lock-close! [(lock (mut FileLock))] (-> (Result i64 DurableError))
+  (try (try! (lock-check-open (load lock)))
+       (let [fd (.fd lock)]
+         (set! (.fd lock) (cast i32 -1))
+         (set! (.held lock) false)
+         (close-fd fd))))
+
+;;; Write `pid` followed by a newline to `path` atomically (mode 0644).
+(defn pid-write! [(a (dyn Allocator)) (path (slice u8)) (pid i64)] (-> (Result i64
+                                                                               DurableError))
+  (try (ensure! (> pid 0) (Err (Invalid "a pid must be positive")))
+       (let [(mut sb) (sb-new a)]
+         (sb-push-i64! (mut sb) pid)
+         (sb-push-str! (mut sb) "\n")
+         (let [text (sb-finish! (mut sb))
+               result (write-file-atomic! a path text 420)]
+           (free-bytes a text 1)
+           result))))
+
+;;; The pid stored at `path`, or `None` when the file does not exist. Content that is
+;;; not a positive decimal integer (surrounding whitespace allowed) is `Corrupt`.
+(defn pid-read [(a (dyn Allocator)) (path (slice u8))] (-> (Result (Option i64)
+                                                                   DurableError))
+  (try (match (try! (read-file-if-exists a path))
+         (None [] (Ok (None [i64])))
+         (Some [bytes]
+               (let [text (str-trim bytes)
+                     (mut value) 0
+                     (mut ok) (> (len text) 0)
+                     (mut i) 0]
+                 (loop (if (or (>= (load i) (len text)) (not (load ok)))
+                           (break)
+                           (let [c (cast i64 (get text (load i)))]
+                             (if (and (>= c 48)
+                                      (<= c 57)
+                                      (< (load value) 100000000000))
+                                 (set! value (+ (* (load value) 10) (- c 48)))
+                                 (set! ok false))
+                             (set! i (+ (load i) 1)))))
+                 (free-bytes a bytes 1)
+                 (ensure! (and (load ok) (> (load value) 0))
+                          (Err (Corrupt "pid file does not contain a positive decimal pid")))
+                 (Ok (Some (load value))))))))
+
+;;; Whether process `pid` exists, by kill(pid, 0). EPERM (the process exists but
+;;; belongs to another user) counts as alive; ESRCH as dead. A zombie that has not
+;;; been reaped still counts as alive. Non-positive pids are refused: kill(0, ...)
+;;; and kill(-1, ...) address process groups.
+(defn pid-alive? [(pid i64)] (-> (Result bool DurableError))
+  (try (ensure! (> pid 0) (Err (Invalid "a pid must be positive")))
+       (ensure! (<= pid 2147483647) (Err (Invalid "pid out of range")))
+       (if (= (os/kill (cast i32 pid) (cast i32 0)) (cast i32 0))
+           (Ok true)
+           (let [err (os-error "kill")]
+             (match (error-os-code err)
+               (Some [code]
+                     (cond (= code SYS-EPERM) (Ok true)
+                           (= code SYS-ESRCH) (Ok false)
+                           :else (Err err)))
+               (None [] (Err err)))))))

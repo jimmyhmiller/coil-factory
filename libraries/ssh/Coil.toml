@@ -1,0 +1,12 @@
+[package]
+name = "ssh"
+source-roots = ["src", "tests"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]
+
+[test.suites.live]
+roots = ["tests/live"]
+suffixes = ["_live.coil"]
+default = false

@@ -1,0 +1,137 @@
+(module agent_tools.bundle)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.files" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.shell" :use *)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(export StandardTools standard-tools standard-tools-free!)
+
+;;; The tools for one workspace and the registry that lists them. The tools
+;;; are allocated in `allocator`; the registry borrows them. Free everything
+;;; with `standard-tools-free!`.
+;;; Group "files": read_file, write_file, edit_file, list_dir, search.
+;;; Group "shell": shell.
+(defstruct StandardTools
+  [(allocator (dyn Allocator))
+   (registry ToolRegistry)
+   (read-file (Option (ptr ReadFileTool)))
+   (write-file (Option (ptr WriteFileTool)))
+   (edit-file (Option (ptr EditFileTool)))
+   (list-dir (Option (ptr ListDirTool)))
+   (search (Option (ptr SearchTool)))
+   (shell (Option (ptr ShellTool)))])
+
+(defn known-group? [(name (slice u8))] (-> bool)
+  (or (= name "files") (= name "shell")))
+
+(defn selected? [(groups (slice (slice u8))) (name (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (len groups)))
+              (break)
+              (do (when (= (get groups (load i)) name)
+                    (set! found true)
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;;; Err for an unknown or repeated group name. Names match exactly.
+(defn check-groups [(a (dyn Allocator)) (groups (slice (slice u8)))] (-> (Result i64 (slice u8)))
+  (let [(mut i) 0
+        (mut outcome) (: (Ok 0) (Result i64 (slice u8)))]
+    (loop (if (>= (load i) (len groups))
+              (break)
+              (let [name (get groups (load i))]
+                (cond (not (known-group? name))
+                        (do (set! outcome (Err (join3 a "unknown tool group " (quoted a name) "; the groups are \"files\" and \"shell\"")))
+                            (break))
+                      (selected? (subslice groups 0 (load i)) name)
+                        (do (set! outcome (Err (join3 a "tool group " (quoted a name) " is listed more than once")))
+                            (break))
+                      :else (set! i (+ (load i) 1))))))
+    (load outcome)))
+
+(defn add! [(tools (mut StandardTools)) (tool (dyn Tool))] (-> i64)
+  (if (registry-add! (mut (.registry tools)) tool)
+      0
+      ;; Every tool here has a distinct name, so this is a programming error.
+      (sys/fatal "standard-tools registered two tools with the same name")))
+
+(defn add-files! [(tools (mut StandardTools)) (workspace Workspace) (backend SearchBackend)] (-> i64)
+  (let [a (.allocator tools)
+        read (box! a ReadFileTool (read-file-tool workspace))
+        write (box! a WriteFileTool (write-file-tool workspace))
+        edit (box! a EditFileTool (edit-file-tool workspace))
+        list (box! a ListDirTool (list-dir-tool workspace))
+        search (box! a SearchTool (search-tool workspace backend))]
+    (set! (.read-file tools) (Some read))
+    (set! (.write-file tools) (Some write))
+    (set! (.edit-file tools) (Some edit))
+    (set! (.list-dir tools) (Some list))
+    (set! (.search tools) (Some search))
+    (add! (mut tools) read)
+    (add! (mut tools) write)
+    (add! (mut tools) edit)
+    (add! (mut tools) list)
+    (add! (mut tools) search)))
+
+(defn add-shell! [(tools (mut StandardTools)) (workspace Workspace) (policy SandboxPolicy)] (-> i64)
+  (let [shell (box! (.allocator tools) ShellTool (shell-tool workspace policy))]
+    (set! (.shell tools) (Some shell))
+    (add! (mut tools) shell)))
+
+;;; Allocate the tools for `groups` (a subset of "files" and "shell") over
+;;; `workspace`, with shell commands confined by `policy`, and register them.
+;;; Err names an unknown or repeated group, or a missing search program.
+(defn standard-tools [(a (dyn Allocator))
+                      (workspace Workspace)
+                      (policy SandboxPolicy)
+                      (groups (slice (slice u8)))] (-> (Result StandardTools (slice u8)))
+  (match (check-groups a groups)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [(mut tools) (StandardTools :allocator a
+                                         :registry (registry-new a)
+                                         :read-file (None)
+                                         :write-file (None)
+                                         :edit-file (None)
+                                         :list-dir (None)
+                                         :search (None)
+                                         :shell (None))
+              files (: (if (selected? groups "files")
+                        (match (search-backend-detect a)
+                          (Err [message] (Err message))
+                          (Ok [backend] (Ok (add-files! (mut tools) workspace backend))))
+                        (Ok 0))
+                       (Result i64 (slice u8)))]
+          (match files
+            (Err [message] (do (standard-tools-free! (mut tools)) (Err message)))
+            (Ok [_]
+                (do (when (selected? groups "shell")
+                      (add-shell! (mut tools) workspace policy)
+                      0)
+                    (Ok (load tools)))))))))
+
+;;; Free the registry and every tool `standard-tools` allocated.
+(defn standard-tools-free! [(tools (mut StandardTools))] (-> i64)
+  (let [a (.allocator tools)]
+    (registry-free! (mut (.registry tools)))
+    (match (.read-file tools) (Some [p] (destroy a p)) (None [] 0))
+    (match (.write-file tools) (Some [p] (destroy a p)) (None [] 0))
+    (match (.edit-file tools) (Some [p] (destroy a p)) (None [] 0))
+    (match (.list-dir tools) (Some [p] (destroy a p)) (None [] 0))
+    (match (.search tools) (Some [p] (destroy a p)) (None [] 0))
+    (match (.shell tools) (Some [p] (destroy a p)) (None [] 0))
+    (set! (.read-file tools) (None))
+    (set! (.write-file tools) (None))
+    (set! (.edit-file tools) (None))
+    (set! (.list-dir tools) (None))
+    (set! (.search tools) (None))
+    (set! (.shell tools) (None))
+    0))

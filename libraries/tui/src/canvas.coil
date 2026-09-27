@@ -1,0 +1,1271 @@
+(module tui.canvas)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "tui.fatal" :use [fatal])
+(import "tui.width" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Colors and styles
+
+;;; A terminal color. `Default` leaves the terminal's own foreground/background.
+;;; `Rgb` is 24-bit; it is downgraded to the 256- or 16-color palette at render
+;;; time when the terminal lacks truecolor. `Indexed` is a 256-color palette slot.
+(defsum Color
+  (Default)
+  (Rgb [(r u8) (g u8) (b u8)])
+  (Indexed [(n u8)]))
+
+(impl Eq Color
+  (= [(a Color) (b Color)]
+     (-> bool)
+     (match a
+       (Default [] (match b (Default [] true) (_ false)))
+       (Rgb [r g bl]
+            (match b
+              (Rgb [r2 g2 b2] (and (= r r2) (= g g2) (= bl b2)))
+              (_ false)))
+       (Indexed [n] (match b (Indexed [m] (= n m)) (_ false))))))
+
+;;; A 24-bit color from 0xRRGGBB.
+(defn hex [(value i64)] (-> Color)
+  (Rgb
+    :r (cast u8 (primitive/iand (primitive/ishr value 16) 255))
+    :g (cast u8 (primitive/iand (primitive/ishr value 8) 255))
+    :b (cast u8 (primitive/iand value 255))))
+
+;;; A 24-bit color from components (each 0-255).
+(defn rgb [(r i64) (g i64) (b i64)] (-> Color)
+  (Rgb
+    :r (cast u8 r)
+    :g (cast u8 g)
+    :b (cast u8 b)))
+
+;;; A 256-color palette slot.
+(defn indexed [(n i64)] (-> Color)
+  (Indexed (cast u8 n)))
+
+(const ATTR-BOLD 1)
+
+(const ATTR-DIM 2)
+
+(const ATTR-ITALIC 4)
+
+(const ATTR-UNDERLINE 8)
+
+(const ATTR-REVERSE 16)
+
+;;; Foreground, background and an attribute bit set (ATTR-BOLD, ATTR-DIM,
+;;; ATTR-ITALIC, ATTR-UNDERLINE, ATTR-REVERSE).
+(defstruct Style [(fg Color) (bg Color) (attrs i64)])
+
+(impl Eq Style
+  (= [(a Style) (b Style)]
+     (-> bool)
+     (and (= (.attrs a) (.attrs b)) (= (.fg a) (.fg b)) (= (.bg a) (.bg b)))))
+
+;;; The terminal's default style: no colors, no attributes.
+(defn style-default [] (-> Style)
+  (Style
+    :fg (Default)
+    :bg (Default)
+    :attrs 0))
+
+;;; Default style with foreground `color`.
+(defn fg [(color Color)] (-> Style)
+  (Style
+    :fg color
+    :bg (Default)
+    :attrs 0))
+
+(defn with-fg [(s Style) (color Color)] (-> Style)
+  (Style
+    :fg color
+    :bg (.bg s)
+    :attrs (.attrs s)))
+
+(defn with-bg [(s Style) (color Color)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bg color
+    :attrs (.attrs s)))
+
+(defn with-attrs [(s Style) (attrs i64)] (-> Style)
+  (Style
+    :fg (.fg s)
+    :bg (.bg s)
+    :attrs (primitive/ior (.attrs s) attrs)))
+
+(defn bold [(s Style)] (-> Style)
+  (with-attrs s ATTR-BOLD))
+
+(defn dim [(s Style)] (-> Style)
+  (with-attrs s ATTR-DIM))
+
+(defn italic [(s Style)] (-> Style)
+  (with-attrs s ATTR-ITALIC))
+
+(defn underline [(s Style)] (-> Style)
+  (with-attrs s ATTR-UNDERLINE))
+
+(defn reverse [(s Style)] (-> Style)
+  (with-attrs s ATTR-REVERSE))
+
+;;; How many colors the terminal can show. See `tui.term/detect-color-mode`.
+(defsum ColorMode
+  (NoColor)
+  (Ansi16)
+  (Ansi256)
+  (TrueColor))
+
+;; ---------------------------------------------------------------------------
+;; Rectangles and layout
+
+;;; A rectangle of cells. Width/height are never negative in values this library
+;;; produces.
+(defstruct Rect [(x i64) (y i64) (w i64) (h i64)])
+
+(defn rect [(x i64) (y i64) (w i64) (h i64)] (-> Rect)
+  (Rect
+    :x x
+    :y y
+    :w (if (< w 0) 0 w)
+    :h (if (< h 0) 0 h)))
+
+(defn rect-empty? [(r Rect)] (-> bool)
+  (or (<= (.w r) 0) (<= (.h r) 0)))
+
+(defn rect-right [(r Rect)] (-> i64)
+  (+ (.x r) (.w r)))
+
+(defn rect-bottom [(r Rect)] (-> i64)
+  (+ (.y r) (.h r)))
+
+(defn rect-contains? [(r Rect) (x i64) (y i64)] (-> bool)
+  (and (>= x (.x r)) (< x (rect-right r)) (>= y (.y r)) (< y (rect-bottom r))))
+
+;;; Shrink by `dx` columns on the left and right and `dy` rows top and bottom.
+(defn rect-inset-xy [(r Rect) (dx i64) (dy i64)] (-> Rect)
+  (rect (+ (.x r) dx) (+ (.y r) dy) (- (.w r) (* 2 dx)) (- (.h r) (* 2 dy))))
+
+;;; Shrink by `n` cells on every side.
+(defn rect-inset [(r Rect) (n i64)] (-> Rect)
+  (rect-inset-xy r n n))
+
+(defn rect-intersect [(a Rect) (b Rect)] (-> Rect)
+  (let [x0 (if (> (.x a) (.x b)) (.x a) (.x b))
+        y0 (if (> (.y a) (.y b)) (.y a) (.y b))
+        x1 (if (< (rect-right a) (rect-right b)) (rect-right a) (rect-right b))
+        y1
+          (if (< (rect-bottom a) (rect-bottom b))
+              (rect-bottom a)
+              (rect-bottom b))]
+    (rect x0 y0 (- x1 x0) (- y1 y0))))
+
+(defn layout--clamp [(n i64) (limit i64)] (-> i64)
+  (cond (< n 0) 0 (> n limit) limit :else n))
+
+;;; The first `n` rows of `r` (clamped).
+(defn rect-take-top [(r Rect) (n i64)] (-> Rect)
+  (rect (.x r) (.y r) (.w r) (layout--clamp n (.h r))))
+
+;;; `r` without its first `n` rows.
+(defn rect-drop-top [(r Rect) (n i64)] (-> Rect)
+  (let [k (layout--clamp n (.h r))]
+    (rect (.x r) (+ (.y r) k) (.w r) (- (.h r) k))))
+
+;;; The last `n` rows of `r`.
+(defn rect-take-bottom [(r Rect) (n i64)] (-> Rect)
+  (let [k (layout--clamp n (.h r))]
+    (rect (.x r) (- (rect-bottom r) k) (.w r) k)))
+
+;;; `r` without its last `n` rows.
+(defn rect-drop-bottom [(r Rect) (n i64)] (-> Rect)
+  (rect (.x r) (.y r) (.w r) (- (.h r) (layout--clamp n (.h r)))))
+
+;;; The first `n` columns of `r`.
+(defn rect-take-left [(r Rect) (n i64)] (-> Rect)
+  (rect (.x r) (.y r) (layout--clamp n (.w r)) (.h r)))
+
+;;; `r` without its first `n` columns.
+(defn rect-drop-left [(r Rect) (n i64)] (-> Rect)
+  (let [k (layout--clamp n (.w r))]
+    (rect (+ (.x r) k) (.y r) (- (.w r) k) (.h r))))
+
+;;; The last `n` columns of `r`.
+(defn rect-take-right [(r Rect) (n i64)] (-> Rect)
+  (let [k (layout--clamp n (.w r))]
+    (rect (- (rect-right r) k) (.y r) k (.h r))))
+
+;;; `r` without its last `n` columns.
+(defn rect-drop-right [(r Rect) (n i64)] (-> Rect)
+  (rect (.x r) (.y r) (- (.w r) (layout--clamp n (.w r))) (.h r)))
+
+;;; A size request for one part of a split. `Fixed` cells, a `Ratio` of the whole
+;;; (num/den), or a `Fill` share (by weight) of what the others leave.
+(defsum Constraint
+  (Fixed [(cells i64)])
+  (Ratio [(num i64) (den i64)])
+  (Fill [(weight i64)]))
+
+;;; Resolve `constraints` over `total` cells separated by `gap`, writing each
+;;; part's size into `sizes` (same length). Fixed and ratio parts are granted in
+;;; order until space runs out; fill parts share the remainder by weight.
+(defn layout-sizes [(total i64)
+                    (gap i64)
+                    (constraints (slice Constraint))
+                    (sizes (slice i64))] (-> i64)
+  (when (!= (len constraints) (len sizes))
+    (fatal "layout-sizes: constraints and sizes differ in length"))
+  (let [n (len constraints)
+        gaps (if (> n 1) (* gap (- n 1)) 0)
+        (mut remaining) (if (> (- total gaps) 0) (- total gaps) 0)
+        (mut weights) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [want
+                        (match (get constraints (load i))
+                          (Fixed [cells] cells)
+                          (Ratio [num den]
+                                 (if (<= den 0)
+                                     (fatal "layout-sizes: Ratio denominator must be positive")
+                                     (/ (* total num) den)))
+                          (Fill [weight]
+                                (do
+                                  (when (< weight 0)
+                                    (fatal "layout-sizes: Fill weight must not be negative"))
+                                  (set! weights (+ (load weights) weight))
+                                  -1)))]
+                  (if (< want 0)
+                      (set! (index (slice-data sizes) (load i)) 0)
+                      (let [granted (layout--clamp want (load remaining))]
+                        (set! (index (slice-data sizes) (load i)) granted)
+                        (set! remaining (- (load remaining) granted)))))
+                (set! i (+ (load i) 1)))))
+    (let [pool (load remaining)
+          (mut given) 0
+          (mut last-fill) -1
+          (mut j) 0]
+      (loop (if (>= (load j) n)
+                (break)
+                (do
+                  (match (get constraints (load j))
+                    (Fill [weight]
+                          (let [share
+                                  (if (= (load weights) 0)
+                                      0
+                                      (/ (* pool weight) (load weights)))]
+                            (set! (index (slice-data sizes) (load j)) share)
+                            (set! given (+ (load given) share))
+                            (set! last-fill (load j))))
+                    (_ 0))
+                  (set! j (+ (load j) 1)))))
+      ;; Integer division leaves at most a few cells; the last fill part absorbs them.
+      (when (>= (load last-fill) 0)
+        (let [slot (index (slice-data sizes) (load last-fill))]
+          (set! slot (+ (load slot) (- pool (load given))))))
+      0)))
+
+(defn layout--split [(r Rect)
+                     (constraints (slice Constraint))
+                     (gap i64)
+                     (out (slice Rect))
+                     (vertical bool)] (-> i64)
+  (when (!= (len constraints) (len out))
+    (fatal "split: constraints and output rects differ in length"))
+  (let [n (len constraints)
+        (mut sizes) (zeroed (array i64 32))]
+    (when (> n 32) (fatal "split: at most 32 parts are supported"))
+    (layout-sizes (if vertical (.h r) (.w r))
+                  gap
+                  constraints
+                  (slice-new [i64] (index sizes 0) n))
+    (let [(mut at) (if vertical (.y r) (.x r))
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (let [size (load (index sizes (load i)))]
+                  (set! (index (slice-data out) (load i))
+                        (if vertical
+                            (rect (.x r) (load at) (.w r) size)
+                            (rect (load at) (.y r) size (.h r))))
+                  (set! at (+ (load at) (+ size gap)))
+                  (set! i (+ (load i) 1)))))
+      n)))
+
+;;; Stack parts top-to-bottom: divides the height of `r`. Writes one Rect per
+;;; constraint into `out` (same length, at most 32).
+(defn split-vertical [(r Rect)
+                      (constraints (slice Constraint))
+                      (gap i64)
+                      (out (slice Rect))] (-> i64)
+  (layout--split r constraints gap out true))
+
+;;; Place parts left-to-right: divides the width of `r`.
+(defn split-horizontal [(r Rect)
+                        (constraints (slice Constraint))
+                        (gap i64)
+                        (out (slice Rect))] (-> i64)
+  (layout--split r constraints gap out false))
+
+;;; A rect of `w`x`h` centered in `r` (clamped to `r`).
+(defn rect-center [(r Rect) (w i64) (h i64)] (-> Rect)
+  (let [cw (layout--clamp w (.w r))
+        ch (layout--clamp h (.h r))]
+    (rect (+ (.x r) (/ (- (.w r) cw) 2)) (+ (.y r) (/ (- (.h r) ch) 2)) cw ch)))
+
+;; ---------------------------------------------------------------------------
+;; The cell grid
+
+;;; One screen cell. `width` is 1 or 2 for a cell that starts a grapheme and 0
+;;; for the right half of a wide grapheme. A single-scalar grapheme lives in
+;;; `rune`; a multi-scalar one (`ext-len` > 0) lives in the canvas byte pool.
+(defstruct Cell
+  [(rune i64)
+   (ext-off i64)
+   (ext-len i64)
+   (width i64)
+   (style Style)])
+
+;;; A width x height grid of styled cells plus the desired cursor state.
+;;; `valid` is false until the canvas mirrors what is on screen (used for the
+;;; previous frame in diff rendering).
+(defstruct Canvas
+  [(allocator (dyn Allocator))
+   (width i64)
+   (height i64)
+   (cells (ArrayList Cell))
+   (pool (ArrayList u8))
+   (cursor-visible bool)
+   (cursor-x i64)
+   (cursor-y i64)
+   (valid bool)])
+
+(defn blank-cell [] (-> Cell)
+  (Cell
+    :rune 32
+    :ext-off 0
+    :ext-len 0
+    :width 1
+    :style (style-default)))
+
+(defn canvas--fill-blank! [(c (ptr Canvas))] (-> i64)
+  (al-clear! (mut (.cells c)))
+  (al-clear! (mut (.pool c)))
+  (let [n (* (.width c) (.height c))
+        (mut i) 0]
+    (al-reserve! (mut (.cells c)) n)
+    (loop (if (>= (load i) n)
+              (break)
+              (do (push! (mut (.cells c)) (blank-cell)) (set! i (+ (load i) 1)))))
+    0))
+
+;;; A blank canvas of `width` x `height` cells (negative sizes become 0).
+(defn canvas-new [(a (dyn Allocator)) (width i64) (height i64)] (-> Canvas)
+  (let [(mut c)
+          (Canvas
+            :allocator a
+            :width (if (< width 0) 0 width)
+            :height (if (< height 0) 0 height)
+            :cells (al-new [Cell] a)
+            :pool (al-new [u8] a)
+            :cursor-visible false
+            :cursor-x 0
+            :cursor-y 0
+            :valid false)]
+    (canvas--fill-blank! (mut c))
+    (load c)))
+
+;;; Release the canvas's storage.
+(defn canvas-free! [(c (ptr Canvas))] (-> i64)
+  (al-free! (mut (.cells c)))
+  (al-free! (mut (.pool c)))
+  0)
+
+;;; Resize and blank the canvas. It is marked invalid (it no longer mirrors the
+;;; screen), so the next diff against it repaints everything.
+(defn canvas-resize! [(c (ptr Canvas)) (width i64) (height i64)] (-> i64)
+  (set! (.width c) (if (< width 0) 0 width))
+  (set! (.height c) (if (< height 0) 0 height))
+  (set! (.valid c) false)
+  (canvas--fill-blank! c))
+
+;;; Blank every cell and hide the cursor. Keeps size and validity.
+(defn canvas-clear! [(c (ptr Canvas))] (-> i64)
+  (let [n (* (.width c) (.height c))
+        data (.data (.cells c))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (set! (index data (load i)) (blank-cell))
+                (set! i (+ (load i) 1)))))
+    (al-clear! (mut (.pool c)))
+    (set! (.cursor-visible c) false)
+    0))
+
+;;; Mark the canvas as not mirroring the screen (forces a full repaint).
+(defn canvas-invalidate! [(c (ptr Canvas))] (-> i64)
+  (set! (.valid c) false)
+  0)
+
+;;; The whole canvas as a rect.
+(defn canvas-rect [(c (ptr Canvas))] (-> Rect)
+  (rect 0 0 (.width c) (.height c)))
+
+;;; Pointer to the cell at (x, y). Aborts when out of bounds.
+(defn canvas-cell [(c (ptr Canvas)) (x i64) (y i64)] (-> (ptr Cell))
+  (when (or (< x 0) (< y 0) (>= x (.width c)) (>= y (.height c)))
+    (fatal "canvas-cell: coordinates outside the canvas"))
+  (index (.data (.cells c)) (+ (* y (.width c)) x)))
+
+;;; The grapheme bytes of a cell (encoded from `rune` into `scratch` when it is a
+;;; single scalar). `scratch` must hold 4 bytes and outlive the result.
+(defn cell-bytes [(c (ptr Canvas)) (cell (ptr Cell)) (scratch (ptr u8))] (-> (slice u8))
+  (if (> (.ext-len cell) 0)
+      (slice-new [u8] (index (.data (.pool c)) (.ext-off cell)) (.ext-len cell))
+      (slice-new [u8] scratch (utf8-encode-into scratch (.rune cell)))))
+
+;;; Show the terminal cursor at (x, y) after the frame is drawn.
+(defn canvas-set-cursor! [(c (ptr Canvas)) (x i64) (y i64)] (-> i64)
+  (set! (.cursor-visible c) true)
+  (set! (.cursor-x c) x)
+  (set! (.cursor-y c) y)
+  0)
+
+(defn canvas-hide-cursor! [(c (ptr Canvas))] (-> i64)
+  (set! (.cursor-visible c) false)
+  0)
+
+;;; Clear the cell at (x, y) to a blank, keeping its style.
+(defn canvas--blank-at! [(c (ptr Canvas)) (x i64) (y i64)] (-> i64)
+  (let [cell (canvas-cell c x y)]
+    (set! (.rune cell) 32)
+    (set! (.ext-len cell) 0)
+    (set! (.width cell) 1)
+    0))
+
+;;; Before overwriting (x, y) with a grapheme of `width` cells, repair any wide
+;;; grapheme it would cut in half.
+(defn canvas--prepare! [(c (ptr Canvas)) (x i64) (y i64) (width i64)] (-> i64)
+  (let [cell (canvas-cell c x y)]
+    (when (and (= (.width cell) 0) (> x 0))
+      (canvas--blank-at! c (- x 1) y))
+    (when (and (= (.width cell) 2) (< (+ x 1) (.width c)))
+      (canvas--blank-at! c (+ x 1) y))
+    (when (and (= width 2) (< (+ x 1) (.width c)))
+      (let [right (canvas-cell c (+ x 1) y)]
+        (when (and (= (.width right) 2) (< (+ x 2) (.width c)))
+          (canvas--blank-at! c (+ x 2) y))))
+    0))
+
+;;; Store one grapheme cluster of `text` at (x, y). The caller guarantees the
+;;; cluster (and its right half, when wide) lies on the canvas.
+(defn canvas--put-cluster! [(c (ptr Canvas))
+                            (x i64)
+                            (y i64)
+                            (text (slice u8))
+                            (start i64)
+                            (end i64)
+                            (rune i64)
+                            (single bool)
+                            (width i64)
+                            (style Style)] (-> i64)
+  (canvas--prepare! c x y width)
+  (let [cell (canvas-cell c x y)]
+    (set! (.rune cell) rune)
+    (set! (.width cell) width)
+    (set! (.style cell) style)
+    (if single
+        (set! (.ext-len cell) 0)
+        (do
+          (set! (.ext-off cell) (len (.pool c)))
+          (set! (.ext-len cell) (- end start))
+          (al-extend! (mut (.pool c))
+                      (index (slice-data text) start)
+                      (- end start))))
+    (when (= width 2)
+      (let [right (canvas-cell c (+ x 1) y)]
+        (set! (.rune right) 0)
+        (set! (.ext-len right) 0)
+        (set! (.width right) 0)
+        (set! (.style right) style)))
+    0))
+
+;;; Append a zero-width cluster (e.g. a stray combining mark) to the grapheme in
+;;; cell (x, y), moving that cell's grapheme into the pool.
+(defn canvas--append-to-cell! [(c (ptr Canvas))
+                               (x i64)
+                               (y i64)
+                               (bytes (slice u8))] (-> i64)
+  (let [cell (canvas-cell c x y)
+        (mut scratch) (zeroed (array u8 4))
+        old (cell-bytes c cell (index scratch 0))
+        off (len (.pool c))]
+    ;; `old` may live in the pool; copy it byte by byte so growth cannot move it
+    ;; out from under the read.
+    (let [(mut copy) (al-new [u8] (.allocator c))]
+      (al-extend! (mut copy) (slice-data old) (len old))
+      (al-extend! (mut (.pool c)) (.data copy) (len copy))
+      (al-free! (mut copy)))
+    (al-extend! (mut (.pool c)) (slice-data bytes) (len bytes))
+    (set! (.ext-off cell) off)
+    (set! (.ext-len cell) (- (len (.pool c)) off))
+    0))
+
+(defn canvas--draw-text! [(c (ptr Canvas))
+                          (clip Rect)
+                          (x i64)
+                          (y i64)
+                          (text (slice u8))
+                          (style Style)
+                          (ellipsis bool)] (-> i64)
+  (let [area (rect-intersect clip (canvas-rect c))]
+    (if (or (rect-empty? area) (< y (.y area)) (>= y (rect-bottom area)))
+        0
+        (let [limit (rect-right area)
+              total (if ellipsis (text-width text) 0)
+              cut (and ellipsis (> (+ x total) limit) (> limit (.x area)))
+              stop (if cut (- limit 1) limit)
+              (mut it) (clusters text)
+              (mut col) x
+              (mut last-x) -1
+              (mut written) 0]
+          (loop (match (cluster-next! (mut it))
+                  (None [] (break))
+                  (Some [(Cluster
+                           :start start
+                           :end end
+                           :width w
+                           :rune r
+                           :single single)]
+                        (cond (= w 0)
+                                (when (and (not (rune-control? r))
+                                           (>= (load last-x) 0))
+                                  (canvas--append-to-cell! c
+                                                           (load last-x)
+                                                           y
+                                                           (subslice text
+                                                                     start
+                                                                     end)))
+                              (> (+ (load col) w) stop) (break)
+                              (< (load col) (.x area))
+                                (do
+                                  ;; The part of a wide grapheme that lands inside the clip is blank.
+                                  (when (> (+ (load col) w) (.x area))
+                                    (canvas--prepare! c (.x area) y 1)
+                                    (let [cell (canvas-cell c (.x area) y)]
+                                      (set! (.rune cell) 32)
+                                      (set! (.ext-len cell) 0)
+                                      (set! (.width cell) 1)
+                                      (set! (.style cell) style))
+                                    (set! written (+ (load written) 1)))
+                                  (set! col (+ (load col) w)))
+                              :else
+                                (do
+                                  (canvas--put-cluster! c
+                                                        (load col)
+                                                        y
+                                                        text
+                                                        start
+                                                        end
+                                                        r
+                                                        single
+                                                        w
+                                                        style)
+                                  (set! last-x (load col))
+                                  (set! col (+ (load col) w))
+                                  (set! written (+ (load written) w)))))))
+          (when (and cut (>= (load col) (.x area)) (< (load col) limit))
+            (canvas--prepare! c (load col) y 1)
+            (let [cell (canvas-cell c (load col) y)]
+              (set! (.rune cell) 0x2026)
+              (set! (.ext-len cell) 0)
+              (set! (.width cell) 1)
+              (set! (.style cell) style))
+            (set! written (+ (load written) 1)))
+          (load written)))))
+
+;;; Draw one line of text at (x, y), clipped to `clip` and the canvas. Width
+;;; aware: a wide grapheme that would straddle the right edge is not drawn.
+;;; Control characters (including newlines) are skipped. Returns the number of
+;;; columns written, so spans can be chained: `(+ x (put-text! …))`.
+(defn put-text! [(c (ptr Canvas))
+                 (clip Rect)
+                 (x i64)
+                 (y i64)
+                 (text (slice u8))
+                 (style Style)] (-> i64)
+  (canvas--draw-text! c clip x y text style false))
+
+;;; Like `put-text!`, but when the text does not fit before the right edge of the
+;;; clip it ends in "…" in the last visible column.
+(defn put-text-ellipsis! [(c (ptr Canvas))
+                          (clip Rect)
+                          (x i64)
+                          (y i64)
+                          (text (slice u8))
+                          (style Style)] (-> i64)
+  (canvas--draw-text! c clip x y text style true))
+
+;;; Fill `r` (clipped to the canvas) with the single-cell glyph `rune`.
+(defn fill! [(c (ptr Canvas)) (r Rect) (rune i64) (style Style)] (-> i64)
+  (when (!= (rune-width rune) 1)
+    (fatal "fill!: the fill glyph must be exactly one cell wide"))
+  (let [area (rect-intersect r (canvas-rect c))
+        (mut y) (.y area)]
+    (loop (if (>= (load y) (rect-bottom area))
+              (break)
+              (let [(mut x) (.x area)]
+                (loop (if (>= (load x) (rect-right area))
+                          (break)
+                          (do
+                            (canvas--prepare! c (load x) (load y) 1)
+                            (let [cell (canvas-cell c (load x) (load y))]
+                              (set! (.rune cell) rune)
+                              (set! (.ext-len cell) 0)
+                              (set! (.width cell) 1)
+                              (set! (.style cell) style))
+                            (set! x (+ (load x) 1)))))
+                (set! y (+ (load y) 1)))))
+    0))
+
+;;; Set the style of every cell in `r` without changing its glyph (e.g. to
+;;; highlight a selected row).
+(defn restyle! [(c (ptr Canvas)) (r Rect) (style Style)] (-> i64)
+  (let [area (rect-intersect r (canvas-rect c))
+        (mut y) (.y area)]
+    (loop (if (>= (load y) (rect-bottom area))
+              (break)
+              (let [(mut x) (.x area)]
+                (loop (if (>= (load x) (rect-right area))
+                          (break)
+                          (do
+                            (set! (.style (canvas-cell c (load x) (load y)))
+                                  style)
+                            (set! x (+ (load x) 1)))))
+                (set! y (+ (load y) 1)))))
+    0))
+
+;;; Horizontal run of `rune` from (x, y), `length` cells long.
+(defn hline! [(c (ptr Canvas))
+              (x i64)
+              (y i64)
+              (length i64)
+              (rune i64)
+              (style Style)] (-> i64)
+  (fill! c (rect x y length 1) rune style))
+
+;;; Vertical run of `rune` from (x, y), `length` cells tall.
+(defn vline! [(c (ptr Canvas))
+              (x i64)
+              (y i64)
+              (length i64)
+              (rune i64)
+              (style Style)] (-> i64)
+  (fill! c (rect x y 1 length) rune style))
+
+;;; Set one cell to the single-cell glyph `rune` (ignored outside the canvas).
+(defn put-rune! [(c (ptr Canvas)) (x i64) (y i64) (rune i64) (style Style)] (-> i64)
+  (fill! c (rect x y 1 1) rune style))
+
+;; ---------------------------------------------------------------------------
+;; Boxes
+
+;;; Border line style for `draw-box!`.
+(defsum BorderKind
+  (Rounded)
+  (Plain)
+  (Heavy)
+  (Double))
+
+;;; Glyphs of a border: corners, horizontal and vertical runs.
+(defstruct BorderGlyphs
+  [(top-left i64)
+   (top-right i64)
+   (bottom-left i64)
+   (bottom-right i64)
+   (horizontal i64)
+   (vertical i64)])
+
+(defn border-glyphs [(kind BorderKind)] (-> BorderGlyphs)
+  (match kind
+    (Rounded []
+             (BorderGlyphs
+               :top-left 0x256D
+               :top-right 0x256E
+               :bottom-left 0x2570
+               :bottom-right 0x256F
+               :horizontal 0x2500
+               :vertical 0x2502))
+    (Plain []
+           (BorderGlyphs
+             :top-left 0x250C
+             :top-right 0x2510
+             :bottom-left 0x2514
+             :bottom-right 0x2518
+             :horizontal 0x2500
+             :vertical 0x2502))
+    (Heavy []
+           (BorderGlyphs
+             :top-left 0x250F
+             :top-right 0x2513
+             :bottom-left 0x2517
+             :bottom-right 0x251B
+             :horizontal 0x2501
+             :vertical 0x2503))
+    (Double []
+            (BorderGlyphs
+              :top-left 0x2554
+              :top-right 0x2557
+              :bottom-left 0x255A
+              :bottom-right 0x255D
+              :horizontal 0x2550
+              :vertical 0x2551))))
+
+;;; Everything `draw-box!` needs. An empty `title`/`footer` is not drawn. The
+;;; title sits left in the top border, the footer right in the bottom border,
+;;; each padded by one space drawn in its own style.
+(defstruct BoxOpts
+  [(border BorderKind)
+   (style Style)
+   (title (slice u8))
+   (title-style Style)
+   (footer (slice u8))
+   (footer-style Style)])
+
+;;; Box options with no title or footer.
+(defn box-opts [(border BorderKind) (style Style)] (-> BoxOpts)
+  (BoxOpts
+    :border border
+    :style style
+    :title ""
+    :title-style style
+    :footer ""
+    :footer-style style))
+
+(defn box-titled [(border BorderKind)
+                  (style Style)
+                  (title (slice u8))
+                  (title-style Style)] (-> BoxOpts)
+  (BoxOpts
+    :border border
+    :style style
+    :title title
+    :title-style title-style
+    :footer ""
+    :footer-style style))
+
+;;; Draw a border around `r` and return the interior rect. Boxes smaller than
+;;; 2x2 draw nothing and return an empty interior.
+(defn draw-box! [(c (ptr Canvas)) (r Rect) (opts BoxOpts)] (-> Rect)
+  (if (or (< (.w r) 2) (< (.h r) 2))
+      (rect (.x r) (.y r) 0 0)
+      (let [g (border-glyphs (.border opts))
+            s (.style opts)
+            x0 (.x r)
+            y0 (.y r)
+            x1 (- (rect-right r) 1)
+            y1 (- (rect-bottom r) 1)]
+        (hline! c (+ x0 1) y0 (- (.w r) 2) (.horizontal g) s)
+        (hline! c (+ x0 1) y1 (- (.w r) 2) (.horizontal g) s)
+        (vline! c x0 (+ y0 1) (- (.h r) 2) (.vertical g) s)
+        (vline! c x1 (+ y0 1) (- (.h r) 2) (.vertical g) s)
+        (put-rune! c x0 y0 (.top-left g) s)
+        (put-rune! c x1 y0 (.top-right g) s)
+        (put-rune! c x0 y1 (.bottom-left g) s)
+        (put-rune! c x1 y1 (.bottom-right g) s)
+        ;; ╭─ Title ───╮ : the title starts two cells in and never touches the corner.
+        (when (and (> (len (.title opts)) 0) (>= (.w r) 7))
+          (let [text-x (+ x0 3)
+                t
+                  (put-text-ellipsis! c
+                                      (rect text-x y0 (- (.w r) 6) 1)
+                                      text-x
+                                      y0
+                                      (.title opts)
+                                      (.title-style opts))]
+            (put-rune! c (+ x0 2) y0 32 (.title-style opts))
+            (put-rune! c (+ text-x t) y0 32 (.title-style opts))))
+        ;; ╰──── footer ─╯ : right aligned, two cells from the corner.
+        (when (and (> (len (.footer opts)) 0) (>= (.w r) 7))
+          (let [room (- (.w r) 6)
+                fw (text-width (.footer opts))
+                shown (if (> fw room) room fw)
+                start (- (- x1 2) shown)
+                clip (rect (- start 1) y1 (+ shown 2) 1)]
+            (put-text! c clip (- start 1) y1 " " (.footer-style opts))
+            (put-text-ellipsis! c
+                                (rect start y1 shown 1)
+                                start
+                                y1
+                                (.footer opts)
+                                (.footer-style opts))
+            (put-text! c clip (+ start shown) y1 " " (.footer-style opts))))
+        (rect-inset r 1))))
+
+;; ---------------------------------------------------------------------------
+;; Rendering
+(defn out--str! [(out (mut (ArrayList u8))) (s (slice u8))] (-> i64)
+  (al-extend! (mut out) (slice-data s) (len s))
+  0)
+
+(defn out--byte! [(out (mut (ArrayList u8))) (b i64)] (-> i64)
+  (push! (mut out) (cast u8 b))
+  0)
+
+;;; Append the decimal digits of a non-negative integer.
+(defn out--dec! [(out (mut (ArrayList u8))) (n i64)] (-> i64)
+  (when (< n 0) (fatal "out--dec!: negative number in an escape sequence"))
+  (let [(mut digits) (zeroed (array u8 20))
+        (mut count) 0
+        (mut v) n]
+    (loop (do
+            (set! (index digits (load count)) (cast u8 (+ 48 (% (load v) 10))))
+            (set! count (+ (load count) 1))
+            (set! v (/ (load v) 10))
+            (when (= (load v) 0) (break))))
+    (loop (if (<= (load count) 0)
+              (break)
+              (do
+                (set! count (- (load count) 1))
+                (push! (mut out) (load (index digits (load count)))))))
+    0))
+
+;;; Append CUP: move the cursor to 0-based (x, y).
+(defn out-cursor-to! [(out (mut (ArrayList u8))) (x i64) (y i64)] (-> i64)
+  (out--str! (mut out) "\x1b;[")
+  (out--dec! (mut out) (+ y 1))
+  (out--byte! (mut out) #\;)
+  (out--dec! (mut out) (+ x 1))
+  (out--byte! (mut out) #\H))
+
+(const XTERM-16
+       [0x000000
+        0x800000
+        0x008000
+        0x808000
+        0x000080
+        0x800080
+        0x008080
+        0xC0C0C0
+        0x808080
+        0xFF0000
+        0x00FF00
+        0xFFFF00
+        0x0000FF
+        0xFF00FF
+        0x00FFFF
+        0xFFFFFF])
+
+(defn color--level [(i i64)] (-> i64)
+  (if (= i 0) 0 (+ 55 (* 40 i))))
+
+;;; The 0xRRGGBB value of a 256-color palette slot (xterm defaults).
+(defn palette-rgb [(n i64)] (-> i64)
+  (cond (< n 16) (get XTERM-16 n)
+        (< n 232)
+          (let [k (- n 16)]
+            (primitive/ior (primitive/ior (primitive/ishl (color--level (/ k 36))
+                                                          16)
+                                          (primitive/ishl (color--level (% (/ k
+                                                                              6)
+                                                                           6))
+                                                          8))
+                           (color--level (% k 6))))
+        :else
+          (let [v (+ 8 (* 10 (- n 232)))]
+            (primitive/ior (primitive/ior (primitive/ishl v 16)
+                                          (primitive/ishl v 8))
+                           v))))
+
+(defn color--dist [(rgb-a i64) (r i64) (g i64) (b i64)] (-> i64)
+  (let [dr (- (primitive/iand (primitive/ishr rgb-a 16) 255) r)
+        dg (- (primitive/iand (primitive/ishr rgb-a 8) 255) g)
+        db (- (primitive/iand rgb-a 255) b)]
+    (+ (+ (* dr dr) (* dg dg)) (* db db))))
+
+(defn color--cube-index [(v i64)] (-> i64)
+  (cond (< v 48) 0 (< v 115) 1 :else (/ (- v 35) 40)))
+
+;;; Nearest 256-color slot (cube or gray ramp, never the themable 0-15) to an RGB color.
+(defn rgb-to-256 [(r i64) (g i64) (b i64)] (-> i64)
+  (let [ri (color--cube-index r)
+        gi (color--cube-index g)
+        bi (color--cube-index b)
+        cube (+ (+ 16 (* 36 ri)) (+ (* 6 gi) bi))
+        avg (/ (+ (+ r g) b) 3)
+        gray-i (cond (< avg 8) 0 (> avg 238) 23 :else (/ (- avg 3) 10))
+        gray (+ 232 (if (> gray-i 23) 23 gray-i))]
+    (if (< (color--dist (palette-rgb gray) r g b)
+           (color--dist (palette-rgb cube) r g b))
+        gray
+        cube)))
+
+;;; Nearest of the 16 basic ANSI colors to an RGB color.
+(defn rgb-to-16 [(r i64) (g i64) (b i64)] (-> i64)
+  (let [(mut best) 0
+        (mut best-d) -1
+        (mut i) 0]
+    (loop (if (>= (load i) 16)
+              (break)
+              (let [d (color--dist (get XTERM-16 (load i)) r g b)]
+                (when (or (< (load best-d) 0) (< d (load best-d)))
+                  (set! best (load i))
+                  (set! best-d d))
+                (set! i (+ (load i) 1)))))
+    (load best)))
+
+;;; `color` as the terminal will be asked to show it under `mode`.
+(defn color-for-mode [(color Color) (mode ColorMode)] (-> Color)
+  (match mode
+    (NoColor [] (Default))
+    (TrueColor [] color)
+    (Ansi256 []
+             (match color
+               (Rgb [r g b]
+                    (indexed (rgb-to-256 (cast i64 r) (cast i64 g) (cast i64 b))))
+               (_ color)))
+    (Ansi16 []
+            (match color
+              (Default [] color)
+              (Rgb [r g b]
+                   (indexed (rgb-to-16 (cast i64 r) (cast i64 g) (cast i64 b))))
+              (Indexed [n]
+                       (if (< (cast i64 n) 16)
+                           color
+                           (let [v (palette-rgb (cast i64 n))]
+                             (indexed (rgb-to-16 (primitive/iand (primitive/ishr v
+                                                                                 16)
+                                                                 255)
+                                                 (primitive/iand (primitive/ishr v
+                                                                                 8)
+                                                                 255)
+                                                 (primitive/iand v 255))))))))))
+
+;;; `s` as it will be rendered under `mode`. Without color, a background tint
+;;; (selection, badges) becomes reverse video so it stays visible.
+(defn style-for-mode [(s Style) (mode ColorMode)] (-> Style)
+  (let [tinted (not (= (.bg s) (Default)))
+        attrs
+          (match mode
+            (NoColor []
+                     (if tinted
+                         (primitive/ior (.attrs s) ATTR-REVERSE)
+                         (.attrs s)))
+            (_ (.attrs s)))]
+    (Style
+      :fg (color-for-mode (.fg s) mode)
+      :bg (color-for-mode (.bg s) mode)
+      :attrs attrs)))
+
+(defn sgr--param! [(out (mut (ArrayList u8))) (count (mut i64))] (-> i64)
+  (if (= (load count) 0)
+      (out--str! (mut out) "\x1b;[")
+      (out--byte! (mut out) #\;))
+  (set! count (+ (load count) 1))
+  0)
+
+(defn sgr--color! [(out (mut (ArrayList u8)))
+                   (count (mut i64))
+                   (color Color)
+                   (background bool)] (-> i64)
+  (sgr--param! (mut out) (mut count))
+  (match color
+    (Default [] (out--str! (mut out) (if background "49" "39")))
+    (Rgb [r g b]
+         (do
+           (out--str! (mut out) (if background "48;2;" "38;2;"))
+           (out--dec! (mut out) (cast i64 r))
+           (out--byte! (mut out) #\;)
+           (out--dec! (mut out) (cast i64 g))
+           (out--byte! (mut out) #\;)
+           (out--dec! (mut out) (cast i64 b))))
+    (Indexed [n]
+             (let [k (cast i64 n)]
+               (cond (< k 8) (out--dec! (mut out) (+ k (if background 40 30)))
+                     (< k 16)
+                       (out--dec! (mut out) (+ (- k 8) (if background 100 90)))
+                     :else
+                       (do
+                         (out--str! (mut out) (if background "48;5;" "38;5;"))
+                         (out--dec! (mut out) k)))))))
+
+(defn sgr--code! [(out (mut (ArrayList u8))) (count (mut i64)) (code i64)] (-> i64)
+  (sgr--param! (mut out) (mut count))
+  (out--dec! (mut out) code))
+
+(defn attr? [(attrs i64) (bit i64)] (-> bool)
+  (!= (primitive/iand attrs bit) 0))
+
+;;; Append the shortest SGR sequence that changes the pen from `cur` to `next`
+;;; (both already mapped for the color mode). Emits nothing when they are equal.
+(defn out-sgr-transition! [(out (mut (ArrayList u8))) (cur Style) (next Style)] (-> i64)
+  (let [(mut count) 0
+        ca (.attrs cur)
+        na (.attrs next)
+        intensity-off
+          (or (and (attr? ca ATTR-BOLD) (not (attr? na ATTR-BOLD)))
+              (and (attr? ca ATTR-DIM) (not (attr? na ATTR-DIM))))]
+    (when intensity-off (sgr--code! (mut out) (mut count) 22))
+    (when (and (attr? ca ATTR-ITALIC) (not (attr? na ATTR-ITALIC)))
+      (sgr--code! (mut out) (mut count) 23))
+    (when (and (attr? ca ATTR-UNDERLINE) (not (attr? na ATTR-UNDERLINE)))
+      (sgr--code! (mut out) (mut count) 24))
+    (when (and (attr? ca ATTR-REVERSE) (not (attr? na ATTR-REVERSE)))
+      (sgr--code! (mut out) (mut count) 27))
+    (when (and (attr? na ATTR-BOLD)
+               (or intensity-off (not (attr? ca ATTR-BOLD))))
+      (sgr--code! (mut out) (mut count) 1))
+    (when (and (attr? na ATTR-DIM) (or intensity-off (not (attr? ca ATTR-DIM))))
+      (sgr--code! (mut out) (mut count) 2))
+    (when (and (attr? na ATTR-ITALIC) (not (attr? ca ATTR-ITALIC)))
+      (sgr--code! (mut out) (mut count) 3))
+    (when (and (attr? na ATTR-UNDERLINE) (not (attr? ca ATTR-UNDERLINE)))
+      (sgr--code! (mut out) (mut count) 4))
+    (when (and (attr? na ATTR-REVERSE) (not (attr? ca ATTR-REVERSE)))
+      (sgr--code! (mut out) (mut count) 7))
+    (when (not (= (.fg cur) (.fg next)))
+      (sgr--color! (mut out) (mut count) (.fg next) false))
+    (when (not (= (.bg cur) (.bg next)))
+      (sgr--color! (mut out) (mut count) (.bg next) true))
+    (when (> (load count) 0) (out--byte! (mut out) #\m))
+    0))
+
+;;; True when cell (x, y) of `a` and of `b` would look identical on screen.
+(defn cells-equal? [(a (ptr Canvas)) (b (ptr Canvas)) (x i64) (y i64)] (-> bool)
+  (let [ca (canvas-cell a x y)
+        cb (canvas-cell b x y)]
+    (and (= (.rune ca) (.rune cb))
+         (= (.width ca) (.width cb))
+         (= (.ext-len ca) (.ext-len cb))
+         (= (.style ca) (.style cb))
+         (or (= (.ext-len ca) 0)
+             (let [(mut i) 0
+                   (mut same) true
+                   pa (index (.data (.pool a)) (.ext-off ca))
+                   pb (index (.data (.pool b)) (.ext-off cb))]
+               (loop (if (>= (load i) (.ext-len ca))
+                         (break)
+                         (do
+                           (when (!= (load (index pa (load i)))
+                                     (load (index pb (load i))))
+                             (set! same false)
+                             (break))
+                           (set! i (+ (load i) 1)))))
+               (load same))))))
+
+(defn render--blank-default? [(cell (ptr Cell))] (-> bool)
+  (and (= (.rune cell) 32)
+       (= (.ext-len cell) 0)
+       (= (.width cell) 1)
+       (= (.style cell) (style-default))))
+
+(defn render--cursor-same? [(prev (ptr Canvas)) (next (ptr Canvas))] (-> bool)
+  (and (= (.cursor-visible prev) (.cursor-visible next))
+       (or (not (.cursor-visible next))
+           (and (= (.cursor-x prev) (.cursor-x next))
+                (= (.cursor-y prev) (.cursor-y next))))))
+
+;;; Whether cell (x, y) must be sent: it differs from `prev` (or, for a full
+;;; repaint, is not a default blank), or it is a wide grapheme whose right half
+;;; changed.
+(defn render--dirty? [(prev (ptr Canvas))
+                      (next (ptr Canvas))
+                      (full bool)
+                      (x i64)
+                      (y i64)] (-> bool)
+  (let [cell (canvas-cell next x y)]
+    (if full
+        (not (render--blank-default? cell))
+        (or (not (cells-equal? prev next x y))
+            (and (= (.width cell) 2)
+                 (< (+ x 1) (.width next))
+                 (not (cells-equal? prev next (+ x 1) y)))))))
+
+(const RENDER-BRIDGE-CELLS 4)
+
+;;; Whether a dirty cell follows within RENDER-BRIDGE-CELLS cells on this row.
+(defn render--dirty-soon? [(prev (ptr Canvas))
+                           (next (ptr Canvas))
+                           (full bool)
+                           (x i64)
+                           (y i64)] (-> bool)
+  (let [(mut i) 1
+        (mut found) false]
+    (loop (if (or (> (load i) RENDER-BRIDGE-CELLS)
+                  (>= (+ x (load i)) (.width next)))
+              (break)
+              (if (render--dirty? prev next full (+ x (load i)) y)
+                  (do (set! found true) (break))
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+
+;;; Append the escape sequences that turn the screen showing `prev` into `next`.
+;;; Only changed cells are sent: runs are addressed with CUP and styled with
+;;; minimal SGR transitions. When `prev` is invalid or differently sized, the
+;;; screen is cleared and fully repainted. The frame is bracketed by synchronized
+;;; output (DEC mode 2026) and ends with the pen reset, so the terminal never
+;;; shows a half-drawn frame. Nothing is appended when nothing changed. Returns
+;;; the number of bytes appended.
+(defn render-diff! [(out (mut (ArrayList u8)))
+                    (prev (ptr Canvas))
+                    (next (ptr Canvas))
+                    (mode ColorMode)] (-> i64)
+  (let [start (len out)
+        full
+          (or (not (.valid prev))
+              (!= (.width prev) (.width next))
+              (!= (.height prev) (.height next)))
+        w (.width next)
+        h (.height next)
+        (mut begun) false
+        (mut pen) (style-default)
+        (mut cx) -1
+        (mut cy) -1
+        (mut scratch) (zeroed (array u8 4))
+        (mut y) 0]
+    (when full
+      (out--str! (mut out) "\x1b;[?2026h\x1b;[?25l\x1b;[0m\x1b;[H\x1b;[2J")
+      (set! begun true))
+    (loop (if (>= (load y) h)
+              (break)
+              (let [(mut x) 0]
+                (loop (if (>= (load x) w)
+                          (break)
+                          (let [cell (canvas-cell next (load x) (load y))
+                                dirty
+                                  (or (render--dirty? prev
+                                                      next
+                                                      full
+                                                      (load x)
+                                                      (load y))
+                                      ;; Re-sending a few clean cells in the current pen is
+                                      ;; cheaper than a CUP jump over them.
+                                      (and (= (load cx) (load x))
+                                           (= (load cy) (load y))
+                                           (= (style-for-mode (.style cell)
+                                                              mode)
+                                              (load pen))
+                                           (render--dirty-soon? prev
+                                                                next
+                                                                full
+                                                                (load x)
+                                                                (load y))))]
+                            (if (or (= (.width cell) 0) (not dirty))
+                                (set! x (+ (load x) 1))
+                                (do
+                                  (when (not (load begun))
+                                    (out--str! (mut out)
+                                               "\x1b;[?2026h\x1b;[?25l")
+                                    (set! begun true))
+                                  (when (or (!= (load cx) (load x))
+                                            (!= (load cy) (load y)))
+                                    (out-cursor-to! (mut out) (load x) (load y)))
+                                  (let [style
+                                          (style-for-mode (.style cell) mode)]
+                                    (out-sgr-transition! (mut out)
+                                                         (load pen)
+                                                         style)
+                                    (set! pen style))
+                                  (out--str! (mut out)
+                                             (cell-bytes next
+                                                         cell
+                                                         (index scratch 0)))
+                                  (set! x (+ (load x) (.width cell)))
+                                  ;; At the right margin the terminal's cursor position is not
+                                  ;; trustworthy (pending wrap); always re-address after it.
+                                  (set! cx (if (>= (load x) w) -1 (load x)))
+                                  (set! cy (load y)))))))
+                (set! y (+ (load y) 1)))))
+    (when (and (not (load begun)) (not (render--cursor-same? prev next)))
+      (out--str! (mut out) "\x1b;[?2026h\x1b;[?25l")
+      (set! begun true))
+    (when (load begun)
+      (when (not (= (load pen) (style-default)))
+        (out--str! (mut out) "\x1b;[0m"))
+      (when (.cursor-visible next)
+        (out-cursor-to! (mut out) (.cursor-x next) (.cursor-y next))
+        (out--str! (mut out) "\x1b;[?25h"))
+      (out--str! (mut out) "\x1b;[?2026l"))
+    (- (len out) start)))
+
+;;; Append a complete repaint of `next` (clear screen, then every cell).
+(defn render-full! [(out (mut (ArrayList u8)))
+                    (next (ptr Canvas))
+                    (mode ColorMode)] (-> i64)
+  (let [(mut blank) (canvas-new (.allocator next) 0 0)
+        n (render-diff! (mut out) (mut blank) next mode)]
+    (canvas-free! (mut blank))
+    n))
+
+;;; Make `dst` an exact copy of `src` (size, cells, pool, cursor, validity).
+(defn canvas-copy! [(dst (ptr Canvas)) (src (ptr Canvas))] (-> i64)
+  (al-clear! (mut (.cells dst)))
+  (al-extend! (mut (.cells dst)) (.data (.cells src)) (len (.cells src)))
+  (al-clear! (mut (.pool dst)))
+  (al-extend! (mut (.pool dst)) (.data (.pool src)) (len (.pool src)))
+  (set! (.width dst) (.width src))
+  (set! (.height dst) (.height src))
+  (set! (.cursor-visible dst) (.cursor-visible src))
+  (set! (.cursor-x dst) (.cursor-x src))
+  (set! (.cursor-y dst) (.cursor-y src))
+  (set! (.valid dst) (.valid src))
+  0)
+
+;;; The canvas as plain text: one line per row, right-trimmed, each ending in
+;;; "\n", with no escape sequences. Allocated from `a`. For snapshot tests.
+(defn render-plain [(a (dyn Allocator)) (c (ptr Canvas))] (-> (slice u8))
+  (let [(mut out) (al-new [u8] a)
+        (mut scratch) (zeroed (array u8 4))
+        (mut y) 0]
+    (loop (if (>= (load y) (.height c))
+              (break)
+              (let [line-start (len out)
+                    (mut keep) (len out)
+                    (mut x) 0]
+                (loop (if (>= (load x) (.width c))
+                          (break)
+                          (let [cell (canvas-cell c (load x) (load y))]
+                            (when (!= (.width cell) 0)
+                              (out--str! (mut out)
+                                         (cell-bytes c cell (index scratch 0)))
+                              (when (not (and (= (.rune cell) 32)
+                                              (= (.ext-len cell) 0)))
+                                (set! keep (len out))))
+                            (set! x (+ (load x) 1)))))
+                (set! (.len out)
+                      (if (> (load keep) line-start) (load keep) line-start))
+                (out--byte! (mut out) 10)
+                (set! y (+ (load y) 1)))))
+    (al-into-slice (mut out))))
+
+;;; Record that the screen now shows `next`: copy it into `prev` and mark `prev`
+;;; valid. Call after the bytes from `render-diff!` have been written.
+(defn canvas-commit! [(prev (ptr Canvas)) (next (ptr Canvas))] (-> i64)
+  (canvas-copy! prev next)
+  (set! (.valid prev) true)
+  0)
+
+;;; A horizontal divider across the box drawn at `r` (the same rect and border
+;;; kind passed to `draw-box!`), on row `y`: ├───┤, joined to the side borders.
+(defn draw-box-divider! [(c (ptr Canvas))
+                         (r Rect)
+                         (y i64)
+                         (border BorderKind)
+                         (style Style)] (-> i64)
+  (when (>= (.w r) 2)
+    (let [g (border-glyphs border)
+          tees
+            (match border
+              (Rounded [] [0x251C 0x2524])
+              (Plain [] [0x251C 0x2524])
+              (Heavy [] [0x2523 0x252B])
+              (Double [] [0x2560 0x2563]))]
+      (hline! c (+ (.x r) 1) y (- (.w r) 2) (.horizontal g) style)
+      (put-rune! c (.x r) y (get tees 0) style)
+      (put-rune! c (- (rect-right r) 1) y (get tees 1) style)))
+  0)

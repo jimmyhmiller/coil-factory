@@ -1,0 +1,111 @@
+(module factory.prompts)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; The words every station agent starts with. The factory's own Markdown
+;;; says what to build; this says how to behave inside a factory: where the
+;;; agent is, how its station ends, who may talk to it, and what counts as
+;;; honest work.
+
+(defstruct Handoff [(station (slice u8)) (summary (slice u8))])
+
+(defstruct StationBrief
+  [(factory (slice u8))
+   (station (slice u8))
+   (station-number i64)
+   (station-count i64)
+   (workspace (slice u8))
+   (branch (slice u8))
+   (base (slice u8))
+   (gate (slice u8))
+   (attempts i64)
+   (tools (slice u8))
+   (context (slice u8))
+   (instructions (slice u8))
+   (brief (slice u8))
+   (handoffs (slice Handoff))])
+
+(defn push-all! [(out (mut StrBuf)) (parts (slice (slice u8)))] (-> i64)
+  (do (for part (iter parts) (sb-push-str! (mut out) part)) 0))
+
+(defn station-system-prompt [(a (dyn Allocator)) (b StationBrief)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-all! (mut out) ["You are the `" (.station b) "` station of the \"" (.factory b)
+                          "\" software factory (station "])
+    (sb-push-i64! (mut out) (.station-number b))
+    (sb-push-str! (mut out) " of ")
+    (sb-push-i64! (mut out) (.station-count b))
+    (sb-push-str! (mut out) ").\n\n")
+    (push-all! (mut out)
+               ["## Where you are\n\n"
+                "You work in a git worktree at `" (.workspace b) "` on branch `" (.branch b)
+                "`, which started at `" (.base b) "`. Every path you give a tool is relative to "
+                "that directory, and shell commands already start in it. Your tools: " (.tools b) ". When your station passes, the "
+                "factory commits your work on the branch for you; do not commit yourself. "
+                "The worktree shares its repository with a person's checkout, so leave shared git "
+                "state alone: no `git stash`, no switching or creating branches, no reset or "
+                "rebase, no push. Use `git diff` and `git status` freely; to set work aside, copy "
+                "files instead.\n\n"])
+    (sb-push-str! (mut out) "## How your station ends\n\n")
+    (sb-push-str! (mut out)
+                  "When the work this station asks for is complete and you have verified it with real commands, call `finish` with outcome `done` and a summary a teammate can act on: what changed, how you verified it, and anything still uncertain.\n\n")
+    (when (> (len (.gate b)) 0)
+      (push-all! (mut out)
+                 ["After you call `finish`, the factory runs this station's gate in the workspace: `"
+                  (.gate b) "`. If it fails you will be shown its output and should keep working. "])
+      (sb-push-str! (mut out) "After ")
+      (sb-push-i64! (mut out) (.attempts b))
+      (sb-push-str! (mut out) " failed attempts the station stops and waits for a person.\n\n")
+      0)
+    (sb-push-str! (mut out)
+                  "If you cannot proceed, because the task is impossible, contradictory, or needs a decision only a person can make, call `finish` with outcome `blocked` and say exactly what you need. A person will answer you, and you will continue from where you stopped. Do not end your turn without calling a tool until you are finished; a reply without a tool call is treated as a question for a person.\n\n")
+    (sb-push-str! (mut out) "## Who may talk to you\n\n")
+    (sb-push-str! (mut out)
+                  "Messages can arrive while you work. `[operator]` is a person running this factory: follow their instructions; they override the station instructions. `[overseer]` is an automated reviewer that watches for loops, stalls, and shortcuts: take its observations seriously and change course when it is right.\n\n")
+    (sb-push-str! (mut out) "## Honest work\n\n")
+    (sb-push-str! (mut out)
+                  "- Never fake success. No placeholder implementations that silently return default values, no skipped, deleted, or weakened tests, no loosened checks. Something unfinished must fail loudly with a clear message, and you must say so.\n- Keep changes focused on the brief and preserve unrelated code and behavior.\n- Learn the repository's conventions and validation commands from the repository itself before changing it.\n- Verify claims by running things. Say what you ran.\n\n")
+    (when (> (len (str-trim (.context b))) 0)
+      (push-all! (mut out) ["## The factory\n\n" (str-trim (.context b)) "\n\n"])
+      0)
+    (push-all! (mut out) ["## Your station: " (.station b) "\n\n" (str-trim (.instructions b)) "\n\n"])
+    (push-all! (mut out) ["## The brief\n\n"
+                          (if (> (len (str-trim (.brief b))) 0)
+                              (str-trim (.brief b))
+                              "(No brief was given; the factory and station instructions are the whole task.)")
+                          "\n"])
+    (when (> (len (.handoffs b)) 0)
+      (sb-push-str! (mut out) "\n## Handoffs from earlier stations\n")
+      (for handoff (iter (.handoffs b))
+        (let [h handoff]
+          (push-all! (mut out) ["\n### " (.station h) "\n\n" (str-trim (.summary h)) "\n"])))
+      0)
+    (sb-finish! (mut out))))
+
+(defn station-kickoff [(a (dyn Allocator)) (station (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-all! (mut out) ["Begin the `" station "` station. Start by looking at the workspace."])
+    (sb-finish! (mut out))))
+
+(defn gate-failure-message [(a (dyn Allocator))
+                            (gate (slice u8))
+                            (exit i64)
+                            (output (slice u8))
+                            (attempts-left i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-all! (mut out) ["[factory] The gate `" gate "` failed (exit "])
+    (sb-push-i64! (mut out) exit)
+    (sb-push-str! (mut out) "). Its output:\n\n```\n")
+    (sb-push-str! (mut out) output)
+    (sb-push-str! (mut out) "\n```\n\nFix the cause, verify, and call `finish` again. ")
+    (sb-push-i64! (mut out) attempts-left)
+    (sb-push-str! (mut out) (if (= attempts-left 1) " attempt remains." " attempts remain."))
+    (sb-finish! (mut out))))
+
+(defn no-tool-nudge [] (-> (slice u8))
+  "[factory] You replied without calling a tool. If the station is complete, call `finish` with outcome `done`. If you need a person, call `finish` with outcome `blocked` and ask your question there. Otherwise, keep working with your tools.")
+
+(defn conversation-note [] (-> (slice u8))
+  "[factory] This run has finished; a person is now talking with you directly in your workspace. Answer them. If they ask for changes, make and verify them; the factory commits whatever you change when you are done. Reply without a tool call when you are done.")

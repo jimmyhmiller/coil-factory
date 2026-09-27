@@ -1,0 +1,385 @@
+(module durable.atomic)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.os" :as os)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.try" :use *)
+(import "durable.error" :use *)
+(import "durable.fdio" :use *)
+(import "durable.ids" :use *)
+(import "durable.sys" :use *)
+
+;;; What `path-kind` found at a path (after following symbolic links).
+(defsum PathKind
+  (Missing)
+  (Directory)
+  (NotDirectory))
+
+;;; Classify `path`, following symbolic links: `Missing` when nothing (or a dangling
+;;; link) is there, `Directory`, or `NotDirectory` for anything else (regular file,
+;;; socket, FIFO, device). Other failures, such as a permission error on a parent
+;;; directory, are returned as errors rather than guessed.
+(defn path-kind [(a (dyn Allocator)) (path (slice u8))] (-> (Result PathKind
+                                                                    DurableError))
+  (match (open-path a path (| SYS-O-RDONLY (| SYS-O-DIRECTORY SYS-O-CLOEXEC)) 0)
+    (Ok [fd]
+        (match (close-fd fd)
+          (Err [e] (Err e))
+          (Ok [closed] (Ok (Directory)))))
+    (Err [e]
+         (match (error-os-code e)
+           (Some [code]
+                 (cond (= code SYS-ENOENT) (Ok (Missing))
+                       (= code SYS-ENOTDIR) (Ok (NotDirectory))
+                       :else (Err e)))
+           (None [] (Err e))))))
+
+;;; True when `path` exists and is not a directory (following symbolic links).
+(defn file-exists? [(a (dyn Allocator)) (path (slice u8))] (-> (Result bool
+                                                                       DurableError))
+  (match (path-kind a path)
+    (Err [e] (Err e))
+    (Ok [kind]
+        (Ok (match kind
+              (NotDirectory [] true)
+              (_ false))))))
+
+;;; True when `path` is a directory (following symbolic links).
+(defn dir-exists? [(a (dyn Allocator)) (path (slice u8))] (-> (Result bool
+                                                                      DurableError))
+  (match (path-kind a path)
+    (Err [e] (Err e))
+    (Ok [kind]
+        (Ok (match kind
+              (Directory [] true)
+              (_ false))))))
+
+;;; `<dir>/.<base>.tmp-<pid>-<16 hex>`, owned by `a`.
+(defn atomic-temp-path [(a (dyn Allocator)) (path (slice u8))] (-> (Result (slice u8)
+                                                                           DurableError))
+  (try (let [dir (parent-dir path)
+             base (base-name path)
+             token (try! (random-hex a 8))
+             (mut sb) (sb-new a)]
+         (sb-push-str! (mut sb) dir)
+         (when (not (= dir "/")) (sb-push-str! (mut sb) "/") 0)
+         (sb-push-str! (mut sb) ".")
+         (sb-push-str! (mut sb) base)
+         (sb-push-str! (mut sb) ".tmp-")
+         (sb-push-i64! (mut sb) (cast i64 (os/getpid)))
+         (sb-push-str! (mut sb) "-")
+         (sb-push-str! (mut sb) token)
+         (free-bytes a token 1)
+         (Ok (sb-finish! (mut sb))))))
+
+(defn unlink-path [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64
+                                                                      DurableError))
+  (try (let [cp (try! (path-cstr a path))
+             rc (unlink cp)
+             err
+               (if (= rc (cast i32 0))
+                   (Ok [i64 DurableError] 0)
+                   (Err (os-error "unlink")))]
+         (path-cstr-free a path cp)
+         err)))
+
+(defn rename-path [(a (dyn Allocator)) (from (slice u8)) (to (slice u8))] (-> (Result i64
+                                                                                      DurableError))
+  (try (let [cf (try! (path-cstr a from))]
+         (match (path-cstr a to)
+           (Err [e]
+                (do
+                  (path-cstr-free a from cf)
+                  (Err e)))
+           (Ok [ct]
+               (let [rc (fs/rename cf ct)
+                     result
+                       (if (= rc (cast i32 0))
+                           (Ok [i64 DurableError] 0)
+                           (Err (os-error "rename")))]
+                 (path-cstr-free a from cf)
+                 (path-cstr-free a to ct)
+                 result))))))
+
+(defn write-temp [(a (dyn Allocator))
+                  (temp (slice u8))
+                  (data (slice u8))
+                  (mode i64)] (-> (Result i64 DurableError))
+  (try (let [fd
+               (try! (open-path a
+                                temp
+                                (| SYS-O-WRONLY
+                                   (| SYS-O-CREAT (| SYS-O-EXCL SYS-O-CLOEXEC)))
+                                mode))]
+         (close-after fd
+                      (match (write-all-fd fd data)
+                        (Err [e] (Err [i64 DurableError] e))
+                        (Ok [written] (fsync-fd fd)))))))
+
+;;; Replace the file at `path` with `data` so that a concurrent reader, or a reader
+;;; after a crash, sees either the old content or the new content, never a mix.
+;;;
+;;; Writes a temporary file with a unique name next to `path` (same directory, so the
+;;; rename cannot cross filesystems), fsyncs it, renames it over `path`, and fsyncs
+;;; the directory so the rename itself is durable. `mode` is the new file's permission
+;;; bits (subject to the umask). On failure the temporary file is removed and `path`
+;;; is untouched. Returns the number of bytes written.
+(defn write-file-atomic! [(a (dyn Allocator))
+                          (path (slice u8))
+                          (data (slice u8))
+                          (mode i64)] (-> (Result i64 DurableError))
+  (try (ensure! (> (len (base-name path)) 0)
+                (Err (Invalid "write-file-atomic! needs a file path, not a directory path")))
+       (let [temp (try! (atomic-temp-path a path))
+             written
+               (match (write-temp a temp data mode)
+                 (Err [e] (Err [i64 DurableError] e))
+                 (Ok [ignored] (rename-path a temp path)))]
+         (match written
+           (Err [e]
+                (do
+                  ;; The temporary may not exist (open failed); the write error is
+                  ;; what matters either way.
+                  (unlink-path a temp)
+                  (free-bytes a temp 1)
+                  (Err e)))
+           (Ok [ignored]
+               (do
+                 (free-bytes a temp 1)
+                 (try! (fsync-dir a (parent-dir path)))
+                 (Ok (len data))))))))
+
+;;; The whole content of `path` owned by `a` (free with `(free-bytes a bytes 1)`), or
+;;; `None` when the file does not exist. A directory or unreadable file is an error.
+(defn read-file-if-exists [(a (dyn Allocator)) (path (slice u8))] (-> (Result (Option (slice u8))
+                                                                              DurableError))
+  (match (open-path a path (| SYS-O-RDONLY SYS-O-CLOEXEC) 0)
+    (Err [e]
+         (match (error-os-code e)
+           (Some [code]
+                 (if (= code SYS-ENOENT)
+                     (Ok (None [(slice u8)]))
+                     (Err e)))
+           (None [] (Err e))))
+    (Ok [fd]
+        (match (close-after fd (read-all-fd a fd))
+          (Err [e] (Err e))
+          (Ok [bytes] (Ok (Some bytes)))))))
+
+;; mkdir(2) one directory. An existing directory is success; an existing
+;; non-directory is EEXIST for the final component and ENOTDIR for a parent.
+(defn mkdir-one [(a (dyn Allocator))
+                 (cp (ptr i8))
+                 (prefix (slice u8))
+                 (mode i64)
+                 (final bool)] (-> (Result i64
+                                           DurableError))
+  (if (= (fs/make-dir cp mode) (cast i32 0))
+      (Ok 0)
+      (let [err (os-error "mkdir")]
+        (match (error-os-code err)
+          (Some [code]
+                (if (= code SYS-EEXIST)
+                    (match (path-kind a prefix)
+                      (Err [e] (Err e))
+                      (Ok [kind]
+                          (match kind
+                            (Directory [] (Ok 0))
+                            (_ (if final
+                                   (Err err)
+                                   (Err (Os "mkdir" SYS-ENOTDIR)))))))
+                    (Err err)))
+          (None [] (Err err))))))
+
+;;; Create `path` and any missing parents (like `mkdir -p`) with permission bits
+;;; `mode` (subject to the umask). Succeeds when the directory already exists; fails
+;;; when `path` or a parent exists but is not a directory.
+(defn ensure-dir! [(a (dyn Allocator)) (path (slice u8)) (mode i64)] (-> (Result i64
+                                                                                 DurableError))
+  (try (let [cp (try! (path-cstr a path))
+             n (len path)
+             (mut i) 1
+             (mut result) (Ok [i64 DurableError] 0)]
+         ;; Create each proper prefix ending before a `/`, then the whole path.
+         (loop (if (> (load i) n)
+                   (break)
+                   (let [at-end (= (load i) n)
+                         at-slash
+                           (and (not at-end)
+                                (= (cast i64 (get path (load i))) 47)
+                                (!= (cast i64 (get path (- (load i) 1))) 47))]
+                     (when (or at-end at-slash)
+                       (when at-slash (set! (index cp (load i)) (cast i8 0)) 0)
+                       (let [r
+                               (mkdir-one a
+                                          cp
+                                          (subslice [u8] path 0 (load i))
+                                          mode
+                                          at-end)]
+                         (when at-slash
+                           (set! (index cp (load i)) (cast i8 47))
+                           0)
+                         (match r
+                           (Err [e]
+                                (do
+                                  (set! result (Err e))
+                                  (break)))
+                           (Ok [ignored] 0)))
+                       0)
+                     (set! i (+ (load i) 1)))))
+         (path-cstr-free a path cp)
+         (load result))))
+
+(defn names-compare [(x (slice u8)) (y (slice u8))] (-> i64)
+  (str-cmp x y))
+
+;;; The entry names of directory `path` (without `.` and `..`) sorted bytewise,
+;;; each owned by `a`. Free the list with `list-dir-free!`.
+(defn list-dir [(a (dyn Allocator)) (path (slice u8))] (-> (Result (ArrayList (slice u8))
+                                                                   DurableError))
+  (try (let [fd
+               (try! (open-path a
+                                path
+                                (| SYS-O-RDONLY
+                                   (| SYS-O-DIRECTORY SYS-O-CLOEXEC))
+                                0))
+             names (try! (close-after fd (dir-names-fd a fd)))]
+         (sort [(slice u8)]
+               (al-slice [(slice u8)] names)
+               (fnptr-of names-compare))
+         (Ok names))))
+
+(defn list-dir-free! [(a (dyn Allocator)) (names (mut (ArrayList (slice u8))))] (-> i64)
+  (dir-names-free! a (mut names)))
+
+;;; Shortest path `remove-tree!` accepts, in bytes.
+(const REMOVE-TREE-MIN-LENGTH 8)
+
+;;; Why `remove-tree!` refuses `path`, or `None` when it is acceptable.
+;;;
+;;; Refused: an empty path; a path shorter than `REMOVE-TREE-MIN-LENGTH` bytes; the
+;;; root directory in any spelling (`/`, `//`); any `.` or `..` component (so
+;;; `.`, `..`, `./x`, `a/../b` are all refused -- pass a plain path); and an absolute
+;;; path with fewer than two components (`/home`, `/tmp`). These guards stop the
+;;; classic accidents (an empty variable, a truncated path, a parent reference); they
+;;; cannot know which longer paths matter to you.
+(defn remove-tree-refusal [(path (slice u8))] (-> (Option (slice u8)))
+  (block :check
+         (when (= (len path) 0)
+           (return-from :check (Some "refusing to remove an empty path"))
+           0)
+         (when (< (len path) REMOVE-TREE-MIN-LENGTH)
+           (return-from :check
+                          (Some "refusing to remove a path shorter than 8 bytes"))
+           0)
+         (let [n (len path)
+               (mut i) 0
+               (mut components) 0]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (if (= (cast i64 (get path (load i))) 47)
+                         (set! i (+ (load i) 1))
+                         (let [(mut j) (load i)]
+                           (loop (if (or (>= (load j) n)
+                                         (= (cast i64 (get path (load j))) 47))
+                                     (break)
+                                     (set! j (+ (load j) 1))))
+                           (let [part (subslice [u8] path (load i) (load j))]
+                             (when (or (= part ".") (= part ".."))
+                               (return-from :check
+                                              (Some "refusing to remove a path with a . or .. component"))
+                               0)
+                             (set! components (+ (load components) 1))
+                             (set! i (load j)))))))
+           (when (= (load components) 0)
+             (return-from :check (Some "refusing to remove the root directory"))
+             0)
+           (when (and (= (cast i64 (get path 0)) 47) (< (load components) 2))
+             (return-from :check
+                            (Some "refusing to remove a top-level directory"))
+             0)
+           (None))))
+
+(defn unlinkat-tolerant [(dirfd i32) (name (ptr i8)) (flags i64)] (-> (Result i64
+                                                                              DurableError))
+  (if (= (unlinkat dirfd name (cast i32 flags)) (cast i32 0))
+      (Ok 1)
+      (let [err (os-error "unlinkat")]
+        (match (error-os-code err)
+          (Some [code] (if (= code SYS-ENOENT) (Ok 0) (Err err)))
+          (None [] (Err err))))))
+
+(defn remove-children [(a (dyn Allocator)) (fd i32)] (-> (Result i64
+                                                                 DurableError))
+  (try (let [(mut names) (try! (dir-names-fd a fd))
+             count (len (load names))
+             (mut removed) 0
+             (mut failure) (None [DurableError])
+             (mut i) 0]
+         (loop (if (>= (load i) count)
+                   (break)
+                   (let [name (get (load names) (load i))]
+                     (match (path-cstr a name)
+                       (Err [e]
+                            (do
+                              (set! failure (Some e))
+                              (break)))
+                       (Ok [cp]
+                           (let [r (remove-entry a fd cp)]
+                             (path-cstr-free a name cp)
+                             (match r
+                               (Err [e]
+                                    (do
+                                      (set! failure (Some e))
+                                      (break)))
+                               (Ok [k] (set! removed (+ (load removed) k)))))))
+                     (set! i (+ (load i) 1)))))
+         (dir-names-free! a (mut names))
+         (match (load failure)
+           (Some [e] (Err e))
+           (None [] (Ok (load removed)))))))
+
+;; Remove `name` relative to `dirfd` without following symbolic links: a real
+;; directory is emptied recursively and removed; anything else (including a link to
+;; a directory) is unlinked. Returns the number of entries removed.
+(defn remove-entry [(a (dyn Allocator)) (dirfd i32) (name (ptr i8))] (-> (Result i64
+                                                                                 DurableError))
+  (let [fd
+          (openat dirfd
+                  name
+                  (cast i32
+                        (| SYS-O-RDONLY
+                           (| SYS-O-DIRECTORY (| SYS-O-NOFOLLOW SYS-O-CLOEXEC)))))]
+    (if (< fd (cast i32 0))
+        (let [err (os-error "openat")]
+          (match (error-os-code err)
+            (Some [code]
+                  (cond (= code SYS-ENOENT) (Ok 0)
+                        (or (= code SYS-ENOTDIR) (= code SYS-ELOOP))
+                          (unlinkat-tolerant dirfd name 0)
+                        :else (Err err)))
+            (None [] (Err err))))
+        (match (close-after fd (remove-children a fd))
+          (Err [e] (Err e))
+          (Ok [inner]
+              (match (unlinkat-tolerant dirfd name SYS-AT-REMOVEDIR)
+                (Err [e] (Err e))
+                (Ok [self] (Ok (+ inner self)))))))))
+
+;;; Recursively delete `path`, like `rm -rf`, and return how many entries were
+;;; removed (0 when `path` did not exist). Symbolic links are removed, never
+;;; followed, at every level including `path` itself. Traversal uses descriptors
+;;; (openat/unlinkat), so a directory renamed mid-walk cannot redirect it elsewhere.
+;;; Refuses dangerous paths with `Invalid`; see `remove-tree-refusal`.
+(defn remove-tree! [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64
+                                                                       DurableError))
+  (try (match (remove-tree-refusal path)
+         (Some [reason] (return-from :try (Err (Invalid reason))))
+         (None [] 0))
+       (let [cp (try! (path-cstr a path))
+             result (remove-entry a (cast i32 SYS-AT-FDCWD) cp)]
+         (path-cstr-free a path cp)
+         result)))

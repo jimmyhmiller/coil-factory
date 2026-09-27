@@ -1,0 +1,465 @@
+(module factory.ui.runview)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "tui.widgets" :use *)
+(import "tui.app" :use [Frame])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.feed" :use *)
+(import "factory.ui.model" :use *)
+
+;;; One run: its header, the station pipeline, what each agent is doing, and
+;;; the live journal feed.
+(defn run-doc [(d (ptr Dash))] (-> JVal)
+  (.value (field d run)))
+
+(defn run-elapsed [(d (ptr Dash)) (run JVal)] (-> i64)
+  (let [started (ji run "started")
+        finished (ji run "finished")]
+    (cond (= started 0) 0
+          (> finished 0) (- finished started)
+          :else (- (.now d) started))))
+
+(defn draw-run-header! [(d (ptr Dash))
+                        (c (ptr Canvas))
+                        (a (dyn Allocator))
+                        (r Rect)
+                        (run JVal)] (-> i64)
+  (let [theme (.theme d)
+        status (js run "status")
+        x (draw-topbar! d c a r [(js run "factory") (.run-id d)])]
+    (when (.has (field d run))
+      (draw-badge! c
+                   r
+                   (+ x 2)
+                   (.y r)
+                   status
+                   (badge-style theme (status-color status))))
+    0))
+
+(defn draw-run-meta! [(d (ptr Dash))
+                      (c (ptr Canvas))
+                      (a (dyn Allocator))
+                      (r Rect)
+                      (run JVal)] (-> i64)
+  (let [theme (.theme d)
+        sep "  ·  "
+        (mut x) (+ (.x r) 3)]
+    (set! x
+          (span! c
+                 r
+                 (load x)
+                 (fmt-duration a (run-elapsed d run))
+                 (.text theme)))
+    (set! x (span! c r (load x) sep (.subtle theme)))
+    (set! x (span! c r (load x) (js run "model") (.muted theme)))
+    (set! x (span! c r (load x) sep (.subtle theme)))
+    (set! x
+          (span! c
+                 r
+                 (load x)
+                 (concat a [(fmt-tokens a (run-tokens run)) " tokens"])
+                 (.muted theme)))
+    (set! x
+          (span! c
+                 r
+                 (load x)
+                 (concat a
+                         [" (↑"
+                          (fmt-tokens a (ji run "input_tokens"))
+                          " ↓"
+                          (fmt-tokens a (ji run "output_tokens"))
+                          ")"])
+                 (.subtle theme)))
+    (set! x (span! c r (load x) sep (.subtle theme)))
+    (set! x (span! c r (load x) (js run "branch") (.accent-alt theme)))
+    (let [site (js run "site")]
+      (when (> (len site) 0)
+        (set! x (span! c r (load x) sep (.subtle theme)))
+        (span! c r (load x) (concat a ["on " site]) (.muted theme))))
+    0))
+
+(defn draw-run-brief! [(d (ptr Dash))
+                       (c (ptr Canvas))
+                       (a (dyn Allocator))
+                       (r Rect)
+                       (run JVal)] (-> i64)
+  (let [theme (.theme d)
+        x (span! c r (+ (.x r) 3) "brief  " (.subtle theme))]
+    (put-text-ellipsis! c
+                        r
+                        x
+                        (.y r)
+                        (first-line (js run "brief"))
+                        (.muted theme))))
+
+(defn draw-verdict! [(d (ptr Dash))
+                     (c (ptr Canvas))
+                     (a (dyn Allocator))
+                     (r Rect)
+                     (run JVal)] (-> i64)
+  (let [theme (.theme d)
+        verdict (js run "verdict")
+        status (js run "status")
+        x (span! c r (+ (.x r) 3) "overseer  " (.subtle theme))]
+    (cond (= status "blocked")
+            (put-text-ellipsis! c
+                                r
+                                x
+                                (.y r)
+                                (concat a
+                                        ["▲ needs you — "
+                                         (first-line (js run "reason"))
+                                         "  (c to answer)"])
+                                (bold (.warning theme)))
+          (> (len verdict) 0)
+            (let [x2
+                    (span! c
+                           r
+                           x
+                           (concat a ["◉ " verdict])
+                           (tone-style theme (verdict-tone verdict)))]
+              (put-text-ellipsis! c
+                                  r
+                                  (+ x2 2)
+                                  (.y r)
+                                  (first-line (js run "verdict_reason"))
+                                  (.muted theme)))
+          :else (put-text! c r x (.y r) "no judgment yet" (.subtle theme)))))
+
+(defn draw-pipeline! [(d (ptr Dash))
+                      (c (ptr Canvas))
+                      (a (dyn Allocator))
+                      (r Rect)
+                      (run JVal)
+                      (tick i64)] (-> i64)
+  (let [theme (.theme d)
+        stations (jv-get run "stations")
+        inner
+          (rect-inset-xy (draw-box! c r (panel-opts theme "Stations" false))
+                         1
+                         0)
+        (mut x) (.x inner)
+        (mut focus) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len stations))
+              (break)
+              (let [s (jv-nth stations (load i))
+                    status (js s "status")
+                    failures (ji s "gate_failures")]
+                (when (> (load i) 0)
+                  (set! x
+                        (span! c
+                               inner
+                               (+ (load x) 1)
+                               "────"
+                               (.border theme))))
+                (when (> (load i) 0) (set! x (+ (load x) 1)))
+                (set! x
+                      (span! c
+                             inner
+                             (load x)
+                             (station-glyph status (+ tick (load i)))
+                             (station-style theme status)))
+                (set! x
+                      (span! c
+                             inner
+                             (+ (load x) 1)
+                             (js s "name")
+                             (if (= status "pending")
+                                 (.subtle theme)
+                                 (bold (station-style theme status)))))
+                (when (> failures 0)
+                  (set! x
+                        (span! c
+                               inner
+                               (+ (load x) 1)
+                               (concat a ["gate ✗" (int-text a failures)])
+                               (.error theme))))
+                (when (not (= status "pending")) (set! focus (load i)))
+                (set! i (+ (load i) 1)))))
+    (when (>= (load focus) 0)
+      (let [s (jv-nth stations (load focus))
+            summary (first-line (js s "summary"))
+            detail
+              (concat a
+                      [(js s "name")
+                       " · attempt "
+                       (int-text a (ji s "attempts"))
+                       (if (> (len summary) 0) " · " "")
+                       summary])]
+        (put-text-ellipsis! c
+                            inner
+                            (.x inner)
+                            (+ (.y inner) 1)
+                            detail
+                            (.muted theme))))
+    0))
+
+(const AGENT-COLUMNS
+       [(Column
+          :title "AGENT"
+          :width (Fixed 12)
+          :align (AlignLeft))
+        (Column
+          :title "PHASE"
+          :width (Fixed 10)
+          :align (AlignLeft))
+        (Column
+          :title "DOING"
+          :width (Fill 1)
+          :align (AlignLeft))
+        (Column
+          :title "TURNS"
+          :width (Fixed 5)
+          :align (AlignRight))
+        (Column
+          :title "TOOLS"
+          :width (Fixed 7)
+          :align (AlignRight))
+        (Column
+          :title "TOKENS"
+          :width (Fixed 6)
+          :align (AlignRight))
+        (Column
+          :title "SEEN"
+          :width (Fixed 4)
+          :align (AlignRight))])
+
+(defn draw-agents! [(d (ptr Dash))
+                    (c (ptr Canvas))
+                    (a (dyn Allocator))
+                    (r Rect)
+                    (run JVal)
+                    (tick i64)] (-> i64)
+  (let [theme (.theme d)
+        agents (jv-get run "agents")
+        pending (jv-len (jv-get run "pending_messages"))
+        focused (not (.feed-focus d))
+        (mut opts) (panel-opts theme "Agents" focused)]
+    (when (> pending 0)
+      (set! (.footer opts)
+            (concat a
+                    [(int-text a pending)
+                     " message"
+                     (if (= pending 1) "" "s")
+                     " waiting"])))
+    (let [inner (draw-box! c r opts)]
+      (if (= (jv-len agents) 0)
+          (put-text! c
+                     inner
+                     (+ (.x inner) 2)
+                     (+ (.y inner) 1)
+                     "No agent has started yet."
+                     (.subtle theme))
+          (let [(mut cells) (al-new [TableCell] a)
+                (mut i) 0]
+            (loop (if (>= (load i) (jv-len agents))
+                      (break)
+                      (let [g (jv-nth agents (load i))
+                            phase (js g "phase")
+                            errors (ji g "tool_errors")]
+                        (push! (mut cells)
+                               (table-cell (js g "name") (bold (.text theme))))
+                        (push! (mut cells)
+                               (table-cell (concat a
+                                                   [(if (phase-active? phase)
+                                                        (spinner-frame (+ tick
+                                                                          (load i)))
+                                                        "·")
+                                                    " "
+                                                    phase])
+                                           (phase-style theme phase)))
+                        (push! (mut cells)
+                               (table-cell (js g "activity")
+                                           (if (phase-active? phase)
+                                               (.text theme)
+                                               (.muted theme))))
+                        (push! (mut cells)
+                               (table-cell (int-text a (ji g "turns"))
+                                           (.muted theme)))
+                        (push! (mut cells)
+                               (table-cell (if (> errors 0)
+                                               (concat a
+                                                       [(int-text a
+                                                                  (ji g
+                                                                      "tool_calls"))
+                                                        " ✗"
+                                                        (int-text a errors)])
+                                               (int-text a (ji g "tool_calls")))
+                                           (if (> errors 0)
+                                               (.warning theme)
+                                               (.muted theme))))
+                        (push! (mut cells)
+                               (table-cell (fmt-tokens a
+                                                       (+ (ji g "input_tokens")
+                                                          (ji g "output_tokens")))
+                                           (.subtle theme)))
+                        (push! (mut cells)
+                               (table-cell (fmt-age a
+                                                    (- (.now d)
+                                                       (ji g "activity_t")))
+                                           (.subtle theme)))
+                        (set! i (+ (load i) 1)))))
+            (draw-table! c
+                         inner
+                         AGENT-COLUMNS
+                         (al-slice cells)
+                         (field d agents-lv)
+                         2
+                         theme
+                         focused)))
+      0)))
+
+;;; The feed: "HH:MM:SS agent  glyph text  result", following the tail unless
+;;; scrolled up.
+(defn draw-feed! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)] (-> i64)
+  (let [theme (.theme d)
+        feed (field d feed)
+        sv (field d feed-sv)
+        focused (.feed-focus d)
+        (mut opts) (panel-opts theme "Activity" focused)]
+    (set! (.footer opts)
+          (if (.stick-bottom sv) "● live" "↑ scrolled · end follows"))
+    (set! (.footer-style opts)
+          (if (.stick-bottom sv) (.success theme) (.warning theme)))
+    (let [inner (rect-inset-xy (draw-box! c r opts) 1 0)
+          total (feed-count feed)
+          max-offset (if (> total (.h inner)) (- total (.h inner)) 0)]
+      (set! (.total sv) total)
+      (set! (.height sv) (.h inner))
+      (when (or (.stick-bottom sv) (> (.offset sv) max-offset))
+        (set! (.offset sv) max-offset))
+      (when (= total 0)
+        (put-text! c
+                   inner
+                   (.x inner)
+                   (.y inner)
+                   (if (.loaded feed)
+                       "Nothing has happened yet."
+                       "Loading the journal…")
+                   (.subtle theme)))
+      (let [(mut agent-w) 6
+            (mut k) 0]
+        (loop (if (>= (load k) total)
+                  (break)
+                  (do
+                    (let [w (text-width (.agent (feed-item feed (load k))))]
+                      (when (> w (load agent-w))
+                        (set! agent-w (if (> w 14) 14 w))))
+                    (set! k (+ (load k) 1)))))
+        (let [(mut row) 0]
+          (loop (if (or (>= (load row) (.h inner))
+                        (>= (+ (.offset sv) (load row)) total))
+                    (break)
+                    (let [it (feed-item feed (+ (.offset sv) (load row)))
+                          y (+ (.y inner) (load row))
+                          x1
+                            (span! c
+                                   (rect (.x inner) y (.w inner) 1)
+                                   (.x inner)
+                                   (.clock it)
+                                   (.subtle theme))
+                          agent-x (+ x1 2)
+                          glyph-x (+ agent-x (+ (load agent-w) 2))
+                          text-x (+ glyph-x 3)
+                          result-w (text-width (.result it))
+                          text-room
+                            (- (- (rect-right inner) text-x)
+                               (if (> result-w 0) (+ result-w 2) 0))
+                          row-r (rect (.x inner) y (.w inner) 1)]
+                      (put-text-ellipsis! c
+                                          (rect agent-x y (load agent-w) 1)
+                                          agent-x
+                                          y
+                                          (.agent it)
+                                          (.muted theme))
+                      (put-text! c
+                                 row-r
+                                 glyph-x
+                                 y
+                                 (.glyph it)
+                                 (tone-style theme (.glyph-tone it)))
+                      (let [tw
+                              (put-text-ellipsis! c
+                                                  (rect text-x
+                                                        y
+                                                        (if (< text-room 0)
+                                                            0
+                                                            text-room)
+                                                        1)
+                                                  text-x
+                                                  y
+                                                  (.text it)
+                                                  (tone-style theme (.tone it)))]
+                        (when (> result-w 0)
+                          (put-text! c
+                                     row-r
+                                     (+ (+ text-x tw) 2)
+                                     y
+                                     (.result it)
+                                     (tone-style theme (.result-tone it)))))
+                      (set! row (+ (load row) 1))))))
+        (draw-scrollbar! c
+                         (rect (+ (rect-right inner) 1) (.y inner) 1 (.h inner))
+                         total
+                         (.offset sv)
+                         (.h inner)
+                         (if focused (.border-focus theme) (.border theme))
+                         (bold (.accent theme))))
+      0)))
+
+(const RUN-HINTS
+       [(KeyHint :key "↑↓" :label "agent")
+        (KeyHint :key "enter" :label "chat")
+        (KeyHint :key "tab" :label "feed")
+        (KeyHint :key "pgup/pgdn" :label "scroll")
+        (KeyHint :key "p" :label "pause/resume")
+        (KeyHint :key "x" :label "stop")
+        (KeyHint :key "esc" :label "back")])
+
+(defn draw-run-view! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
+  (let [c (.canvas frame)
+        a (.scratch frame)
+        run (run-doc d)
+        full (canvas-rect c)
+        banner (if (hub-down? d) 1 0)
+        agents-h
+          (let [n (jv-len (jv-get run "agents"))]
+            (cond (< n 1) 4 (> n 6) 9 :else (+ n 3)))
+        (mut parts) (zeroed (array Rect 9))]
+    (split-vertical full
+                    [(Fixed 1)
+                     (Fixed banner)
+                     (Fixed 1)
+                     (Fixed 1)
+                     (Fixed 1)
+                     (Fixed 4)
+                     (Fixed agents-h)
+                     (Fill 1)
+                     (Fixed 1)]
+                    0
+                    parts)
+    (draw-run-header! d c a (index parts 0) run)
+    (when (hub-down? d) (draw-hub-banner! d c a (index parts 1)))
+    (if (.has (field d run))
+        (do
+          (draw-run-meta! d c a (index parts 2) run)
+          (draw-run-brief! d c a (index parts 3) run)
+          (draw-verdict! d c a (index parts 4) run)
+          (draw-pipeline! d c a (index parts 5) run (.tick frame))
+          (draw-agents! d c a (index parts 6) run (.tick frame))
+          (draw-feed! d c a (index parts 7)))
+        (put-text! c
+                   (index parts 2)
+                   3
+                   (.y (index parts 2))
+                   "Loading the run…"
+                   (.subtle (.theme d))))
+    (draw-footer! d c (index parts 8) RUN-HINTS)
+    0))

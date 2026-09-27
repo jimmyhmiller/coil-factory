@@ -1,0 +1,750 @@
+(module agent_tools.files)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.shell" :as shell)
+(import "agent_tools.sys" :as sys)
+(import "agent_tools.text" :use *)
+(import "agent_tools.workspace" :use *)
+(export ReadFileTool read-file-tool WriteFileTool write-file-tool EditFileTool edit-file-tool
+        ListDirTool list-dir-tool SearchBackend Ripgrep Grep search-backend-detect SearchTool search-tool)
+
+(const READ_DEFAULT_LIMIT 400)
+;;; A read never returns more than this many bytes of numbered text.
+(const READ_MAX_OUTPUT_BYTES 50000)
+;;; Longer lines are cut, so one minified line cannot fill the output.
+(const READ_MAX_LINE_BYTES 2000)
+(const READ_CHUNK_BYTES 65536)
+;;; edit_file loads the whole file; larger files must be edited another way.
+(const EDIT_MAX_FILE_BYTES 16777216)
+(const EDIT_CONTEXT_LINES 3)
+(const EDIT_SNIPPET_MAX_BYTES 4000)
+(const LIST_MAX_ENTRIES 500)
+(const SEARCH_TIMEOUT_MS 60000)
+(const SEARCH_MAX_OUTPUT_BYTES 32768)
+(const SEARCH_MAX_LINES 250)
+
+;;; ---------------------------------------------------------------------------
+;;; Arguments
+
+(defn missing [(a (dyn Allocator)) (key (slice u8))] (-> (slice u8))
+  (join2 a "missing required argument " (quoted a key)))
+
+;;; A required string argument. Err names the problem for the model.
+(defn arg-string [(a (dyn Allocator)) (call ToolCall) (key (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (match (jv-get (.arguments call) key)
+    (JStr [s] (Ok s))
+    (JNull [] (Err (missing a key)))
+    (_ (Err (join2 a (quoted a key) " must be a string")))))
+
+;;; An optional string argument, `default` when absent.
+(defn arg-string-or [(a (dyn Allocator)) (call ToolCall) (key (slice u8)) (default (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (match (jv-get (.arguments call) key)
+    (JStr [s] (Ok s))
+    (JNull [] (Ok default))
+    (_ (Err (join2 a (quoted a key) " must be a string")))))
+
+;;; An optional integer argument that must be at least `minimum`.
+(defn arg-int-or [(a (dyn Allocator)) (call ToolCall) (key (slice u8)) (default i64) (minimum i64)] (-> (Result i64 (slice u8)))
+  (match (jv-get (.arguments call) key)
+    (JNull [] (Ok default))
+    (JInt [n] (if (< n minimum)
+                  (let [(mut b) (sb-new a)]
+                    (sb-push-str! (mut b) (quoted a key))
+                    (sb-push-str! (mut b) " must be at least ")
+                    (sb-push-i64! (mut b) minimum)
+                    (Err (sb-finish! (mut b))))
+                  (Ok n)))
+    (_ (Err (join2 a (quoted a key) " must be an integer")))))
+
+(defn arg-bool-or [(a (dyn Allocator)) (call ToolCall) (key (slice u8)) (default bool)] (-> (Result bool (slice u8)))
+  (match (jv-get (.arguments call) key)
+    (JNull [] (Ok default))
+    (JBool [b] (Ok b))
+    (_ (Err (join2 a (quoted a key) " must be true or false")))))
+
+(defn errno-message [(a (dyn Allocator)) (verb (slice u8)) (path (slice u8)) (code i64)] (-> (slice u8))
+  (join3 a (join3 a verb " " (quoted a path)) ": " (sys/errno-text code)))
+
+(defn io-error-code [(error io/IoError)] (-> i64)
+  (match error
+    (io/Errno [code] code)
+    (io/OutOfMemory [] 12)
+    (_ 5)))
+
+(defn summary-path [(call ToolCall) (key (slice u8)) (default (slice u8))] (-> (slice u8))
+  (let [path (call-string call key)]
+    (if (= (len path) 0) default path)))
+
+(defn plural [(n i64) (one (slice u8)) (many (slice u8))] (-> (slice u8))
+  (if (= n 1) one many))
+
+;;; ---------------------------------------------------------------------------
+;;; read_file
+
+(defstruct ReadFileTool [(workspace Workspace)])
+
+(defn read-file-tool [(workspace Workspace)] (-> ReadFileTool)
+  (ReadFileTool :workspace workspace))
+
+(const READ_FILE_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workspace root.\"},\"offset\":{\"type\":\"integer\",\"description\":\"1-based line number to start at. Default 1.\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of lines to show. Default 400.\"}},\"required\":[\"path\"],\"additionalProperties\":false}")
+
+(const READ_FILE_DESCRIPTION
+       "Read a text file in the workspace. Each line is shown as `   12\x2502; text`; the number and the `\x2502; ` are not part of the file. Shows up to `limit` lines (default 400) starting at line `offset` (default 1), at most 50 KB, and says how to continue when the file is longer. Lines over 2000 bytes are cut. Refuses binary files.")
+
+;;; State of one streaming read.
+(defstruct LineReader
+  [(offset i64)
+   (end i64)                       ; first line past the window
+   (line i64)                      ; current line number
+   (line-bytes i64)                ; bytes seen on the current line
+   (current StrBuf)                ; kept bytes of the current line (window only)
+   (out StrBuf)
+   (last-shown i64)
+   (more bool)                     ; content exists past the last shown line
+   (full bool)])                   ; stopped at the output byte limit
+
+(defn emit-line! [(r (mut LineReader))] (-> i64)
+  (let [text (sb-str (.current r))
+        cut (> (.line-bytes r) READ_MAX_LINE_BYTES)
+        needed (+ (len text) 64)]
+    (if (and (> (.last-shown r) 0)
+             (> (+ (len (sb-str (.out r))) needed) READ_MAX_OUTPUT_BYTES))
+        (do (set! (.full r) true)
+            (set! (.more r) true)
+            0)
+        (do (push-line-number! (mut (.out r)) (.line r))
+            (sb-push-str! (mut (.out r)) text)
+            (when cut
+              (sb-push-str! (mut (.out r)) " \x2026; [line cut at 2000 of ")
+              (sb-push-i64! (mut (.out r)) (.line-bytes r))
+              (sb-push-str! (mut (.out r)) " bytes]")
+              0)
+            (sb-push-str! (mut (.out r)) "\n")
+            (set! (.last-shown r) (.line r))
+            0))))
+
+(defn in-window? [(r (ptr LineReader))] (-> bool)
+  (and (>= (.line r) (.offset r)) (< (.line r) (.end r))))
+
+;;; Feed one chunk. Returns false once nothing more needs to be read.
+(defn feed! [(r (mut LineReader)) (chunk (slice u8))] (-> bool)
+  (let [(mut i) 0
+        (mut going) true
+        n (len chunk)]
+    (loop (if (or (not (load going)) (>= (load i) n))
+              (break)
+              (let [byte (get chunk (load i))]
+                (if (>= (.line r) (.end r))
+                    (do (set! (.more r) true)
+                        (set! going false))
+                    (if (= byte (primitive/cast u8 #\newline))
+                        (do (when (in-window? r)
+                              (emit-line! (mut r))
+                              0)
+                            (if (.full r)
+                                (set! going false)
+                                (do (set! (.line r) (+ (.line r) 1))
+                                    (set! (.line-bytes r) 0)
+                                    (sb-free! (mut (.current r)))
+                                    0)))
+                        (do (when (and (in-window? r) (< (.line-bytes r) READ_MAX_LINE_BYTES))
+                              (sb-push-byte! (mut (.current r)) byte)
+                              0)
+                            (set! (.line-bytes r) (+ (.line-bytes r) 1))
+                            0)))
+                (set! i (+ (load i) 1)))))
+    (load going)))
+
+(defsum ReadOutcome
+  (ReadDone [(text (slice u8)) (lines-seen i64) (last-shown i64) (more bool) (full bool)])
+  (ReadBinary)
+  (ReadFailed [(code i64)]))
+
+(defn stream-lines [(a (dyn Allocator)) (path (slice u8)) (offset i64) (limit i64)] (-> ReadOutcome)
+  (let [c (sys/c-string a path)]
+    (match (fs/file-open c fs/O_RDONLY 0)
+      (Err [error] (do (sys/c-string-free a path c) (ReadFailed (io-error-code error))))
+      (Ok [(fs/File :fd fd)]
+          (do
+            (sys/c-string-free a path c)
+            (match (alloc [u8] a READ_CHUNK_BYTES)
+              (None [] (do (os/close (primitive/cast i32 fd)) (ReadFailed 12)))
+              (Some [buffer]
+                    (let [(mut reader) (LineReader :offset offset
+                                                   :end (+ offset limit)
+                                                   :line 1
+                                                   :line-bytes 0
+                                                   :current (sb-new a)
+                                                   :out (sb-new a)
+                                                   :last-shown 0
+                                                   :more false
+                                                   :full false)
+                          (mut first) true
+                          (mut outcome) (: (ReadBinary) ReadOutcome)
+                          (mut finished) false]
+                      (loop (if (load finished)
+                                (break)
+                                (let [n (primitive/cast i64 (io/read (primitive/cast i32 fd)
+                                                                     (primitive/cast (ptr i8) (slice-data buffer))
+                                                                     (primitive/cast isize READ_CHUNK_BYTES)))]
+                                  (cond (< n 0)
+                                          (let [code (os/os-errno)]
+                                            (when (!= code sys/EINTR)
+                                              (set! outcome (ReadFailed code))
+                                              (set! finished true)
+                                              0)
+                                            0)
+                                        (= n 0)
+                                          (do (when (and (> (.line-bytes reader) 0) (in-window? (mut reader)) (not (.full reader)))
+                                                (emit-line! (mut reader))
+                                                0)
+                                              (let [seen (if (> (.line-bytes reader) 0) (.line reader) (- (.line reader) 1))]
+                                                (set! outcome (ReadDone :text (sb-finish! (mut (.out reader)))
+                                                                        :lines-seen seen
+                                                                        :last-shown (.last-shown reader)
+                                                                        :more (.more reader)
+                                                                        :full (.full reader))))
+                                              (set! finished true)
+                                              0)
+                                        :else
+                                          (let [chunk (subslice buffer 0 n)]
+                                            (if (and (load first) (binary? chunk))
+                                                (do (set! outcome (ReadBinary)) (set! finished true) 0)
+                                                (do (set! first false)
+                                                    (when (not (feed! (mut reader) chunk))
+                                                      (set! outcome (ReadDone :text (sb-finish! (mut (.out reader)))
+                                                                              :lines-seen (.line reader)
+                                                                              :last-shown (.last-shown reader)
+                                                                              :more (.more reader)
+                                                                              :full (.full reader)))
+                                                      (set! finished true)
+                                                      0)
+                                                    0)))))))
+                      (sb-free! (mut (.current reader)))
+                      (free [u8] a buffer)
+                      (os/close (primitive/cast i32 fd))
+                      (load outcome)))))))))
+
+(defn read-report [(a (dyn Allocator)) (relative (slice u8)) (offset i64) (outcome ReadOutcome)] (-> ToolOutcome)
+  (match outcome
+    (ReadFailed [code] (ToolFailed (errno-message a "cannot read" relative code)))
+    (ReadBinary [] (ToolFailed (join2 a (quoted a relative) " is not a text file (it contains NUL bytes); read_file only shows text")))
+    (ReadDone [text lines-seen last-shown more full]
+              (cond (and (= lines-seen 0) (= offset 1)) (ToolOk (join2 a (quoted a relative) " is empty"))
+                    (= last-shown 0)
+                      (let [(mut b) (sb-new a)]
+                        (sb-push-str! (mut b) "offset ")
+                        (sb-push-i64! (mut b) offset)
+                        (sb-push-str! (mut b) " is past the end of ")
+                        (sb-push-str! (mut b) (quoted a relative))
+                        (sb-push-str! (mut b) ", which has ")
+                        (sb-push-i64! (mut b) lines-seen)
+                        (sb-push-str! (mut b) (plural lines-seen " line" " lines"))
+                        (ToolFailed (sb-finish! (mut b))))
+                    :else
+                      (let [(mut b) (sb-new a)]
+                        (sb-push-str! (mut b) (sanitize-utf8 a text))
+                        (when more
+                          (sb-push-str! (mut b) "(showing lines ")
+                          (sb-push-i64! (mut b) offset)
+                          (sb-push-str! (mut b) "-")
+                          (sb-push-i64! (mut b) last-shown)
+                          (when full
+                            (sb-push-str! (mut b) ", the 50 KB output limit")
+                            0)
+                          (sb-push-str! (mut b) "; the file continues. Read more with offset=")
+                          (sb-push-i64! (mut b) (+ last-shown 1))
+                          (sb-push-str! (mut b) ")\n")
+                          0)
+                        (ToolOk (sb-finish! (mut b))))))))
+
+(impl Tool ReadFileTool
+  (tool-spec [(self (ptr ReadFileTool))] (-> ToolSpec)
+    (ToolSpec :name "read_file" :description READ_FILE_DESCRIPTION :parameters READ_FILE_SCHEMA))
+  (tool-summary [(self (ptr ReadFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "read " (summary-path call "path" "(no path)")))
+  (tool-run [(self (ptr ReadFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (arg-string a call "path")
+      (Err [m] (ToolFailed m))
+      (Ok [path]
+          (match (arg-int-or a call "offset" 1 1)
+            (Err [m] (ToolFailed m))
+            (Ok [offset]
+                (match (arg-int-or a call "limit" READ_DEFAULT_LIMIT 1)
+                  (Err [m] (ToolFailed m))
+                  (Ok [limit]
+                      (match (resolve a (.workspace self) path)
+                        (Err [m] (ToolFailed m))
+                        (Ok [(ResolvedPath :absolute absolute :relative relative)]
+                            (if (sys/directory? a absolute)
+                                (ToolFailed (join2 a (quoted a relative) " is a directory; use list_dir to see what it contains"))
+                                (read-report a relative offset (stream-lines a absolute offset limit)))))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; write_file
+
+(defstruct WriteFileTool [(workspace Workspace)])
+
+(defn write-file-tool [(workspace Workspace)] (-> WriteFileTool)
+  (WriteFileTool :workspace workspace))
+
+(const WRITE_FILE_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workspace root.\"},\"content\":{\"type\":\"string\",\"description\":\"The complete new contents of the file.\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}")
+
+(const WRITE_FILE_DESCRIPTION
+       "Create a file in the workspace, or replace one completely, with `content`. Missing parent directories are created. To change part of an existing file, use edit_file instead.")
+
+;;; Create every missing directory above `relative` (a normalized path).
+(defn make-parents [(a (dyn Allocator)) (workspace Workspace) (relative (slice u8))] (-> (Result i64 (slice u8)))
+  (let [root (workspace-root workspace)
+        (mut i) 0
+        (mut failed) false
+        (mut outcome) (: (Ok 0) (Result i64 (slice u8)))]
+    (loop (if (>= (load i) (len relative))
+              (break)
+              (do (when (= (get relative (load i)) (primitive/cast u8 #\/))
+                    (let [dir-relative (subslice relative 0 (load i))
+                          dir (if (= root "/") (join2 a "/" dir-relative) (join3 a root "/" dir-relative))]
+                      (match (sys/make-directory a dir)
+                        (Ok [_] 0)
+                        (Err [code] (do (set! outcome (Err (errno-message a "cannot create directory" dir-relative code)))
+                                        (set! failed true)))))
+                    0)
+                  (if (load failed)
+                      (break)
+                      (set! i (+ (load i) 1))))))
+    (load outcome)))
+
+(impl Tool WriteFileTool
+  (tool-spec [(self (ptr WriteFileTool))] (-> ToolSpec)
+    (ToolSpec :name "write_file" :description WRITE_FILE_DESCRIPTION :parameters WRITE_FILE_SCHEMA))
+  (tool-summary [(self (ptr WriteFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "write " (summary-path call "path" "(no path)")))
+  (tool-run [(self (ptr WriteFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (arg-string a call "path")
+      (Err [m] (ToolFailed m))
+      (Ok [path]
+          (match (arg-string a call "content")
+            (Err [m] (ToolFailed m))
+            (Ok [content]
+                (match (resolve a (.workspace self) path)
+                  (Err [m] (ToolFailed m))
+                  (Ok [(ResolvedPath :absolute absolute :relative relative)]
+                      (cond (= relative ".") (ToolFailed "path names the workspace root, which is a directory; pass a file path")
+                            (sys/directory? a absolute)
+                              (ToolFailed (join2 a (quoted a relative) " is a directory; pass a file path"))
+                            :else
+                              (match (make-parents a (.workspace self) relative)
+                                (Err [m] (ToolFailed m))
+                                (Ok [_]
+                                    (let [existed (sys/existing-file? a absolute)]
+                                      (match (fs/write-file a absolute content)
+                                        (Err [error] (ToolFailed (errno-message a "cannot write" relative (io-error-code error))))
+                                        (Ok [written]
+                                            (let [(mut b) (sb-new a)
+                                                  lines (line-count content)]
+                                              (sb-push-str! (mut b) (if existed "overwrote " "created "))
+                                              (sb-push-str! (mut b) relative)
+                                              (sb-push-str! (mut b) " (")
+                                              (sb-push-i64! (mut b) written)
+                                              (sb-push-str! (mut b) (plural written " byte, " " bytes, "))
+                                              (sb-push-i64! (mut b) lines)
+                                              (sb-push-str! (mut b) (plural lines " line)" " lines)"))
+                                              (ToolOk (sb-finish! (mut b))))))))))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; edit_file
+
+(defstruct EditFileTool [(workspace Workspace)])
+
+(defn edit-file-tool [(workspace Workspace)] (-> EditFileTool)
+  (EditFileTool :workspace workspace))
+
+(const EDIT_FILE_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workspace root.\"},\"old_text\":{\"type\":\"string\",\"description\":\"Text to replace. Must match the file exactly, including whitespace and indentation, without line-number prefixes.\"},\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text.\"},\"replace_all\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence instead of requiring exactly one. Default false.\"}},\"required\":[\"path\",\"old_text\",\"new_text\"],\"additionalProperties\":false}")
+
+(const EDIT_FILE_DESCRIPTION
+       "Replace exact text in an existing workspace file. `old_text` must match the file exactly and occur exactly once, unless `replace_all` is true. Returns the edited region with line numbers.")
+
+;;; Non-overlapping occurrences of `needle` in `hay`.
+(defn count-occurrences [(hay (slice u8)) (needle (slice u8))] (-> i64)
+  (let [(mut count) 0
+        (mut from) 0]
+    (loop (match (str-find-from hay needle (load from))
+            (None [] (break))
+            (Some [at] (do (set! count (+ (load count) 1))
+                           (set! from (+ at (len needle)))))))
+    (load count)))
+
+(defn replace-text [(a (dyn Allocator)) (hay (slice u8)) (old (slice u8)) (new (slice u8)) (all bool)] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        (mut from) 0
+        (mut done) false]
+    (loop (if (load done)
+              (break)
+              (match (str-find-from hay old (load from))
+                (None [] (break))
+                (Some [at] (do (sb-push-str! (mut b) (subslice hay (load from) at))
+                               (sb-push-str! (mut b) new)
+                               (set! from (+ at (len old)))
+                               (when (not all) (set! done true) 0)
+                               0)))))
+    (sb-push-str! (mut b) (subslice hay (load from) (len hay)))
+    (sb-finish! (mut b))))
+
+;;; 1-based line number of byte `at`.
+(defn line-of [(text (slice u8)) (at i64)] (-> i64)
+  (+ 1 (- (line-count (subslice text 0 at))
+          (if (and (> at 0) (!= (get text (- at 1)) (primitive/cast u8 #\newline))) 1 0))))
+
+;;; Numbered lines `first`..`last` of `text`, cut at EDIT_SNIPPET_MAX_BYTES.
+(defn numbered-lines [(a (dyn Allocator)) (text (slice u8)) (first i64) (last i64)] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        (mut line) 1
+        (mut start) 0
+        (mut i) 0
+        n (len text)]
+    (loop (if (or (> (load line) last) (> (load i) n))
+              (break)
+              (do (when (or (= (load i) n) (= (get text (load i)) (primitive/cast u8 #\newline)))
+                    (when (and (>= (load line) first) (or (< (load i) n) (> (load i) (load start))))
+                      (if (> (len (sb-str (mut b))) EDIT_SNIPPET_MAX_BYTES)
+                          (do (sb-push-str! (mut b) "      \x2026;\n")
+                              (set! line last))
+                          (do (push-line-number! (mut b) (load line))
+                              (sb-push-str! (mut b) (utf8-prefix (subslice text (load start) (load i)) READ_MAX_LINE_BYTES))
+                              (sb-push-str! (mut b) "\n")
+                              0))
+                      0)
+                    (set! line (+ (load line) 1))
+                    (set! start (+ (load i) 1))
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (sanitize-utf8 a (sb-finish! (mut b)))))
+
+(defn edit-file [(a (dyn Allocator))
+                 (workspace Workspace)
+                 (relative (slice u8))
+                 (absolute (slice u8))
+                 (old (slice u8))
+                 (new (slice u8))
+                 (all bool)] (-> ToolOutcome)
+  (match (fs/read-file a absolute)
+    (Err [error] (ToolFailed (errno-message a "cannot read" relative (io-error-code error))))
+    (Ok [content]
+        (let [occurrences (count-occurrences content old)]
+          (cond (> (len content) EDIT_MAX_FILE_BYTES)
+                  (ToolFailed (join2 a (quoted a relative) " is larger than 16 MB; edit it with the shell tool instead"))
+                (binary? content)
+                  (ToolFailed (join2 a (quoted a relative) " is not a text file (it contains NUL bytes)"))
+                (= occurrences 0)
+                  (ToolFailed (join3 a
+                                     "old_text was not found in "
+                                     (quoted a relative)
+                                     ". Nothing was changed. Read the file again and copy the text exactly, including indentation and line breaks, without the line-number prefixes."))
+                (and (> occurrences 1) (not all))
+                  (let [(mut b) (sb-new a)]
+                    (sb-push-str! (mut b) "old_text appears ")
+                    (sb-push-i64! (mut b) occurrences)
+                    (sb-push-str! (mut b) " times in ")
+                    (sb-push-str! (mut b) (quoted a relative))
+                    (sb-push-str! (mut b) ". Nothing was changed. Include more surrounding lines so it matches exactly once, or set replace_all to true to replace every occurrence.")
+                    (ToolFailed (sb-finish! (mut b))))
+                :else
+                  (let [updated (replace-text a content old new all)
+                        at (match (str-find content old) (Some [i] i) (None [] 0))]
+                    (match (fs/write-file a absolute updated)
+                      (Err [error] (ToolFailed (errno-message a "cannot write" relative (io-error-code error))))
+                      (Ok [_]
+                          (let [first-line (line-of updated at)
+                                last-line (line-of updated (+ at (len new)))
+                                (mut b) (sb-new a)]
+                            (sb-push-str! (mut b) "edited ")
+                            (sb-push-str! (mut b) relative)
+                            (sb-push-str! (mut b) ": replaced ")
+                            (sb-push-i64! (mut b) occurrences)
+                            (sb-push-str! (mut b) (plural occurrences " occurrence" " occurrences"))
+                            (when (> occurrences 1)
+                              (sb-push-str! (mut b) "; the first is shown")
+                              0)
+                            (sb-push-str! (mut b) "\n")
+                            (sb-push-str! (mut b) (numbered-lines a updated
+                                                                  (if (> first-line EDIT_CONTEXT_LINES) (- first-line EDIT_CONTEXT_LINES) 1)
+                                                                  (+ last-line EDIT_CONTEXT_LINES)))
+                            (free-bytes a content 1)
+                            (free-bytes a updated 1)
+                            (ToolOk (sb-finish! (mut b))))))))))))
+
+(impl Tool EditFileTool
+  (tool-spec [(self (ptr EditFileTool))] (-> ToolSpec)
+    (ToolSpec :name "edit_file" :description EDIT_FILE_DESCRIPTION :parameters EDIT_FILE_SCHEMA))
+  (tool-summary [(self (ptr EditFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "edit " (summary-path call "path" "(no path)")))
+  (tool-run [(self (ptr EditFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (arg-string a call "path")
+      (Err [m] (ToolFailed m))
+      (Ok [path]
+          (match (arg-string a call "old_text")
+            (Err [m] (ToolFailed m))
+            (Ok [old]
+                (match (arg-string a call "new_text")
+                  (Err [m] (ToolFailed m))
+                  (Ok [new]
+                      (match (arg-bool-or a call "replace_all" false)
+                        (Err [m] (ToolFailed m))
+                        (Ok [all]
+                            (cond (= (len old) 0)
+                                    (ToolFailed "old_text is empty. To create a file or replace all of it, use write_file.")
+                                  (= old new)
+                                    (ToolFailed "old_text and new_text are identical, so there is nothing to change")
+                                  :else
+                                    (match (resolve a (.workspace self) path)
+                                      (Err [m] (ToolFailed m))
+                                      (Ok [(ResolvedPath :absolute absolute :relative relative)]
+                                          (if (sys/directory? a absolute)
+                                              (ToolFailed (join2 a (quoted a relative) " is a directory, not a file"))
+                                              (edit-file a (.workspace self) relative absolute old new all)))))))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; list_dir
+
+(defstruct ListDirTool [(workspace Workspace)])
+
+(defn list-dir-tool [(workspace Workspace)] (-> ListDirTool)
+  (ListDirTool :workspace workspace))
+
+(const LIST_DIR_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Directory path relative to the workspace root. Default \\\".\\\", the root.\"}},\"additionalProperties\":false}")
+
+(const LIST_DIR_DESCRIPTION
+       "List a directory in the workspace: one entry per line, sorted by name. Directories end with `/`; symbolic links show `-> target`. The .git directory is skipped. Shows at most 500 entries.")
+
+(defn list-dir [(a (dyn Allocator)) (relative (slice u8)) (absolute (slice u8))] (-> ToolOutcome)
+  (match (fs/dir-list a absolute)
+    (Err [error] (ToolFailed (errno-message a "cannot list" relative (io-error-code error))))
+    (Ok [names]
+        (let [(mut entries) names
+              all (al-slice entries)
+              (mut b) (sb-new a)
+              (mut shown) 0
+              (mut hidden) 0
+              (mut i) 0]
+          (sort all (fn [x y] (str-cmp x y)))
+          (loop (if (>= (load i) (len all))
+                    (break)
+                    (let [name (get all (load i))]
+                      (cond (= name ".git") 0
+                            (>= (load shown) LIST_MAX_ENTRIES) (set! hidden (+ (load hidden) 1))
+                            :else
+                              (let [full (join3 a absolute "/" name)]
+                                (sb-push-str! (mut b) name)
+                                (when (sys/directory? a full)
+                                  (sb-push-str! (mut b) "/")
+                                  0)
+                                (match (sys/read-link a full)
+                                  (Some [target] (do (sb-push-str! (mut b) " -> ")
+                                                     (sb-push-str! (mut b) target)
+                                                     (free-bytes a target 1)))
+                                  (None [] 0))
+                                (sb-push-str! (mut b) "\n")
+                                (free-bytes a full 1)
+                                (set! shown (+ (load shown) 1))))
+                      (set! i (+ (load i) 1)))))
+          (when (> (load hidden) 0)
+            (sb-push-str! (mut b) "\x2026; ")
+            (sb-push-i64! (mut b) (load hidden))
+            (sb-push-str! (mut b) " more entries not shown\n")
+            0)
+          (when (= (load shown) 0)
+            (sb-push-str! (mut b) (join2 a (quoted a relative) " is empty"))
+            0)
+          (fs/dir-list-free a (mut entries))
+          (ToolOk (sanitize-utf8 a (sb-finish! (mut b))))))))
+
+(impl Tool ListDirTool
+  (tool-spec [(self (ptr ListDirTool))] (-> ToolSpec)
+    (ToolSpec :name "list_dir" :description LIST_DIR_DESCRIPTION :parameters LIST_DIR_SCHEMA))
+  (tool-summary [(self (ptr ListDirTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "ls " (summary-path call "path" ".")))
+  (tool-run [(self (ptr ListDirTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (arg-string-or a call "path" ".")
+      (Err [m] (ToolFailed m))
+      (Ok [path]
+          (match (resolve a (.workspace self) path)
+            (Err [m] (ToolFailed m))
+            (Ok [(ResolvedPath :absolute absolute :relative relative)]
+                (cond (sys/directory? a absolute) (list-dir a relative absolute)
+                      (sys/existing-file? a absolute)
+                        (ToolFailed (join2 a (quoted a relative) " is a file, not a directory; use read_file to read it"))
+                      :else (ToolFailed (join2 a (quoted a relative) " does not exist")))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; search
+
+;;; The program `search` runs. Ripgrep honors .gitignore; grep does not.
+(defsum SearchBackend
+  (Ripgrep [(program (slice u8))])
+  (Grep [(program (slice u8))]))
+
+;;; `rg` when it is on PATH, otherwise `grep`. Err when neither exists.
+(defn search-backend-detect [(a (dyn Allocator))] (-> (Result SearchBackend (slice u8)))
+  (match (sys/find-on-path a "rg")
+    (Some [path] (Ok (Ripgrep path)))
+    (None [] (match (sys/find-on-path a "grep")
+               (Some [path] (Ok (Grep path)))
+               (None [] (Err "neither rg nor grep is on PATH; the search tool needs one of them"))))))
+
+(defstruct SearchTool [(workspace Workspace) (backend SearchBackend)])
+
+(defn search-tool [(workspace Workspace) (backend SearchBackend)] (-> SearchTool)
+  (SearchTool :workspace workspace :backend backend))
+
+(const SEARCH_SCHEMA
+       "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression to search file contents for.\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search, relative to the workspace root. Default \\\".\\\", the whole workspace.\"},\"glob\":{\"type\":\"string\",\"description\":\"Only search files whose names match this glob, such as \\\"*.coil\\\".\"}},\"required\":[\"pattern\"],\"additionalProperties\":false}")
+
+(const SEARCH_DESCRIPTION_RG
+       "Search file contents in the workspace with a regular expression (ripgrep syntax). Returns matching lines as `path:line:text`, at most 250 lines. Files ignored by .gitignore, binary files, and .git are skipped. Narrow `path` or `glob` when there are too many matches.")
+
+(const SEARCH_DESCRIPTION_GREP
+       "Search file contents in the workspace with a POSIX extended regular expression. Returns matching lines as `path:line:text`, at most 250 lines. Binary files and .git are skipped. Narrow `path` or `glob` when there are too many matches.")
+
+(defn search-argv [(a (dyn Allocator)) (backend SearchBackend) (pattern (slice u8)) (relative (slice u8)) (glob (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut argv) (al-new [(slice u8)] a)
+        has-glob (> (len glob) 0)]
+    (match backend
+      (Ripgrep [program]
+               (do (push! (mut argv) program)
+                   (push! (mut argv) "--line-number")
+                   (push! (mut argv) "--no-heading")
+                   (push! (mut argv) "--with-filename")
+                   (push! (mut argv) "--color=never")
+                   (push! (mut argv) "--hidden")
+                   (push! (mut argv) "--glob=!.git")
+                   (push! (mut argv) "--max-columns=400")
+                   (push! (mut argv) "--max-columns-preview")
+                   (when has-glob
+                     (push! (mut argv) (join2 a "--glob=" glob))
+                     0)
+                   (push! (mut argv) "-e")
+                   (push! (mut argv) pattern)
+                   (when (!= relative ".")
+                     (push! (mut argv) "--")
+                     (push! (mut argv) relative)
+                     0)
+                   0))
+      (Grep [program]
+            (do (push! (mut argv) program)
+                (push! (mut argv) "-rnIHE")
+                (push! (mut argv) "--exclude-dir=.git")
+                (when has-glob
+                  (push! (mut argv) (join2 a "--include=" glob))
+                  0)
+                (push! (mut argv) "-e")
+                (push! (mut argv) pattern)
+                (push! (mut argv) "--")
+                (push! (mut argv) relative)
+                0)))
+    (load argv)))
+
+;;; The first SEARCH_MAX_LINES lines of `output`, each without a leading "./"
+;;; (grep prints one when asked to search ".").
+(defn search-lines [(a (dyn Allocator)) (output (slice u8))] (-> (slice u8))
+  (let [(mut b) (sb-new a)
+        (mut lines) 0
+        (mut start) 0
+        (mut i) 0
+        n (len output)]
+    (loop (if (or (>= (load i) n) (>= (load lines) SEARCH_MAX_LINES))
+              (break)
+              (do (when (= (get output (load i)) (primitive/cast u8 #\newline))
+                    (let [line (subslice output (load start) (+ (load i) 1))]
+                      (sb-push-str! (mut b) (if (starts-with line "./") (subslice line 2 (len line)) line))
+                      (set! lines (+ (load lines) 1))
+                      (set! start (+ (load i) 1)))
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (sb-finish! (mut b))))
+
+(defn search [(a (dyn Allocator))
+              (self (ptr SearchTool))
+              (pattern (slice u8))
+              (relative (slice u8))
+              (glob (slice u8))
+              (context (dyn ToolContext))] (-> ToolOutcome)
+  (let [(mut argv) (search-argv a (.backend self) pattern relative glob)
+        all (al-slice argv)
+        ran (shell/execute a
+                           (shell/ExecSpec :program (get all 0)
+                                           :args (subslice all 1 (len all))
+                                           :cwd (workspace-root (.workspace self))
+                                           :timeout-ms SEARCH_TIMEOUT_MS
+                                           :head-bytes SEARCH_MAX_OUTPUT_BYTES
+                                           :tail-bytes 0)
+                           context)]
+    (al-free! (mut argv))
+    (match ran
+      (Err [m] (ToolFailed m))
+      (Ok [finished]
+          (let [result finished]
+           (cond (.timed-out result)
+                  (ToolFailed "search timed out after 60s; narrow the path, glob, or pattern")
+                (.cancelled result) (ToolFailed "search cancelled")
+                (= (.exit-code result) 1)
+                  (ToolOk (join2 a (join3 a "no matches for " (quoted a pattern) " in ") (quoted a relative)))
+                (!= (.exit-code result) 0)
+                  (let [(mut b) (sb-new a)]
+                    (sb-push-str! (mut b) "search failed (exit ")
+                    (sb-push-i64! (mut b) (.exit-code result))
+                    (sb-push-str! (mut b) "):\n")
+                    (sb-push-str! (mut b) (.output result))
+                    (ToolFailed (sb-finish! (mut b))))
+                :else
+                  (let [shown (search-lines a (.output result))
+                        shown-lines (line-count shown)
+                        (mut b) (sb-new a)]
+                    (sb-push-str! (mut b) shown)
+                    (when (or (> (.output-lines result) shown-lines) (> (.omitted-bytes result) 0))
+                      (sb-push-str! (mut b) "(showing ")
+                      (sb-push-i64! (mut b) shown-lines)
+                      (sb-push-str! (mut b) " of ")
+                      (sb-push-i64! (mut b) (.output-lines result))
+                      (sb-push-str! (mut b) " matching lines; narrow the pattern, path, or glob to see the rest)\n")
+                      0)
+                    (ToolOk (sb-finish! (mut b))))))))))
+
+(impl Tool SearchTool
+  (tool-spec [(self (ptr SearchTool))] (-> ToolSpec)
+    (ToolSpec :name "search"
+              :description (match (.backend self)
+                             (Ripgrep [_] SEARCH_DESCRIPTION_RG)
+                             (Grep [_] SEARCH_DESCRIPTION_GREP))
+              :parameters SEARCH_SCHEMA))
+  (tool-summary [(self (ptr SearchTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+    (join2 a "search " (quoted a (utf8-prefix (call-string call "pattern") 80))))
+  (tool-run [(self (ptr SearchTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (arg-string a call "pattern")
+      (Err [m] (ToolFailed m))
+      (Ok [pattern]
+          (match (arg-string-or a call "path" ".")
+            (Err [m] (ToolFailed m))
+            (Ok [path]
+                (match (arg-string-or a call "glob" "")
+                  (Err [m] (ToolFailed m))
+                  (Ok [glob]
+                      (cond (= (len pattern) 0) (ToolFailed "pattern is empty; pass a regular expression to search for")
+                            :else
+                              (match (resolve a (.workspace self) path)
+                                (Err [m] (ToolFailed m))
+                                (Ok [(ResolvedPath :absolute absolute :relative relative)]
+                                    (if (or (sys/directory? a absolute) (sys/existing-file? a absolute))
+                                        (search a self pattern relative glob context)
+                                        (ToolFailed (join2 a (quoted a relative) " does not exist"))))))))))))))

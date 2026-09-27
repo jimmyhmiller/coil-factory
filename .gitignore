@@ -1,2 +1,8 @@
 .DS_Store
 .claude/settings.local.json
+# Coil build products
+/build/
+**/.coil/
+**/build/
+# Worktrees made by agents working on this repository
+/.worktrees/

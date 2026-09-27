@@ -1,0 +1,275 @@
+(module http_app.native)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.slice" :use *)
+
+;;; Host ABI facts the server needs beyond `coil.socket`. Every value that differs
+;;; between Darwin and Linux is chosen at compile time for the target, the same way
+;;; `coil.socket` chooses its own layouts.
+(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+
+(extern shutdown :cc c [i32 i32] (-> i32))
+
+(extern abort :cc c [] (-> void))
+
+(const F_GETFD 1)
+
+(const F_SETFD 2)
+
+(const F_GETFL 3)
+
+(const F_SETFL 4)
+
+(const FD_CLOEXEC 1)
+
+(const SHUT_WR 1)
+
+(const EINTR 4)
+
+(const ENOMEM 12)
+
+(const ENFILE 23)
+
+(const EMFILE 24)
+
+;; hygiene: platform constants, layouts, and socket primitives intentionally enter
+;; this module's public namespace under their conventional spellings.
+(defn native-public-name [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
+
+(extern socket :cc c [i32 i32 i32] (-> i32))
+
+(extern setsockopt :cc c [i32 i32 i32 (ptr i8) u32] (-> i32))
+
+(extern bind :cc c [i32 (ptr i8) u32] (-> i32))
+
+(extern listen :cc c [i32 i32] (-> i32))
+
+(extern accept :cc c [i32 (ptr i8) (ptr u32)] (-> i32))
+
+(extern htons :cc c [u16] (-> u16))
+
+(extern inet_pton :cc c [i32 (ptr i8) (ptr i8)] (-> i32))
+
+(const AF_INET 2)
+
+(const SOCK_STREAM 1)
+
+(defstruct InAddr [(s_addr u32)])
+
+(defn gen-native-platform [] (-> Code)
+  (if (= (primitive/target-os) `linux)
+      `(do
+         (const ~(native-public-name `O_NONBLOCK) 2048)
+         (const ~(native-public-name `EAGAIN) 11)
+         (const ~(native-public-name `ECONNABORTED) 103)
+         (const ~(native-public-name `ENOBUFS) 105)
+         (const ~(native-public-name `SOL_SOCKET) 1)
+         (const ~(native-public-name `SO_REUSEADDR) 2)
+         ;; SOCK_CLOEXEC | SOCK_NONBLOCK: the kernel applies both atomically, so no
+         ;; concurrent fork/exec can observe an inheritable descriptor.
+         (const ~(native-public-name `SOCKET-ATOMIC-FLAGS) 526336)
+         (defstruct ~(native-public-name `SockaddrIn)
+           [(sin_family u16)
+            (sin_port u16)
+            (sin_addr InAddr)
+            (sin_zero (array u8 8))])
+         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))] (-> i64)
+           (store! (field address sin_family) (primitive/cast u16 AF_INET))
+           0)
+         (extern ~(native-public-name `accept4)
+                 :cc
+                 c
+                 [i32 (ptr i8) (ptr u32) i32]
+                 (-> i32))
+         (defn ~(native-public-name `accept-raw) [(listener-fd i32)] (-> i32)
+           (~(native-public-name `accept4) listener-fd
+              (primitive/cast (ptr i8) 0)
+              (primitive/cast (ptr u32) 0)
+              (primitive/cast i32 526336)))
+         ;; Linux suppresses SIGPIPE per call with MSG_NOSIGNAL, which
+         ;; `coil.socket/tcp-write` passes on every send.
+         (defn ~(native-public-name `suppress-sigpipe!) [(fd i32)] (-> i64)
+           0))
+      `(do
+         (const ~(native-public-name `O_NONBLOCK) 4)
+         (const ~(native-public-name `EAGAIN) 35)
+         (const ~(native-public-name `ECONNABORTED) 53)
+         (const ~(native-public-name `ENOBUFS) 55)
+         (const ~(native-public-name `SOL_SOCKET) 65535)
+         (const ~(native-public-name `SO_REUSEADDR) 4)
+         ;; Darwin has no SOCK_CLOEXEC/accept4: descriptor flags are set with fcntl
+         ;; immediately after creation instead.
+         (const ~(native-public-name `SOCKET-ATOMIC-FLAGS) 0)
+         (defstruct ~(native-public-name `SockaddrIn)
+           [(sin_len u8)
+            (sin_family u8)
+            (sin_port u16)
+            (sin_addr InAddr)
+            (sin_zero (array u8 8))])
+         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))] (-> i64)
+           (store! (field address sin_len) (primitive/cast u8 16))
+           (store! (field address sin_family) (primitive/cast u8 AF_INET))
+           0)
+         (defn ~(native-public-name `accept-raw) [(listener-fd i32)] (-> i32)
+           (accept listener-fd
+                   (primitive/cast (ptr i8) 0)
+                   (primitive/cast (ptr u32) 0)))
+         ;; SO_NOSIGPIPE turns a write to a closed peer into EPIPE instead of a
+         ;; process-killing SIGPIPE. Returns 0 or errno.
+         (defn ~(native-public-name `suppress-sigpipe!) [(fd i32)] (-> i64)
+           (let [enabled (primitive/alloc-stack i32)]
+             (store! enabled (primitive/cast i32 1))
+             (if (< (setsockopt fd
+                                (primitive/cast i32 65535)
+                                (primitive/cast i32 4130)
+                                (primitive/cast (ptr i8) enabled)
+                                (primitive/cast u32 4))
+                    (primitive/cast i32 0))
+                 (os/os-errno)
+                 0))))))
+
+(meta (gen-native-platform))
+
+;;; Report a violated library contract and abort the process. Used only for
+;;; programming errors, never for data- or network-dependent failures.
+(defn fatal [T] [(message (slice u8))] (-> T)
+  (io/print-str (io/stderr) "http_app: fatal: ")
+  (io/print-str (io/stderr) message)
+  (io/print-str (io/stderr) "\n")
+  (abort)
+  (primitive/zeroed T))
+
+;;; Mark `fd` close-on-exec so child processes never inherit it. Returns 0 or errno.
+(defn set-cloexec! [(fd i32)] (-> i64)
+  (let [flags (os/fcntl fd (primitive/cast i32 F_GETFD))]
+    (if (< flags (primitive/cast i32 0))
+        (os/os-errno)
+        (if (< (os/fcntl fd
+                         (primitive/cast i32 F_SETFD)
+                         (primitive/ior flags (primitive/cast i32 FD_CLOEXEC)))
+               (primitive/cast i32 0))
+            (os/os-errno)
+            0))))
+
+;;; Put `fd` in non-blocking mode. Returns 0 or errno.
+(defn set-nonblocking! [(fd i32)] (-> i64)
+  (let [flags (os/fcntl fd (primitive/cast i32 F_GETFL))]
+    (if (< flags (primitive/cast i32 0))
+        (os/os-errno)
+        (if (< (os/fcntl fd
+                         (primitive/cast i32 F_SETFL)
+                         (primitive/ior flags (primitive/cast i32 O_NONBLOCK)))
+               (primitive/cast i32 0))
+            (os/os-errno)
+            0))))
+
+;;; True when `fd` currently carries FD_CLOEXEC.
+(defn cloexec? [(fd i32)] (-> bool)
+  (let [flags (os/fcntl fd (primitive/cast i32 F_GETFD))]
+    (and (>= flags (primitive/cast i32 0))
+         (!= (primitive/iand flags (primitive/cast i32 FD_CLOEXEC))
+             (primitive/cast i32 0)))))
+
+;;; Transient accept failures leave the listener usable.
+(defn accept-error-transient? [(code i64)] (-> bool)
+  (or (= code EINTR)
+      (= code EAGAIN)
+      (= code ECONNABORTED)
+      (= code ENOBUFS)
+      (= code ENOMEM)
+      (= code EMFILE)
+      (= code ENFILE)))
+
+;;; Descriptor exhaustion: back off briefly instead of spinning on accept.
+(defn accept-error-exhausted? [(code i64)] (-> bool)
+  (or (= code EMFILE) (= code ENFILE) (= code ENOBUFS) (= code ENOMEM)))
+
+(static-assert (= (primitive/sizeof SockaddrIn) 16) "sockaddr_in ABI size")
+
+;;; Close `fd` and turn `code` into the negative-errno convention of `listen-ipv4`.
+(defn abandon-fd [(fd i32) (code i64)] (-> i64)
+  (os/close fd)
+  (- 0 code))
+
+;;; Apply descriptor flags, SO_REUSEADDR, bind, and listen to a fresh socket.
+(defn listen-ipv4-configure [(a (dyn alloc/Allocator))
+                             (fd i32)
+                             (host (slice u8))
+                             (port i64)
+                             (backlog i64)] (-> i64)
+  (let [cloexec (set-cloexec! fd)
+        nonblocking (if (= cloexec 0) (set-nonblocking! fd) cloexec)]
+    (if (!= nonblocking 0)
+        (abandon-fd fd nonblocking)
+        (let [enabled (primitive/alloc-stack i32)]
+          (set! enabled (primitive/cast i32 1))
+          (if (< (setsockopt fd
+                             (primitive/cast i32 SOL_SOCKET)
+                             (primitive/cast i32 SO_REUSEADDR)
+                             (primitive/cast (ptr i8) enabled)
+                             (primitive/cast u32 4))
+                 (primitive/cast i32 0))
+              (abandon-fd fd (os/os-errno))
+              (let [address (primitive/alloc-stack SockaddrIn)
+                    c-host (str/str->cstr a host)]
+                (set! address (primitive/zeroed SockaddrIn))
+                (sockaddr-in-family! address)
+                (set! (.sin_port address) (htons (primitive/cast u16 port)))
+                (if (= (primitive/cast i64 c-host) 0)
+                    (abandon-fd fd ENOMEM)
+                    (let [parsed
+                            (inet_pton (primitive/cast i32 AF_INET)
+                                       c-host
+                                       (primitive/cast (ptr i8)
+                                                       (field address sin_addr)))]
+                      (alloc/free-bytes a
+                                        (slice-new [u8]
+                                                   (primitive/cast (ptr u8)
+                                                                   c-host)
+                                                   (+ (len host) 1))
+                                        1)
+                      (cond (!= parsed (primitive/cast i32 1))
+                              (abandon-fd fd 22)
+                            (< (bind fd
+                                     (primitive/cast (ptr i8) address)
+                                     (primitive/cast u32 16))
+                               (primitive/cast i32 0))
+                              (abandon-fd fd (os/os-errno))
+                            (< (listen fd (primitive/cast i32 backlog))
+                               (primitive/cast i32 0))
+                              (abandon-fd fd (os/os-errno))
+                            :else (primitive/cast i64 fd))))))))))
+
+;;; Create a close-on-exec, non-blocking IPv4 listening socket with SO_REUSEADDR.
+;;; `host` must be a dotted-quad IPv4 address. Returns the fd, or a negative errno
+;;; (`-22`, EINVAL, for an invalid address, port, or backlog).
+(defn listen-ipv4 [(a (dyn alloc/Allocator))
+                   (host (slice u8))
+                   (port i64)
+                   (backlog i64)] (-> i64)
+  (if (or (< port 0) (> port 65535) (<= backlog 0))
+      -22
+      (let [fd
+              (socket (primitive/cast i32 AF_INET)
+                      (primitive/cast i32 (+ SOCK_STREAM SOCKET-ATOMIC-FLAGS))
+                      (primitive/cast i32 0))]
+        (if (< fd (primitive/cast i32 0))
+            (- 0 (os/os-errno))
+            (listen-ipv4-configure a fd host port backlog)))))
+
+;;; Accept one connection as a close-on-exec, non-blocking, SIGPIPE-safe fd.
+;;; Returns the fd, or a negative errno.
+(defn accept-connection [(listener-fd i32)] (-> i64)
+  (let [fd (accept-raw listener-fd)]
+    (if (< fd (primitive/cast i32 0))
+        (- 0 (os/os-errno))
+        (let [cloexec (set-cloexec! fd)
+              nonblocking (if (= cloexec 0) (set-nonblocking! fd) cloexec)
+              sigpipe (if (= nonblocking 0) (suppress-sigpipe! fd) nonblocking)]
+          (if (!= sigpipe 0)
+              (abandon-fd fd sigpipe)
+              (primitive/cast i64 fd))))))

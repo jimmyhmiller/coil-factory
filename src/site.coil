@@ -1,0 +1,198 @@
+(module factory.site)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "coil.sync" :as sync)
+(import "durable.atomic" :as atomic)
+(import "durable.lock" :as lock)
+(import "agent.fail" :use *)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.journal" :use *)
+(import "factory.proc" :use *)
+(import "factory.runstate" :use *)
+
+;;; A site's live view of its runs, and the supervisor that keeps them moving.
+;;;
+;;; The journal of each run is the truth; the site folds it incrementally into
+;;; a `RunState` and acts on what it sees:
+;;;
+;;; - a `queued` run is started when there is capacity;
+;;; - a `running` or `paused` run whose process has died becomes `lost`;
+;;; - a message for an agent whose run has no process starts one, which
+;;;   resumes a blocked station or holds a conversation after the run ended.
+;;;
+;;; Everything here is guarded by one mutex shared with the API threads.
+
+(defstruct RunEntry
+  [(id (slice u8))
+   (arena scratch/ScratchArena)
+   (state RunState)
+   (child (ptr subprocess/Child))
+   (spawned-t i64)])
+
+(defstruct Site
+  [(allocator (dyn Allocator))
+   (home (slice u8))
+   (config SiteConfig)
+   (token (slice u8))
+   (executable (slice u8))
+   (mutex sync/Mutex)
+   (runs (ArrayList (ptr RunEntry)))
+   (started-t i64)])
+
+(defn site-lock! [(site (ptr Site))] (-> i64)
+  (match (sync/mutex-lock! (field site mutex))
+    (Ok [held] 0)
+    (Err [failure] (fail [i64] "factory: the site mutex could not be locked"))))
+
+(defn site-unlock! [(site (ptr Site))] (-> i64)
+  (match (sync/mutex-unlock! (field site mutex))
+    (Ok [released] 0)
+    (Err [failure] (fail [i64] "factory: the site mutex could not be unlocked"))))
+
+(defn entry-new [(a (dyn Allocator)) (id (slice u8))] (-> (ptr RunEntry))
+  (let [entry (box! a RunEntry (primitive/zeroed RunEntry))]
+    (set! (.id entry) (copy-bytes a id))
+    (scratch/scratch-init (field entry arena) a)
+    (set! (.state entry) (runstate-new (scratch/scratch-allocator (field entry arena)) id))
+    (set! (.child entry) (cast (ptr subprocess/Child) 0))
+    entry))
+
+;;; Fold new journal records. When the state's arena has grown large from
+;;; replaced activity strings, fold the whole journal again into a fresh one.
+(defn entry-refresh! [(site (ptr Site)) (entry (ptr RunEntry))] (-> i64)
+  (let [path (events-path (.allocator site) (.home site) (.id entry))]
+    (catch-up! (field entry state) path)
+    (when (> (scratch/scratch-total (field entry arena)) 8388608)
+      (scratch/scratch-close! (field entry arena))
+      (set! (.arena entry) (primitive/zeroed scratch/ScratchArena))
+      (scratch/scratch-init (field entry arena) (.allocator site))
+      (set! (.state entry) (runstate-new (scratch/scratch-allocator (field entry arena)) (.id entry)))
+      (catch-up! (field entry state) path)
+      0)
+    0))
+
+(defn find-entry [(site (ptr Site)) (id (slice u8))] (-> (ptr RunEntry))
+  (let [(mut found) (cast (ptr RunEntry) 0)]
+    (for entry (iter (.runs site))
+      (when (= (.id entry) id) (set! found entry) 0))
+    (load found)))
+
+;;; Runs whose id starts with `prefix`, for short references like `7f3a`.
+(defn find-by-prefix [(site (ptr Site)) (a (dyn Allocator)) (prefix (slice u8))] (-> (ArrayList (ptr RunEntry)))
+  (let [(mut out) (al-new [(ptr RunEntry)] a)]
+    (for entry (iter (.runs site))
+      (when (or (= (.id entry) prefix) (starts-with (.id entry) prefix)
+                (match (str-find (.id entry) prefix) (Some [at] (> (len prefix) 3)) (None [] false)))
+        (push! [(ptr RunEntry)] (mut out) entry)
+        0))
+    (load out)))
+
+(defn read-pid [(site (ptr Site)) (id (slice u8))] (-> i64)
+  (match (lock/pid-read (.allocator site) (run-file (.allocator site) (.home site) id "pid"))
+    (Ok [found] (match found (Some [n] n) (None [] 0)))
+    (Err [failure] 0)))
+
+;;; Whether a process is working on this run right now.
+(defn entry-alive? [(site (ptr Site)) (entry (ptr RunEntry))] (-> bool)
+  (let [child (.child entry)]
+    (if (!= (cast i64 child) 0)
+        (match (subprocess/child-try-wait child)
+          (Ok [status] (match status
+                         (None [] true)
+                         (Some [exited] (do (set! (.child entry) (cast (ptr subprocess/Child) 0)) false))))
+          (Err [failure] (do (set! (.child entry) (cast (ptr subprocess/Child) 0)) false)))
+        (process-alive? (read-pid site (.id entry))))))
+
+(defn spawn-run-process! [(site (ptr Site)) (entry (ptr RunEntry))] (-> bool)
+  (let [a (.allocator site)
+        child (box! a subprocess/Child (primitive/zeroed subprocess/Child))]
+    (match (subprocess/spawn a child (.executable site) ["_run" (.id entry)]
+                             (subprocess/null-stdio) (subprocess/null-stdio) (subprocess/null-stdio))
+      (Ok [spawned] (do (set! (.child entry) spawned)
+                        (set! (.spawned-t entry) (wall-ms))
+                        true))
+      (Err [failure] false))))
+
+(defn append! [(site (ptr Site)) (id (slice u8)) (record JVal)] (-> bool)
+  (match (append-run-event! (.allocator site) (.home site) id record)
+    (AppendedAt [offset] true)
+    (AppendFailed [message] false)))
+
+(defn running-count [(site (ptr Site))] (-> i64)
+  (let [(mut n) 0]
+    (for entry (iter (.runs site))
+      (when (active-status? (.status (field entry state))) (set! n (+ (load n) 1)) 0))
+    (load n)))
+
+;;; One supervision pass. Call with the site lock held.
+(defn supervise! [(site (ptr Site))] (-> i64)
+  (let [a (.allocator site)
+        now (wall-ms)
+        (mut capacity) (- (.max-runs (field site config)) (running-count site))]
+    (for entry (iter (.runs site))
+      (entry-refresh! site entry)
+      (let [st (field entry state)
+            status (.status st)
+            recently-spawned (< (- now (.spawned-t entry)) 5000)
+            alive (entry-alive? site entry)]
+        (cond
+          (and (= status "queued") (not alive) (> (load capacity) 0) (not recently-spawned))
+            (when (spawn-run-process! site entry)
+              (set! capacity (- (load capacity) 1))
+              0)
+          (and (active-status? status) (not alive) (not recently-spawned))
+            (do (append! site (.id entry)
+                         (ev-str! (ev a "run.lost") "reason" "the run process is gone; `factory resume` continues from the last checkpoint"))
+                0)
+          (and (> (len (.pending st)) 0) (not alive) (not recently-spawned)
+               (not (active-status? status)) (not (= status "queued")))
+            (do (spawn-run-process! site entry) 0)
+          :else 0)))
+    0))
+
+;;; Load every run under `runs/` into the site.
+(defn load-runs! [(site (ptr Site))] (-> i64)
+  (let [a (.allocator site)
+        dir (runs-dir a (.home site))]
+    (atomic/ensure-dir! a dir 448)
+    (match (atomic/list-dir a dir)
+      (Err [failure] 0)
+      (Ok [names]
+          (do (for name (iter names)
+                (when (and (> (len name) 0) (!= (cast i64 (get name 0)) 46))
+                  (let [entry (entry-new a name)]
+                    (entry-refresh! site entry)
+                    (push! [(ptr RunEntry)] (mut (.runs site)) entry)
+                    0)
+                  0))
+              0)))))
+
+(defn site-open [(a (dyn Allocator)) (home (slice u8)) (config SiteConfig) (token (slice u8)) (executable (slice u8))] (-> (ptr Site))
+  (let [site (box! a Site (primitive/zeroed Site))]
+    (set! (.allocator site) a)
+    (set! (.home site) home)
+    (set! (.config site) config)
+    (set! (.token site) token)
+    (set! (.executable site) executable)
+    (set! (.runs site) (al-new [(ptr RunEntry)] a))
+    (set! (.started-t site) (wall-ms))
+    (match (sync/mutex-init (field site mutex))
+      (Ok [m] 0)
+      (Err [failure] (fail [i64] "factory: cannot initialize the site mutex")))
+    (load-runs! site)
+    site))
+
+;;; Register a run whose directory and `run.created` record already exist.
+(defn adopt-run! [(site (ptr Site)) (id (slice u8))] (-> (ptr RunEntry))
+  (let [entry (entry-new (.allocator site) id)]
+    (entry-refresh! site entry)
+    (push! [(ptr RunEntry)] (mut (.runs site)) entry)
+    entry))

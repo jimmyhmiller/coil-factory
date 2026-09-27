@@ -1,0 +1,80 @@
+(module factory.ui.store)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [jv-parse])
+
+;;; Memory for data the dashboard keeps between frames. Every fetched document
+;;; is parsed into an arena; a `Snap` holds two, so a new document is built in
+;;; the spare one and only replaces the shown one when it arrived intact. Long
+;;; lists (the event feed) compact into the spare arena and flip.
+(defstruct Arenas [(pair (array scratch/ScratchArena 2)) (current i64)])
+
+(defn arenas-init! [(arenas (ptr Arenas)) (parent (dyn Allocator))] (-> i64)
+  (scratch/scratch-init (index (field arenas pair) 0) parent)
+  (scratch/scratch-init (index (field arenas pair) 1) parent)
+  (set! (.current arenas) 0)
+  0)
+
+(defn arenas-close! [(arenas (ptr Arenas))] (-> i64)
+  (scratch/scratch-close! (index (field arenas pair) 0))
+  (scratch/scratch-close! (index (field arenas pair) 1))
+  0)
+
+;;; The arena holding what is shown now.
+(defn arenas-active [(arenas (ptr Arenas))] (-> (dyn Allocator))
+  (scratch/scratch-allocator (index (field arenas pair) (.current arenas))))
+
+;;; The other arena, emptied, for building a replacement.
+(defn arenas-spare [(arenas (ptr Arenas))] (-> (dyn Allocator))
+  (let [spare (index (field arenas pair) (- 1 (.current arenas)))]
+    (scratch/scratch-recycle! spare)
+    (scratch/scratch-allocator spare)))
+
+;;; Make the spare arena the active one.
+(defn arenas-flip! [(arenas (ptr Arenas))] (-> i64)
+  (set! (.current arenas) (- 1 (.current arenas)))
+  0)
+
+;;; Empty the active arena (everything allocated from it becomes invalid).
+(defn arenas-clear! [(arenas (ptr Arenas))] (-> i64)
+  (scratch/scratch-recycle! (index (field arenas pair) (.current arenas)))
+  0)
+
+;;; One fetched JSON document. `value` lives in the active arena; `has` is
+;;; false until the first successful load.
+(defstruct Snap [(arenas Arenas) (value JVal) (has bool) (loaded-t i64)])
+
+(defn snap-init! [(snap (ptr Snap)) (parent (dyn Allocator))] (-> i64)
+  (arenas-init! (field snap arenas) parent)
+  (set! (.value snap) (JNull))
+  (set! (.has snap) false)
+  (set! (.loaded-t snap) 0)
+  0)
+
+;;; An emptied allocator to fetch the next document into.
+(defn snap-spare [(snap (ptr Snap))] (-> (dyn Allocator))
+  (arenas-spare (field snap arenas)))
+
+;;; Show `value`, which was built in `snap-spare`'s allocator.
+(defn snap-commit! [(snap (ptr Snap)) (value JVal) (t i64)] (-> i64)
+  (arenas-flip! (field snap arenas))
+  (set! (.value snap) value)
+  (set! (.has snap) true)
+  (set! (.loaded-t snap) t)
+  0)
+
+;;; Forget the document.
+(defn snap-reset! [(snap (ptr Snap))] (-> i64)
+  (arenas-clear! (field snap arenas))
+  (set! (.value snap) (JNull))
+  (set! (.has snap) false)
+  0)
+
+;;; Parse `text` and show it. Returns false (keeping the old document) when it
+;;; is not JSON.
+(defn snap-load-text! [(snap (ptr Snap)) (text (slice u8)) (t i64)] (-> bool)
+  (match (jv-parse (snap-spare snap) text)
+    (Some [value] (do (snap-commit! snap value t) true))
+    (None [] false)))

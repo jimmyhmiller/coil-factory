@@ -1,0 +1,6 @@
+[package]
+name = "greet"
+entry = "src/main.coil"
+
+[dependencies]
+cli = { path = "../.." }

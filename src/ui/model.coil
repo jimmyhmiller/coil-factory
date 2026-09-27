@@ -1,0 +1,410 @@
+(module factory.ui.model)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator free])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [copy-bytes])
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "tui.widgets" :use *)
+(import "factory.client" :use [Hub])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.feed" :use *)
+(import "factory.ui.chat" :use *)
+
+;;; The dashboard's whole state. Views draw from it; the event handler fetches
+;;; into it. Nothing here touches the network.
+(defsum View
+  (ViewOverview)
+  (ViewRun)
+  (ViewChat))
+
+(defstruct Dash
+  [(allocator (dyn Allocator))
+   (hub Hub)
+   (theme Theme)
+   (view View)
+   (chat-from-run bool)
+   (now i64)
+   (tick i64)
+   ;; overview
+   (overview Snap)
+   (runs-lv ListView)
+   (selected-id (slice u8))
+   ;; run view
+   (run-id (slice u8))
+   (run Snap)
+   (agents-lv ListView)
+   (feed Feed)
+   (feed-sv ScrollView)
+   (feed-focus bool)
+   ;; chat view
+   (chat Chat)
+   ;; overlays and status
+   (help bool)
+   (confirm-stop bool)
+   (confirm-run (slice u8))
+   (toast (slice u8))
+   (toast-tone Tone)
+   (toast-until i64)
+   (hub-error (slice u8))
+   (hub-ok-t i64)
+   (polled-overview-t i64)
+   (polled-run-t i64)
+   (polled-events-t i64)
+   (io scratch/ScratchArena)])
+
+(defn dash-init! [(d (ptr Dash)) (a (dyn Allocator)) (hub Hub)] (-> i64)
+  (set! (.allocator d) a)
+  (set! (.hub d) hub)
+  (set! (.theme d) (theme-default))
+  (set! (.view d) (ViewOverview))
+  (set! (.chat-from-run d) false)
+  (set! (.now d) 0)
+  (set! (.tick d) 0)
+  (snap-init! (field d overview) a)
+  (set! (.runs-lv d) (list-view-new))
+  (set! (.selected-id d) "")
+  (set! (.run-id d) "")
+  (snap-init! (field d run) a)
+  (set! (.agents-lv d) (list-view-new))
+  (feed-init! (field d feed) a)
+  (set! (.feed-sv d) (scroll-view-new))
+  (set! (.feed-focus d) false)
+  (chat-init! (field d chat) a)
+  (set! (.help d) false)
+  (set! (.confirm-stop d) false)
+  (set! (.confirm-run d) "")
+  (set! (.toast d) "")
+  (set! (.toast-tone d) (ToneMuted))
+  (set! (.toast-until d) 0)
+  (set! (.hub-error d) "")
+  (set! (.hub-ok-t d) 0)
+  (set! (.polled-overview-t d) 0)
+  (set! (.polled-run-t d) 0)
+  (set! (.polled-events-t d) 0)
+  (scratch/scratch-init (field d io) a)
+  0)
+
+;;; Replace an owned string field's value (the old one is freed).
+(defn own! [(d (ptr Dash)) (slot (ptr (slice u8))) (text (slice u8))] (-> i64)
+  (let [old (load slot)]
+    (set! slot (copy-bytes (.allocator d) text))
+    (when (> (len old) 0) (free [u8] (.allocator d) old))
+    0))
+
+(defn toast! [(d (ptr Dash)) (text (slice u8)) (tone Tone)] (-> i64)
+  (own! d (field d toast) text)
+  (set! (.toast-tone d) tone)
+  (set! (.toast-until d) (+ (.now d) 5000))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; Lookups into the fetched documents
+(defn overview-runs [(d (ptr Dash))] (-> JVal)
+  (jv-get (.value (field d overview)) "runs"))
+
+(defn overview-sites [(d (ptr Dash))] (-> JVal)
+  (jv-get (.value (field d overview)) "sites"))
+
+;;; The run under the overview's cursor, or JNull.
+(defn selected-run [(d (ptr Dash))] (-> JVal)
+  (let [runs (overview-runs d)]
+    (if (and (> (jv-len runs) 0) (< (.selected (.runs-lv d)) (jv-len runs)))
+        (jv-nth runs (.selected (.runs-lv d)))
+        (JNull))))
+
+;;; After a refresh, keep the cursor on the same run id.
+(defn sync-selection! [(d (ptr Dash))] (-> i64)
+  (let [runs (overview-runs d)
+        n (jv-len runs)
+        (mut i) 0]
+    (list-set-count! (field d runs-lv) n)
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (js (jv-nth runs (load i)) "id") (.selected-id d))
+                  (do (list-select! (field d runs-lv) (load i)) (break))
+                  (set! i (+ (load i) 1)))))
+    (own! d (field d selected-id) (js (selected-run d) "id"))))
+
+;;; The agent (from a run state's `agents`) named `name`, or JNull.
+(defn agent-named [(run JVal) (name (slice u8))] (-> JVal)
+  (let [agents (jv-get run "agents")
+        (mut found) (JNull)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len agents))
+              (break)
+              (let [g (jv-nth agents (load i))]
+                (if (= (js g "name") name)
+                    (do (set! found g) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+;;; The agent a person most likely wants to talk to: the current station's,
+;;; else the last one that ran, else the first station.
+(defn default-agent [(run JVal)] (-> (slice u8))
+  (let [current (js run "current")
+        agents (jv-get run "agents")]
+    (cond (> (len current) 0) current
+          (> (jv-len agents) 0)
+            (js (jv-nth agents (- (jv-len agents) 1)) "name")
+          :else (js (jv-nth (jv-get run "stations") 0) "name"))))
+
+;;; "build 2/3": the current station and its position.
+(defn station-progress [(a (dyn Allocator)) (run JVal)] (-> (slice u8))
+  (let [stations (jv-get run "stations")
+        n (jv-len stations)
+        current (js run "current")
+        (mut index) -1
+        (mut passed) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [s (jv-nth stations (load i))]
+                (when (= (js s "name") current) (set! index (load i)))
+                (when (= (js s "status") "passed")
+                  (set! passed (+ (load passed) 1)))
+                (set! i (+ (load i) 1)))))
+    (cond (and (>= (load index) 0) (not (finished-status? (js run "status"))))
+            (concat a
+                    [current
+                     " "
+                     (int-text a (+ (load index) 1))
+                     "/"
+                     (int-text a n)])
+          (= n 0) "—"
+          :else
+            (concat a [(int-text a (load passed)) "/" (int-text a n) " passed"]))))
+
+;;; One human line for what a run is doing now.
+(defn run-activity [(a (dyn Allocator)) (run JVal)] (-> (slice u8))
+  (let [status (js run "status")
+        agent (agent-named run (js run "current"))
+        reason (first-line (js run "reason"))]
+    (cond (= status "blocked") reason
+          (= status "queued") "waiting for a slot"
+          (and (= status "running") (not (jv-null? agent)))
+            (concat a [(js agent "name") ": " (js agent "activity")])
+          (> (len reason) 0) reason
+          (and (= status "succeeded") (> (ji run "finished") 0))
+            (concat a
+                    ["done in "
+                     (fmt-duration a (- (ji run "finished") (ji run "started")))])
+          :else status)))
+
+(defn run-tokens [(run JVal)] (-> i64)
+  (+ (ji run "input_tokens") (ji run "output_tokens")))
+
+;;; How many runs wait for a person.
+(defn needs-you-count [(runs JVal)] (-> i64)
+  (let [(mut n) 0
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len runs))
+              (break)
+              (do
+                (when (= (js (jv-nth runs (load i)) "status") "blocked")
+                  (set! n (+ (load n) 1)))
+                (set! i (+ (load i) 1)))))
+    (load n)))
+
+(defn running-count [(runs JVal)] (-> i64)
+  (let [(mut n) 0
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len runs))
+              (break)
+              (do
+                (when (= (js (jv-nth runs (load i)) "status") "running")
+                  (set! n (+ (load n) 1)))
+                (set! i (+ (load i) 1)))))
+    (load n)))
+
+;; ---------------------------------------------------------------------------
+;; Chrome shared by every view
+
+;;; Draw spans left to right from `x`, returning the x after the last one.
+(defn span! [(c (ptr Canvas)) (r Rect) (x i64) (text (slice u8)) (style Style)] (-> i64)
+  (+ x (put-text! c r x (.y r) text style)))
+
+;;; The top line: "◆ factory" and breadcrumbs on the left, the clock on the right.
+(defn draw-topbar! [(d (ptr Dash))
+                    (c (ptr Canvas))
+                    (a (dyn Allocator))
+                    (r Rect)
+                    (crumbs (slice (slice u8)))] (-> i64)
+  (let [theme (.theme d)
+        (mut x) (span! c r (+ (.x r) 1) "◆" (.accent-alt theme))
+        (mut i) 0]
+    (set! x (span! c r (+ (load x) 1) "factory" (bold (.text theme))))
+    (loop (if (>= (load i) (len crumbs))
+              (break)
+              (do
+                (set! x (span! c r (load x) " › " (.subtle theme)))
+                (set! x
+                      (span! c
+                             r
+                             (load x)
+                             (get crumbs (load i))
+                             (if (= (load i) (- (len crumbs) 1))
+                                 (bold (.accent theme))
+                                 (.muted theme))))
+                (set! i (+ (load i) 1)))))
+    (let [clock (fmt-clock a (.now d) false)]
+      (put-text! c
+                 r
+                 (- (rect-right r) (+ (text-width clock) 1))
+                 (.y r)
+                 clock
+                 (.muted theme)))
+    (load x)))
+
+;;; The hub-down banner, when the last request failed.
+(defn draw-hub-banner! [(d (ptr Dash))
+                        (c (ptr Canvas))
+                        (a (dyn Allocator))
+                        (r Rect)] (-> i64)
+  (let [theme (.theme d)
+        w
+          (draw-badge! c
+                       r
+                       (+ (.x r) 1)
+                       (.y r)
+                       "HUB DOWN"
+                       (badge-style theme (hex 0xF7768E)))
+        since
+          (if (> (.hub-ok-t d) 0)
+              (concat a
+                      [" · last update "
+                       (fmt-age a (- (.now d) (.hub-ok-t d)))
+                       " ago"])
+              "")]
+    (put-text-ellipsis! c
+                        r
+                        (+ (.x r) (+ w 2))
+                        (.y r)
+                        (concat a
+                                [(.hub-error d)
+                                 " — retrying every second"
+                                 since])
+                        (.error theme))))
+
+(defn hub-down? [(d (ptr Dash))] (-> bool)
+  (> (len (.hub-error d)) 0))
+
+;;; The bottom line: key hints, or a toast while one is showing.
+(defn draw-footer! [(d (ptr Dash))
+                    (c (ptr Canvas))
+                    (r Rect)
+                    (hints (slice KeyHint))] (-> i64)
+  (if (and (> (len (.toast d)) 0) (< (.now d) (.toast-until d)))
+      (put-text-ellipsis! c
+                          r
+                          (+ (.x r) 1)
+                          (.y r)
+                          (.toast d)
+                          (bold (tone-style (.theme d) (.toast-tone d))))
+      (draw-key-hints! c (rect-drop-left r 1) hints (.theme d))))
+
+(defn draw--overlay-box! [(d (ptr Dash))
+                          (c (ptr Canvas))
+                          (r Rect)
+                          (title (slice u8))
+                          (tone Tone)] (-> Rect)
+  (fill! c r 32 (style-default))
+  (draw-box! c
+             r
+             (BoxOpts
+               :border (Rounded)
+               :style (tone-style (.theme d) tone)
+               :title title
+               :title-style (bold (tone-style (.theme d) tone))
+               :footer "esc closes"
+               :footer-style (.subtle (.theme d)))))
+
+(defstruct HelpRow [(key (slice u8)) (what (slice u8))])
+
+(const HELP-ROWS
+       [(HelpRow :key "↑ ↓  pgup pgdn" :what "move, scroll")
+        (HelpRow :key "enter" :what "open the run / the agent's chat")
+        (HelpRow :key "c" :what "chat with the run's current agent")
+        (HelpRow :key "p" :what "pause or resume the run")
+        (HelpRow :key "x" :what "stop the run (asks first)")
+        (HelpRow :key "tab"
+          :what "switch between agents and the feed (run view)")
+        (HelpRow :key "end" :what "follow the live feed again")
+        (HelpRow :key "enter  shift-enter" :what "send, or add a line (chat)")
+        (HelpRow :key "ctrl-t"
+          :what "show tool output and full reasoning (chat)")
+        (HelpRow :key "esc" :what "back")
+        (HelpRow :key "q  ctrl-c" :what "quit")])
+
+(defn draw-help! [(d (ptr Dash)) (c (ptr Canvas))] (-> i64)
+  (let [r (rect-center (canvas-rect c) 76 (+ (len HELP-ROWS) 4))
+        inner (rect-inset-xy (draw--overlay-box! d c r "Keys" (ToneAccent)) 2 1)
+        theme (.theme d)
+        (mut i) 0]
+    (loop (if (>= (load i) (len HELP-ROWS))
+              (break)
+              (let [row (index (slice-data HELP-ROWS) (load i))
+                    y (+ (.y inner) (load i))]
+                (put-text! c
+                           inner
+                           (.x inner)
+                           y
+                           (.key row)
+                           (bold (.accent theme)))
+                (put-text-ellipsis! c
+                                    inner
+                                    (+ (.x inner) 20)
+                                    y
+                                    (.what row)
+                                    (.muted theme))
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn draw-confirm-stop! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))] (-> i64)
+  (let [r (rect-center (canvas-rect c) 52 6)
+        inner
+          (rect-inset-xy (draw--overlay-box! d c r "Stop run" (ToneError)) 2 1)
+        theme (.theme d)]
+    (put-text-ellipsis! c
+                        inner
+                        (.x inner)
+                        (.y inner)
+                        (concat a
+                                ["Stop "
+                                 (.confirm-run d)
+                                 "? Its agents are cancelled."])
+                        (.text theme))
+    (let [x
+            (span! c
+                   (rect-drop-top inner 2)
+                   (.x inner)
+                   "y"
+                   (bold (.error theme)))]
+      (let [x2 (span! c (rect-drop-top inner 2) x " stop   " (.muted theme))
+            x3 (span! c (rect-drop-top inner 2) x2 "n" (bold (.accent theme)))]
+        (span! c (rect-drop-top inner 2) x3 " keep running" (.muted theme))))
+    0))
+
+;;; No breadcrumbs (the overview's top line).
+(defn no-crumbs [] (-> (slice (slice u8)))
+  (slice-new [(slice u8)] (cast (ptr (slice u8)) 0) 0))
+
+;;; After a run document arrives: keep the agent list in range and, the first
+;;; time, put the cursor on the current station's agent.
+(defn run-loaded! [(d (ptr Dash)) (first bool)] (-> i64)
+  (let [run (.value (field d run))
+        agents (jv-get run "agents")
+        current (js run "current")
+        (mut i) 0]
+    (list-set-count! (field d agents-lv) (jv-len agents))
+    (when first
+      (loop (if (>= (load i) (jv-len agents))
+                (break)
+                (if (= (js (jv-nth agents (load i)) "name") current)
+                    (do (list-select! (field d agents-lv) (load i)) (break))
+                    (set! i (+ (load i) 1))))))
+    0))

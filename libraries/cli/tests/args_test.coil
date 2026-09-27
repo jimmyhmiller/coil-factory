@@ -1,0 +1,594 @@
+(module cli.args-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+(import "cli.args" :use *)
+(import "cli.style" :use [term term-plain])
+
+;; The command table as an expression, so each test builds it in its own frame:
+;; its array literals are frame storage and must not outlive the test.
+(defn factory-program [] (-> Code)
+  `(Program
+     :name "factory"
+     :summary "Run AI-agent software factories anywhere."
+     :version "0.1.0"
+     :commands
+       [(Command
+          :name "up"
+          :group "Hub"
+          :summary "Start the hub"
+          :usage ""
+          :args (no-args)
+          :flags (no-flags))
+        (Command
+          :name "down"
+          :group "Hub"
+          :summary "Stop the hub"
+          :usage ""
+          :args (no-args)
+          :flags (no-flags))
+        (Command
+          :name "site add"
+          :group "Sites"
+          :summary "Add a remote site"
+          :usage ""
+          :args ["NAME"]
+          :flags
+            [(flag "ssh" 0 "HOST" "SSH destination")
+             (switch "sandbox" 0 "Sandbox every shell command")])
+        (Command
+          :name "site rm"
+          :group "Sites"
+          :summary "Remove a site"
+          :usage ""
+          :args ["NAME"]
+          :flags (no-flags))
+        (Command
+          :name "start"
+          :group "Runs"
+          :summary "Start a run"
+          :usage ""
+          :args ["FACTORY"]
+          :flags
+            [(flag "on" 0 "SITE" "Site to run on")
+             (flag "project" #\p "PATH" "Project directory")
+             (flag "tag" #\t "TAG" "Label the run (repeatable)")
+             (switch "detach" #\d "Return immediately")
+             (switch "quiet" #\q "Print only the run id")])
+        (Command
+          :name "ps"
+          :group "Runs"
+          :summary "List runs everywhere"
+          :usage ""
+          :args (no-args)
+          :flags (no-flags))
+        (Command
+          :name "pull"
+          :group "Runs"
+          :summary "Fetch a run's branch"
+          :usage "pull RUN [DEST]"
+          :args ["RUN" "[DEST]"]
+          :flags (no-flags))
+        (Command
+          :name "check"
+          :group "Factories"
+          :summary "Validate factories"
+          :usage ""
+          :args ["FILE..."]
+          :flags (no-flags))]
+     :flags [(switch "json" 0 "Print JSON") (flag "hub" 0 "URL" "Hub address")]))
+
+(defn dashboard-program [] (-> Code)
+  `(Program
+     :name "dash"
+     :summary ""
+     :version ""
+     :commands
+       [(Command
+          :name ""
+          :group ""
+          :summary "Show the dashboard"
+          :usage ""
+          :args (no-args)
+          :flags [(switch "watch" #\w "Keep refreshing")])
+        (Command
+          :name "ps"
+          :group ""
+          :summary "List runs"
+          :usage ""
+          :args (no-args)
+          :flags (no-flags))]
+     :flags (no-flags)))
+
+(defn run-of [(parsed Parsed)] (-> Invocation)
+  (match parsed
+    (Run [invocation] invocation)
+    (_ (do (assert false) (zeroed Invocation)))))
+
+(defn error-of [(parsed Parsed)] (-> ArgError)
+  (match parsed
+    (Failed [error] error)
+    (_ (do (assert false) (MissingSubcommand "")))))
+
+(defn help-of [(parsed Parsed)] (-> HelpTarget)
+  (match parsed
+    (Help [target] target)
+    (_ (do (assert false) (ProgramHelp)))))
+
+(defn some-text [(value (Option (slice u8)))] (-> (slice u8))
+  (match value
+    (Some [text] text)
+    (None [] "<none>")))
+
+(deftest parses-flags-in-every-spelling
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               inv
+                 (run-of (parse a
+                                prog
+                                ["factory"
+                                 "start"
+                                 "my-factory"
+                                 "--on"
+                                 "metaphysics"
+                                 "-p"
+                                 "."
+                                 "-dq"
+                                 "--tag"
+                                 "a"
+                                 "--tag=b"
+                                 "-tc"]))]
+           (assert (command-is? inv "start"))
+           (assert-eq (.command inv) 4)
+           (assert-eq (positional-count inv) 1)
+           (assert-eq (some-text (positional inv 0)) "my-factory")
+           (assert-eq (some-text (flag-value inv "on")) "metaphysics")
+           (assert-eq (some-text (flag-value inv "project")) ".")
+           (assert (flag? inv "detach"))
+           (assert (flag? inv "quiet"))
+           (assert (not (flag? inv "json")))
+           (assert-eq (some-text (flag-value inv "tag")) "c")
+           (let [tags (flag-values a inv "tag")]
+             (assert-eq (len tags) 3)
+             (assert-eq (get tags 0) "a")
+             (assert-eq (get tags 1) "b")
+             (assert-eq (get tags 2) "c"))
+           (assert-eq (flag-value-or inv "hub" "http://localhost")
+                      "http://localhost")))
+
+(deftest parses-multi-word-commands-and-inline-values
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               inv
+                 (run-of (parse a
+                                prog
+                                ["factory"
+                                 "site"
+                                 "add"
+                                 "box"
+                                 "--ssh=me@box:2222"
+                                 "--sandbox"]))]
+           (assert (command-is? inv "site add"))
+           (assert-eq (some-text (positional inv 0)) "box")
+           (assert-eq (some-text (flag-value inv "ssh")) "me@box:2222")
+           (assert (flag? inv "sandbox"))))
+
+(deftest attached-short-values-and-empty-values
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               inv
+                 (run-of (parse a prog ["factory" "start" "-pPATH" "f" "--on="]))]
+           (assert-eq (some-text (flag-value inv "project")) "PATH")
+           (assert-eq (some-text (flag-value inv "on")) "")
+           (assert-eq (some-text (positional inv 0)) "f")))
+
+(deftest terminator-and-dash-are-positional
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               inv
+                 (run-of (parse a
+                                prog
+                                ["factory" "check" "-" "--" "--not-a-flag" "-x"]))
+               args (positionals inv)]
+           (assert-eq (len args) 3)
+           (assert-eq (get args 0) "-")
+           (assert-eq (get args 1) "--not-a-flag")
+           (assert-eq (get args 2) "-x")))
+
+(deftest program-flags-before-or-after-the-command
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               before
+                 (run-of (parse a
+                                prog
+                                ["factory" "--json" "--hub" "http://h:1" "ps"]))
+               after (run-of (parse a prog ["factory" "ps" "--json"]))]
+           (assert (command-is? before "ps"))
+           (assert (flag? before "json"))
+           (assert-eq (some-text (flag-value before "hub")) "http://h:1")
+           (assert (flag? after "json"))))
+
+(deftest positional-arity
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (assert-eq (positional-count (run-of (parse a
+                                                       prog
+                                                       ["factory"
+                                                        "check"
+                                                        "a"
+                                                        "b"
+                                                        "c"])))
+                      3)
+           (assert-eq (positional-count (run-of (parse a
+                                                       prog
+                                                       ["factory" "pull" "r1"])))
+                      1)
+           (assert-eq (positional-count (run-of (parse a
+                                                       prog
+                                                       ["factory"
+                                                        "pull"
+                                                        "r1"
+                                                        "dest"])))
+                      2)
+           (match (error-of (parse a prog ["factory" "check"]))
+             (MissingArgument [command name]
+                              (do (assert-eq command 7) (assert-eq name "FILE")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "start"]))
+             (MissingArgument [command name]
+                              (do
+                                (assert-eq command 4)
+                                (assert-eq name "FACTORY")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "pull" "r1" "d" "extra"]))
+             (UnexpectedArgument [command value]
+                                 (do
+                                   (assert-eq command 6)
+                                   (assert-eq value "extra")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "ps" "extra"]))
+             (UnexpectedArgument [command value] (assert-eq value "extra"))
+             (_ (assert false)))))
+
+(deftest unknown-commands-suggest-the-closest
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (match (error-of (parse a prog ["factory" "strat"]))
+             (UnknownCommand [input suggestion]
+                             (do
+                               (assert-eq input "strat")
+                               (assert-eq suggestion "start")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "site" "ad" "x"]))
+             (UnknownCommand [input suggestion]
+                             (do
+                               (assert-eq input "site ad")
+                               (assert-eq suggestion "site add")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "sitee" "add"]))
+             (UnknownCommand [input suggestion]
+                             (do
+                               (assert-eq input "sitee")
+                               (assert-eq suggestion "site")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "che"]))
+             (UnknownCommand [input suggestion] (assert-eq suggestion "check"))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "zzzzzz"]))
+             (UnknownCommand [input suggestion] (assert-eq suggestion ""))
+             (_ (assert false)))))
+
+(deftest flag-errors
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (match (error-of (parse a prog ["factory" "start" "f" "--detahc"]))
+             (UnknownFlag [command given suggestion]
+                          (do
+                            (assert-eq command 4)
+                            (assert-eq given "--detahc")
+                            (assert-eq suggestion "--detach")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "start" "-x" "f"]))
+             (UnknownFlag [command given suggestion]
+                          (do (assert-eq given "-x") (assert-eq suggestion "")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "start" "f" "--on"]))
+             (MissingValue [command given] (assert-eq given "--on"))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "start" "f" "-dp"]))
+             (MissingValue [command given] (assert-eq given "-p"))
+             (_ (assert false)))
+           (match (error-of (parse a
+                                   prog
+                                   ["factory" "start" "f" "--detach=yes"]))
+             (UnexpectedValue [command given] (assert-eq given "--detach"))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "--jsn" "ps"]))
+             (UnknownFlag [command given suggestion]
+                          (do
+                            (assert-eq command -1)
+                            (assert-eq suggestion "--json")))
+             (_ (assert false)))))
+
+(deftest help-and-version-requests
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (match (help-of (parse a prog ["factory"]))
+             (ProgramHelp [] 0)
+             (_ (assert false)))
+           (match (help-of (parse a prog ["factory" "--help"]))
+             (ProgramHelp [] 0)
+             (_ (assert false)))
+           (match (help-of (parse a prog ["factory" "start" "-h"]))
+             (CommandHelp [command] (assert-eq command 4))
+             (_ (assert false)))
+           (match (help-of (parse a prog ["factory" "start" "--bogus" "--help"]))
+             (CommandHelp [command] (assert-eq command 4))
+             (_ (assert false)))
+           (match (help-of (parse a prog ["factory" "site" "--help"]))
+             (GroupHelp [prefix] (assert-eq prefix "site"))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["factory" "site"]))
+             (MissingSubcommand [prefix] (assert-eq prefix "site"))
+             (_ (assert false)))
+           (match (parse a prog ["factory" "--version"])
+             (Version [] 0)
+             (_ (assert false)))
+           (match (parse a prog ["factory" "start" "-x" "--" "--help"])
+             (Failed [error] 0)
+             (_ (assert false)))))
+
+(deftest root-command-and-its-flags
+         (let [a (malloc-allocator)
+               prog (dashboard-program)]
+           (assert (command-is? (run-of (parse a prog ["dash"])) ""))
+           (assert (flag? (run-of (parse a prog ["dash" "-w"])) "watch"))
+           (assert (command-is? (run-of (parse a prog ["dash" "ps"])) "ps"))
+           (match (error-of (parse a prog ["dash" "--watch" "ps"]))
+             (UnknownFlag [command given suggestion]
+                          (do (assert-eq command 1) (assert-eq given "--watch")))
+             (_ (assert false)))
+           (match (error-of (parse a prog ["dash" "pss"]))
+             (UnknownCommand [input suggestion] (assert-eq suggestion "ps"))
+             (_ (assert false)))
+           (match (help-of (parse a prog ["dash" "--help"]))
+             (ProgramHelp [] 0)
+             (_ (assert false)))
+           (match (error-of (parse a prog ["dash" "--version"]))
+             (UnknownFlag [command given suggestion]
+                          (assert-eq given "--version"))
+             (_ (assert false)))))
+
+(deftest edit-distances
+         (let [a (malloc-allocator)]
+           (assert-eq (edit-distance a "kitten" "sitting") 3)
+           (assert-eq (edit-distance a "strat" "start") 1)
+           (assert-eq (edit-distance a "" "abc") 3)
+           (assert-eq (edit-distance a "same" "same") 0)))
+
+(deftest argv-from-main-converts-c-strings
+         (let [a (malloc-allocator)
+               strings (primitive/alloc-stack (array (ptr i8) 3))]
+           (set! (index strings 0) c"prog")
+           (set! (index strings 1) c"start")
+           (set! (index strings 2) c"")
+           (let [argv (argv-from-main a 3 (cast (ptr (ptr i8)) strings))]
+             (assert-eq (len argv) 3)
+             (assert-eq (get argv 0) "prog")
+             (assert-eq (get argv 1) "start")
+             (assert-eq (get argv 2) ""))))
+
+(deftest renders-program-help
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (assert-eq (render-help a (term-plain) prog (ProgramHelp))
+                      "Run AI-agent software factories anywhere.
+
+Usage:
+  factory <command> [flags]
+
+Hub:
+  up         Start the hub
+  down       Stop the hub
+
+Sites:
+  site add   Add a remote site
+  site rm    Remove a site
+
+Runs:
+  start      Start a run
+  ps         List runs everywhere
+  pull       Fetch a run's branch
+
+Factories:
+  check      Validate factories
+
+Flags:
+      --json      Print JSON
+      --hub URL   Hub address
+  -h, --help      Show help
+      --version   Show the version
+
+Run 'factory <command> --help' for more about a command.
+")))
+
+(deftest renders-command-help
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (assert-eq (render-help a (term-plain) prog (CommandHelp 4))
+                      "Start a run
+
+Usage:
+  factory start FACTORY [flags]
+
+Flags:
+      --on SITE        Site to run on
+  -p, --project PATH   Project directory
+  -t, --tag TAG        Label the run (repeatable)
+  -d, --detach         Return immediately
+  -q, --quiet          Print only the run id
+  -h, --help           Show help for this command
+
+Global flags:
+      --json      Print JSON
+      --hub URL   Hub address
+      --version   Show the version
+")
+           (assert-eq (render-help a (term-plain) prog (CommandHelp 6))
+                      "Fetch a run's branch
+
+Usage:
+  factory pull RUN [DEST]
+
+Flags:
+  -h, --help   Show help for this command
+
+Global flags:
+      --json      Print JSON
+      --hub URL   Hub address
+      --version   Show the version
+")))
+
+(deftest renders-group-help
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (assert-eq (render-help a (term-plain) prog (GroupHelp "site"))
+                      "Usage:
+  factory site <command> [flags]
+
+Commands:
+  add   Add a remote site
+  rm    Remove a site
+
+Run 'factory site <command> --help' for more about a command.
+")))
+
+(deftest renders-help-with-root-command
+         (let [a (malloc-allocator)
+               prog (dashboard-program)]
+           (assert-eq (render-help a (term-plain) prog (ProgramHelp))
+                      "Usage:
+  dash [flags]
+  dash <command> [flags]
+
+Commands:
+  ps   List runs
+
+Flags:
+  -h, --help   Show help
+
+Run 'dash <command> --help' for more about a command.
+")))
+
+(deftest renders-errors
+         (let [a (malloc-allocator)
+               prog (factory-program)
+               t (term-plain)]
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a prog ["factory" "strat"])))
+                      "error: unknown command 'strat' for 'factory'
+
+  Did you mean 'factory start'?
+
+Run 'factory --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a
+                                                     prog
+                                                     ["factory" "site" "ad" "x"])))
+                      "error: unknown command 'site ad' for 'factory'
+
+  Did you mean 'factory site add'?
+
+Run 'factory --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a
+                                                     prog
+                                                     ["factory"
+                                                      "start"
+                                                      "f"
+                                                      "--detahc"])))
+                      "error: unknown flag '--detahc' for 'factory start'
+
+  Did you mean '--detach'?
+
+Run 'factory start --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a prog ["factory" "start"])))
+                      "error: missing argument FACTORY for 'factory start'
+
+Run 'factory start --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a
+                                                     prog
+                                                     ["factory" "ps" "x"])))
+                      "error: unexpected argument 'x' for 'factory ps'
+
+Run 'factory ps --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a
+                                                     prog
+                                                     ["factory"
+                                                      "start"
+                                                      "f"
+                                                      "--on"])))
+                      "error: flag '--on' needs a value
+
+Run 'factory start --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a
+                                                     prog
+                                                     ["factory" "ps" "--json=1"])))
+                      "error: flag '--json' does not take a value
+
+Run 'factory ps --help' for usage.
+")
+           (assert-eq (render-error a
+                                    t
+                                    prog
+                                    (error-of (parse a prog ["factory" "site"])))
+                      "error: 'factory site' requires a subcommand
+
+Usage:
+  factory site <command> [flags]
+
+Commands:
+  add   Add a remote site
+  rm    Remove a site
+
+Run 'factory site <command> --help' for more about a command.
+")))
+
+(deftest renders-errors-in-color
+         (let [a (malloc-allocator)
+               prog (factory-program)]
+           (assert-eq (render-error a
+                                    (term true true)
+                                    prog
+                                    (error-of (parse a prog ["factory" "strat"])))
+                      "\x1b;[1;31merror:\x1b;[0m unknown command '\x1b;[36mstrat\x1b;[0m' for '\x1b;[36mfactory\x1b;[0m'
+
+  Did you mean '\x1b;[36mfactory start\x1b;[0m'?
+
+Run 'factory --help' for usage.
+")))

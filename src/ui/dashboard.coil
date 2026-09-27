@@ -1,0 +1,541 @@
+(module factory.ui.dashboard)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator free])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-trim])
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.time" :as time)
+(import "agent.json" :use [copy-bytes jv-object jv-put! jv-encode])
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+(import "tui.app" :use *)
+(import "tui.term" :use [TermError NotATerminal])
+(import "factory.client"
+        :use
+        [Hub
+         Reply
+         ReplyOk
+         ReplyFailed
+         hub-call
+         reply-ok?
+         reply-body
+         reply-error])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.feed" :use *)
+(import "factory.ui.chat" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.overview" :use [draw-overview!])
+(import "factory.ui.runview" :use [draw-run-view!])
+(import "factory.ui.chatview" :use [draw-chat-view!])
+
+;;; The `factory` dashboard: an event loop over `factory.ui.model/Dash`. Every
+;;; request happens here, in the event handler, never while drawing; each
+;;; view reads only what the last successful fetch left in the model.
+(defn wall-now [] (-> i64)
+  (match (time/wall-now-ms)
+    (Ok [ms] ms)
+    (Err [e] 0)))
+
+;; ---------------------------------------------------------------------------
+;; Requests
+(defn io-allocator [(d (ptr Dash))] (-> (dyn Allocator))
+  (scratch/scratch-recycle! (field d io))
+  (scratch/scratch-allocator (field d io)))
+
+;;; One request to the hub, recording whether the hub answered at all.
+(defn request! [(d (ptr Dash))
+                (a (dyn Allocator))
+                (method (slice u8))
+                (path (slice u8))
+                (body (slice u8))] (-> Reply)
+  (let [reply (hub-call a (.hub d) method path body 5000)]
+    (match reply
+      (ReplyFailed [message]
+                   (own! d
+                         (field d hub-error)
+                         (concat a [message " (" (.base-url (.hub d)) ")"])))
+      (ReplyOk [status value text]
+               (do
+                 (own! d (field d hub-error) "")
+                 (set! (.hub-ok-t d) (.now d))
+                 0)))
+    reply))
+
+;;; An API error (the hub answered, but not 2xx) becomes a toast.
+(defn complain! [(d (ptr Dash)) (a (dyn Allocator)) (reply Reply)] (-> i64)
+  (match reply
+    (ReplyOk [status value text] (toast! d (reply-error a reply) (ToneError)))
+    (ReplyFailed [message] 0)))
+
+(defn run-path [(a (dyn Allocator)) (run (slice u8)) (suffix (slice u8))] (-> (slice u8))
+  (concat a ["/v1/runs/" run suffix]))
+
+(defn fetch-overview! [(d (ptr Dash))] (-> i64)
+  (set! (.polled-overview-t d) (.now d))
+  (let [a (snap-spare (field d overview))
+        reply (request! d a "GET" "/v1/overview" "")]
+    (if (reply-ok? reply)
+        (do
+          (snap-commit! (field d overview) (reply-body reply) (.now d))
+          (sync-selection! d))
+        (complain! d a reply))))
+
+(defn fetch-run! [(d (ptr Dash))] (-> i64)
+  (set! (.polled-run-t d) (.now d))
+  (let [a (snap-spare (field d run))
+        reply (request! d a "GET" (run-path a (.run-id d) "") "")]
+    (if (reply-ok? reply)
+        (let [doc (reply-body reply)
+              id (js doc "id")
+              first (not (.has (field d run)))]
+          (snap-commit! (field d run) doc (.now d))
+          (run-loaded! d first)
+          ;; A prefix given on the command line becomes the full id.
+          (when (not (= id (.run-id d))) (own! d (field d run-id) id))
+          (let [chat (field d chat)]
+            (when (and (> (len (.run chat)) 0) (not (= (.run chat) id)))
+              (let [old (.run chat)]
+                (set! (.run chat) (copy-bytes (.allocator d) id))
+                (free [u8] (.allocator d) old)))
+            (chat-sync-pending! chat doc))
+          0)
+        (match reply
+          (ReplyOk [status value text]
+                   (do
+                     (toast! d (reply-error a reply) (ToneError))
+                     (when (= status 404)
+                       (set! (.view d) (ViewOverview))
+                       (fetch-overview! d))
+                     0))
+          (ReplyFailed [m] 0)))))
+
+(defn fetch-feed! [(d (ptr Dash))] (-> i64)
+  (set! (.polled-events-t d) (.now d))
+  (let [feed (field d feed)
+        (mut pages) 0]
+    (loop (let [a (io-allocator d)
+                path
+                  (if (.loaded feed)
+                      (run-path a
+                                (.run-id d)
+                                (concat a
+                                        ["/events?after="
+                                         (int-text a (.cursor feed))
+                                         "&limit=500"]))
+                      (run-path a (.run-id d) "/events?tail=300"))
+                reply (request! d a "GET" path "")]
+            (if (reply-ok? reply)
+                (let [n (feed-ingest-page! feed (reply-body reply))]
+                  (set! pages (+ (load pages) 1))
+                  (when (or (< n 500) (>= (load pages) 4)) (break)))
+                (do (complain! d a reply) (break)))))
+    0))
+
+;;; Fetch the agent document; returns true when an exact transcript was adopted
+;;; and the overlay must be reread from the chat's cursor.
+(defn fetch-transcript! [(d (ptr Dash))] (-> bool)
+  (let [chat (field d chat)
+        ta (snap-spare (field chat transcript))
+        reply
+          (request! d
+                    ta
+                    "GET"
+                    (run-path ta
+                              (.run chat)
+                              (concat ta ["/agents/" (.agent chat)]))
+                    "")]
+    (if (reply-ok? reply)
+        (chat-adopt-transcript! chat (reply-body reply) (.now d))
+        (do (complain! d ta reply) false))))
+
+;;; Read the journal after the chat's cursor, a few pages at most per poll.
+(defn fetch-chat-events! [(d (ptr Dash))] (-> i64)
+  (let [chat (field d chat)
+        (mut pages) 0]
+    (loop (let [a (io-allocator d)
+                reply
+                  (request! d
+                            a
+                            "GET"
+                            (run-path a
+                                      (.run chat)
+                                      (concat a
+                                              ["/events?after="
+                                               (int-text a (.cursor chat))
+                                               "&limit=500"]))
+                            "")]
+            (if (reply-ok? reply)
+                (let [n (chat-ingest-page! chat (reply-body reply))]
+                  (set! pages (+ (load pages) 1))
+                  (when (or (< n 500) (>= (load pages) 4)) (break)))
+                (do (complain! d a reply) (break)))))
+    0))
+
+;;; Keep the chat current. The transcript comes first: when it reports the
+;;; journal cursor it reflects, the chat shows exactly the transcript plus the
+;;; records from that cursor on. Sites without a cursor fall back to reading
+;;; the tail and treating turn and station records as checkpoints.
+(defn fetch-chat! [(d (ptr Dash))] (-> i64)
+  (set! (.polled-events-t d) (.now d))
+  (let [chat (field d chat)]
+    (when (not (.loaded chat))
+      (fetch-transcript! d))
+    (if (.loaded chat)
+        (fetch-chat-events! d)
+        (let [a (io-allocator d)
+              reply
+                (request! d
+                          a
+                          "GET"
+                          (run-path a (.run chat) "/events?tail=400")
+                          "")]
+          (if (reply-ok? reply)
+              (chat-start-from-tail! chat (reply-body reply))
+              (complain! d a reply))))
+    (when (.needs-transcript chat)
+      (when (fetch-transcript! d) (fetch-chat-events! d)))
+    0))
+
+;;; Refresh whatever the current view shows, at most once a second (events
+;;; twice a second).
+(defn poll! [(d (ptr Dash))] (-> i64)
+  (let [now (.now d)]
+    (match (.view d)
+      (ViewOverview []
+                    (when (>= (- now (.polled-overview-t d)) 1000)
+                      (fetch-overview! d)))
+      (ViewRun []
+               (do
+                 (when (>= (- now (.polled-run-t d)) 1000) (fetch-run! d))
+                 (when (>= (- now (.polled-events-t d)) 500) (fetch-feed! d))
+                 0))
+      (ViewChat []
+                (do
+                  (when (>= (- now (.polled-run-t d)) 1000) (fetch-run! d))
+                  (when (>= (- now (.polled-events-t d)) 500) (fetch-chat! d))
+                  0)))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Navigation
+(defn open-run! [(d (ptr Dash)) (id (slice u8))] (-> i64)
+  (when (not (= id (.run-id d)))
+    (own! d (field d run-id) id)
+    (snap-reset! (field d run))
+    (feed-reset! (field d feed))
+    (set! (.feed-sv d) (scroll-view-new))
+    (set! (.agents-lv d) (list-view-new)))
+  (set! (.feed-focus d) false)
+  (set! (.view d) (ViewRun))
+  (fetch-run! d)
+  (fetch-feed! d))
+
+(defn open-chat! [(d (ptr Dash))
+                  (run (slice u8))
+                  (agent (slice u8))
+                  (from-run bool)] (-> i64)
+  (if (= (len agent) 0)
+      (toast! d "this run has no agent yet" (ToneWarning))
+      (do
+        (when (not (= run (.run-id d)))
+          (own! d (field d run-id) run)
+          (snap-reset! (field d run))
+          (feed-reset! (field d feed))
+          (set! (.feed-sv d) (scroll-view-new))
+          (set! (.agents-lv d) (list-view-new)))
+        (let [chat (field d chat)]
+          (when (or (not (= (.run chat) (.run-id d)))
+                    (not (= (.agent chat) agent)))
+            (chat-open! chat (.run-id d) agent)))
+        (set! (.chat-from-run d) from-run)
+        (set! (.view d) (ViewChat))
+        (fetch-run! d)
+        (fetch-chat! d))))
+
+(defn back! [(d (ptr Dash))] (-> i64)
+  (match (.view d)
+    (ViewChat []
+              (if (.chat-from-run d)
+                  (open-run! d (.run-id d))
+                  (do (set! (.view d) (ViewOverview)) (fetch-overview! d))))
+    (ViewRun [] (do (set! (.view d) (ViewOverview)) (fetch-overview! d)))
+    (ViewOverview [] 0)))
+
+;;; The run the current view is about.
+(defn focused-run [(d (ptr Dash))] (-> JVal)
+  (match (.view d)
+    (ViewOverview [] (selected-run d))
+    (_ (.value (field d run)))))
+
+(defn after-action! [(d (ptr Dash))] (-> i64)
+  (set! (.polled-overview-t d) 0)
+  (set! (.polled-run-t d) 0)
+  (poll! d))
+
+(defn post-run! [(d (ptr Dash))
+                 (id (slice u8))
+                 (action (slice u8))
+                 (done (slice u8))] (-> i64)
+  (let [a (io-allocator d)
+        reply (request! d a "POST" (run-path a id (concat a ["/" action])) "{}")]
+    (if (reply-ok? reply)
+        (toast! d (concat a [done " " id]) (ToneSuccess))
+        (complain! d a reply))
+    (after-action! d)))
+
+(defn pause-or-resume! [(d (ptr Dash))] (-> i64)
+  (let [run (focused-run d)
+        id (js run "id")
+        status (js run "status")
+        a (io-allocator d)]
+    (cond (= (len id) 0) 0
+          (= status "running") (post-run! d id "pause" "paused")
+          (or (= status "paused") (= status "lost") (= status "failed"))
+            (post-run! d id "resume" "resumed")
+          (= status "blocked")
+            (toast! d
+                    (concat a
+                            [id
+                             " is blocked — answer its agent in chat (c) to resume it"])
+                    (ToneWarning))
+          :else
+            (toast! d
+                    (concat a [id " is " status "; nothing to pause"])
+                    (ToneMuted)))))
+
+(defn ask-stop! [(d (ptr Dash))] (-> i64)
+  (let [run (focused-run d)
+        id (js run "id")
+        status (js run "status")]
+    (cond (= (len id) 0) 0
+          (finished-status? status)
+            (toast! d
+                    (concat (io-allocator d) [id " is already " status])
+                    (ToneMuted))
+          :else
+            (do
+              (own! d (field d confirm-run) id)
+              (set! (.confirm-stop d) true)
+              0))))
+
+(defn send! [(d (ptr Dash))] (-> i64)
+  (let [chat (field d chat)
+        text (str-trim (input-text (field chat input)))]
+    (if (= (len text) 0)
+        0
+        (let [a (io-allocator d)
+              body (jv-object a)]
+          (jv-put! body "text" (JStr text))
+          (let [reply
+                  (request! d
+                            a
+                            "POST"
+                            (run-path a
+                                      (.run chat)
+                                      (concat a
+                                              ["/agents/"
+                                               (.agent chat)
+                                               "/messages"]))
+                            (jv-encode a body))]
+            (if (reply-ok? reply)
+                (do
+                  (chat-add-local! chat
+                                   (ji (reply-body reply) "ref")
+                                   text
+                                   (.now d))
+                  (input-submit! (field chat input) a)
+                  (scroll-to-bottom! (field chat sv))
+                  (after-action! d))
+                (complain! d a reply)))))))
+
+;; ---------------------------------------------------------------------------
+;; Keys
+(defn overview-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (match key
+    (Char [ch]
+          (cond (= ch #\q) (Quit)
+                (= ch #\?) (do (set! (.help d) true) (Continue))
+                (= ch #\c)
+                  (let [run (selected-run d)]
+                    (open-chat! d (js run "id") (default-agent run) false)
+                    (Continue))
+                (= ch #\p) (do (pause-or-resume! d) (Continue))
+                (= ch #\x) (do (ask-stop! d) (Continue))
+                (= ch #\r) (do (fetch-overview! d) (Continue))
+                (= ch #\j)
+                  (do
+                    (list-move! (field d runs-lv) 1)
+                    (sync-selection-id! d)
+                    (Continue))
+                (= ch #\k)
+                  (do
+                    (list-move! (field d runs-lv) -1)
+                    (sync-selection-id! d)
+                    (Continue))
+                :else (Continue)))
+    (Enter []
+           (let [id (js (selected-run d) "id")]
+             (when (> (len id) 0) (open-run! d id))
+             (Continue)))
+    (_ (do
+         (when (list-handle-key! (field d runs-lv) key 10)
+           (sync-selection-id! d))
+         (Continue)))))
+
+(defn sync-selection-id! [(d (ptr Dash))] (-> i64)
+  (own! d (field d selected-id) (js (selected-run d) "id")))
+
+(defn selected-agent [(d (ptr Dash))] (-> (slice u8))
+  (let [run (.value (field d run))
+        agents (jv-get run "agents")]
+    (if (> (jv-len agents) 0)
+        (js (jv-nth agents (.selected (.agents-lv d))) "name")
+        (default-agent run))))
+
+(defn run-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [sv (field d feed-sv)]
+    (match key
+      (Escape [] (do (back! d) (Continue)))
+      (Char [ch]
+            (cond (= ch #\q) (Quit)
+                  (= ch #\?) (do (set! (.help d) true) (Continue))
+                  (= ch #\c)
+                    (do
+                      (open-chat! d (.run-id d) (selected-agent d) true)
+                      (Continue))
+                  (= ch #\p) (do (pause-or-resume! d) (Continue))
+                  (= ch #\x) (do (ask-stop! d) (Continue))
+                  :else (Continue)))
+      (Enter []
+             (do (open-chat! d (.run-id d) (selected-agent d) true) (Continue)))
+      (Tab [] (do (set! (.feed-focus d) (not (.feed-focus d))) (Continue)))
+      (BackTab [] (do (set! (.feed-focus d) (not (.feed-focus d))) (Continue)))
+      (PageUp []
+              (do
+                (scroll-up! sv (if (> (.height sv) 2) (- (.height sv) 1) 1))
+                (Continue)))
+      (PageDown []
+                (do
+                  (scroll-down! sv (if (> (.height sv) 2) (- (.height sv) 1) 1))
+                  (Continue)))
+      (Home [] (do (scroll-to-top! sv) (Continue)))
+      (End [] (do (scroll-to-bottom! sv) (Continue)))
+      (Up []
+          (do
+            (if (.feed-focus d)
+                (scroll-up! sv 1)
+                (list-move! (field d agents-lv) -1))
+            (Continue)))
+      (Down []
+            (do
+              (if (.feed-focus d)
+                  (scroll-down! sv 1)
+                  (list-move! (field d agents-lv) 1))
+              (Continue)))
+      (_ (Continue)))))
+
+(defn chat-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [chat (field d chat)]
+    (match key
+      (Escape [] (do (back! d) (Continue)))
+      (PageUp []
+              (do
+                (scroll-up! (field chat sv)
+                            (if (> (.height (.sv chat)) 2)
+                                (- (.height (.sv chat)) 1)
+                                1))
+                (Continue)))
+      (PageDown []
+                (do
+                  (scroll-down! (field chat sv)
+                                (if (> (.height (.sv chat)) 2)
+                                    (- (.height (.sv chat)) 1)
+                                    1))
+                  (Continue)))
+      (Ctrl [l]
+            (if (= l #\t)
+                (do (set! (.details chat) (not (.details chat))) (Continue))
+                (do (input-handle-key! (field chat input) key) (Continue))))
+      (_ (match (input-handle-key! (field chat input) key)
+           (InputSubmitted [] (do (send! d) (Continue)))
+           (_ (Continue)))))))
+
+(defn dashboard-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (cond (match key (Ctrl [l] (= l #\c)) (_ false)) (Quit)
+        (.confirm-stop d)
+          (match key
+            (Char [ch]
+                  (cond (or (= ch #\y) (= ch #\Y))
+                          (do
+                            (set! (.confirm-stop d) false)
+                            (post-run! d (.confirm-run d) "cancel" "stopped")
+                            (Continue))
+                        (or (= ch #\n) (= ch #\N))
+                          (do (set! (.confirm-stop d) false) (Continue))
+                        :else (Continue)))
+            (Escape [] (do (set! (.confirm-stop d) false) (Continue)))
+            (_ (Continue)))
+        (.help d)
+          (do
+            (match key
+              (Escape [] (set! (.help d) false))
+              (Char [ch]
+                    (when (or (= ch #\?) (= ch #\q)) (set! (.help d) false)))
+              (_ 0))
+            (Continue))
+        :else
+          (match (.view d)
+            (ViewOverview [] (overview-key! d key))
+            (ViewRun [] (run-key! d key))
+            (ViewChat [] (chat-key! d key)))))
+
+;; ---------------------------------------------------------------------------
+;; The app
+(impl App Dash
+  (app-draw [(self (ptr Dash)) (frame (ptr Frame))]
+            (-> i64)
+            (set! (.tick self) (.tick frame))
+            (match (.view self)
+              (ViewOverview [] (draw-overview! self frame))
+              (ViewRun [] (draw-run-view! self frame))
+              (ViewChat [] (draw-chat-view! self frame)))
+            (when (.help self) (draw-help! self (.canvas frame)))
+            (when (.confirm-stop self)
+              (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
+            0)
+  (app-event [(self (ptr Dash)) (event Event)]
+             (-> AppFlow)
+             (set! (.now self) (wall-now))
+             (match event
+               (TickEvent [n] (do (poll! self) (Continue)))
+               (ResizeEvent [w h] (Continue))
+               (KeyEvent [key] (dashboard-key! self key)))))
+
+;;; The dashboard, full screen, until the person quits. With `initial-agent`
+;;; (and `initial-run`) it opens that agent's chat; with only `initial-run`
+;;; (an id or unique prefix) that run; otherwise the overview. Returns the
+;;; process exit code.
+(defn run-dashboard [(a (dyn Allocator))
+                     (hub Hub)
+                     (initial-run (slice u8))
+                     (initial-agent (slice u8))] (-> i64)
+  (let [d (primitive/alloc-stack Dash)]
+    (dash-init! d a hub)
+    (set! (.now d) (wall-now))
+    (cond (and (> (len initial-run) 0) (> (len initial-agent) 0))
+            (open-chat! d initial-run initial-agent false)
+          (> (len initial-run) 0) (open-run! d initial-run)
+          :else (fetch-overview! d))
+    (match (app-run d (app-options-default) a)
+      (Ok [_] 0)
+      (Err [e]
+           (match e
+             (NotATerminal []
+                           (do
+                             (println "factory: the dashboard needs an interactive terminal (try `factory ps`)")
+                             1))
+             (_ (do (println "factory: could not take over the terminal") 1)))))))

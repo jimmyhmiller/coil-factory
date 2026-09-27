@@ -1,0 +1,1269 @@
+(module tui.widgets)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator free])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "tui.fatal" :use [fatal])
+(import "tui.width" :use *)
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+
+;; ---------------------------------------------------------------------------
+;; Theme
+
+;;; The palette every widget draws with. Colors are soft and legible on dark
+;;; terminals; nothing paints the whole screen, so the terminal's own background
+;;; shows through. `selection` is a background tint (rendered as reverse video
+;;; when colors are off). `badge-fg` is the dark text drawn on colored badges.
+(defstruct Theme
+  [(text Style)
+   (muted Style)
+   (subtle Style)
+   (accent Style)
+   (accent-alt Style)
+   (info Style)
+   (success Style)
+   (warning Style)
+   (error Style)
+   (border Style)
+   (border-focus Style)
+   (title Style)
+   (title-focus Style)
+   (header Style)
+   (selection Style)
+   (badge-fg Color)])
+
+(const COLOR-BLUE 0x7AA2F7)
+
+(const COLOR-VIOLET 0xBB9AF7)
+
+(const COLOR-CYAN 0x7DCFFF)
+
+(const COLOR-GREEN 0x9ECE6A)
+
+(const COLOR-AMBER 0xE0AF68)
+
+(const COLOR-RED 0xF7768E)
+
+(const COLOR-GRAY 0x8089B3)
+
+(const COLOR-SUBTLE 0x565F89)
+
+(const COLOR-LINE 0x3B4261)
+
+(const COLOR-SELECTION 0x2E3C64)
+
+(const COLOR-INK 0x1A1B26)
+
+;;; The default dark theme: blue/violet accents, green/amber/red status colors,
+;;; muted blue-grays for chrome.
+(defn theme-default [] (-> Theme)
+  (Theme
+    :text (style-default)
+    :muted (fg (hex COLOR-GRAY))
+    :subtle (fg (hex COLOR-SUBTLE))
+    :accent (fg (hex COLOR-BLUE))
+    :accent-alt (fg (hex COLOR-VIOLET))
+    :info (fg (hex COLOR-CYAN))
+    :success (fg (hex COLOR-GREEN))
+    :warning (fg (hex COLOR-AMBER))
+    :error (fg (hex COLOR-RED))
+    :border (fg (hex COLOR-LINE))
+    :border-focus (fg (hex COLOR-BLUE))
+    :title (bold (fg (hex COLOR-GRAY)))
+    :title-focus (bold (fg (hex COLOR-BLUE)))
+    :header (bold (fg (hex COLOR-SUBTLE)))
+    :selection (with-bg (style-default) (hex COLOR-SELECTION))
+    :badge-fg (hex COLOR-INK)))
+
+;;; A rounded panel border in the theme's focused or unfocused colors, titled.
+(defn panel-opts [(theme Theme) (title (slice u8)) (focused bool)] (-> BoxOpts)
+  (BoxOpts
+    :border (Rounded)
+    :style (if focused (.border-focus theme) (.border theme))
+    :title title
+    :title-style (if focused (.title-focus theme) (.title theme))
+    :footer ""
+    :footer-style (.muted theme)))
+
+;; ---------------------------------------------------------------------------
+;; Small pieces: spinner, badge, progress bar, key hints, sparkline, scrollbar
+(const SPINNER-FRAMES "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+;;; The braille spinner glyph for animation tick `tick` (any integer).
+(defn spinner-frame [(tick i64)] (-> (slice u8))
+  (let [count (/ (len SPINNER-FRAMES) 3)
+        i (% (+ (% tick count) count) count)]
+    (subslice SPINNER-FRAMES (* i 3) (+ (* i 3) 3))))
+
+;;; A badge style: bold dark text on `color`.
+(defn badge-style [(theme Theme) (color Color)] (-> Style)
+  (bold (Style
+          :fg (.badge-fg theme)
+          :bg color
+          :attrs 0)))
+
+;;; Draw " LABEL " at (x, y) in `style` (normally from `badge-style`), clipped to
+;;; `clip`. Returns the columns used.
+(defn draw-badge! [(c (ptr Canvas))
+                   (clip Rect)
+                   (x i64)
+                   (y i64)
+                   (label (slice u8))
+                   (style Style)] (-> i64)
+  (let [a (put-text! c clip x y " " style)
+        b (put-text! c clip (+ x a) y label style)]
+    (+ (+ a b) (put-text! c clip (+ (+ x a) b) y " " style))))
+
+;;; A thin progress bar across row `r.y` of `r`: `done` of `total` filled in
+;;; half-cell steps with heavy line glyphs, the rest drawn as a track.
+(defn draw-progress-bar! [(c (ptr Canvas))
+                          (r Rect)
+                          (done i64)
+                          (total i64)
+                          (filled Style)
+                          (track Style)] (-> i64)
+  (let [w (.w r)
+        halves
+          (cond (<= total 0) 0
+                (>= done total) (* 2 w)
+                (<= done 0) 0
+                :else (/ (* (* 2 w) done) total))
+        full (/ halves 2)
+        half (% halves 2)]
+    (hline! c (.x r) (.y r) w 0x2501 track)
+    (hline! c (.x r) (.y r) full 0x2501 filled)
+    (when (= half 1) (put-rune! c (+ (.x r) full) (.y r) 0x2578 filled))
+    0))
+
+;;; One entry of a key-hint bar: the key and what it does.
+(defstruct KeyHint [(key (slice u8)) (label (slice u8))])
+
+;;; Draw hints like `q quit · ↑↓ move` on row `r.y`, keys in the accent style and
+;;; labels muted, stopping before a hint would be cut. Returns columns used.
+(defn draw-key-hints! [(c (ptr Canvas))
+                       (r Rect)
+                       (hints (slice KeyHint))
+                       (theme Theme)] (-> i64)
+  (let [(mut x) (.x r)
+        (mut i) 0]
+    (loop (if (>= (load i) (len hints))
+              (break)
+              (let [hint (get hints (load i))
+                    sep (if (> (load i) 0) 3 0)
+                    need
+                      (+ (+ sep (text-width (.key hint)))
+                         (+ 1 (text-width (.label hint))))]
+                (if (> (+ (load x) need) (rect-right r))
+                    (break)
+                    (do
+                      (when (> sep 0)
+                        (put-text! c r (load x) (.y r) " · " (.subtle theme))
+                        (set! x (+ (load x) sep)))
+                      (set! x
+                            (+ (load x)
+                               (put-text! c
+                                          r
+                                          (load x)
+                                          (.y r)
+                                          (.key hint)
+                                          (bold (.accent theme)))))
+                      (set! x (+ (load x) 1))
+                      (set! x
+                            (+ (load x)
+                               (put-text! c
+                                          r
+                                          (load x)
+                                          (.y r)
+                                          (.label hint)
+                                          (.muted theme))))
+                      (set! i (+ (load i) 1)))))))
+    (- (load x) (.x r))))
+
+;;; A one-row sparkline of the last `r.w` values with block glyphs ▁…█, scaled so
+;;; `max` (or the largest value when `max` <= 0) is a full block.
+(defn draw-sparkline! [(c (ptr Canvas))
+                       (r Rect)
+                       (values (slice i64))
+                       (max i64)
+                       (style Style)] (-> i64)
+  (let [n (len values)
+        shown (if (< n (.w r)) n (.w r))
+        first (- n shown)
+        (mut top) max
+        (mut i) first]
+    (when (<= (load top) 0)
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (when (> (get values (load i)) (load top))
+                    (set! top (get values (load i))))
+                  (set! i (+ (load i) 1))))))
+    (let [(mut k) 0
+          x0 (+ (.x r) (- (.w r) shown))]
+      (loop (if (>= (load k) shown)
+                (break)
+                (let [v (get values (+ first (load k)))
+                      level
+                        (cond (<= (load top) 0) 0
+                              (<= v 0) 0
+                              (>= v (load top)) 8
+                              :else (+ 1 (/ (* v 7) (load top))))]
+                  (put-rune! c
+                             (+ x0 (load k))
+                             (.y r)
+                             (if (= level 0) 0x2581 (+ 0x2580 level))
+                             style)
+                  (set! k (+ (load k) 1)))))
+      shown)))
+
+;;; A vertical scrollbar in column `r.x` spanning `r.h` rows, for `total` rows of
+;;; content of which `visible` are shown from `offset`. Draws nothing when all
+;;; content fits.
+(defn draw-scrollbar! [(c (ptr Canvas))
+                       (r Rect)
+                       (total i64)
+                       (offset i64)
+                       (visible i64)
+                       (track Style)
+                       (thumb Style)] (-> i64)
+  (if (or (<= total visible) (<= (.h r) 0))
+      0
+      (let [h (.h r)
+            size (let [s (/ (* h visible) total)] (if (< s 1) 1 s))
+            max-offset (- total visible)
+            pos
+              (if (<= max-offset 0)
+                  0
+                  (/ (* (- h size) (if (> offset max-offset) max-offset offset))
+                     max-offset))]
+        (vline! c (.x r) (.y r) h 0x2502 track)
+        (vline! c (.x r) (+ (.y r) pos) size 0x2503 thumb)
+        1)))
+
+;; ---------------------------------------------------------------------------
+;; Word wrapping
+(defn wrap--space? [(rune i64)] (-> bool)
+  (or (= rune 32) (= rune 9)))
+
+;;; Wrap one paragraph (no newlines) into `out`.
+(defn wrap--paragraph! [(out (mut (ArrayList (slice u8))))
+                        (text (slice u8))
+                        (width i64)] (-> i64)
+  (let [(mut it) (clusters text)
+        (mut line-start) 0
+        (mut w) 0
+        (mut in-space) false
+        (mut brk-end) -1
+        (mut brk-resume) 0
+        (mut w-resume) 0]
+    (loop (match (cluster-next! (mut it))
+            (None [] (break))
+            (Some [(Cluster
+                     :start start
+                     :end end
+                     :width cw
+                     :rune rune)]
+                  (if (wrap--space? rune)
+                      (do
+                        (when (not (load in-space)) (set! brk-end start))
+                        (set! in-space true)
+                        (set! w (+ (load w) (if (= rune 9) 1 cw)))
+                        (set! brk-resume end)
+                        (set! w-resume (load w)))
+                      (do
+                        (set! in-space false)
+                        (loop (if (<= (+ (load w) cw) width)
+                                  (break)
+                                  (cond ;; Break at the last space run.
+                                        (> (load brk-end) (load line-start))
+                                          (do
+                                            (push! (mut out)
+                                                   (subslice text
+                                                             (load line-start)
+                                                             (load brk-end)))
+                                            (set! line-start (load brk-resume))
+                                            (set! w
+                                                  (- (load w) (load w-resume)))
+                                            (set! brk-end -1))
+                                        ;; Leading spaces only: drop them.
+                                        (and (= (load brk-end)
+                                                (load line-start))
+                                             (> (load brk-resume)
+                                                (load line-start)))
+                                          (do
+                                            (set! line-start (load brk-resume))
+                                            (set! w
+                                                  (- (load w) (load w-resume)))
+                                            (set! brk-end -1))
+                                        ;; A word longer than the line: hard break inside it.
+                                        (> start (load line-start))
+                                          (do
+                                            (push! (mut out)
+                                                   (subslice text
+                                                             (load line-start)
+                                                             start))
+                                            (set! line-start start)
+                                            (set! w 0)
+                                            (set! brk-end -1))
+                                        ;; A single grapheme wider than the line stands alone.
+                                        :else (break))))
+                        (set! w (+ (load w) cw)))))))
+    ;; The last line, without trailing spaces that would overflow.
+    (let [end
+            (if (and (load in-space)
+                     (> (load w) width)
+                     (>= (load brk-end) (load line-start)))
+                (load brk-end)
+                (len text))]
+      (push! (mut out) (subslice text (load line-start) end)))
+    0))
+
+;;; Word-wrap `text` to `width` cells. Explicit newlines ("\n" or "\r\n") always
+;;; break, and an empty line stays an empty line. Lines break at spaces; a word
+;;; longer than `width` is broken hard. The returned lines borrow `text`; the
+;;; list itself is allocated from `a`. A `width` below 1 yields no lines, since
+;;; nothing can be shown.
+(defn wrap-text [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (when (>= width 1)
+      (let [(mut start) 0
+            (mut i) 0
+            n (len text)]
+        (loop (if (> (load i) n)
+                  (break)
+                  (if (or (= (load i) n) (= (cast i64 (get text (load i))) 10))
+                      (let [end
+                              (if (and (> (load i) (load start))
+                                       (= (cast i64 (get text (- (load i) 1)))
+                                          13))
+                                  (- (load i) 1)
+                                  (load i))]
+                        (wrap--paragraph! (mut out)
+                                          (subslice text (load start) end)
+                                          width)
+                        (set! start (+ (load i) 1))
+                        (set! i (+ (load i) 1)))
+                      (set! i (+ (load i) 1)))))))
+    (load out)))
+
+;; ---------------------------------------------------------------------------
+;; List view
+
+;;; Selection and scroll state for a vertical list of `count` rows.
+(defstruct ListView [(selected i64) (offset i64) (count i64)])
+
+(defn list-view-new [] (-> ListView)
+  (ListView
+    :selected 0
+    :offset 0
+    :count 0))
+
+(defn list--clamp! [(lv (ptr ListView))] (-> i64)
+  (when (>= (.selected lv) (.count lv)) (set! (.selected lv) (- (.count lv) 1)))
+  (when (< (.selected lv) 0) (set! (.selected lv) 0))
+  0)
+
+;;; Update the number of rows, keeping the selection in range.
+(defn list-set-count! [(lv (ptr ListView)) (count i64)] (-> i64)
+  (set! (.count lv) (if (< count 0) 0 count))
+  (list--clamp! lv))
+
+(defn list-select! [(lv (ptr ListView)) (index i64)] (-> i64)
+  (set! (.selected lv) index)
+  (list--clamp! lv))
+
+(defn list-move! [(lv (ptr ListView)) (delta i64)] (-> i64)
+  (list-select! lv (+ (.selected lv) delta)))
+
+;;; Adjust the scroll offset so the selection is within `height` visible rows.
+(defn list-scroll-into-view! [(lv (ptr ListView)) (height i64)] (-> i64)
+  (let [h (if (< height 1) 1 height)]
+    (when (< (.selected lv) (.offset lv)) (set! (.offset lv) (.selected lv)))
+    (when (>= (.selected lv) (+ (.offset lv) h))
+      (set! (.offset lv) (+ (- (.selected lv) h) 1)))
+    (let [max-offset (if (> (.count lv) h) (- (.count lv) h) 0)]
+      (when (> (.offset lv) max-offset) (set! (.offset lv) max-offset))
+      (when (< (.offset lv) 0) (set! (.offset lv) 0)))
+    0))
+
+;;; Handle navigation keys (Up/Down, Ctrl-p/Ctrl-n, PageUp/PageDown by `page`
+;;; rows, Home/End). Returns true when the key was used.
+(defn list-handle-key! [(lv (ptr ListView)) (key Key) (page i64)] (-> bool)
+  (let [p (if (< page 1) 1 page)]
+    (match key
+      (Up [] (do (list-move! lv -1) true))
+      (Down [] (do (list-move! lv 1) true))
+      (Ctrl [l]
+            (cond (= l #\p) (do (list-move! lv -1) true)
+                  (= l #\n) (do (list-move! lv 1) true)
+                  :else false))
+      (PageUp [] (do (list-move! lv (- 0 p)) true))
+      (PageDown [] (do (list-move! lv p) true))
+      (Home [] (do (list-select! lv 0) true))
+      (End [] (do (list-select! lv (- (.count lv) 1)) true))
+      (_ false))))
+
+;;; Highlight row `y` of `r` as selected: a selection tint across the row and an
+;;; accent bar in the first column.
+(defn draw--selection-row! [(c (ptr Canvas))
+                            (r Rect)
+                            (y i64)
+                            (theme Theme)
+                            (focused bool)] (-> i64)
+  (let [row (rect (.x r) y (.w r) 1)
+        tint (.selection theme)]
+    (fill! c row 32 tint)
+    (put-rune! c
+               (.x r)
+               y
+               0x258E
+               (with-bg (if focused (.accent theme) (.subtle theme)) (.bg tint)))
+    0))
+
+;;; Draw `items` as a scrolling list in `r` with the selection highlighted and
+;;; a scrollbar when they overflow. Updates `lv`'s count and scroll offset.
+(defn draw-list! [(c (ptr Canvas))
+                  (r Rect)
+                  (lv (ptr ListView))
+                  (items (slice (slice u8)))
+                  (theme Theme)
+                  (focused bool)] (-> i64)
+  (list-set-count! lv (len items))
+  (list-scroll-into-view! lv (.h r))
+  (let [overflow (> (len items) (.h r))
+        body (rect-drop-right r (if overflow 1 0))
+        (mut row) 0]
+    (loop (if (or (>= (load row) (.h r))
+                  (>= (+ (.offset lv) (load row)) (len items)))
+              (break)
+              (let [i (+ (.offset lv) (load row))
+                    y (+ (.y r) (load row))
+                    selected (= i (.selected lv))
+                    style
+                      (if selected
+                          (with-bg (if focused
+                                       (bold (.text theme))
+                                       (.text theme))
+                                   (.bg (.selection theme)))
+                          (.text theme))]
+                (when selected (draw--selection-row! c body y theme focused))
+                (put-text-ellipsis! c
+                                    (rect-drop-left body 2)
+                                    (+ (.x body) 2)
+                                    y
+                                    (get items i)
+                                    style)
+                (set! row (+ (load row) 1)))))
+    (when overflow
+      (draw-scrollbar! c
+                       (rect-take-right r 1)
+                       (len items)
+                       (.offset lv)
+                       (.h r)
+                       (.border theme)
+                       (.muted theme)))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Table
+(defsum Align (AlignLeft) (AlignRight) (AlignCenter))
+
+;;; A table column: header text, width request (see `Constraint`) and alignment.
+(defstruct Column [(title (slice u8)) (width Constraint) (align Align)])
+
+;;; One table cell: text and style.
+(defstruct TableCell [(text (slice u8)) (style Style)])
+
+(defn table-cell [(text (slice u8)) (style Style)] (-> TableCell)
+  (TableCell :text text :style style))
+
+;;; Draw `text` aligned within `r` (one row), truncating with "…".
+(defn draw-aligned! [(c (ptr Canvas))
+                     (r Rect)
+                     (text (slice u8))
+                     (style Style)
+                     (align Align)] (-> i64)
+  (let [w (text-width text)]
+    (if (>= w (.w r))
+        (put-text-ellipsis! c r (.x r) (.y r) text style)
+        (let [x
+                (match align
+                  (AlignLeft [] (.x r))
+                  (AlignRight [] (- (rect-right r) w))
+                  (AlignCenter [] (+ (.x r) (/ (- (.w r) w) 2))))]
+          (put-text! c r x (.y r) text style)))))
+
+;;; Draw a table in `r`: a header row, then `cells` (row-major, `len columns`
+;;; per row) scrolled so `lv`'s selection is visible and highlighted. Columns are
+;;; separated by `gap` cells. Cell styles keep their colors on the selected row.
+;;; Updates `lv`'s count and offset.
+(defn draw-table! [(c (ptr Canvas))
+                   (r Rect)
+                   (columns (slice Column))
+                   (cells (slice TableCell))
+                   (lv (ptr ListView))
+                   (gap i64)
+                   (theme Theme)
+                   (focused bool)] (-> i64)
+  (let [ncols (len columns)]
+    (when (or (= ncols 0) (> ncols 32))
+      (fatal "draw-table!: a table needs between 1 and 32 columns"))
+    (when (!= (% (len cells) ncols) 0)
+      (fatal "draw-table!: cell count is not a multiple of the column count"))
+    (let [nrows (/ (len cells) ncols)
+          (mut constraints) (zeroed (array Constraint 32))
+          (mut rects) (zeroed (array Rect 32))
+          (mut i) 0]
+      (loop (if (>= (load i) ncols)
+                (break)
+                (do
+                  (set! (index constraints (load i))
+                        (.width (index (slice-data columns) (load i))))
+                  (set! i (+ (load i) 1)))))
+      (let [body-h (if (> (.h r) 1) (- (.h r) 1) 0)
+            overflow (> nrows body-h)
+            inner (rect-drop-left (rect-drop-right r 1) 2)
+            cols (slice-new [Rect] (index rects 0) ncols)]
+        (split-horizontal inner
+                          (slice-new [Constraint] (index constraints 0) ncols)
+                          gap
+                          cols)
+        (list-set-count! lv nrows)
+        (list-scroll-into-view! lv body-h)
+        ;; Header
+        (let [(mut k) 0]
+          (loop (if (>= (load k) ncols)
+                    (break)
+                    (let [col (index (slice-data columns) (load k))
+                          cr (get cols (load k))]
+                      (draw-aligned! c
+                                     (rect (.x cr) (.y r) (.w cr) 1)
+                                     (.title col)
+                                     (.header theme)
+                                     (.align col))
+                      (set! k (+ (load k) 1))))))
+        ;; Rows
+        (let [(mut row) 0]
+          (loop (if (or (>= (load row) body-h)
+                        (>= (+ (.offset lv) (load row)) nrows))
+                    (break)
+                    (let [ri (+ (.offset lv) (load row))
+                          y (+ (+ (.y r) 1) (load row))
+                          selected (= ri (.selected lv))
+                          (mut k) 0]
+                      (when selected
+                        (draw--selection-row! c
+                                              (rect-drop-right r
+                                                               (if overflow 1 0))
+                                              y
+                                              theme
+                                              focused))
+                      (loop (if (>= (load k) ncols)
+                                (break)
+                                (let [col (index (slice-data columns) (load k))
+                                      cell
+                                        (index (slice-data cells)
+                                               (+ (* ri ncols) (load k)))
+                                      cr (get cols (load k))
+                                      base (.style cell)
+                                      style
+                                        (if selected
+                                            (let [s
+                                                    (with-bg base
+                                                             (.bg (.selection theme)))]
+                                              (with-attrs s
+                                                          (if focused
+                                                              ATTR-BOLD
+                                                              0)))
+                                            (load base))]
+                                  (draw-aligned! c
+                                                 (rect (.x cr) y (.w cr) 1)
+                                                 (.text cell)
+                                                 style
+                                                 (.align col))
+                                  (set! k (+ (load k) 1)))))
+                      (set! row (+ (load row) 1))))))
+        (when overflow
+          (draw-scrollbar! c
+                           (rect (- (rect-right r) 1) (+ (.y r) 1) 1 body-h)
+                           nrows
+                           (.offset lv)
+                           body-h
+                           (.border theme)
+                           (.muted theme)))
+        nrows))))
+
+;; ---------------------------------------------------------------------------
+;; Scroll view (chat transcripts, logs)
+
+;;; A display line: a gutter (drawn at the left edge in `gutter-style`) followed
+;;; by `text` in `style`. Text is borrowed.
+(defstruct StyledLine
+  [(gutter (slice u8)) (gutter-style Style) (text (slice u8)) (style Style)])
+
+;;; Scroll state. With `stick-bottom` the view follows new content (a chat
+;;; transcript); scrolling up releases it and scrolling back to the end re-arms it.
+(defstruct ScrollView
+  [(offset i64) (stick-bottom bool) (total i64) (height i64)])
+
+(defn scroll-view-new [] (-> ScrollView)
+  (ScrollView
+    :offset 0
+    :stick-bottom true
+    :total 0
+    :height 0))
+
+(defn scroll--max [(sv (ptr ScrollView))] (-> i64)
+  (if (> (.total sv) (.height sv)) (- (.total sv) (.height sv)) 0))
+
+(defn scroll-up! [(sv (ptr ScrollView)) (rows i64)] (-> i64)
+  (when (.stick-bottom sv) (set! (.offset sv) (scroll--max sv)))
+  (set! (.offset sv) (- (.offset sv) rows))
+  (when (< (.offset sv) 0) (set! (.offset sv) 0))
+  (set! (.stick-bottom sv) (>= (.offset sv) (scroll--max sv)))
+  0)
+
+(defn scroll-down! [(sv (ptr ScrollView)) (rows i64)] (-> i64)
+  (set! (.offset sv) (+ (.offset sv) rows))
+  (when (>= (.offset sv) (scroll--max sv))
+    (set! (.offset sv) (scroll--max sv))
+    (set! (.stick-bottom sv) true))
+  0)
+
+(defn scroll-to-bottom! [(sv (ptr ScrollView))] (-> i64)
+  (set! (.stick-bottom sv) true)
+  (set! (.offset sv) (scroll--max sv))
+  0)
+
+(defn scroll-to-top! [(sv (ptr ScrollView))] (-> i64)
+  (set! (.offset sv) 0)
+  (set! (.stick-bottom sv) (= (scroll--max sv) 0))
+  0)
+
+;;; PageUp/PageDown scroll by a page (the last drawn height, minus one row of
+;;; overlap). Returns true when the key was used.
+(defn scroll-view-handle-key! [(sv (ptr ScrollView)) (key Key)] (-> bool)
+  (let [page (if (> (.height sv) 2) (- (.height sv) 1) 1)]
+    (match key
+      (PageUp [] (do (scroll-up! sv page) true))
+      (PageDown [] (do (scroll-down! sv page) true))
+      (_ false))))
+
+;;; Append `text` word-wrapped to `width` cells (gutter included) as display
+;;; lines. Every line carries the gutter, so a colored "│ " marks a whole message.
+(defn push-wrapped! [(lines (mut (ArrayList StyledLine)))
+                     (a (dyn Allocator))
+                     (text (slice u8))
+                     (width i64)
+                     (style Style)
+                     (gutter (slice u8))
+                     (gutter-style Style)] (-> i64)
+  (let [(mut wrapped) (wrap-text a text (- width (text-width gutter)))
+        (mut i) 0]
+    (loop (if (>= (load i) (len wrapped))
+              (break)
+              (do
+                (push! (mut lines)
+                       (StyledLine
+                         :gutter gutter
+                         :gutter-style gutter-style
+                         :text (get wrapped (load i))
+                         :style style))
+                (set! i (+ (load i) 1)))))
+    (let [n (len wrapped)]
+      (al-free! (mut wrapped))
+      n)))
+
+;;; Draw the visible window of `lines` into `r` and record the geometry in `sv`.
+;;; A sticky view shows the last rows.
+(defn draw-scroll-view! [(c (ptr Canvas))
+                         (r Rect)
+                         (sv (ptr ScrollView))
+                         (lines (slice StyledLine))] (-> i64)
+  (set! (.total sv) (len lines))
+  (set! (.height sv) (.h r))
+  (if (.stick-bottom sv)
+      (set! (.offset sv) (scroll--max sv))
+      (when (> (.offset sv) (scroll--max sv))
+        (set! (.offset sv) (scroll--max sv))))
+  (let [(mut row) 0]
+    (loop (if (or (>= (load row) (.h r))
+                  (>= (+ (.offset sv) (load row)) (len lines)))
+              (break)
+              (let [line (index (slice-data lines) (+ (.offset sv) (load row)))
+                    y (+ (.y r) (load row))
+                    gw
+                      (put-text! c
+                                 r
+                                 (.x r)
+                                 y
+                                 (.gutter line)
+                                 (.gutter-style line))]
+                (put-text! c r (+ (.x r) gw) y (.text line) (.style line))
+                (set! row (+ (load row) 1)))))
+    (load row)))
+
+;; ---------------------------------------------------------------------------
+;; Text input
+
+;;; An editable text buffer with a cursor (a byte offset on a grapheme
+;;; boundary), optional multi-line editing, and submission history.
+(defstruct TextInput
+  [(allocator (dyn Allocator))
+   (text (ArrayList u8))
+   (cursor i64)
+   (multiline bool)
+   (history (ArrayList (slice u8)))
+   (history-pos i64)
+   (draft (ArrayList u8))
+   (scroll i64)])
+
+(defn text-input-new [(a (dyn Allocator)) (multiline bool)] (-> TextInput)
+  (TextInput
+    :allocator a
+    :text (al-new [u8] a)
+    :cursor 0
+    :multiline multiline
+    :history (al-new [(slice u8)] a)
+    :history-pos -1
+    :draft (al-new [u8] a)
+    :scroll 0))
+
+(defn text-input-free! [(input (ptr TextInput))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (.history input)))
+              (break)
+              (let [entry (get (.history input) (load i))]
+                (free [u8] (.allocator input) entry)
+                (set! i (+ (load i) 1))))))
+  (al-free! (mut (.history input)))
+  (al-free! (mut (.text input)))
+  (al-free! (mut (.draft input)))
+  0)
+
+;;; The current contents (borrowed; invalidated by the next edit).
+(defn input-text [(input (ptr TextInput))] (-> (slice u8))
+  (al-slice (.text input)))
+
+(defn input-empty? [(input (ptr TextInput))] (-> bool)
+  (= (len (.text input)) 0))
+
+;;; Replace the contents and put the cursor at the end.
+(defn input-set-text! [(input (ptr TextInput)) (text (slice u8))] (-> i64)
+  (al-clear! (mut (.text input)))
+  (al-extend! (mut (.text input)) (slice-data text) (len text))
+  (set! (.cursor input) (len text))
+  0)
+
+(defn input-clear! [(input (ptr TextInput))] (-> i64)
+  (al-clear! (mut (.text input)))
+  (set! (.cursor input) 0)
+  (set! (.scroll input) 0)
+  (set! (.history-pos input) -1)
+  0)
+
+(defn input--byte [(input (ptr TextInput)) (i i64)] (-> i64)
+  (cast i64 (get (.text input) i)))
+
+(defn input--next-boundary [(input (ptr TextInput)) (pos i64)] (-> i64)
+  (let [(mut it)
+          (ClusterIter
+            :text (al-slice (.text input))
+            :offset pos
+            :valid-end 0)]
+    (match (cluster-next! (mut it))
+      (None [] pos)
+      (Some [(Cluster :end end)] end))))
+
+(defn input--prev-boundary [(input (ptr TextInput)) (pos i64)] (-> i64)
+  (let [(mut it) (clusters (al-slice (.text input)))
+        (mut prev) 0]
+    (loop (match (cluster-next! (mut it))
+            (None [] (break))
+            (Some [(Cluster :start start :end end)]
+                  (if (>= end pos)
+                      (do (set! prev start) (break))
+                      (set! prev end)))))
+    (load prev)))
+
+(defn input--delete-range! [(input (ptr TextInput)) (lo i64) (hi i64)] (-> i64)
+  (let [n (len (.text input))
+        data (.data (.text input))
+        k (- hi lo)
+        (mut i) hi]
+    (when (or (< lo 0) (> hi n) (> lo hi))
+      (fatal "input: delete range out of bounds"))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (set! (index data (- (load i) k)) (load (index data (load i))))
+                (set! i (+ (load i) 1)))))
+    (set! (.len (.text input)) (- n k))
+    (when (> (.cursor input) hi) (set! (.cursor input) (- (.cursor input) k)))
+    (when (and (> (.cursor input) lo) (<= (.cursor input) hi))
+      (set! (.cursor input) lo))
+    0))
+
+(defn input--insert-bytes! [(input (ptr TextInput)) (bytes (slice u8))] (-> i64)
+  (let [k (len bytes)
+        at (.cursor input)
+        old (len (.text input))]
+    (al-reserve! (mut (.text input)) (+ old k))
+    (set! (.len (.text input)) (+ old k))
+    (let [data (.data (.text input))
+          (mut i) (- old 1)]
+      (loop (if (< (load i) at)
+                (break)
+                (do
+                  (set! (index data (+ (load i) k))
+                        (load (index data (load i))))
+                  (set! i (- (load i) 1)))))
+      (let [(mut j) 0]
+        (loop (if (>= (load j) k)
+                  (break)
+                  (do
+                    (set! (index data (+ at (load j))) (get bytes (load j)))
+                    (set! j (+ (load j) 1)))))))
+    (set! (.cursor input) (+ at k))
+    0))
+
+;;; Insert one scalar at the cursor. Control characters are rejected (except a
+;;; newline in a multi-line input) since they cannot be displayed.
+(defn input-insert-rune! [(input (ptr TextInput)) (rune i64)] (-> bool)
+  (if (or (and (rune-control? rune) (not (and (= rune 10) (.multiline input))))
+          (not (rune-valid? rune)))
+      false
+      (let [buf (primitive/alloc-stack (array u8 4))
+            n (utf8-encode-into (index buf 0) rune)]
+        (input--insert-bytes! input (slice-new [u8] (index buf 0) n))
+        true)))
+
+;;; Insert pasted text at the cursor. CR LF and CR become newlines (spaces in a
+;;; single-line input), tabs become four spaces, other controls are dropped,
+;;; and malformed UTF-8 becomes U+FFFD.
+(defn input-insert-text! [(input (ptr TextInput)) (text (slice u8))] (-> i64)
+  (let [(mut clean) (al-new [u8] (.allocator input))
+        (mut i) 0
+        n (len text)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [d (utf8-decode text (load i))
+                    r (.rune d)]
+                (cond (= r 13)
+                        (do
+                          (utf8-encode! (mut clean)
+                                        (if (.multiline input) 10 32))
+                          (when (and (< (+ (load i) 1) n)
+                                     (= (cast i64 (get text (+ (load i) 1))) 10))
+                            (set! i (+ (load i) 1))))
+                      (= r 10)
+                        (utf8-encode! (mut clean) (if (.multiline input) 10 32))
+                      (= r 9)
+                        (do
+                          (utf8-encode! (mut clean) 32)
+                          (utf8-encode! (mut clean) 32)
+                          (utf8-encode! (mut clean) 32)
+                          (utf8-encode! (mut clean) 32))
+                      (rune-control? r) 0
+                      :else (utf8-encode! (mut clean) r))
+                (set! i (+ (load i) (.len d))))))
+    (input--insert-bytes! input (al-slice clean))
+    (al-free! (mut clean))
+    0))
+
+(defn input-backspace! [(input (ptr TextInput))] (-> bool)
+  (if (= (.cursor input) 0)
+      false
+      (do
+        (input--delete-range! input
+                              (input--prev-boundary input (.cursor input))
+                              (.cursor input))
+        true)))
+
+(defn input-delete! [(input (ptr TextInput))] (-> bool)
+  (if (>= (.cursor input) (len (.text input)))
+      false
+      (do
+        (input--delete-range! input
+                              (.cursor input)
+                              (input--next-boundary input (.cursor input)))
+        true)))
+
+(defn input-left! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--prev-boundary input (.cursor input)))
+  0)
+
+(defn input-right! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--next-boundary input (.cursor input)))
+  0)
+
+(defn input--line-start [(input (ptr TextInput)) (pos i64)] (-> i64)
+  (let [(mut i) pos]
+    (loop (if (or (<= (load i) 0) (= (input--byte input (- (load i) 1)) 10))
+              (break)
+              (set! i (- (load i) 1))))
+    (load i)))
+
+(defn input--line-end [(input (ptr TextInput)) (pos i64)] (-> i64)
+  (let [(mut i) pos
+        n (len (.text input))]
+    (loop (if (or (>= (load i) n) (= (input--byte input (load i)) 10))
+              (break)
+              (set! i (+ (load i) 1))))
+    (load i)))
+
+;;; Start of the current line (of the text, in a multi-line input).
+(defn input-home! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--line-start input (.cursor input)))
+  0)
+
+(defn input-end! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--line-end input (.cursor input)))
+  0)
+
+(defn input--space-at? [(input (ptr TextInput)) (i i64)] (-> bool)
+  (let [b (input--byte input i)]
+    (or (= b 32) (= b 10) (= b 9))))
+
+(defn input--word-left [(input (ptr TextInput))] (-> i64)
+  (let [(mut i) (.cursor input)]
+    (loop (if (or (<= (load i) 0) (not (input--space-at? input (- (load i) 1))))
+              (break)
+              (set! i (- (load i) 1))))
+    (loop (if (or (<= (load i) 0) (input--space-at? input (- (load i) 1)))
+              (break)
+              (set! i (- (load i) 1))))
+    (load i)))
+
+(defn input--word-right [(input (ptr TextInput))] (-> i64)
+  (let [(mut i) (.cursor input)
+        n (len (.text input))]
+    (loop (if (or (>= (load i) n) (not (input--space-at? input (load i))))
+              (break)
+              (set! i (+ (load i) 1))))
+    (loop (if (or (>= (load i) n) (input--space-at? input (load i)))
+              (break)
+              (set! i (+ (load i) 1))))
+    (load i)))
+
+;;; Move to the start of the previous word (Alt-b, Alt/Ctrl-Left).
+(defn input-word-left! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--word-left input))
+  0)
+
+;;; Move past the end of the next word (Alt-f, Alt/Ctrl-Right).
+(defn input-word-right! [(input (ptr TextInput))] (-> i64)
+  (set! (.cursor input) (input--word-right input))
+  0)
+
+;;; Ctrl-W / Alt-Backspace: delete the word before the cursor.
+(defn input-delete-word-back! [(input (ptr TextInput))] (-> bool)
+  (let [start (input--word-left input)]
+    (if (= start (.cursor input))
+        false
+        (do (input--delete-range! input start (.cursor input)) true))))
+
+;;; Alt-D: delete the word after the cursor.
+(defn input-delete-word-forward! [(input (ptr TextInput))] (-> bool)
+  (let [end (input--word-right input)]
+    (if (= end (.cursor input))
+        false
+        (do (input--delete-range! input (.cursor input) end) true))))
+
+;;; Ctrl-U: delete from the start of the line to the cursor.
+(defn input-kill-to-start! [(input (ptr TextInput))] (-> bool)
+  (let [start (input--line-start input (.cursor input))]
+    (if (= start (.cursor input))
+        false
+        (do (input--delete-range! input start (.cursor input)) true))))
+
+;;; Ctrl-K: delete from the cursor to the end of the line.
+(defn input-kill-to-end! [(input (ptr TextInput))] (-> bool)
+  (let [end (input--line-end input (.cursor input))]
+    (if (= end (.cursor input))
+        false
+        (do (input--delete-range! input (.cursor input) end) true))))
+
+(defn input--copy [(a (dyn Allocator)) (bytes (slice u8))] (-> (slice u8))
+  (let [(mut copy) (al-new [u8] a)]
+    (al-extend! (mut copy) (slice-data bytes) (len bytes))
+    (al-into-slice (mut copy))))
+
+;;; Record `text` as the newest history entry (skipping empty text and repeats
+;;; of the newest entry). The entry is copied.
+(defn input-history-push! [(input (ptr TextInput)) (text (slice u8))] (-> i64)
+  (let [n (len (.history input))]
+    (when (and (> (len text) 0)
+               (or (= n 0) (not (= (get (.history input) (- n 1)) text))))
+      (push! (mut (.history input)) (input--copy (.allocator input) text)))
+    (set! (.history-pos input) -1)
+    0))
+
+;;; Recall the previous (older) history entry, saving the unsent draft first.
+(defn input-history-prev! [(input (ptr TextInput))] (-> bool)
+  (let [n (len (.history input))
+        pos (.history-pos input)]
+    (if (or (= n 0) (= pos 0))
+        false
+        (do
+          (when (< pos 0)
+            (al-clear! (mut (.draft input)))
+            (al-extend! (mut (.draft input))
+                        (.data (.text input))
+                        (len (.text input))))
+          (set! (.history-pos input) (if (< pos 0) (- n 1) (- pos 1)))
+          (input-set-text! input (get (.history input) (.history-pos input)))
+          true))))
+
+;;; Recall the next (newer) entry; past the newest, restore the saved draft.
+(defn input-history-next! [(input (ptr TextInput))] (-> bool)
+  (let [n (len (.history input))
+        pos (.history-pos input)]
+    (cond (< pos 0) false
+          (< (+ pos 1) n)
+            (do
+              (set! (.history-pos input) (+ pos 1))
+              (input-set-text! input (get (.history input) (+ pos 1)))
+              true)
+          :else
+            (do
+              (set! (.history-pos input) -1)
+              (input-set-text! input (al-slice (.draft input)))
+              true))))
+
+;;; Take the text for sending: push it to history, clear the input, and return
+;;; a copy allocated from `a`.
+(defn input-submit! [(input (ptr TextInput)) (a (dyn Allocator))] (-> (slice u8))
+  (let [text (input--copy a (al-slice (.text input)))]
+    (input-history-push! input text)
+    (input-clear! input)
+    text))
+
+;;; What a key did to a text input.
+(defsum InputResult
+  (InputSubmitted)
+  (InputHandled)
+  (InputIgnored))
+
+(defn input--on-first-line? [(input (ptr TextInput))] (-> bool)
+  (= (input--line-start input (.cursor input)) 0))
+
+(defn input--on-last-line? [(input (ptr TextInput))] (-> bool)
+  (= (input--line-end input (.cursor input)) (len (.text input))))
+
+;;; Move to the same display column on the previous/next text line.
+(defn input--vertical! [(input (ptr TextInput)) (down bool)] (-> i64)
+  (let [text (al-slice (.text input))
+        start (input--line-start input (.cursor input))
+        column (text-width (subslice text start (.cursor input)))
+        target-start
+          (if down
+              (+ (input--line-end input (.cursor input)) 1)
+              (input--line-start input (- start 1)))]
+    (set! (.cursor input) (input--snap-column input target-start column))
+    0))
+
+;;; The position `column` display cells into the line starting at `start`
+;;; (or the line end when it is shorter).
+(defn input--snap-column [(input (ptr TextInput)) (start i64) (column i64)] (-> i64)
+  (let [(mut it)
+          (ClusterIter
+            :text (al-slice (.text input))
+            :offset start
+            :valid-end 0)
+        (mut pos) start
+        (mut w) 0]
+    (loop (match (cluster-next! (mut it))
+            (None [] (break))
+            (Some [(Cluster
+                     :end end
+                     :width cw
+                     :rune rune)]
+                  (if (or (= rune 10) (> (+ (load w) cw) column))
+                      (break)
+                      (do (set! pos end) (set! w (+ (load w) cw)))))))
+    (load pos)))
+
+;;; Apply an editing key: characters, paste, Backspace/Delete, Left/Right,
+;;; Home/End (and Ctrl-A/E), word motion (Alt-B/F, Alt/Ctrl-Left/Right), Ctrl-U,
+;;; Ctrl-K, Ctrl-W, Alt-Backspace, Alt-D, Ctrl-B/F, Up/Down (line motion in a
+;;; multi-line input, otherwise history), Enter (submit) and Shift/Alt-Enter or
+;;; Ctrl-J (newline in a multi-line input).
+(defn input-handle-key! [(input (ptr TextInput)) (key Key)] (-> InputResult)
+  (match key
+    (Char [rune] (do (input-insert-rune! input rune) (InputHandled)))
+    (Paste [text] (do (input-insert-text! input text) (InputHandled)))
+    (Enter [] (InputSubmitted))
+    (ShiftEnter []
+                (if (.multiline input)
+                    (do (input-insert-rune! input 10) (InputHandled))
+                    (InputIgnored)))
+    (AltEnter []
+              (if (.multiline input)
+                  (do (input-insert-rune! input 10) (InputHandled))
+                  (InputIgnored)))
+    (Backspace [] (do (input-backspace! input) (InputHandled)))
+    (Delete [] (do (input-delete! input) (InputHandled)))
+    (Left [] (do (input-left! input) (InputHandled)))
+    (Right [] (do (input-right! input) (InputHandled)))
+    (Home [] (do (input-home! input) (InputHandled)))
+    (End [] (do (input-end! input) (InputHandled)))
+    (WordLeft [] (do (input-word-left! input) (InputHandled)))
+    (WordRight [] (do (input-word-right! input) (InputHandled)))
+    (AltBackspace [] (do (input-delete-word-back! input) (InputHandled)))
+    (Up []
+        (if (and (.multiline input) (not (input--on-first-line? input)))
+            (do (input--vertical! input false) (InputHandled))
+            (if (input-history-prev! input) (InputHandled) (InputIgnored))))
+    (Down []
+          (if (and (.multiline input) (not (input--on-last-line? input)))
+              (do (input--vertical! input true) (InputHandled))
+              (if (input-history-next! input) (InputHandled) (InputIgnored))))
+    (Alt [rune]
+         (cond (= rune #\b) (do (input-word-left! input) (InputHandled))
+               (= rune #\f) (do (input-word-right! input) (InputHandled))
+               (= rune #\d)
+                 (do (input-delete-word-forward! input) (InputHandled))
+               :else (InputIgnored)))
+    (Ctrl [letter]
+          (cond (= letter #\a) (do (input-home! input) (InputHandled))
+                (= letter #\e) (do (input-end! input) (InputHandled))
+                (= letter #\b) (do (input-left! input) (InputHandled))
+                (= letter #\f) (do (input-right! input) (InputHandled))
+                (= letter #\u) (do (input-kill-to-start! input) (InputHandled))
+                (= letter #\k) (do (input-kill-to-end! input) (InputHandled))
+                (= letter #\w)
+                  (do (input-delete-word-back! input) (InputHandled))
+                (= letter #\h) (do (input-backspace! input) (InputHandled))
+                (and (= letter #\d) (not (input-empty? input)))
+                  (do (input-delete! input) (InputHandled))
+                (and (= letter #\j) (.multiline input))
+                  (do (input-insert-rune! input 10) (InputHandled))
+                :else (InputIgnored)))
+    (_ (InputIgnored))))
+
+;;; One visual row of the input: bytes [start, end) and where the next row
+;;; starts (past a newline, or equal to `end` for a soft wrap).
+(defstruct InputRow [(start i64) (end i64) (next i64)])
+
+(defn input--row [(text (slice u8)) (start i64) (width i64)] (-> InputRow)
+  (let [(mut it)
+          (ClusterIter
+            :text text
+            :offset start
+            :valid-end 0)
+        (mut w) 0
+        (mut end) start
+        (mut next) (len text)
+        (mut done) false]
+    (loop (match (cluster-next! (mut it))
+            (None [] (do (set! next (load end)) (break)))
+            (Some [(Cluster
+                     :start s
+                     :end e
+                     :width cw
+                     :rune rune)]
+                  (cond (= rune 10) (do (set! next e) (break))
+                        (and (> (+ (load w) cw) width) (> (load end) start))
+                          (do (set! next (load end)) (break))
+                        :else (do (set! w (+ (load w) cw)) (set! end e))))))
+    (InputRow
+      :start start
+      :end (load end)
+      :next (load next))))
+
+;;; Number of rows `draw-input!` needs to show all of `input` in a rect `width`
+;;; columns wide (at least 1): use it to size a growing chat input box.
+(defn input-visual-rows [(input (ptr TextInput)) (width i64)] (-> i64)
+  (let [text (al-slice (.text input))
+        w (if (< width 2) 2 width)
+        (mut start) 0
+        (mut rows) 0]
+    (loop (let [row (input--row text (load start) (- w 1))]
+            (set! rows (+ (load rows) 1))
+            (if (or (>= (.next row) (len text)) (= (.next row) (load start)))
+                (do
+                  ;; A trailing newline opens one more (empty) row.
+                  (when (and (> (len text) 0)
+                             (= (.next row) (len text))
+                             (!= (.end row) (.next row)))
+                    (set! rows (+ (load rows) 1)))
+                  (break))
+                (set! start (.next row)))))
+    (load rows)))
+
+;;; Draw the input in `r`, wrapping at `r.w - 1` columns (the last column keeps
+;;; room for the cursor), scrolled so the cursor row is visible. Shows
+;;; `placeholder` in `placeholder-style` when empty. When `focused`, places the
+;;; terminal cursor at the insertion point.
+(defn draw-input! [(c (ptr Canvas))
+                   (r Rect)
+                   (input (ptr TextInput))
+                   (style Style)
+                   (placeholder (slice u8))
+                   (placeholder-style Style)
+                   (focused bool)] (-> i64)
+  (if (rect-empty? r)
+      0
+      (let [text (al-slice (.text input))
+            width (if (> (.w r) 1) (- (.w r) 1) 1)
+            cursor (.cursor input)]
+        (when (= (len text) 0)
+          (put-text-ellipsis! c r (.x r) (.y r) placeholder placeholder-style)
+          (set! (.scroll input) 0)
+          (when focused (canvas-set-cursor! c (.x r) (.y r))))
+        (when (> (len text) 0)
+          ;; First pass: locate the cursor's row and column.
+          (let [(mut start) 0
+                (mut row-index) 0
+                (mut cursor-row) 0
+                (mut cursor-col) 0]
+            (loop (let [row (input--row text (load start) width)]
+                    (when (and (>= cursor (.start row))
+                               (or (< cursor (.end row))
+                                   (and (= cursor (.end row))
+                                        (!= (.next row) (.end row)))
+                                   (and (= cursor (.end row))
+                                        (>= (.end row) (len text)))))
+                      (set! cursor-row (load row-index))
+                      (set! cursor-col
+                            (text-width (subslice text (.start row) cursor))))
+                    (if (or (>= (.next row) (len text))
+                            (= (.next row) (load start)))
+                        (do
+                          (when (and (= (.next row) (len text))
+                                     (!= (.end row) (.next row))
+                                     (= cursor (len text)))
+                            (set! cursor-row (+ (load row-index) 1))
+                            (set! cursor-col 0))
+                          (break))
+                        (do
+                          (set! start (.next row))
+                          (set! row-index (+ (load row-index) 1))))))
+            (when (< (load cursor-row) (.scroll input))
+              (set! (.scroll input) (load cursor-row)))
+            (when (>= (load cursor-row) (+ (.scroll input) (.h r)))
+              (set! (.scroll input) (+ (- (load cursor-row) (.h r)) 1)))
+            ;; Second pass: draw the visible rows.
+            (let [(mut s) 0
+                  (mut i) 0]
+              (loop (let [row (input--row text (load s) width)
+                          visible (- (load i) (.scroll input))]
+                      (when (and (>= visible 0) (< visible (.h r)))
+                        (put-text! c
+                                   r
+                                   (.x r)
+                                   (+ (.y r) visible)
+                                   (subslice text (.start row) (.end row))
+                                   style))
+                      (if (or (>= (.next row) (len text))
+                              (= (.next row) (load s)))
+                          (break)
+                          (do (set! s (.next row)) (set! i (+ (load i) 1)))))))
+            (when focused
+              (canvas-set-cursor! c
+                                  (+ (.x r) (load cursor-col))
+                                  (+ (.y r)
+                                     (- (load cursor-row) (.scroll input)))))))
+        0)))

@@ -1,0 +1,14 @@
+(module agent.fail)
+(import "coil.alloc" :use *)
+(import "coil.io" :as io)
+(import "coil.primitive" :as primitive)
+
+;;; Stop the process with a message on stderr. For states that are programming
+;;; errors, never for conditions a caller should handle.
+(defn fail [T] [(message (slice u8))] (-> T)
+  (do
+    (io/print-str (io/stderr) "fatal: ")
+    (io/print-str (io/stderr) message)
+    (io/print-str (io/stderr) "\n")
+    (abort)
+    (primitive/zeroed T)))

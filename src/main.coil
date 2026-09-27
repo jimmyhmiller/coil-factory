@@ -1,0 +1,169 @@
+(module factory.main)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.args" :as args)
+(import "cli.prompt" :as prompt)
+(import "cli.style" :as style)
+(import "factory.config" :use *)
+(import "factory.proc" :use *)
+(import "factory.worker" :as worker)
+(import "factory.daemon" :as daemon)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use [join])
+(import "factory.cli.runs" :as runs)
+(import "factory.cli.sites" :as sites)
+(import "factory.cli.start" :as start)
+(import "factory.cli.design" :as design)
+(import "factory.cli.chat" :as chat)
+
+;;; factory — run software factories anywhere, watch everything, talk to any agent.
+
+(defn words [(a (dyn Allocator)) (items (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut first) true]
+    (for item (iter items)
+      (when (not (load first)) (sb-push-str! (mut out) " ") 0)
+      (sb-push-str! (mut out) item)
+      (set! first false))
+    (sb-finish! (mut out))))
+
+(defn positional-or [(inv args/Invocation) (i i64) (fallback (slice u8))] (-> (slice u8))
+  (match (args/positional inv i) (Some [v] v) (None [] fallback)))
+
+(defn rest-from [(a (dyn Allocator)) (inv args/Invocation) (i i64)] (-> (slice u8))
+  (let [all (args/positionals inv)]
+    (if (>= i (len all)) "" (words a (subslice all i (len all))))))
+
+(defn int-flag [(inv args/Invocation) (name (slice u8)) (fallback i64)] (-> i64)
+  (match (args/flag-value inv name)
+    (Some [text] (match (str-parse-int text) (Some [n] n) (None [] fallback)))
+    (None [] fallback)))
+
+(defn run-command [(ctx (ptr Ctx)) (inv args/Invocation)] (-> i64)
+  (let [a (.allocator ctx)
+        first (positional-or inv 0 "")]
+    (cond
+      (args/command-is? inv "") (chat/cmd-dashboard ctx "" "")
+      (args/command-is? inv "up") (sites/cmd-up ctx (args/flag? inv "quiet"))
+      (args/command-is? inv "down") (sites/cmd-down ctx)
+      (args/command-is? inv "status") (sites/cmd-status ctx)
+      (args/command-is? inv "new") (design/cmd-new ctx first (args/flag-value-or inv "out" ""))
+      (args/command-is? inv "check") (design/cmd-check ctx first)
+      (args/command-is? inv "factories") (design/cmd-factories ctx)
+      (args/command-is? inv "start")
+        (let [brief-file (args/flag-value-or inv "brief-file" "")
+              brief (cond (> (len (args/flag-value-or inv "brief" "")) 0) (args/flag-value-or inv "brief" "")
+                          (> (len brief-file) 0) (match (read-text a brief-file) (Some [t] t) (None [] ""))
+                          :else (rest-from a inv 1))]
+          (if (and (> (len brief-file) 0) (= (len brief) 0))
+              (fail-with ctx (join a ["cannot read " brief-file]))
+              (start/cmd-start ctx (start/StartOptions :factory first
+                                                       :on (args/flag-value-or inv "on" "")
+                                                       :project (args/flag-value-or inv "project" "")
+                                                       :brief brief
+                                                       :model (args/flag-value-or inv "model" "")
+                                                       :watch (args/flag? inv "watch")))))
+      (args/command-is? inv "ps") (runs/cmd-ps ctx (args/flag? inv "all"))
+      (args/command-is? inv "show") (runs/cmd-show ctx first)
+      (args/command-is? inv "watch") (runs/cmd-watch ctx first (args/flag? inv "verbose") (args/flag? inv "follow"))
+      (args/command-is? inv "transcript") (runs/cmd-transcript ctx first)
+      (args/command-is? inv "diff") (runs/cmd-diff ctx first)
+      (args/command-is? inv "chat") (chat/cmd-chat ctx first)
+      (args/command-is? inv "ask") (runs/cmd-ask ctx first (rest-from a inv 1) (int-flag inv "timeout" 600))
+      (args/command-is? inv "say") (runs/cmd-say ctx first (rest-from a inv 1))
+      (args/command-is? inv "pause") (runs/cmd-control ctx first "pause")
+      (args/command-is? inv "resume") (runs/cmd-control ctx first "resume")
+      (args/command-is? inv "stop") (runs/cmd-control ctx first "cancel")
+      (args/command-is? inv "pull") (start/cmd-pull ctx first)
+      (args/command-is? inv "sites") (sites/cmd-sites ctx)
+      (args/command-is? inv "site add")
+        (sites/cmd-site-add ctx first (args/flag-value-or inv "ssh" "") (args/flag? inv "sandbox") (int-flag inv "port" 7788))
+      (args/command-is? inv "site remove") (sites/cmd-site-remove ctx first)
+      (args/command-is? inv "site install")
+        (sites/cmd-site-install ctx first (args/flag-value-or inv "ssh" "") (args/flag-value-or inv "source" ""))
+      (args/command-is? inv "site secrets")
+        (let [all (args/positionals inv)]
+          (sites/cmd-site-secrets ctx first (subslice all 1 (len all))))
+      (args/command-is? inv "skills install") (design/cmd-skills-install ctx (args/flag-value-or inv "dir" ""))
+      :else (fail-with ctx (join a ["no handler for command `" (.name inv) "`"])))))
+
+(defn arg [(argv (ptr (ptr i8))) (i i64)] (-> (slice u8))
+  (cstr->str (load (primitive/index argv i))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [a (malloc-allocator)
+        home (factory-home a)]
+    (remember-argv0! (arg argv 0))
+    (cond
+      ;; Internal entry points, started by the daemon and by `factory up`.
+      (and (>= argc 3) (= (arg argv 1) "_run"))
+        (let [id (arg argv 2)]
+          (become-detached! a (run-file a home id "process.log"))
+          (worker/worker-main a home id))
+      (and (>= argc 2) (= (arg argv 1) "daemon"))
+        (do (when (and (>= argc 3) (= (arg argv 2) "--background"))
+              (become-detached! a (path-join a home "daemon.log"))
+              0)
+            (daemon/daemon-main a home))
+      :else
+        (let [program (args/Program
+                        :name "factory"
+                        :summary "Run software factories anywhere. Watch every agent. Talk to any of them."
+                        :version "0.1.0"
+                        :flags (args/no-flags)
+                        :commands
+                          [(args/Command :name "" :group "" :summary "Open the dashboard" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "up" :group "Start" :summary "Start the hub on this machine (and its tunnels)" :usage ""
+                                         :args (args/no-args) :flags [(args/switch "quiet" #\q "Print nothing on success")])
+                           (args/Command :name "down" :group "Start" :summary "Stop the hub; runs keep going" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "status" :group "Start" :summary "Is factory running here?" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "start" :group "Start" :summary "Start a run of a factory" :usage "start FACTORY [BRIEF...] [flags]"
+                                         :args ["FACTORY" "[BRIEF...]"]
+                                         :flags [(args/flag "on" 0 "SITE" "Run on another site (factory sites)")
+                                                 (args/flag "project" #\p "PATH" "Work on this git repository (default: an empty workspace)")
+                                                 (args/flag "brief" #\b "TEXT" "What this run should do")
+                                                 (args/flag "brief-file" 0 "FILE" "Read the brief from a file")
+                                                 (args/flag "model" #\m "PROVIDER/MODEL" "Use this model for every station")
+                                                 (args/switch "watch" #\w "Watch the run after starting it")])
+                           (args/Command :name "new" :group "Design" :summary "Design a new factory, interactively" :usage ""
+                                         :args ["NAME"] :flags [(args/flag "out" #\o "PATH" "Write here instead of the library")])
+                           (args/Command :name "check" :group "Design" :summary "Validate a factory (name or path)" :usage "" :args ["FACTORY"] :flags (args/no-flags))
+                           (args/Command :name "factories" :group "Design" :summary "The factory library" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "ps" :group "Watch" :summary "Runs on every site" :usage ""
+                                         :args (args/no-args) :flags [(args/switch "all" #\a "Include every finished run")])
+                           (args/Command :name "show" :group "Watch" :summary "A run: stations, agents, findings" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "watch" :group "Watch" :summary "Follow a run as it happens" :usage ""
+                                         :args ["RUN"] :flags [(args/switch "verbose" #\v "Show every turn, thought, and tool result")
+                                                               (args/switch "follow" #\f "Keep watching after the run finishes")])
+                           (args/Command :name "transcript" :group "Watch" :summary "An agent's whole conversation" :usage "" :args ["RUN/STATION"] :flags (args/no-flags))
+                           (args/Command :name "diff" :group "Watch" :summary "The run branch's changes" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "chat" :group "Talk" :summary "Talk with an agent (interactive)" :usage "" :args ["RUN/STATION"] :flags (args/no-flags))
+                           (args/Command :name "ask" :group "Talk" :summary "Send a message and print the reply" :usage ""
+                                         :args ["RUN/STATION" "MESSAGE..."] :flags [(args/flag "timeout" 0 "SECONDS" "Give up after this long (default 600)")])
+                           (args/Command :name "say" :group "Talk" :summary "Send a message without waiting" :usage "" :args ["RUN/STATION" "MESSAGE..."] :flags (args/no-flags))
+                           (args/Command :name "pause" :group "Control" :summary "Pause at the next turn boundary" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "resume" :group "Control" :summary "Resume a paused, lost, or failed run" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "stop" :group "Control" :summary "Cancel a run" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "pull" :group "Control" :summary "Fetch a run's branch into this repository" :usage "" :args ["RUN"] :flags (args/no-flags))
+                           (args/Command :name "sites" :group "Sites" :summary "Every site this hub reaches" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "site add" :group "Sites" :summary "Reach another machine over SSH" :usage ""
+                                         :args ["NAME"] :flags [(args/flag "ssh" 0 "USER@HOST" "SSH destination")
+                                                                (args/switch "sandbox" 0 "Sandbox every shell command there")
+                                                                (args/flag "port" 0 "PORT" "The remote daemon's port (default 7788)")])
+                           (args/Command :name "site remove" :group "Sites" :summary "Stop reaching a site" :usage "" :args ["NAME"] :flags (args/no-flags))
+                           (args/Command :name "site install" :group "Sites" :summary "Build factory on another machine from this checkout" :usage ""
+                                         :args ["NAME"] :flags [(args/flag "ssh" 0 "USER@HOST" "SSH destination")
+                                                                (args/flag "source" 0 "DIR" "The factory source checkout (default: the one you are in)")])
+                           (args/Command :name "site secrets" :group "Sites" :summary "Copy API keys from this shell to a site" :usage ""
+                                         :args ["NAME" "VAR..."] :flags (args/no-flags))
+                           (args/Command :name "skills install" :group "Setup" :summary "Teach Claude Code to design and run factories" :usage ""
+                                         :args (args/no-args) :flags [(args/flag "dir" 0 "DIR" "Skills directory (default ~/.claude/skills)")])])]
+          (match (args/parse-standard a program (args/argv-from-main a argc argv))
+            (Err [code] code)
+            (Ok [inv]
+                (match (ctx-open a)
+                  (CtxBad [message] (do (write-err (join a ["error: " message "\n"])) 78))
+                  (CtxOk [opened] (let [(mut ctx) opened] (run-command (mut ctx) inv))))))))))

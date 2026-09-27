@@ -1,0 +1,96 @@
+(module factory.cli.ctx)
+(import "coil.alloc" :use *)
+(import "coil.io" :as io)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.style" :as style)
+(import "agent.json" :use *)
+(import "factory.client" :as client)
+(import "factory.config" :use *)
+(import "factory.cli.render" :use *)
+
+;;; What every command has: an allocator, this machine's site configuration,
+;;; the hub connection, and what the terminal can show.
+
+(defstruct Ctx
+  [(allocator (dyn Allocator))
+   (home (slice u8))
+   (config SiteConfig)
+   (hub client/Hub)
+   (out style/Term)
+   (err style/Term)])
+
+(defsum CtxResult
+  (CtxOk [(ctx Ctx)])
+  (CtxBad [(message (slice u8))]))
+
+(defn ctx-open [(a (dyn Allocator))] (-> CtxResult)
+  (let [home (factory-home a)]
+    (match (load-site-config a home)
+      (SiteConfigBad [message] (CtxBad message))
+      (SiteConfigOk [loaded]
+                    (let [(mut config) loaded]
+                      (CtxOk (Ctx :allocator a
+                                  :home home
+                                  :config (load config)
+                                  :hub (client/hub-for a (mut config))
+                                  :out (style/term-stdout)
+                                  :err (style/term-stderr))))))))
+
+(defn write-err [(text (slice u8))] (-> i64)
+  (do (io/print-str (io/stderr) text) 0))
+
+;;; `error: message` on stderr; returns the exit code 1.
+(defn fail-with [(ctx (ptr Ctx)) (message (slice u8))] (-> i64)
+  (let [a (.allocator ctx)]
+    (write-err (join a [(style/err a (.err ctx) "error:") " " message "\n"]))
+    1))
+
+(defn hint [(ctx (ptr Ctx)) (text (slice u8))] (-> i64)
+  (let [a (.allocator ctx)]
+    (write-err (join a [(style/muted a (.err ctx) text) "\n"]))
+    0))
+
+(defn hub-up? [(ctx (ptr Ctx))] (-> bool)
+  (client/reply-ok? (client/hub-get (.allocator ctx) (.hub ctx) "/v1/site")))
+
+(defn hub-down-message [(ctx (ptr Ctx))] (-> i64)
+  (do (fail-with ctx "the factory hub is not running on this machine")
+      (hint ctx "  start it with `factory up`")
+      1))
+
+(defsum Fetched
+  (FetchedOk [(body JVal)])
+  (FetchedFailed [(code i64)]))
+
+;;; A request whose failure has already been reported to the person.
+(defn fetch [(ctx (ptr Ctx)) (method (slice u8)) (path (slice u8)) (body JVal)] (-> Fetched)
+  (let [a (.allocator ctx)
+        reply (if (= method "GET")
+                  (client/hub-get a (.hub ctx) path)
+                  (client/hub-post a (.hub ctx) path body))]
+    (match reply
+      (client/ReplyFailed [message] (FetchedFailed (hub-down-message ctx)))
+      (client/ReplyOk [status value text]
+                      (if (and (>= status 200) (< status 300))
+                          (FetchedOk value)
+                          (FetchedFailed (fail-with ctx (client/reply-error a reply))))))))
+
+(defn get-json [(ctx (ptr Ctx)) (path (slice u8))] (-> Fetched)
+  (fetch ctx "GET" path (JNull)))
+
+(defn post-json [(ctx (ptr Ctx)) (path (slice u8)) (body JVal)] (-> Fetched)
+  (fetch ctx "POST" path body))
+
+(defn say [(text (slice u8))] (-> i64)
+  (do (io/print-str (io/stdout) text) (io/print-str (io/stdout) "\n") 0))
+
+;;; `RUN/AGENT` split in two; the agent part is "" when absent.
+(defstruct AgentRef [(run (slice u8)) (agent (slice u8))])
+
+(defn agent-ref [(text (slice u8))] (-> AgentRef)
+  (match (str-find text "/")
+    (Some [at] (AgentRef :run (subslice [u8] text 0 at) :agent (subslice [u8] text (+ at 1) (len text))))
+    (None [] (AgentRef :run text :agent ""))))

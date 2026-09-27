@@ -1,0 +1,436 @@
+(module tui-demo.main)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str"
+        :use
+        [sb-new sb-push-str! sb-push-i64! sb-finish! str-eq cstr->str])
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+(import "tui.app" :use *)
+(import "tui.term" :use [TermError NotATerminal])
+
+;;; One chat message. `text` is owned by the demo's allocator.
+(defstruct Message [(from-user bool) (text (slice u8))])
+
+(const FOCUS-MACHINES 0)
+
+(const FOCUS-RUNS 1)
+
+(const FOCUS-CHAT 2)
+
+(defstruct Demo
+  [(allocator (dyn Allocator))
+   (theme Theme)
+   (focus i64)
+   (machines ListView)
+   (runs ListView)
+   (chat ScrollView)
+   (input TextInput)
+   (messages (ArrayList Message))
+   (activity (ArrayList i64))
+   (tick i64)])
+
+(const MACHINE-NAMES
+       ["build-01  · arm64"
+        "build-02  · arm64"
+        "gpu-a100  · x86_64"
+        "laptop    · arm64"
+        "ci-runner · x86_64"
+        "staging   · x86_64"
+        "edge-7    · arm64"
+        "archive   · x86_64"])
+
+(const RUN-NAMES
+       ["refactor-parser"
+        "add-sse-tests"
+        "fix-flaky-ci"
+        "port-renderer"
+        "docs-sweep"
+        "bump-deps"
+        "wide-文字-run"])
+
+(const RUN-MACHINES
+       ["build-01"
+        "gpu-a100"
+        "ci-runner"
+        "build-02"
+        "laptop"
+        "edge-7"
+        "staging"])
+
+;; 0 running, 1 queued, 2 done, 3 failed
+(const RUN-STATES [0 0 3 1 2 0 1])
+
+(const RUN-TOTALS [40 12 30 25 8 16 10])
+
+(defn run-done [(i i64) (tick i64)] (-> i64)
+  (let [total (get RUN-TOTALS i)
+        state (get RUN-STATES i)]
+    (cond (= state 2) total
+          (= state 1) 0
+          (= state 3) (/ total 3)
+          :else (% (+ (/ tick 4) (* i 7)) (+ total 1)))))
+
+(defn demo-new [(a (dyn Allocator))] (-> Demo)
+  (let [(mut d)
+          (Demo
+            :allocator a
+            :theme (theme-default)
+            :focus FOCUS-CHAT
+            :machines (list-view-new)
+            :runs (list-view-new)
+            :chat (scroll-view-new)
+            :input (text-input-new a true)
+            :messages (al-new [Message] a)
+            :activity (al-new [i64] a)
+            :tick 0)]
+    (push! (mut (.messages d))
+           (Message :from-user false
+             :text
+               "Hi! I'm the factory agent. This transcript word-wraps, sticks to the bottom as messages arrive, and scrolls with PageUp/PageDown. Try typing below: Enter sends, Shift-Enter or Alt-Enter adds a newline, ↑/↓ recall history."))
+    (push! (mut (.messages d))
+           (Message :from-user false
+             :text
+               "Wide text works too: 中文字符, emoji 🚀✨, combining e\x301; — all measured in terminal cells."))
+    (load d)))
+
+(defn push-reply! [(d (ptr Demo)) (prompt (slice u8))] (-> i64)
+  (let [(mut sb) (sb-new (.allocator d))]
+    (sb-push-str! (mut sb) "Received ")
+    (sb-push-i64! (mut sb) (len prompt))
+    (sb-push-str! (mut sb)
+                  " bytes. In the real dashboard this is where the agent's streamed answer lands, one wrapped line at a time.")
+    (let [text (sb-finish! (mut sb))]
+      (push! (mut (.messages d)) (Message :from-user false :text text)))
+    0))
+
+(defn focus-name [(focus i64)] (-> (slice u8))
+  (cond (= focus FOCUS-MACHINES) "machines"
+        (= focus FOCUS-RUNS) "runs"
+        :else "chat"))
+
+(defn draw-header! [(d (ptr Demo)) (frame (ptr Frame)) (r Rect)] (-> i64)
+  (let [c (.canvas frame)
+        theme (.theme d)
+        x (+ (.x r) 1)
+        w1 (put-text! c r x (.y r) "◆ factory" (bold (.accent theme)))
+        w2 (put-text! c r (+ (+ x w1) 1) (.y r) "dashboard demo" (.muted theme))
+        badge-x (+ (+ (+ x w1) 1) (+ w2 2))]
+    (draw-badge! c r badge-x (.y r) "LIVE" (badge-style theme (hex 0x9ECE6A)))
+    (let [label (focus-name (.focus d))
+          label-x (- (- (rect-right r) (len label)) 1)]
+      (put-text! c r (- label-x 7) (.y r) "focus: " (.subtle theme))
+      (put-text! c r label-x (.y r) label (.accent-alt theme)))))
+
+(defn draw-machines! [(d (ptr Demo)) (frame (ptr Frame)) (r Rect)] (-> i64)
+  (let [c (.canvas frame)
+        theme (.theme d)
+        focused (= (.focus d) FOCUS-MACHINES)
+        (mut opts) (panel-opts theme "Machines" focused)
+        (mut sb) (sb-new (.scratch frame))]
+    (sb-push-i64! (mut sb) (+ (.selected (.machines d)) 1))
+    (sb-push-str! (mut sb) "/")
+    (sb-push-i64! (mut sb) (len MACHINE-NAMES))
+    (set! (.footer opts) (sb-finish! (mut sb)))
+    (let [inner (draw-box! c r opts)
+          list-area (rect-drop-bottom inner 3)
+          spark-area (rect-take-bottom inner 2)]
+      (draw-list! c list-area (mut (.machines d)) MACHINE-NAMES theme focused)
+      (put-text! c
+                 spark-area
+                 (+ (.x spark-area) 1)
+                 (.y spark-area)
+                 "activity"
+                 (.subtle theme))
+      (draw-sparkline! c
+                       (rect (+ (.x spark-area) 1)
+                             (+ (.y spark-area) 1)
+                             (- (.w spark-area) 2)
+                             1)
+                       (al-slice (.activity d))
+                       0
+                       (.accent-alt theme))
+      0)))
+
+(defn state-label [(state i64)] (-> (slice u8))
+  (cond (= state 0) "running"
+        (= state 1) "queued"
+        (= state 2) "✓ done"
+        :else "✗ failed"))
+
+(defn draw-runs! [(d (ptr Demo)) (frame (ptr Frame)) (r Rect)] (-> i64)
+  (let [c (.canvas frame)
+        theme (.theme d)
+        focused (= (.focus d) FOCUS-RUNS)
+        a (.scratch frame)
+        inner (draw-box! c r (panel-opts theme "Runs" focused))
+        columns
+          [(Column
+             :title "RUN"
+             :width (Fill 2)
+             :align (AlignLeft))
+           (Column
+             :title "MACHINE"
+             :width (Fill 1)
+             :align (AlignLeft))
+           (Column
+             :title "STATE"
+             :width (Fixed 10)
+             :align (AlignLeft))
+           (Column
+             :title "STEPS"
+             :width (Fixed 7)
+             :align (AlignRight))]
+        (mut cells) (al-new [TableCell] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (len RUN-NAMES))
+              (break)
+              (let [state (get RUN-STATES (load i))
+                    (mut sb) (sb-new a)
+                    (mut steps) (sb-new a)]
+                (when (= state 0)
+                  (sb-push-str! (mut sb)
+                                (spinner-frame (+ (.tick frame) (load i))))
+                  (sb-push-str! (mut sb) " "))
+                (sb-push-str! (mut sb) (state-label state))
+                (sb-push-i64! (mut steps) (run-done (load i) (.tick frame)))
+                (sb-push-str! (mut steps) "/")
+                (sb-push-i64! (mut steps) (get RUN-TOTALS (load i)))
+                (push! (mut cells)
+                       (table-cell (get RUN-NAMES (load i)) (.text theme)))
+                (push! (mut cells)
+                       (table-cell (get RUN-MACHINES (load i))
+                                   (.muted theme)))
+                (push! (mut cells)
+                       (table-cell (sb-finish! (mut sb))
+                                   (cond (= state 0) (.accent theme)
+                                         (= state 1) (.warning theme)
+                                         (= state 2) (.success theme)
+                                         :else (.error theme))))
+                (push! (mut cells)
+                       (table-cell (sb-finish! (mut steps)) (.muted theme)))
+                (set! i (+ (load i) 1)))))
+    (let [table-area (rect-drop-bottom inner 2)
+          detail (rect-take-bottom inner 1)
+          sel (.selected (.runs d))]
+      (draw-table! c
+                   table-area
+                   columns
+                   (al-slice cells)
+                   (mut (.runs d))
+                   2
+                   theme
+                   focused)
+      (let [label-w
+              (put-text! c
+                         detail
+                         (+ (.x detail) 2)
+                         (.y detail)
+                         (get RUN-NAMES sel)
+                         (bold (.text theme)))
+            bar-x (+ (+ (.x detail) 2) (+ label-w 2))]
+        (draw-progress-bar! c
+                            (rect bar-x
+                                  (.y detail)
+                                  (- (- (rect-right detail) bar-x) 2)
+                                  1)
+                            (run-done sel (.tick frame))
+                            (get RUN-TOTALS sel)
+                            (.accent theme)
+                            (.border theme))))
+    0))
+
+(defn draw-chat! [(d (ptr Demo)) (frame (ptr Frame)) (r Rect)] (-> i64)
+  (let [c (.canvas frame)
+        theme (.theme d)
+        a (.scratch frame)
+        focused (= (.focus d) FOCUS-CHAT)
+        inner (draw-box! c r (panel-opts theme "Chat · agent-7" focused))
+        input-rows
+          (let [n (input-visual-rows (mut (.input d)) (- (.w inner) 3))]
+            (if (> n 5) 5 n))
+        transcript (rect-inset-xy (rect-drop-bottom inner (+ input-rows 1)) 1 0)
+        separator-y (- (rect-bottom inner) (+ input-rows 1))
+        input-area (rect-take-bottom inner input-rows)
+        (mut lines) (al-new [StyledLine] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.messages d)))
+              (break)
+              (let [m (get (.messages d) (load i))]
+                (when (> (load i) 0)
+                  (push! (mut lines)
+                         (StyledLine
+                           :gutter ""
+                           :gutter-style (.text theme)
+                           :text ""
+                           :style (.text theme))))
+                (if (.from-user m)
+                    (do
+                      (push! (mut lines)
+                             (StyledLine
+                               :gutter ""
+                               :gutter-style (.text theme)
+                               :text "you"
+                               :style (bold (.accent-alt theme))))
+                      (push-wrapped! (mut lines)
+                                     a
+                                     (.text m)
+                                     (- (.w transcript) 1)
+                                     (.text theme)
+                                     "│ "
+                                     (.accent-alt theme)))
+                    (do
+                      (push! (mut lines)
+                             (StyledLine
+                               :gutter ""
+                               :gutter-style (.text theme)
+                               :text "agent"
+                               :style (bold (.accent theme))))
+                      (push-wrapped! (mut lines)
+                                     a
+                                     (.text m)
+                                     (- (.w transcript) 1)
+                                     (.text theme)
+                                     "│ "
+                                     (.accent theme))))
+                (set! i (+ (load i) 1)))))
+    (draw-scroll-view! c
+                       (rect-drop-right transcript 1)
+                       (mut (.chat d))
+                       (al-slice lines))
+    (draw-scrollbar! c
+                     (rect-take-right transcript 1)
+                     (len lines)
+                     (.offset (.chat d))
+                     (.h transcript)
+                     (.border theme)
+                     (.muted theme))
+    (draw-box-divider! c
+                       r
+                       separator-y
+                       (Rounded)
+                       (if focused (.border-focus theme) (.border theme)))
+    (put-text! c
+               input-area
+               (+ (.x input-area) 1)
+               (.y input-area)
+               "❯"
+               (if focused (bold (.accent theme)) (.subtle theme)))
+    (draw-input! c
+                 (rect-drop-left input-area 3)
+                 (mut (.input d))
+                 (.text theme)
+                 "Message the agent…"
+                 (.subtle theme)
+                 focused)
+    0))
+
+(defn draw-footer! [(d (ptr Demo)) (frame (ptr Frame)) (r Rect)] (-> i64)
+  (draw-key-hints! (.canvas frame)
+                   (rect-drop-left r 1)
+                   [(KeyHint :key "tab" :label "focus")
+                    (KeyHint :key "↑↓" :label "move")
+                    (KeyHint :key "enter" :label "send")
+                    (KeyHint :key "pgup/pgdn" :label "scroll")
+                    (KeyHint :key "esc" :label "quit")]
+                   (.theme d)))
+
+(impl App Demo
+  (app-draw [(self (ptr Demo)) (frame (ptr Frame))]
+            (-> i64)
+            (let [c (.canvas frame)
+                  full (canvas-rect c)
+                  header (rect-take-top full 1)
+                  footer (rect-take-bottom full 1)
+                  body (rect-drop-bottom (rect-drop-top full 1) 1)
+                  (mut cols) (zeroed (array Rect 2))
+                  (mut rows) (zeroed (array Rect 2))]
+              (draw-header! self frame header)
+              (split-horizontal body [(Fixed 30) (Fill 1)] 0 cols)
+              (draw-machines! self frame (index cols 0))
+              (split-vertical (index cols 1)
+                              [(Fixed (+ (len RUN-NAMES) 5)) (Fill 1)]
+                              0
+                              rows)
+              (draw-runs! self frame (index rows 0))
+              (draw-chat! self frame (index rows 1))
+              (draw-footer! self frame footer)
+              0))
+
+  (app-event [(self (ptr Demo)) (event Event)]
+             (-> AppFlow)
+             (match event
+               (TickEvent [tick]
+                          (do
+                            (set! (.tick self) tick)
+                            (al-push! (mut (.activity self))
+                                      (+ 2 (% (+ (* tick 37) (/ tick 3)) 11)))
+                            (Continue)))
+               (ResizeEvent [w h] (Continue))
+               (KeyEvent [key]
+                         (match key
+                           (Escape [] (Quit))
+                           (Ctrl [l]
+                                 (if (= l #\c)
+                                     (Quit)
+                                     (do (demo-key! self key) (Continue))))
+                           (Tab []
+                                (do
+                                  (set! (.focus self) (% (+ (.focus self) 1) 3))
+                                  (Continue)))
+                           (BackTab []
+                                    (do
+                                      (set! (.focus self)
+                                            (% (+ (.focus self) 2) 3))
+                                      (Continue)))
+                           (_ (do (demo-key! self key) (Continue))))))))
+
+(defn demo-key! [(d (ptr Demo)) (key Key)] (-> i64)
+  (cond (= (.focus d) FOCUS-MACHINES)
+          (do (list-handle-key! (mut (.machines d)) key 5) 0)
+        (= (.focus d) FOCUS-RUNS)
+          (do (list-handle-key! (mut (.runs d)) key 5) 0)
+        :else
+          (if (scroll-view-handle-key! (mut (.chat d)) key)
+              0
+              (match (input-handle-key! (mut (.input d)) key)
+                (InputSubmitted []
+                                (if (input-empty? (mut (.input d)))
+                                    0
+                                    (let [text
+                                            (input-submit! (mut (.input d))
+                                                           (.allocator d))]
+                                      (push! (mut (.messages d))
+                                             (Message :from-user true
+                                               :text text))
+                                      (push-reply! d text)
+                                      (scroll-to-bottom! (mut (.chat d))))))
+                (InputHandled [] 0)
+                (InputIgnored [] 0)))))
+
+;;; `tui-demo` runs interactively; `tui-demo --snapshot` prints one 100x30 frame
+;;; as plain text (no terminal needed).
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [a (malloc-allocator)
+        demo (primitive/alloc-stack Demo)]
+    (set! demo (demo-new a))
+    (if (and (> (cast i64 argc) 1)
+             (= (cstr->str (load (index argv 1))) "--snapshot"))
+        (do
+          (print "{}" (app-snapshot demo 100 30 7 a))
+          0)
+        (run-interactive demo a))))
+
+(defn run-interactive [(demo (ptr Demo)) (a (dyn Allocator))] (-> i64)
+  (match (app-run demo (app-options-default) a)
+    (Ok [_] 0)
+    (Err [e]
+         (match e
+           (NotATerminal []
+                         (do
+                           (println "tui demo: run this in an interactive terminal")
+                           1))
+           (_ (do (println "tui demo: could not set up the terminal") 1))))))

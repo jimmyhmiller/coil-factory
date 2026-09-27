@@ -1,0 +1,102 @@
+(module factory.toolkit)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.bundle" :as bundle)
+(import "agent_tools.sandbox" :as sandbox)
+(import "agent_tools.shell" :as shell)
+(import "agent_tools.workspace" :as ws)
+
+;;; The factory's use of `agent-tools`: a station's tool groups over its
+;;; worktree, and gates run exactly the way the agent's own shell commands
+;;; run, inside the same sandbox.
+
+(const GATE-TIMEOUT-MS 1800000)
+
+(defsum PolicyResult
+  (PolicyOk [(policy sandbox/SandboxPolicy)])
+  (PolicyBad [(message (slice u8))]))
+
+;;; `isolation` is the site setting: "none" or "sandbox". A site that asks for
+;;; a sandbox on a machine without one is refused, never run unconfined.
+(defn policy-for [(a (dyn Allocator)) (workspace ws/Workspace) (isolation (slice u8))] (-> PolicyResult)
+  (if (= isolation "none")
+      (PolicyOk (sandbox/NoSandbox))
+      (match (sandbox/workspace-sandbox-options a workspace true)
+        (Err [message] (PolicyBad message))
+        (Ok [options]
+            (let [policy (sandbox/sandbox-detect a options)]
+              (match policy
+                (sandbox/NoSandbox [] (PolicyBad "this site's isolation is \"sandbox\" but this machine has neither sandbox-exec nor bwrap"))
+                (_ (PolicyOk policy))))))))
+
+(defn split-groups [(a (dyn Allocator)) (tools (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (for raw (iter (str-split a tools ","))
+      (let [name (str-trim raw)]
+        (when (> (len name) 0) (push! [(slice u8)] (mut out) name) 0)))
+    (load out)))
+
+;;; Register the tools named in `tools` ("files, shell") over the workspace.
+;;; Returns a problem description, or None.
+(defn add-tool-groups! [(a (dyn Allocator))
+                        (registry (mut ToolRegistry))
+                        (workspace-path (slice u8))
+                        (tools (slice u8))
+                        (isolation (slice u8))] (-> (Option (slice u8)))
+  (match (ws/workspace-open a workspace-path)
+    (Err [message] (Some message))
+    (Ok [workspace]
+        (match (policy-for a workspace isolation)
+          (PolicyBad [message] (Some message))
+          (PolicyOk [policy]
+                    (let [groups (split-groups a tools)]
+                      (match (bundle/standard-tools a workspace policy (al-slice [(slice u8)] groups))
+                        (Err [message] (Some message))
+                        (Ok [made]
+                            ;; The standard tools live as long as the process.
+                            (let [owned (box! a bundle/StandardTools made)
+                                  n (registry-count (field owned registry))
+                                  (mut i) 0]
+                              (loop (if (>= (load i) n)
+                                        (break)
+                                        (do (registry-add! registry (registry-at (field owned registry) (load i)))
+                                            (set! i (+ (load i) 1)))))
+                              (None))))))))))
+
+(defstruct GateRun [(ok bool) (exit i64) (output (slice u8)) (cancelled bool)])
+
+;;; Run a station's gate in the workspace, cancellable through `control`.
+(defn run-gate [(a (dyn Allocator))
+                (workspace-path (slice u8))
+                (gate (slice u8))
+                (isolation (slice u8))
+                (control (dyn AgentControl))] (-> GateRun)
+  (match (ws/workspace-open a workspace-path)
+    (Err [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+    (Ok [workspace]
+        (match (policy-for a workspace isolation)
+          (PolicyBad [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+          (PolicyOk [policy]
+                    (let [context (box! a ControlledContext (ControlledContext :control control))]
+                      (match (shell/run-command a workspace policy gate GATE-TIMEOUT-MS context)
+                        (Err [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+                        (Ok [ran]
+                            (let [result ran
+                                  timed-out (.timed-out result)]
+                              (GateRun :ok (and (= (.exit-code result) 0) (not timed-out) (not (.cancelled result)))
+                                       :exit (.exit-code result)
+                                       :output (if timed-out
+                                                   (join a ["(timed out after 30 minutes)\n" (.output result)])
+                                                   (.output result))
+                                       :cancelled (.cancelled result)))))))))))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))

@@ -1,0 +1,67 @@
+(module factory.journal)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.error" :as derr)
+(import "durable.jsonl" :as jsonl)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.runstate" :use *)
+
+;;; A run's `events.jsonl`: appended by several processes at once (the run,
+;;; the daemon, the overseer), read by byte cursor.
+
+(defsum Appended
+  (AppendedAt [(offset i64)])
+  (AppendFailed [(message (slice u8))]))
+
+;;; Append one record. Records are fsynced: they are the only copy of what
+;;; happened.
+(defn append-record! [(a (dyn Allocator)) (path (slice u8)) (record JVal)] (-> Appended)
+  (match (jsonl/journal-append! a path (ev-line a record) true)
+    (Ok [offset] (AppendedAt offset))
+    (Err [failure] (AppendFailed (derr/error-describe a failure)))))
+
+(defn append-run-event! [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8)) (record JVal)] (-> Appended)
+  (append-record! a (events-path a home run-id) record))
+
+;;; Fold every complete record after the state's cursor into it. Parsing
+;;; happens in a scratch arena; the state copies what it keeps. Returns the
+;;; number of records folded, or -1 when the journal cannot be read.
+(defn catch-up! [(st (ptr RunState)) (path (slice u8))] (-> i64)
+  (let [(mut arena) (primitive/zeroed scratch/ScratchArena)
+        (mut folded) 0
+        (mut failed) false]
+    (scratch/scratch-init (mut arena) (malloc-allocator))
+    (let [temp (scratch/scratch-allocator (mut arena))]
+      (loop
+        (match (jsonl/journal-read temp path (.cursor st) 512 4194304)
+          (Err [failure] (do (set! failed true) (break)))
+          (Ok [read]
+              (let [(mut batch) read
+                    count (jsonl/batch-count batch)]
+                (for record (iter (jsonl/batch-records batch))
+                  (let [r record]
+                    (match (jv-parse temp (.line r))
+                      (Some [value] (fold-record! st (.offset r) (.next-offset r) value))
+                      ;; A line that is not JSON is skipped, not fatal: the
+                      ;; cursor still moves past it.
+                      (None [] (set! (.cursor st) (.next-offset r))))
+                    (set! folded (+ (load folded) 1))))
+                (jsonl/journal-batch-free! (mut batch))
+                (scratch/scratch-reset! (mut arena))
+                (when (= count 0) (break))
+                0)))))
+    (scratch/scratch-close! (mut arena))
+    (if (load failed) -1 (load folded))))
+
+;;; Fold a whole journal from the beginning.
+(defn load-run-state [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> RunState)
+  (let [(mut st) (runstate-new a run-id)]
+    (catch-up! (mut st) (events-path a home run-id))
+    (load st)))

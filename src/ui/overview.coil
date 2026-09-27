@@ -1,0 +1,377 @@
+(module factory.ui.overview)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "tui.widgets" :use *)
+(import "tui.app" :use [Frame])
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.chat" :use [Line line draw-lines!])
+(import "factory.ui.model" :use *)
+
+;;; The overview: every site and run at a glance, and what the overseer has
+;;; noticed. Blocked runs ("needs you") are the loudest thing on screen.
+(defn plural [(a (dyn Allocator)) (n i64) (one (slice u8)) (many (slice u8))] (-> (slice u8))
+  (concat a [(int-text a n) " " (if (= n 1) one many)]))
+
+(defn draw-overview-header! [(d (ptr Dash))
+                             (c (ptr Canvas))
+                             (a (dyn Allocator))
+                             (r Rect)] (-> i64)
+  (let [theme (.theme d)
+        runs (overview-runs d)
+        sites (overview-sites d)
+        needs (needs-you-count runs)
+        (mut x) (draw-topbar! d c a r (no-crumbs))]
+    (when (.has (field d overview))
+      (set! x (span! c r (load x) "  ·  " (.subtle theme)))
+      (set! x
+            (span! c
+                   r
+                   (load x)
+                   (plural a (jv-len sites) "site" "sites")
+                   (.muted theme)))
+      (set! x (span! c r (load x) "  ·  " (.subtle theme)))
+      (set! x
+            (span! c
+                   r
+                   (load x)
+                   (concat a [(int-text a (running-count runs)) " running"])
+                   (if (> (running-count runs) 0)
+                       (.accent theme)
+                       (.muted theme))))
+      (set! x (span! c r (load x) "  ·  " (.subtle theme)))
+      (if (> needs 0)
+          (draw-badge! c
+                       r
+                       (load x)
+                       (.y r)
+                       (concat a
+                               [(int-text a needs)
+                                " NEED"
+                                (if (= needs 1) "S" "")
+                                " YOU"])
+                       (badge-style theme (hex 0xE0AF68)))
+          (put-text! c r (load x) (.y r) "nothing needs you" (.subtle theme))))
+    0))
+
+(defn draw-sites! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)] (-> i64)
+  (let [theme (.theme d)
+        sites (overview-sites d)
+        (mut x) (+ (.x r) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len sites))
+              (break)
+              (let [s (jv-nth sites (load i))
+                    status (js s "status")
+                    dot
+                      (cond (= status "up") (.success theme)
+                            (= status "down") (.error theme)
+                            :else (.warning theme))]
+                (set! x (span! c r (load x) "●" dot))
+                (set! x
+                      (span! c
+                             r
+                             (+ (load x) 1)
+                             (js s "name")
+                             (bold (.text theme))))
+                (set! x
+                      (span! c r (+ (load x) 1) (js s "kind") (.subtle theme)))
+                (set! x
+                      (span! c
+                             r
+                             (+ (load x) 1)
+                             (concat a
+                                     [(int-text a (ji s "running"))
+                                      "/"
+                                      (int-text a (ji s "max_runs"))
+                                      " running"])
+                             (.muted theme)))
+                (when (not (= status "up"))
+                  (set! x (span! c r (+ (load x) 1) status (.error theme))))
+                (set! x (+ (load x) 4))
+                (set! i (+ (load i) 1)))))
+    (when (= (jv-len sites) 0)
+      (put-text! c
+                 r
+                 (+ (.x r) 1)
+                 (.y r)
+                 (if (.has (field d overview))
+                     "no sites"
+                     "connecting to the hub…")
+                 (.subtle theme)))
+    0))
+
+(defn run-cells [(d (ptr Dash)) (a (dyn Allocator)) (runs JVal) (tick i64)] (-> (slice TableCell))
+  (let [theme (.theme d)
+        (mut cells) (al-new [TableCell] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len runs))
+              (break)
+              (let [run (jv-nth runs (load i))
+                    status (js run "status")
+                    blocked (= status "blocked")
+                    agent (agent-named run (js run "current"))
+                    working
+                      (and (= status "running")
+                           (phase-active? (js agent "phase")))
+                    activity (run-activity a run)]
+                (push! (mut cells)
+                       (table-cell (concat a
+                                           [(status-glyph status
+                                                          (+ tick (load i)))
+                                            " "
+                                            status])
+                                   (status-style theme status)))
+                (push! (mut cells)
+                       (table-cell (js run "id")
+                                   (if blocked
+                                       (bold (.text theme))
+                                       (.text theme))))
+                (push! (mut cells)
+                       (table-cell (js run "factory") (.muted theme)))
+                (push! (mut cells) (table-cell (js run "site") (.subtle theme)))
+                (push! (mut cells)
+                       (table-cell (station-progress a run) (.muted theme)))
+                (push! (mut cells)
+                       (table-cell activity
+                                   (cond blocked (.warning theme)
+                                         working (.text theme)
+                                         (= status "failed") (.error theme)
+                                         :else (.muted theme))))
+                (push! (mut cells)
+                       (table-cell (fmt-tokens a (run-tokens run))
+                                   (.subtle theme)))
+                (push! (mut cells)
+                       (table-cell (fmt-age a (- (.now d) (ji run "created")))
+                                   (.subtle theme)))
+                (set! i (+ (load i) 1)))))
+    (al-slice cells)))
+
+(const RUN-COLUMNS
+       [(Column
+          :title "STATUS"
+          :width (Fixed 11)
+          :align (AlignLeft))
+        (Column
+          :title "RUN"
+          :width (Fixed 16)
+          :align (AlignLeft))
+        (Column
+          :title "FACTORY"
+          :width (Fill 1)
+          :align (AlignLeft))
+        (Column
+          :title "SITE"
+          :width (Fixed 8)
+          :align (AlignLeft))
+        (Column
+          :title "STATION"
+          :width (Fixed 14)
+          :align (AlignLeft))
+        (Column
+          :title "ACTIVITY"
+          :width (Fill 4)
+          :align (AlignLeft))
+        (Column
+          :title "TOKENS"
+          :width (Fixed 6)
+          :align (AlignRight))
+        (Column
+          :title "AGE"
+          :width (Fixed 4)
+          :align (AlignRight))])
+
+(defn draw-runs! [(d (ptr Dash))
+                  (c (ptr Canvas))
+                  (a (dyn Allocator))
+                  (r Rect)
+                  (tick i64)] (-> i64)
+  (let [theme (.theme d)
+        runs (overview-runs d)
+        n (jv-len runs)
+        (mut opts) (panel-opts theme "Runs" true)]
+    (when (> n 0)
+      (set! (.footer opts)
+            (concat a
+                    [(int-text a (+ (.selected (.runs-lv d)) 1))
+                     "/"
+                     (int-text a n)])))
+    (let [inner (draw-box! c r opts)]
+      (if (= n 0)
+          (let [msg
+                  (if (.has (field d overview))
+                      "No runs yet. Start one with: factory start <factory> --brief \"…\""
+                      "Waiting for the hub…")]
+            (put-text-ellipsis! c
+                                inner
+                                (+ (.x inner) 2)
+                                (+ (.y inner) 1)
+                                msg
+                                (.subtle theme)))
+          (draw-table! c
+                       inner
+                       RUN-COLUMNS
+                       (run-cells d a runs tick)
+                       (field d runs-lv)
+                       2
+                       theme
+                       true))
+      0)))
+
+;;; One overseer line with its time, for sorting.
+(defstruct Notice [(t i64) (line Line)])
+
+(defn notices [(d (ptr Dash)) (a (dyn Allocator))] (-> (ArrayList Notice))
+  (let [runs (overview-runs d)
+        (mut out) (al-new [Notice] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len runs))
+              (break)
+              (let [run (jv-nth runs (load i))
+                    id (js run "id")
+                    findings (jv-get run "findings")
+                    verdict (js run "verdict")
+                    (mut k) 0]
+                (loop (if (>= (load k) (jv-len findings))
+                          (break)
+                          (let [f (jv-nth findings (load k))
+                                severity (js f "severity")
+                                t (ji f "t")]
+                            (push! (mut out)
+                                   (Notice
+                                     :t t
+                                     :line
+                                       (Line
+                                         :gutter
+                                           (concat a
+                                                   [(severity-glyph severity)
+                                                    " "
+                                                    (fmt-clock a t false)
+                                                    " "])
+                                         :gutter-tone (severity-tone severity)
+                                         :text
+                                           (concat a
+                                                   [id
+                                                    "/"
+                                                    (js f "agent")
+                                                    "  "
+                                                    (js f "message")])
+                                         :tone (TonePlain)
+                                         :suffix
+                                           (concat a ["[" (js f "code") "]"])
+                                         :suffix-tone (ToneSubtle))))
+                            (set! k (+ (load k) 1)))))
+                (when (and (> (len verdict) 0)
+                           (not (= verdict "on_track"))
+                           (not (finished-status? (js run "status"))))
+                  (let [t (ji run "verdict_t")]
+                    (push! (mut out)
+                           (Notice
+                             :t t
+                             :line
+                               (Line
+                                 :gutter
+                                   (concat a ["◉ " (fmt-clock a t false) " "])
+                                 :gutter-tone (verdict-tone verdict)
+                                 :text
+                                   (concat a
+                                           [id
+                                            "  "
+                                            verdict
+                                            " — "
+                                            (first-line (js run
+                                                            "verdict_reason"))])
+                                 :tone (TonePlain)
+                                 :suffix ""
+                                 :suffix-tone (ToneSubtle))))))
+                (set! i (+ (load i) 1)))))
+    ;; Newest first (insertion sort: a handful of items).
+    (let [(mut j) 1]
+      (loop (if (>= (load j) (len out))
+                (break)
+                (let [(mut m) (load j)]
+                  (loop (if (<= (load m) 0)
+                            (break)
+                            (let [prev (get out (- (load m) 1))
+                                  cur (get out (load m))]
+                              (if (< (.t prev) (.t cur))
+                                  (do
+                                    (set! (mut out) (- (load m) 1) cur)
+                                    (set! (mut out) (load m) prev)
+                                    (set! m (- (load m) 1)))
+                                  (break)))))
+                  (set! j (+ (load j) 1))))))
+    (load out)))
+
+(defn draw-overseer! [(d (ptr Dash))
+                      (c (ptr Canvas))
+                      (a (dyn Allocator))
+                      (r Rect)
+                      (items (ptr (ArrayList Notice)))] (-> i64)
+  (let [theme (.theme d)
+        n (len (load items))
+        (mut opts) (panel-opts theme "Overseer" false)]
+    (when (> n 0) (set! (.footer opts) (plural a n "notice" "notices")))
+    (let [inner (rect-inset-xy (draw-box! c r opts) 1 0)]
+      (cond (not (.has (field d overview)))
+              (put-text! c inner (.x inner) (.y inner) "…" (.subtle theme))
+            (= n 0)
+              (put-text! c
+                         inner
+                         (.x inner)
+                         (.y inner)
+                         "✓ nothing to report — every run looks on track"
+                         (.success theme))
+            :else
+              (let [(mut lines) (al-new [Line] a)
+                    (mut i) 0]
+                (loop (if (>= (load i) n)
+                          (break)
+                          (do
+                            (push! (mut lines) (.line (al-elem items (load i))))
+                            (set! i (+ (load i) 1)))))
+                (let [(mut sv) (scroll-view-new)]
+                  (set! (.stick-bottom sv) false)
+                  (draw-lines! c inner (mut sv) (al-slice lines) theme))))
+      0)))
+
+(const OVERVIEW-HINTS
+       [(KeyHint :key "↑↓" :label "select")
+        (KeyHint :key "enter" :label "open")
+        (KeyHint :key "c" :label "chat")
+        (KeyHint :key "p" :label "pause/resume")
+        (KeyHint :key "x" :label "stop")
+        (KeyHint :key "?" :label "help")
+        (KeyHint :key "q" :label "quit")])
+
+(defn draw-overview! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
+  (let [c (.canvas frame)
+        a (.scratch frame)
+        full (canvas-rect c)
+        banner (if (hub-down? d) 1 0)
+        (mut items) (notices d a)
+        overseer-h
+          (let [want (+ (len items) 2)]
+            (cond (< want 4) 4 (> want 10) 10 :else want))
+        (mut parts) (zeroed (array Rect 6))]
+    (split-vertical full
+                    [(Fixed 1)
+                     (Fixed banner)
+                     (Fixed 1)
+                     (Fill 1)
+                     (Fixed overseer-h)
+                     (Fixed 1)]
+                    0
+                    parts)
+    (draw-overview-header! d c a (index parts 0))
+    (when (hub-down? d) (draw-hub-banner! d c a (index parts 1)))
+    (draw-sites! d c a (index parts 2))
+    (draw-runs! d c a (index parts 3) (.tick frame))
+    (draw-overseer! d c a (index parts 4) (mut items))
+    (draw-footer! d c (index parts 5) OVERVIEW-HINTS)
+    0))

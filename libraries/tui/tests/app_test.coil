@@ -1,0 +1,56 @@
+(module tui.app-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.str" :use [str-eq])
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+(import "tui.app" :use *)
+
+(defstruct Counter [(count i64) (theme Theme)])
+
+(impl App Counter
+  (app-draw [(self (ptr Counter)) (frame (ptr Frame))]
+            (-> i64)
+            (let [c (.canvas frame)
+                  inner
+                    (draw-box! c
+                               (canvas-rect c)
+                               (panel-opts (.theme self) "Count" true))]
+              (put-text! c
+                         inner
+                         (.x inner)
+                         (.y inner)
+                         (spinner-frame (.tick frame))
+                         (.accent (.theme self)))
+              (put-text! c
+                         inner
+                         (+ (.x inner) 2)
+                         (.y inner)
+                         (if (> (.count self) 0) "pressed" "idle")
+                         (.text (.theme self)))
+              0))
+  (app-event [(self (ptr Counter)) (event Event)]
+             (-> AppFlow)
+             (match event
+               (KeyEvent [key]
+                         (match key
+                           (Escape [] (Quit))
+                           (_ (do
+                                (set! (.count self) (+ (.count self) 1))
+                                (Continue)))))
+               (_ (Continue)))))
+
+(deftest snapshots-a-whole-app-frame-without-a-terminal
+         (let [app (primitive/alloc-stack Counter)]
+           (set! app (Counter :count 0 :theme (theme-default)))
+           (assert (= (app-snapshot app 14 3 0 (malloc-allocator))
+                      "╭─ Count ────╮\n│⠋ idle      │\n╰────────────╯\n"))
+           (assert (match (app-event app (KeyEvent (Char #\x)))
+                     (Continue [] true)
+                     (Quit [] false)))
+           (assert (match (app-event app (KeyEvent (Escape)))
+                     (Quit [] true)
+                     (Continue [] false)))
+           (assert (= (app-snapshot app 14 3 1 (malloc-allocator))
+                      "╭─ Count ────╮\n│⠙ pressed   │\n╰────────────╯\n"))))

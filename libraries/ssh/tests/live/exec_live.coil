@@ -1,0 +1,179 @@
+;; Live tests against a real ssh server. Opt-in: `coil test --suite live`.
+;; Requires passwordless ssh to computer.jimmyhmiller.com.
+(module ssh.exec-live)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.process" :as process)
+(import "coil.str" :use *)
+(import "ssh.exec" :use *)
+(import "ssh.sys" :use [now-ms])
+(import "ssh.target" :use *)
+
+(defn live-host [] (-> Target)
+  (target "" "computer.jimmyhmiller.com" 0))
+
+(defn run-ok [(a (dyn Allocator))
+              (command (slice u8))
+              (stdin (Option (slice u8)))] (-> SshResult)
+  (match (ssh-run a (live-host) (ssh-options) command stdin 30000)
+    (Ok [result] result)
+    (Err [error]
+         (do
+           (assert-eq (ssh-error-message a error) "<no error>")
+           (zeroed SshResult)))))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle)
+    (Some [_] true)
+    (None [] false)))
+
+(defn pattern [(a (dyn Allocator)) (size i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut k) 0]
+    (loop (if (>= (load k) size)
+              (break)
+              (do
+                (sb-push-byte! (mut out) (cast u8 (+ 97 (% (load k) 23))))
+                (when (= (% (load k) 61) 60) (sb-push-byte! (mut out) 10) 0)
+                (set! k (+ (load k) 1)))))
+    (sb-finish! (mut out))))
+
+(deftest echo-runs-remotely
+         (let [a (malloc-allocator)
+               (mut result) (run-ok a "echo hi" (None [(slice u8)]))]
+           (assert-eq (.stdout result) "hi\n")
+           (assert-eq (.stderr result) "")
+           (assert-eq (.exit-code result) 0)
+           (assert (ssh-result-ok? result))
+           (ssh-result-free! a (mut result))))
+
+(deftest stdin-passes-through
+         (let [a (malloc-allocator)
+               result (run-ok a "cat" (Some "hello\nworld\n"))]
+           (assert-eq (.stdout result) "hello\nworld\n")
+           (assert-eq (.exit-code result) 0)))
+
+(deftest large-stdin-and-stdout-flow-concurrently
+         (let [a (malloc-allocator)
+               input (pattern a 2097152)
+               result (run-ok a "cat" (Some input))]
+           (assert-eq (len (.stdout result)) (len input))
+           (assert (= (.stdout result) input))
+           (assert (not (.stdout-truncated result)))))
+
+(deftest a-remote-that-stops-reading-is-not-an-error
+         (let [a (malloc-allocator)
+               result (run-ok a "head -c 5" (Some (pattern a 4194304)))]
+           (assert-eq (.stdout result) "abcde")
+           (assert-eq (.exit-code result) 0)))
+
+(deftest captures-stderr-and-nonzero-exit
+         (let [a (malloc-allocator)
+               result
+                 (run-ok a
+                         "echo out; echo oops >&2; exit 7"
+                         (None [(slice u8)]))]
+           (assert-eq (.stdout result) "out\n")
+           (assert-eq (.stderr result) "oops\n")
+           (assert-eq (.exit-code result) 7)
+           (assert (not (ssh-result-ok? result)))
+           (assert (not (ssh-connection-failed? result)))))
+
+(deftest output-beyond-the-limit-is-dropped-and-flagged
+         (let [a (malloc-allocator)
+               (mut opts) (ssh-options)]
+           (set! (.max-output-bytes opts) 10)
+           (try (let [outcome
+                        (try-or! (ssh-run a
+                                          (live-host)
+                                          (load opts)
+                                          "echo 0123456789abcdef"
+                                          (None [(slice u8)])
+                                          30000)
+                                 (assert false))]
+                  (let [result outcome]
+                    (assert-eq (.stdout result) "0123456789")
+                    (assert (.stdout-truncated result)))))))
+
+(deftest deadline-terminates-a-slow-command
+         (let [a (malloc-allocator)
+               started (now-ms)]
+           (try (let [; sleep 30"
+                      outcome
+                        (try-or! (ssh-run a
+                                          (live-host)
+                                          (ssh-options)
+                                          "echo started; sleep 30"
+                                          (None [(slice u8)])
+                                          3000)
+                                 (assert false))]
+                  (let [result outcome]
+                    (assert (.timed-out result))
+                    (assert (not (ssh-result-ok? result)))
+                    (assert-eq (.stdout result) "started\n"))))
+           (assert (< (- (now-ms) started) 8000))))
+
+(deftest unknown-host-is-a-connection-failure
+         (let [a (malloc-allocator)]
+           (try (let [outcome
+                        (try-or! (ssh-run a
+                                          (target ""
+                                                  "nonexistent-host.invalid"
+                                                  0)
+                                          (ssh-options)
+                                          "true"
+                                          (None [(slice u8)])
+                                          30000)
+                                 (assert false))]
+                  (let [result outcome]
+                    (assert-eq (.exit-code result) 255)
+                    (assert (ssh-connection-failed? result))
+                    (assert (contains? (.stderr result)
+                                       "nonexistent-host.invalid")))))))
+
+(deftest reachability
+         (let [a (malloc-allocator)]
+           (try (let [up
+                        (try-or! (ssh-reachable? a
+                                                 (live-host)
+                                                 (ssh-options)
+                                                 30000)
+                                 (assert false))]
+                  (assert up)))
+           (try (let [up
+                        (try-or! (ssh-reachable? a
+                                                 (target ""
+                                                         "nonexistent-host.invalid"
+                                                         0)
+                                                 (ssh-options)
+                                                 30000)
+                                 (assert false))]
+                  (assert (not up))))))
+
+(deftest quoted-words-arrive-intact
+         (let [a (malloc-allocator)
+               weird "it's \"quoted\" $HOME `id` ; rm -rf / * \\ end"
+               result
+                 (run-ok a
+                         (shell-join a ["printf" "%s" weird])
+                         (None [(slice u8)]))]
+           (assert-eq (.stdout result) weird)))
+
+(deftest stdin-to-a-unique-remote-file
+         (let [a (malloc-allocator)
+               (mut path) (sb-new a)]
+           (sb-push-str! (mut path) "/tmp/coil-ssh-live-")
+           (sb-push-i64! (mut path) (process/id))
+           (sb-push-str! (mut path) "-")
+           (sb-push-i64! (mut path) (now-ms))
+           (let [quoted (shell-quote a (sb-str (load path)))
+                 (mut command) (sb-new a)]
+             (sb-push-str! (mut command) "cat > ")
+             (sb-push-str! (mut command) quoted)
+             (sb-push-str! (mut command) " && wc -c < ")
+             (sb-push-str! (mut command) quoted)
+             (sb-push-str! (mut command) " && rm -f ")
+             (sb-push-str! (mut command) quoted)
+             (let [result (run-ok a (sb-str (load command)) (Some "12345"))]
+               (assert-eq (str-trim (.stdout result)) "5")
+               (assert-eq (.exit-code result) 0)))))

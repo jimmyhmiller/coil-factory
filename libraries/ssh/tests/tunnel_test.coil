@@ -1,0 +1,76 @@
+(module ssh.tunnel-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.str" :use *)
+(import "ssh.exec" :use [ssh-options])
+(import "ssh.target" :use *)
+(import "ssh.tunnel" :use *)
+
+(defn status-message [(status TunnelStatus)] (-> (slice u8))
+  (match status
+    (TunnelReady [_] "<ready>")
+    (TunnelFailed [message] message)))
+
+(deftest backoff-doubles-to-a-ceiling
+         (assert-eq (tunnel-backoff-ms 1 500 30000) 500)
+         (assert-eq (tunnel-backoff-ms 2 500 30000) 1000)
+         (assert-eq (tunnel-backoff-ms 4 500 30000) 4000)
+         (assert-eq (tunnel-backoff-ms 7 500 30000) 30000)
+         (assert-eq (tunnel-backoff-ms 60 500 30000) 30000))
+
+(deftest builds-the-forwarding-arguments
+         (let [a (malloc-allocator)
+               args
+                 (tunnel-args a
+                              40123
+                              (tunnel-spec (target "me" "box" 2200) 8080))]
+           (assert-eq (len args) 21)
+           (assert-eq (get args 1) "BatchMode=yes")
+           (assert-eq (get args 8) "-N")
+           (assert-eq (get args 9) "-T")
+           (assert-eq (get args 11) "ExitOnForwardFailure=yes")
+           (assert-eq (get args 13) "ServerAliveInterval=15")
+           (assert-eq (get args 15) "ServerAliveCountMax=3")
+           (assert-eq (get args 16) "-L")
+           (assert-eq (get args 17) "127.0.0.1:40123:127.0.0.1:8080")
+           (assert-eq (get args 18) "-p")
+           (assert-eq (get args 19) "2200")
+           (assert-eq (get args 20) "me@box")))
+
+(deftest brackets-an-ipv6-remote-host
+         (let [a (malloc-allocator)
+               (mut spec) (tunnel-spec (target "" "box" 0) 22)]
+           (set! (.remote-host spec) "::1")
+           (let [args (tunnel-args a 5000 (load spec))]
+             (assert-eq (get args 17) "127.0.0.1:5000:[::1]:22")
+             (assert-eq (get args 18) "box"))))
+
+(deftest invalid-spec-fails-without-spawning
+         (let [a (malloc-allocator)
+               (mut tunnel) (tunnel-new a (tunnel-spec (target "" "box" 0) 0))]
+           (assert-eq (status-message (tunnel-open! (mut tunnel)))
+                      "the remote port must be between 1 and 65535")
+           (assert (not (tunnel-alive? (mut tunnel))))
+           (assert-eq (tunnel-local-port tunnel) 0)
+           (tunnel-free! (mut tunnel))))
+
+(deftest failures-back-off-and-repeat-the-last-error
+         (let [a (malloc-allocator)
+               (mut spec) (tunnel-spec (target "" "box" 0) 22)
+               (mut options) (ssh-options)]
+           (set! (.ssh-binary options) "/nonexistent/ssh-binary")
+           (set! (.options spec) (load options))
+           (set! (.backoff-base-ms spec) 60000)
+           (let [(mut tunnel) (tunnel-new a (load spec))]
+             (assert-eq (status-message (tunnel-ensure! (mut tunnel)))
+                        "could not start ssh; is it installed and on PATH?")
+             (assert-eq (status-message (tunnel-ensure! (mut tunnel)))
+                        "could not start ssh; is it installed and on PATH?")
+             (assert-eq (tunnel-last-error tunnel)
+                        "could not start ssh; is it installed and on PATH?")
+             (assert-eq (.failures tunnel) 1)
+             (tunnel-free! (mut tunnel)))))
+
+(deftest base-url-names-the-local-port
+         (let [a (malloc-allocator)]
+           (assert-eq (tunnel-base-url a 40123) "http://127.0.0.1:40123")))

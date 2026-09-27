@@ -1,0 +1,1137 @@
+(module mddoc.doc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.try" :use *)
+
+;; Markdown documents with a front-matter header and ATX-heading sections.
+;;
+;; Every slice a Document hands out borrows the input text unless noted, so the
+;; text must outlive the Document. Values that needed unescaping (quoted
+;; front-matter strings with escapes) are copied into the Document's allocator
+;; and freed by `document-free!`.
+
+;;; A parse failure: the 1-based line it was found on and a static message.
+(defstruct DocError
+  [(line i64)
+   (message (slice u8))])
+
+;;; One `key: value` entry of the front matter.
+;;;
+;;; - `key: value` (plain or quoted): `is-list` false, `scalar` the value, `items`
+;;;   the one-element list `[value]`.
+;;; - `key: [a, b]` or `key:` followed by `- item` lines: `is-list` true, `scalar`
+;;;   empty, `items` the list.
+;;; - `key:` with nothing after it and no items: `is-list` false, `scalar` empty,
+;;;   `items` empty.
+;;;
+;;; `line` is the 1-based line of the key.
+(defstruct FrontEntry
+  [(key (slice u8))
+   (is-list bool)
+   (scalar (slice u8))
+   (items (ArrayList (slice u8)))
+   (line i64)])
+
+;;; An ATX heading: `level` 1-6, `title` trimmed with any closing `#`s removed.
+(defstruct Heading
+  [(level i64)
+   (title (slice u8))
+   (line i64)])
+
+;;; A heading with the text it governs.
+;;;
+;;; - `body`: from the line after the heading up to the next heading of the same
+;;;   or a higher level (fewer or equal `#`s), or the end of the document. It
+;;;   includes nested subsections.
+;;; - `own-body`: from the line after the heading up to the next heading of any
+;;;   level: the text before the first subsection.
+;;; - `body-line`: the 1-based line number of the first line of `body`.
+;;; - `parent`: index in `doc-sections` of the closest preceding heading with a
+;;;   lower level, or -1 for a top-level section.
+(defstruct Section
+  [(level i64)
+   (title (slice u8))
+   (line i64)
+   (body (slice u8))
+   (own-body (slice u8))
+   (body-line i64)
+   (parent i64)])
+
+;;; A parsed document. See `parse-document`.
+(defstruct Document
+  [(allocator (dyn Allocator))
+   (text (slice u8))
+   (has-front-matter bool)
+   (front (ArrayList FrontEntry))
+   (body (slice u8))
+   (body-line i64)
+   (preamble (slice u8))
+   (sections (ArrayList Section))
+   (headings (ArrayList Heading))
+   (owned (ArrayList (slice u8)))])
+
+;; ---------------------------------------------------------------------------
+;; Lines and characters
+
+;; One line of the text: [start, end) is its content without the line ending
+;; (a trailing CR is excluded too); `next` is where the following line starts.
+(defstruct Line
+  [(start i64)
+   (end i64)
+   (next i64)])
+
+(defn line-at [(text (slice u8)) (start i64)] (-> Line)
+  (let [n (len text)
+        (mut i) start]
+    (loop (if (or (>= (load i) n) (= (cast i64 (get text (load i))) 10))
+              (break)
+              (set! i (+ (load i) 1))))
+    (let [next (if (< (load i) n) (+ (load i) 1) n)
+          end
+            (if (and (> (load i) start)
+                     (= (cast i64 (get text (- (load i) 1))) 13))
+                (- (load i) 1)
+                (load i))]
+      (Line
+        :start start
+        :end end
+        :next next))))
+
+(defn line-text [(text (slice u8)) (line Line)] (-> (slice u8))
+  (subslice [u8] text (.start line) (.end line)))
+
+(defn blank-char? [(c i64)] (-> bool)
+  (or (= c 32) (= c 9)))
+
+(defn trim-blank [(s (slice u8))] (-> (slice u8))
+  (let [(mut lo) 0
+        (mut hi) (len s)]
+    (loop (if (and (< (load lo) (load hi))
+                   (blank-char? (cast i64 (get s (load lo)))))
+              (set! lo (+ (load lo) 1))
+              (break)))
+    (loop (if (and (< (load lo) (load hi))
+                   (blank-char? (cast i64 (get s (- (load hi) 1)))))
+              (set! hi (- (load hi) 1))
+              (break)))
+    (subslice [u8] s (load lo) (load hi))))
+
+(defn blank-line? [(s (slice u8))] (-> bool)
+  (= (len (trim-blank s)) 0))
+
+(defn alpha? [(c i64)] (-> bool)
+  (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defn digit? [(c i64)] (-> bool)
+  (and (>= c 48) (<= c 57)))
+
+;; Number of leading spaces (tabs are not counted as indentation here).
+(defn leading-spaces [(s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (and (< (load i) (len s)) (= (cast i64 (get s (load i))) 32))
+              (set! i (+ (load i) 1))
+              (break)))
+    (load i)))
+
+(defn doc-error [(line i64) (message (slice u8))] (-> DocError)
+  (DocError :line line :message message))
+
+;; ---------------------------------------------------------------------------
+;; Front-matter values
+(defn keep-owned! [(doc (mut Document)) (bytes (slice u8))] (-> (slice u8))
+  (push! [(slice u8)] (mut (.owned doc)) bytes)
+  bytes)
+
+(defn hex-value [(c i64)] (-> i64)
+  (cond (digit? c) (- c 48)
+        (and (>= c 97) (<= c 102)) (+ (- c 97) 10)
+        (and (>= c 65) (<= c 70)) (+ (- c 65) 10)
+        :else -1))
+
+;; Append the UTF-8 encoding of scalar value `cp` (already validated).
+(defn push-utf8! [(sb (mut StrBuf)) (cp i64)] (-> i64)
+  (cond (< cp 128) (sb-push-byte! (mut sb) (cast u8 cp))
+        (< cp 2048)
+          (do
+            (sb-push-byte! (mut sb) (cast u8 (| 192 (>> cp 6))))
+            (sb-push-byte! (mut sb) (cast u8 (| 128 (& cp 63)))))
+        :else
+          (do
+            (sb-push-byte! (mut sb) (cast u8 (| 224 (>> cp 12))))
+            (sb-push-byte! (mut sb) (cast u8 (| 128 (& (>> cp 6) 63))))
+            (sb-push-byte! (mut sb) (cast u8 (| 128 (& cp 63)))))))
+
+;; The result of reading one quoted string: its value and the index just past the
+;; closing quote.
+(defstruct Quoted
+  [(value (slice u8))
+   (after i64)])
+
+;; Read a double-quoted string starting at `s[start]` (which is `"`). Supports the
+;; escapes \" \\ \/ \n \t \r \b \f and \uXXXX (a non-surrogate code point below
+;; U+10000). Borrows `s` when there is no escape.
+(defn read-double-quoted [(doc (mut Document))
+                          (s (slice u8))
+                          (start i64)
+                          (line i64)] (-> (Result Quoted DocError))
+  (try (let [n (len s)
+             (mut i) (+ start 1)
+             (mut escaped) false
+             (mut close) -1]
+         ;; find the closing quote
+         (loop (if (>= (load i) n)
+                   (break)
+                   (let [c (cast i64 (get s (load i)))]
+                     (cond (= c 92)
+                             (do
+                               (set! escaped true)
+                               (set! i (+ (load i) 2)))
+                           (= c 34)
+                             (do
+                               (set! close (load i))
+                               (break))
+                           :else (set! i (+ (load i) 1))))))
+         (ensure! (>= (load close) 0)
+                  (Err (doc-error line "unterminated double-quoted string")))
+         (if (not (load escaped))
+             (Ok (Quoted :value (subslice [u8] s (+ start 1) (load close))
+                   :after (+ (load close) 1)))
+             (let [(mut sb) (sb-new (.allocator doc))
+                   (mut j) (+ start 1)
+                   (mut failure) (None [DocError])]
+               (loop (if (>= (load j) (load close))
+                         (break)
+                         (let [c (cast i64 (get s (load j)))]
+                           (if (!= c 92)
+                               (do
+                                 (sb-push-byte! (mut sb) (cast u8 c))
+                                 (set! j (+ (load j) 1)))
+                               (let [e (cast i64 (get s (+ (load j) 1)))]
+                                 (cond (= e 34)
+                                         (sb-push-byte! (mut sb) (cast u8 34))
+                                       (= e 92)
+                                         (sb-push-byte! (mut sb) (cast u8 92))
+                                       (= e 47)
+                                         (sb-push-byte! (mut sb) (cast u8 47))
+                                       (= e 110)
+                                         (sb-push-byte! (mut sb) (cast u8 10))
+                                       (= e 116)
+                                         (sb-push-byte! (mut sb) (cast u8 9))
+                                       (= e 114)
+                                         (sb-push-byte! (mut sb) (cast u8 13))
+                                       (= e 98)
+                                         (sb-push-byte! (mut sb) (cast u8 8))
+                                       (= e 102)
+                                         (sb-push-byte! (mut sb) (cast u8 12))
+                                       (= e 117)
+                                         (let [(mut cp) 0
+                                               (mut k) 0]
+                                           (loop (if (>= (load k) 4)
+                                                     (break)
+                                                     (let [at
+                                                             (+ (+ (load j) 2)
+                                                                (load k))
+                                                           h
+                                                             (if (< at
+                                                                    (load close))
+                                                                 (hex-value (cast i64
+                                                                                  (get s
+                                                                                       at)))
+                                                                 -1)]
+                                                       (if (< h 0)
+                                                           (do
+                                                             (set! cp -1)
+                                                             (break))
+                                                           (do
+                                                             (set! cp
+                                                                   (+ (* (load cp)
+                                                                         16)
+                                                                      h))
+                                                             (set! k
+                                                                   (+ (load k)
+                                                                      1)))))))
+                                           (if (or (< (load cp) 0)
+                                                   (and (>= (load cp) 55296)
+                                                        (<= (load cp) 57343)))
+                                               (do
+                                                 (set! failure
+                                                       (Some (doc-error line
+                                                                        "bad \\u escape (need four hex digits, not a surrogate)")))
+                                                 (break))
+                                               (do
+                                                 (push-utf8! (mut sb) (load cp))
+                                                 (set! j (+ (load j) 4)))))
+                                       :else
+                                         (do
+                                           (set! failure
+                                                 (Some (doc-error line
+                                                                  "unknown escape in double-quoted string")))
+                                           (break)))
+                                 (set! j (+ (load j) 2)))))))
+               (match (load failure)
+                 (Some [e]
+                       (do
+                         (sb-free! (mut sb))
+                         (Err e)))
+                 (None []
+                       (let [value (keep-owned! (mut doc) (sb-finish! (mut sb)))]
+                         (Ok (Quoted :value value
+                               :after (+ (load close) 1)))))))))))
+
+;; Read a single-quoted string starting at `s[start]` (which is `'`); `''` stands
+;; for one quote. Borrows `s` when there is no doubled quote.
+(defn read-single-quoted [(doc (mut Document))
+                          (s (slice u8))
+                          (start i64)
+                          (line i64)] (-> (Result Quoted DocError))
+  (try (let [n (len s)
+             (mut i) (+ start 1)
+             (mut doubled) false
+             (mut close) -1]
+         (loop (if (>= (load i) n)
+                   (break)
+                   (if (= (cast i64 (get s (load i))) 39)
+                       (if (and (< (+ (load i) 1) n)
+                                (= (cast i64 (get s (+ (load i) 1))) 39))
+                           (do
+                             (set! doubled true)
+                             (set! i (+ (load i) 2)))
+                           (do
+                             (set! close (load i))
+                             (break)))
+                       (set! i (+ (load i) 1)))))
+         (ensure! (>= (load close) 0)
+                  (Err (doc-error line "unterminated single-quoted string")))
+         (if (not (load doubled))
+             (Ok (Quoted :value (subslice [u8] s (+ start 1) (load close))
+                   :after (+ (load close) 1)))
+             (let [(mut sb) (sb-new (.allocator doc))
+                   (mut j) (+ start 1)]
+               (loop (if (>= (load j) (load close))
+                         (break)
+                         (let [c (cast i64 (get s (load j)))]
+                           (sb-push-byte! (mut sb) (cast u8 c))
+                           (set! j (+ (load j) (if (= c 39) 2 1))))))
+               (let [value (keep-owned! (mut doc) (sb-finish! (mut sb)))]
+                 (Ok (Quoted :value value
+                       :after (+ (load close) 1)))))))))
+
+;; A complete scalar value (already trimmed): quoted, or plain. A quoted value must
+;; be followed by nothing but blanks. Plain values starting with a YAML indicator
+;; this subset does not implement are rejected rather than misread.
+(defn read-scalar [(doc (mut Document)) (s (slice u8)) (line i64)] (-> (Result (slice u8)
+                                                                               DocError))
+  (try (if (= (len s) 0)
+           (Ok s)
+           (let [c (cast i64 (get s 0))]
+             (cond (or (= c 34) (= c 39))
+                     (let [q
+                             (try! (if (= c 34)
+                                       (read-double-quoted (mut doc) s 0 line)
+                                       (read-single-quoted (mut doc) s 0 line)))]
+                       (ensure! (blank-line? (subslice [u8]
+                                                       s
+                                                       (.after q)
+                                                       (len s)))
+                                (Err (doc-error line
+                                                "unexpected text after a closing quote")))
+                       (Ok (.value q)))
+                   (or (= c 124) (= c 62))
+                     (Err (doc-error line
+                                     "block scalars (| and >) are not supported"))
+                   (= c 123)
+                     (Err (doc-error line
+                                     "inline mappings ({...}) are not supported"))
+                   (or (= c 38) (= c 42) (= c 33))
+                     (Err (doc-error line
+                                     "YAML anchors, aliases, and tags are not supported"))
+                   :else (Ok s))))))
+
+;; Parse the inside of an inline list `[ ... ]` (without the brackets) into `items`.
+(defn read-inline-list [(doc (mut Document))
+                        (inner (slice u8))
+                        (items (mut (ArrayList (slice u8))))
+                        (line i64)] (-> (Result i64 DocError))
+  (try (let [s (trim-blank inner)
+             n (len s)
+             (mut i) 0]
+         (when (> n 0)
+           (loop (do
+                   ;; skip blanks before an item
+                   (loop (if (and (< (load i) n)
+                                  (blank-char? (cast i64 (get s (load i)))))
+                             (set! i (+ (load i) 1))
+                             (break)))
+                   (ensure! (< (load i) n)
+                            (Err (doc-error line "empty item in inline list")))
+                   (let [c (cast i64 (get s (load i)))]
+                     (if (or (= c 34) (= c 39))
+                         (let [q
+                                 (try! (if (= c 34)
+                                           (read-double-quoted (mut doc)
+                                                               s
+                                                               (load i)
+                                                               line)
+                                           (read-single-quoted (mut doc)
+                                                               s
+                                                               (load i)
+                                                               line)))]
+                           (push! [(slice u8)] (mut items) (.value q))
+                           (set! i (.after q))
+                           (loop (if (and (< (load i) n)
+                                          (blank-char? (cast i64
+                                                             (get s (load i)))))
+                                     (set! i (+ (load i) 1))
+                                     (break))))
+                         (let [start (load i)]
+                           (loop (if (or (>= (load i) n)
+                                         (= (cast i64 (get s (load i))) 44))
+                                     (break)
+                                     (let [d (cast i64 (get s (load i)))]
+                                       (ensure! (not (or (= d 91)
+                                                         (= d 93)
+                                                         (= d 123)
+                                                         (= d 125)))
+                                                (Err (doc-error line
+                                                                "nested lists and mappings are not supported")))
+                                       (set! i (+ (load i) 1)))))
+                           (let [item
+                                   (trim-blank (subslice [u8] s start (load i)))]
+                             (ensure! (> (len item) 0)
+                                      (Err (doc-error line
+                                                      "empty item in inline list")))
+                             (push! [(slice u8)] (mut items) item)))))
+                   (if (>= (load i) n)
+                       (break)
+                       (do
+                         (ensure! (= (cast i64 (get s (load i))) 44)
+                                  (Err (doc-error line
+                                                  "expected , between inline list items")))
+                         (set! i (+ (load i) 1))))))
+           0)
+         (Ok (len (load items))))))
+
+;; ---------------------------------------------------------------------------
+;; Front matter
+(defn front-delimiter? [(s (slice u8))] (-> bool)
+  (and (>= (len s) 3)
+       (= (subslice [u8] s 0 3) "---")
+       (blank-line? (subslice [u8] s 3 (len s)))))
+
+(defn find-entry [(doc (ptr Document)) (key (slice u8))] (-> i64)
+  (let [n (len (.front doc))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [e (al-elem [FrontEntry] (field doc front) (load i))]
+                (if (= (.key e) key)
+                    (do
+                      (set! found (load i))
+                      (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+;; The length of a front-matter key at the start of `s`: [A-Za-z_][A-Za-z0-9_.-]*.
+(defn front-key-length [(s (slice u8))] (-> i64)
+  (if (or (= (len s) 0)
+          (not (or (alpha? (cast i64 (get s 0))) (= (cast i64 (get s 0)) 95))))
+      0
+      (let [(mut i) 1]
+        (loop (if (>= (load i) (len s))
+                  (break)
+                  (let [c (cast i64 (get s (load i)))]
+                    (if (or (alpha? c) (digit? c) (= c 95) (= c 46) (= c 45))
+                        (set! i (+ (load i) 1))
+                        (break)))))
+        (load i))))
+
+;; A block-list item line (`- value` or a lone `-`) after optional indentation:
+;; the item text, or None when the line is not one.
+(defn block-item [(s (slice u8))] (-> (Option (slice u8)))
+  (let [t (trim-blank s)]
+    (cond (= t "-") (Some "")
+          (and (>= (len t) 2)
+               (= (cast i64 (get t 0)) 45)
+               (blank-char? (cast i64 (get t 1))))
+            (Some (trim-blank (subslice [u8] t 2 (len t))))
+          :else (None))))
+
+;; Parse one front-matter line. `open-list` is the index of the entry that may
+;; still receive `- item` lines, or -1; returns the new value of it.
+(defn front-line [(doc (mut Document))
+                  (s (slice u8))
+                  (line i64)
+                  (open-list i64)] (-> (Result i64 DocError))
+  (try (let [t (trim-blank s)]
+         (cond (= (len t) 0) (Ok open-list)
+               (= (cast i64 (get t 0)) 35) (Ok open-list)
+               :else
+                 (match (block-item s)
+                   (Some [text]
+                         (do
+                           (ensure! (>= open-list 0)
+                                    (Err (doc-error line
+                                                    "list item without an open `key:` line above it")))
+                           (ensure! (> (len text) 0)
+                                    (Err (doc-error line "empty list item")))
+                           (let [value (try! (read-scalar (mut doc) text line))
+                                 e
+                                   (al-elem [FrontEntry]
+                                            (mut (.front doc))
+                                            open-list)]
+                             (set! (.is-list e) true)
+                             (push! [(slice u8)] (mut (.items e)) value)
+                             (Ok open-list))))
+                   (None []
+                         (do
+                           (ensure! (not (blank-char? (cast i64 (get s 0))))
+                                    (Err (doc-error line
+                                                    "unexpected indentation (nested values are not supported)")))
+                           (let [k (front-key-length s)]
+                             (ensure! (and (> k 0)
+                                           (< k (len s))
+                                           (= (cast i64 (get s k)) 58))
+                                      (Err (doc-error line
+                                                      "expected `key: value`")))
+                             (ensure! (or (= (+ k 1) (len s))
+                                          (blank-char? (cast i64
+                                                             (get s (+ k 1)))))
+                                      (Err (doc-error line
+                                                      "expected a space after `key:`")))
+                             (let [key (subslice [u8] s 0 k)
+                                   raw
+                                     (trim-blank (subslice [u8]
+                                                           s
+                                                           (+ k 1)
+                                                           (len s)))]
+                               (ensure! (< (find-entry (mut doc) key) 0)
+                                        (Err (doc-error line
+                                                        "duplicate front matter key")))
+                               (let [(mut items)
+                                       (al-new [(slice u8)] (.allocator doc))
+                                     (mut is-list) false
+                                     (mut scalar) ""]
+                                 (let [parsed
+                                         (cond (= (len raw) 0)
+                                                 (Ok [i64 DocError] 0)
+                                               (= (cast i64 (get raw 0)) 91)
+                                                 (if (= (cast i64
+                                                              (get raw
+                                                                   (- (len raw)
+                                                                      1)))
+                                                        93)
+                                                     (do
+                                                       (set! is-list true)
+                                                       (read-inline-list (mut doc)
+                                                                         (subslice [u8]
+                                                                                   raw
+                                                                                   1
+                                                                                   (- (len raw)
+                                                                                      1))
+                                                                         (mut items)
+                                                                         line))
+                                                     (Err [i64 DocError]
+                                                          (doc-error line
+                                                                     "unterminated inline list")))
+                                               :else
+                                                 (match (read-scalar (mut doc)
+                                                                     raw
+                                                                     line)
+                                                   (Err [e]
+                                                        (Err [i64 DocError] e))
+                                                   (Ok [value]
+                                                       (do
+                                                         (set! scalar value)
+                                                         (push! [(slice u8)]
+                                                                (mut items)
+                                                                value)
+                                                         (Ok [i64 DocError] 0)))))]
+                                   (match parsed
+                                     (Err [e]
+                                          (do
+                                            (al-free! [(slice u8)] (mut items))
+                                            (Err e)))
+                                     (Ok [ignored]
+                                         (do
+                                           (push! [FrontEntry]
+                                                  (mut (.front doc))
+                                                  (FrontEntry
+                                                    :key key
+                                                    :is-list (load is-list)
+                                                    :scalar (load scalar)
+                                                    :items (load items)
+                                                    :line line))
+                                           (Ok (if (= (len raw) 0)
+                                                   (- (len (.front doc)) 1)
+                                                   -1))))))))))))))))
+
+;; Where the body starts once the front matter is consumed.
+(defstruct BodyStart
+  [(offset i64)
+   (line i64)])
+
+;; Parse the front matter whose opening `---` line ends at `start` (line
+;; `start-line` is the first entry line).
+(defn parse-front [(doc (mut Document))
+                   (text (slice u8))
+                   (start i64)
+                   (start-line i64)] (-> (Result BodyStart
+                                                 DocError))
+  (try (let [n (len text)
+             (mut at) start
+             (mut line) start-line
+             (mut open-list) -1
+             (mut closed) (None [BodyStart])]
+         (loop (if (>= (load at) n)
+                   (break)
+                   (let [l (line-at text (load at))
+                         s (line-text text l)]
+                     (if (front-delimiter? s)
+                         (do
+                           (set! closed
+                                 (Some (BodyStart :offset (.next l)
+                                         :line (+ (load line) 1))))
+                           (break))
+                         (do
+                           (set! open-list
+                                 (try! (front-line (mut doc)
+                                                   s
+                                                   (load line)
+                                                   (load open-list))))
+                           (set! at (.next l))
+                           (set! line (+ (load line) 1)))))))
+         (match (load closed)
+           (Some [b] (Ok b))
+           (None []
+                 (Err (doc-error (- start-line 1)
+                                 "front matter is not closed (expected a line containing only ---)")))))))
+
+;; ---------------------------------------------------------------------------
+;; Body: fences and headings
+
+;; An opening code fence: the fence character (` or ~) and run length, or None.
+(defstruct Fence
+  [(ch i64)
+   (count i64)])
+
+(defn fence-open [(s (slice u8))] (-> (Option Fence))
+  (let [indent (leading-spaces s)]
+    (if (or (> indent 3) (>= indent (len s)))
+        (None)
+        (let [c (cast i64 (get s indent))]
+          (if (not (or (= c 96) (= c 126)))
+              (None)
+              (let [(mut i) indent]
+                (loop (if (and (< (load i) (len s))
+                               (= (cast i64 (get s (load i))) c))
+                          (set! i (+ (load i) 1))
+                          (break)))
+                (let [count (- (load i) indent)
+                      info (subslice [u8] s (load i) (len s))]
+                  (if (< count 3)
+                      (None)
+                      ;; a backtick fence's info string may not contain a backtick
+                      (if (and (= c 96)
+                               (match (str-find info "`")
+                                 (Some [at] true)
+                                 (None [] false)))
+                          (None)
+                          (Some (Fence :ch c :count count)))))))))))
+
+(defn fence-closes? [(s (slice u8)) (fence Fence)] (-> bool)
+  (let [indent (leading-spaces s)]
+    (if (> indent 3)
+        false
+        (let [(mut i) indent]
+          (loop (if (and (< (load i) (len s))
+                         (= (cast i64 (get s (load i))) (.ch fence)))
+                    (set! i (+ (load i) 1))
+                    (break)))
+          (and (>= (- (load i) indent) (.count fence))
+               (blank-line? (subslice [u8] s (load i) (len s))))))))
+
+;; An ATX heading line: up to three spaces, 1-6 `#`, then a blank or the end of the
+;; line. Returns the heading with `line` unset (0), or None.
+(defn atx-heading [(s (slice u8))] (-> (Option Heading))
+  (let [indent (leading-spaces s)]
+    (if (> indent 3)
+        (None)
+        (let [(mut i) indent]
+          (loop (if (and (< (load i) (len s))
+                         (= (cast i64 (get s (load i))) 35))
+                    (set! i (+ (load i) 1))
+                    (break)))
+          (let [level (- (load i) indent)]
+            (if (or (< level 1)
+                    (> level 6)
+                    (and (< (load i) (len s))
+                         (not (blank-char? (cast i64 (get s (load i)))))))
+                (None)
+                (Some (Heading
+                        :level level
+                        :title
+                          (heading-title (subslice [u8] s (load i) (len s)))
+                        :line 0))))))))
+
+;; Trim a heading's content and drop an optional closing run of `#`s (which must
+;; be preceded by a blank, or be the whole content).
+(defn heading-title [(content (slice u8))] (-> (slice u8))
+  (let [t (trim-blank content)
+        (mut j) (len t)]
+    (loop (if (and (> (load j) 0) (= (cast i64 (get t (- (load j) 1))) 35))
+              (set! j (- (load j) 1))
+              (break)))
+    (cond (= (load j) (len t)) t
+          (= (load j) 0) ""
+          (blank-char? (cast i64 (get t (- (load j) 1))))
+            (trim-blank (subslice [u8] t 0 (load j)))
+          :else t)))
+
+;; A heading found in the body with the offsets of its line.
+(defstruct Found
+  [(heading Heading)
+   (start i64)
+   (next i64)])
+
+(defn parse-body [(doc (mut Document))
+                  (text (slice u8))
+                  (start i64)
+                  (start-line i64)] (-> i64)
+  (let [n (len text)
+        a (.allocator doc)
+        (mut found) (al-new [Found] a)
+        (mut at) start
+        (mut line) start-line
+        (mut fence) (None [Fence])]
+    (loop (if (>= (load at) n)
+              (break)
+              (let [l (line-at text (load at))
+                    s (line-text text l)]
+                (match (load fence)
+                  (Some [f] (when (fence-closes? s f) (set! fence (None)) 0))
+                  (None []
+                        (match (fence-open s)
+                          (Some [f] (set! fence (Some f)))
+                          (None []
+                                (match (atx-heading s)
+                                  (Some [matched]
+                                        (let [h matched]
+                                          (push! [Found]
+                                                 (mut found)
+                                                 (Found
+                                                   :heading
+                                                     (Heading
+                                                       :level (.level h)
+                                                       :title (.title h)
+                                                       :line (load line))
+                                                   :start (.start l)
+                                                   :next (.next l)))))
+                                  (None [] 0))))))
+                (set! at (.next l))
+                (set! line (+ (load line) 1)))))
+    (let [count (len (load found))
+          (mut k) 0]
+      (set! (.body doc) (subslice [u8] text start n))
+      (set! (.body-line doc) start-line)
+      (set! (.preamble doc)
+            (subslice [u8]
+                      text
+                      start
+                      (if (> count 0)
+                          (.start (al-elem [Found] (mut found) 0))
+                          n)))
+      (loop (if (>= (load k) count)
+                (break)
+                (let [f (al-elem [Found] (mut found) (load k))
+                      h (.heading f)
+                      level (.level h)
+                      own-end
+                        (if (< (+ (load k) 1) count)
+                            (.start (al-elem [Found] (mut found) (+ (load k) 1)))
+                            n)
+                      (mut end) n
+                      (mut j) (+ (load k) 1)
+                      (mut parent) -1
+                      (mut p) (- (load k) 1)]
+                  (loop (if (>= (load j) count)
+                            (break)
+                            (let [g (al-elem [Found] (mut found) (load j))]
+                              (if (<= (.level (.heading g)) level)
+                                  (do
+                                    (set! end (.start g))
+                                    (break))
+                                  (set! j (+ (load j) 1))))))
+                  (loop (if (< (load p) 0)
+                            (break)
+                            (let [g (al-elem [Found] (mut found) (load p))]
+                              (if (< (.level (.heading g)) level)
+                                  (do
+                                    (set! parent (load p))
+                                    (break))
+                                  (set! p (- (load p) 1))))))
+                  (push! [Heading] (mut (.headings doc)) (load h))
+                  (push! [Section]
+                         (mut (.sections doc))
+                         (Section
+                           :level level
+                           :title (.title h)
+                           :line (.line h)
+                           :body (subslice [u8] text (.next f) (load end))
+                           :own-body (subslice [u8] text (.next f) own-end)
+                           :body-line (+ (.line h) 1)
+                           :parent (load parent)))
+                  (set! k (+ (load k) 1)))))
+      (al-free! [Found] (mut found)))))
+
+;; ---------------------------------------------------------------------------
+;; Documents
+(defn document-empty [(a (dyn Allocator)) (text (slice u8))] (-> Document)
+  (Document
+    :allocator a
+    :text text
+    :has-front-matter false
+    :front (al-new [FrontEntry] a)
+    :body text
+    :body-line 1
+    :preamble text
+    :sections (al-new [Section] a)
+    :headings (al-new [Heading] a)
+    :owned (al-new [(slice u8)] a)))
+
+;;; Release everything the Document allocated. Borrowed slices of the input text are
+;;; unaffected; unescaped values handed out earlier become invalid.
+(defn document-free! [(doc (mut Document))] (-> i64)
+  (let [a (.allocator doc)
+        nf (len (.front doc))
+        no (len (.owned doc))
+        (mut i) 0]
+    (loop (if (>= (load i) nf)
+              (break)
+              (do
+                (al-free! [(slice u8)]
+                          (mut (.items (al-elem [FrontEntry]
+                                                (mut (.front doc))
+                                                (load i)))))
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) no)
+              (break)
+              (let [s (get (.owned doc) (load i))]
+                (when (> (len s) 0) (free-bytes a s 1) 0)
+                (set! i (+ (load i) 1)))))
+    (al-free! [FrontEntry] (mut (.front doc)))
+    (al-free! [(slice u8)] (mut (.owned doc)))
+    (al-free! [Section] (mut (.sections doc)))
+    (al-free! [Heading] (mut (.headings doc)))))
+
+(defn parse-into [(doc (mut Document)) (text (slice u8))] (-> (Result i64
+                                                                      DocError))
+  (try (let [bom
+               (if (and (>= (len text) 3)
+                        (= (cast i64 (get text 0)) 239)
+                        (= (cast i64 (get text 1)) 187)
+                        (= (cast i64 (get text 2)) 191))
+                   3
+                   0)
+             first (line-at text bom)]
+         (if (and (< bom (len text)) (front-delimiter? (line-text text first)))
+             (let [b (try! (parse-front (mut doc) text (.next first) 2))]
+               (set! (.has-front-matter doc) true)
+               (parse-body (mut doc) text (.offset b) (.line b)))
+             (parse-body (mut doc) text bom 1))
+         (Ok 0))))
+
+;;; Parse Markdown `text` into a Document.
+;;;
+;;; Front matter is recognized only when the first line (after an optional UTF-8
+;;; byte-order mark) is `---`; it runs to the next line that is `---` (trailing
+;;; blanks allowed). Inside it, each line is blank, a `#` comment (the line's first
+;;; non-blank character), `key: value`, or a `- item` of the block list opened by a
+;;; preceding `key:` line. Keys match `[A-Za-z_][A-Za-z0-9_.-]*` and must be unique.
+;;; Values are plain (taken verbatim, trimmed; a `#` inside a plain value is NOT a
+;;; comment), double-quoted (JSON-style escapes), single-quoted (`''` is a quote), or
+;;; inline lists `[a, "b c", 'd']`. YAML features outside this subset (block scalars,
+;;; nested mappings, anchors, tags, indented continuation lines) are errors, never
+;;; silently misread.
+;;;
+;;; The body is split at ATX headings (`#` to `######` followed by a blank or the end
+;;; of the line, indented at most three spaces). Lines inside fenced code blocks
+;;; (``` or ~~~, closed by a fence of the same character at least as long) are never
+;;; headings; an unclosed fence runs to the end. Setext (underlined) headings are not
+;;; recognized. CRLF line endings are accepted; returned text slices keep the input's
+;;; line endings, while titles, keys and values never include a CR.
+(defn parse-document [(a (dyn Allocator)) (text (slice u8))] (-> (Result Document
+                                                                         DocError))
+  (let [(mut doc) (document-empty a text)]
+    (match (parse-into (mut doc) text)
+      (Err [e]
+           (do
+             (document-free! (mut doc))
+             (Err e)))
+      (Ok [ignored] (Ok (load doc))))))
+
+(defn doc-has-front-matter? [(doc Document)] (-> bool)
+  (.has-front-matter doc))
+
+;;; All front-matter entries in file order.
+(defn front-entries [(doc Document)] (-> (slice FrontEntry))
+  (al-slice [FrontEntry] (.front doc)))
+
+;;; The front-matter keys in file order, in a list owned by `a` (the key bytes are
+;;; borrowed from the text). Free the list with `al-free!`.
+(defn front-keys [(a (dyn Allocator)) (doc Document)] (-> (ArrayList (slice u8)))
+  (let [(mut keys) (al-new [(slice u8)] a)]
+    (for e
+      (iter (front-entries doc))
+      (let [entry e]
+        (push! [(slice u8)] (mut keys) (.key entry))))
+    (load keys)))
+
+;;; The entry for `key`, if present.
+(defn front-entry [(doc Document) (key (slice u8))] (-> (Option FrontEntry))
+  (let [(mut result) (None [FrontEntry])]
+    (for e
+      (iter (front-entries doc))
+      (let [entry e]
+        (when (and (none? (load result)) (= (.key entry) key))
+          (set! result (Some entry))
+          0)))
+    (load result)))
+
+;;; The single value of `key`: `None` when absent, the value for a scalar entry, and
+;;; an error (at the key's line) when the entry is a list.
+(defn front-get [(doc Document) (key (slice u8))] (-> (Result (Option (slice u8))
+                                                              DocError))
+  (match (front-entry doc key)
+    (None [] (Ok (None [(slice u8)])))
+    (Some [e]
+          (let [entry e]
+            (if (.is-list entry)
+                (Err (doc-error (.line entry)
+                                "front matter value is a list, not a single value"))
+                (Ok (Some (.scalar entry))))))))
+
+;;; The values of `key` as a list: the items of a list entry, the one-element list of
+;;; a scalar entry, the empty list for `key:` with nothing after it, or `None` when
+;;; absent. Borrowed from the Document.
+(defn front-list [(doc Document) (key (slice u8))] (-> (Option (slice (slice u8))))
+  (match (front-entry doc key)
+    (None [] (None))
+    (Some [e]
+          (let [entry e]
+            (Some (al-slice [(slice u8)] (.items entry)))))))
+
+;;; Like `front-list`, but a scalar value is split on commas, each piece trimmed and
+;;; empty pieces dropped (`tags: a, b,,c` is `[a, b, c]`). A list entry's items are
+;;; returned as they are. The list is owned by `a` (free it with `al-free!`); the
+;;; strings are borrowed.
+(defn front-csv [(a (dyn Allocator)) (doc Document) (key (slice u8))] (-> (Option (ArrayList (slice u8))))
+  (match (front-entry doc key)
+    (None [] (None))
+    (Some [e]
+          (let [entry e
+                (mut out) (al-new [(slice u8)] a)]
+            (if (.is-list entry)
+                (for item
+                  (iter (al-slice [(slice u8)] (.items entry)))
+                  (push! [(slice u8)] (mut out) item))
+                (let [s (.scalar entry)
+                      (mut start) 0
+                      (mut i) 0]
+                  (loop (do
+                          (when (or (>= (load i) (len s))
+                                    (= (cast i64 (get s (load i))) 44))
+                            (let [piece
+                                    (trim-blank (subslice [u8]
+                                                          s
+                                                          (load start)
+                                                          (load i)))]
+                              (when (> (len piece) 0)
+                                (push! [(slice u8)] (mut out) piece)
+                                0)
+                              (set! start (+ (load i) 1)))
+                            0)
+                          (if (>= (load i) (len s))
+                              (break)
+                              (set! i (+ (load i) 1)))))))
+            (Some (load out))))))
+
+;;; The text after the front matter (the whole text without front matter).
+(defn doc-body [(doc Document)] (-> (slice u8))
+  (.body doc))
+
+;;; The 1-based line number where `doc-body` starts.
+(defn doc-body-line [(doc Document)] (-> i64)
+  (.body-line doc))
+
+;;; The body text before the first heading.
+(defn doc-preamble [(doc Document)] (-> (slice u8))
+  (.preamble doc))
+
+;;; Every section, one per heading, in document order.
+(defn doc-sections [(doc Document)] (-> (slice Section))
+  (al-slice [Section] (.sections doc)))
+
+;;; Every heading in document order.
+(defn doc-headings [(doc Document)] (-> (slice Heading))
+  (al-slice [Heading] (.headings doc)))
+
+;;; Index of the first section whose title is exactly `title`.
+(defn find-section [(doc Document) (title (slice u8))] (-> (Option i64))
+  (let [sections (doc-sections doc)
+        (mut i) 0
+        (mut found) (None [i64])]
+    (loop (if (>= (load i) (len sections))
+              (break)
+              (let [s (get sections (load i))]
+                (if (= (.title s) title)
+                    (do
+                      (set! found (Some (load i)))
+                      (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+;; ---------------------------------------------------------------------------
+;; Section settings blocks
+
+;;; One `key: value` line of a settings block.
+(defstruct Attribute
+  [(key (slice u8))
+   (value (slice u8))
+   (line i64)])
+
+;;; A section body split into its leading settings block and the remaining text.
+;;; `rest-line` is the 1-based line where `rest` starts. `attrs` is owned by the
+;;; allocator passed to `section-attributes`; free it with `section-attributes-free!`.
+(defstruct SectionAttributes
+  [(attrs (ArrayList Attribute))
+   (rest (slice u8))
+   (rest-line i64)])
+
+;; A settings line `key: value` (key `[A-Za-z][A-Za-z0-9_-]*`, then `:` and a blank
+;; or the end of the line). Returns the attribute with `line` unset, or None.
+(defn settings-line [(s (slice u8))] (-> (Option Attribute))
+  (if (or (= (len s) 0) (not (alpha? (cast i64 (get s 0)))))
+      (None)
+      (let [(mut i) 1]
+        (loop (if (>= (load i) (len s))
+                  (break)
+                  (let [c (cast i64 (get s (load i)))]
+                    (if (or (alpha? c) (digit? c) (= c 95) (= c 45))
+                        (set! i (+ (load i) 1))
+                        (break)))))
+        (if (and (< (load i) (len s))
+                 (= (cast i64 (get s (load i))) 58)
+                 (or (= (+ (load i) 1) (len s))
+                     (blank-char? (cast i64 (get s (+ (load i) 1))))))
+            (Some (Attribute
+                    :key (subslice [u8] s 0 (load i))
+                    :value (trim-blank (subslice [u8] s (+ (load i) 1) (len s)))
+                    :line 0))
+            (None)))))
+
+;;; Split the leading settings block off a section body.
+;;;
+;;; Blank lines before the block are skipped. The block is the run of consecutive
+;;; lines of the form `key: value` (key `[A-Za-z][A-Za-z0-9_-]*`, a colon, then a
+;;; blank or the end of the line; the value is trimmed and taken verbatim, quotes
+;;; included) and ends at the first blank or other line. `rest` is the text after the
+;;; block with leading blank lines removed. `first-line` is the 1-based line number
+;;; of the first line of `body` (a Section's `body-line`) and is used to number the
+;;; attributes. A key repeated within the block is an error. All slices borrow `body`.
+(defn section-attributes [(a (dyn Allocator))
+                          (body (slice u8))
+                          (first-line i64)] (-> (Result SectionAttributes
+                                                        DocError))
+  (let [n (len body)
+        (mut attrs) (al-new [Attribute] a)
+        (mut at) 0
+        (mut line) first-line
+        (mut in-block) false
+        (mut failure) (None [DocError])]
+    ;; skip leading blank lines, then consume the settings lines
+    (loop (if (>= (load at) n)
+              (break)
+              (let [l (line-at body (load at))
+                    s (line-text body l)]
+                (if (blank-line? s)
+                    (if (load in-block)
+                        (break)
+                        (do
+                          (set! at (.next l))
+                          (set! line (+ (load line) 1))))
+                    (match (settings-line s)
+                      (None [] (break))
+                      (Some [matched-attr]
+                            (let [attr matched-attr
+                                  attr-key (.key attr)
+                                  found
+                                    (block :dup
+                                           (for existing
+                                             (iter (al-slice [Attribute]
+                                                             (load attrs)))
+                                             (let [x existing]
+                                               (when (= (.key x) attr-key)
+                                                 (return-from :dup true)
+                                                 0)))
+                                           false)]
+                              (if found
+                                  (do
+                                    (set! failure
+                                          (Some (doc-error (load line)
+                                                           "duplicate setting in section")))
+                                    (break))
+                                  (do
+                                    (push! [Attribute]
+                                           (mut attrs)
+                                           (Attribute
+                                             :key (.key attr)
+                                             :value (.value attr)
+                                             :line (load line)))
+                                    (set! in-block true)
+                                    (set! at (.next l))
+                                    (set! line (+ (load line) 1)))))))))))
+    ;; skip blank lines between the block and the rest
+    (loop (if (>= (load at) n)
+              (break)
+              (let [l (line-at body (load at))]
+                (if (blank-line? (line-text body l))
+                    (do
+                      (set! at (.next l))
+                      (set! line (+ (load line) 1)))
+                    (break)))))
+    (match (load failure)
+      (Some [e]
+            (do
+              (al-free! [Attribute] (mut attrs))
+              (Err e)))
+      (None []
+            (Ok (SectionAttributes
+                  :attrs (load attrs)
+                  :rest (subslice [u8] body (load at) n)
+                  :rest-line (load line)))))))
+
+;;; `section-attributes` over a Section's `body`.
+(defn section-settings [(a (dyn Allocator)) (section Section)] (-> (Result SectionAttributes
+                                                                           DocError))
+  (section-attributes a (.body section) (.body-line section)))
+
+;;; The value of setting `key`, if present.
+(defn attr-get [(sa SectionAttributes) (key (slice u8))] (-> (Option (slice u8)))
+  (let [(mut result) (None [(slice u8)])]
+    (for x
+      (iter (al-slice [Attribute] (.attrs sa)))
+      (let [attr x]
+        (when (and (none? (load result)) (= (.key attr) key))
+          (set! result (Some (.value attr)))
+          0)))
+    (load result)))
+
+(defn section-attributes-free! [(sa (mut SectionAttributes))] (-> i64)
+  (al-free! [Attribute] (mut (.attrs sa))))

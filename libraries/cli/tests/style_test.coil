@@ -1,0 +1,193 @@
+(module cli.style-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.os" :as os)
+(import "coil.str" :use *)
+(import "cli.style" :use *)
+
+(defn color-term [] (-> Term)
+  (term true true))
+
+(deftest paint-without-color-is-verbatim
+         (let [a (malloc-allocator)]
+           (assert-eq (paint a (term-plain) (bold (fg (Red))) "hi") "hi")
+           (assert-eq (ok a (term-ascii) "done") "done")
+           (assert-eq (err a (term-plain) "failed") "failed")))
+
+(deftest paint-with-color-emits-sgr
+         (let [a (malloc-allocator)]
+           (assert-eq (paint a (color-term) (bold (fg (Red))) "hi")
+                      "\x1b;[1;31mhi\x1b;[0m")
+           (assert-eq (paint a (color-term) (fg (rgb 255 128 0)) "x")
+                      "\x1b;[38;2;255;128;0mx\x1b;[0m")
+           (assert-eq (paint a
+                             (color-term)
+                             (underline (italic (dim (style))))
+                             "u")
+                      "\x1b;[2;3;4mu\x1b;[0m")
+           (assert-eq (paint a (color-term) (style) "plain") "plain")
+           (assert-eq (ok a (color-term) "done") "\x1b;[32mdone\x1b;[0m")
+           (assert-eq (warn a (color-term) "slow") "\x1b;[33mslow\x1b;[0m")
+           (assert-eq (err a (color-term) "no") "\x1b;[1;31mno\x1b;[0m")
+           (assert-eq (muted a (color-term) "2m") "\x1b;[90m2m\x1b;[0m")
+           (assert-eq (accent a (color-term) "run") "\x1b;[36mrun\x1b;[0m")
+           (assert-eq (strong a (color-term) "Hub") "\x1b;[1mHub\x1b;[0m")))
+
+(deftest glyphs-fall-back-to-ascii
+         (assert-eq (glyph-dot (term-plain)) "\x25cf;")
+         (assert-eq (glyph-dot (term-ascii)) "*")
+         (assert-eq (glyph-circle (term-ascii)) "o")
+         (assert-eq (glyph-check (term-plain)) "\x2713;")
+         (assert-eq (glyph-check (term-ascii)) "v")
+         (assert-eq (glyph-cross (term-ascii)) "x")
+         (assert-eq (glyph-warning (term-ascii)) "!")
+         (assert-eq (glyph-arrow (term-plain)) "\x2192;")
+         (assert-eq (glyph-arrow (term-ascii)) "->")
+         (assert-eq (glyph-hline (term-ascii)) "-")
+         (assert-eq (glyph-vline (term-plain)) "\x2502;")
+         (assert-eq (glyph-ellipsis (term-ascii)) "..."))
+
+(deftest color-policy-follows-environment
+         (os/unsetenv c"NO_COLOR")
+         (os/setenv c"TERM" c"xterm-256color" 1)
+         (os/setenv c"FORCE_COLOR" c"1" 1)
+         (assert (color-enabled? 99))
+         (os/setenv c"FORCE_COLOR" c"0" 1)
+         (assert (not (color-enabled? 99)))
+         (os/unsetenv c"FORCE_COLOR")
+         (assert (not (color-enabled? 99)))
+         (os/setenv c"FORCE_COLOR" c"1" 1)
+         (os/setenv c"NO_COLOR" c"1" 1)
+         (assert (color-enabled? 99))
+         (os/unsetenv c"FORCE_COLOR")
+         (assert (not (color-enabled? 99)))
+         (os/setenv c"NO_COLOR" c"" 1)
+         (os/setenv c"TERM" c"dumb" 1)
+         (assert (not (color-enabled? 99))))
+
+(deftest unicode-policy-follows-locale
+         (assert (utf8-locale? "en_US.UTF-8"))
+         (assert (utf8-locale? "C.utf8"))
+         (assert (not (utf8-locale? "C")))
+         (assert (not (utf8-locale? "")))
+         (os/setenv c"TERM" c"xterm" 1)
+         (os/setenv c"LC_ALL" c"" 1)
+         (os/setenv c"LC_CTYPE" c"" 1)
+         (os/setenv c"LANG" c"en_US.UTF-8" 1)
+         (assert (unicode-enabled?))
+         (os/setenv c"LC_ALL" c"C" 1)
+         (assert (not (unicode-enabled?)))
+         (os/setenv c"LC_ALL" c"" 1)
+         (os/setenv c"TERM" c"dumb" 1)
+         (assert (not (unicode-enabled?))))
+
+(deftest display-width-handles-wide-combining-and-escapes
+         (assert-eq (display-width "") 0)
+         (assert-eq (display-width "abc") 3)
+         (assert-eq (display-width "\x65e5;\x672c;") 4)
+         (assert-eq (display-width "e\x301;") 1)
+         (assert-eq (display-width "\x1b;[1;31mred\x1b;[0m") 3)
+         (assert-eq (display-width "\x1b;]8;;https://example.com\x1b;\\link\x1b;]8;;\x1b;\\")
+                    4)
+         (assert-eq (display-width "\x1f44d;") 2)
+         (assert-eq (display-width "\x1f44d;\x1f3fd;") 2)
+         (assert-eq (display-width "\x1f468;\x200d;\x1f469;\x200d;\x1f467;") 2)
+         (assert-eq (display-width "\x25cf; \x2713; \x26a0;") 5)
+         (assert-eq (display-width "\x2705;") 2)
+         (assert-eq (display-width "\xff01;") 2)
+         (assert-eq (display-width "\xac00;") 2)
+         (assert-eq (display-width "\x9;") 0)
+         (assert-eq (codepoint-width 0x4E2D) 2)
+         (assert-eq (codepoint-width 0x0301) 0)
+         (assert-eq (codepoint-width 0x41) 1))
+
+(deftest display-width-survives-malformed-utf8
+         (let [a (malloc-allocator)
+               (mut bytes) (sb-new a)]
+           (sb-push-byte! (mut bytes) 0xFF)
+           (sb-push-byte! (mut bytes) 0x61)
+           (sb-push-byte! (mut bytes) 0xE6)
+           (assert-eq (display-width (sb-str (load bytes))) 3)))
+
+(deftest pads-by-display-width
+         (let [a (malloc-allocator)]
+           (assert-eq (pad-right a "\x65e5;" 4) "\x65e5;  ")
+           (assert-eq (pad-left a "ab" 4) "  ab")
+           (assert-eq (pad-right a "toolong" 3) "toolong")
+           (assert-eq (pad-right a "\x1b;[32mok\x1b;[0m" 4)
+                      "\x1b;[32mok\x1b;[0m  ")))
+
+(deftest table-aligns-wide-characters
+         (let [a (malloc-allocator)
+               (mut table) (table-new a ["NAME" "STATUS" "AGE"])]
+           (table-align! (mut table) 2 (AlignRight))
+           (table-row! (mut table) ["\x65e5;\x672c;" "ok" "3m"])
+           (table-row! (mut table) ["abc" "running" "12s"])
+           (assert-eq (table-row-count table) 2)
+           (assert-eq (table-render a (term-plain) table)
+                      "NAME  STATUS   AGE\n\x65e5;\x672c;  ok        3m\nabc   running  12s\n")
+           (table-free! (mut table))))
+
+(deftest table-aligns-painted-cells-and-trims-trailing-space
+         (let [a (malloc-allocator)
+               t (color-term)
+               (mut table) (table-new a ["ID" "NOTE"])]
+           (table-row! (mut table) [(ok a t "a1") ""])
+           (table-row! (mut table) ["b22" "hi"])
+           (assert-eq (table-render a t table)
+                      "\x1b;[90mID\x1b;[0m   \x1b;[90mNOTE\x1b;[0m\n\x1b;[32ma1\x1b;[0m\nb22  hi\n")
+           (table-free! (mut table))))
+
+(deftest headless-table-renders-rows-only
+         (let [a (malloc-allocator)
+               (mut table) (table-new-headless a 2)]
+           (table-row! (mut table) ["x" "1"])
+           (table-row! (mut table) ["yy" "22"])
+           (assert-eq (table-render a (term-ascii) table) "x   1\nyy  22\n")
+           (table-free! (mut table))))
+
+(deftest relative-times
+         (let [a (malloc-allocator)]
+           (assert-eq (relative-time a 0) "just now")
+           (assert-eq (relative-time a 999) "just now")
+           (assert-eq (relative-time a 12000) "12s")
+           (assert-eq (relative-time a 245000) "4m")
+           (assert-eq (relative-time a (* 3 3600000)) "3h")
+           (assert-eq (relative-time a (+ (* 2 86400000) 5000)) "2d")
+           (assert-eq (relative-time a (* 45 86400000)) "1mo")
+           (assert-eq (relative-time a (* 400 86400000)) "1y")
+           (assert-eq (relative-time a -240000) "in 4m")
+           (assert-eq (relative-time-ago a 240000) "4m ago")
+           (assert-eq (relative-time-ago a -240000) "in 4m")
+           (assert-eq (relative-time-ago a 10) "just now")))
+
+(deftest human-bytes-uses-binary-units
+         (let [a (malloc-allocator)]
+           (assert-eq (human-bytes a 0) "0 B")
+           (assert-eq (human-bytes a 1023) "1023 B")
+           (assert-eq (human-bytes a 1024) "1 KiB")
+           (assert-eq (human-bytes a 1536) "1.5 KiB")
+           (assert-eq (human-bytes a 10240) "10 KiB")
+           (assert-eq (human-bytes a 1048575) "1 MiB")
+           (assert-eq (human-bytes a 3650722202) "3.4 GiB")
+           (assert-eq (human-bytes a -2048) "-2 KiB")))
+
+(deftest human-count-uses-decimal-units
+         (let [a (malloc-allocator)]
+           (assert-eq (human-count a 0) "0")
+           (assert-eq (human-count a 999) "999")
+           (assert-eq (human-count a 1000) "1k")
+           (assert-eq (human-count a 1234) "1.2k")
+           (assert-eq (human-count a 9960) "10k")
+           (assert-eq (human-count a 12345) "12k")
+           (assert-eq (human-count a 999999) "1M")
+           (assert-eq (human-count a 3400000) "3.4M")
+           (assert-eq (human-count a 2000000000) "2B")
+           (assert-eq (human-count a -1500) "-1.5k")))
+
+(deftest plurals
+         (let [a (malloc-allocator)]
+           (assert-eq (plural 1 "run" "runs") "run")
+           (assert-eq (plural 0 "run" "runs") "runs")
+           (assert-eq (count-noun a 3 "run" "runs") "3 runs")
+           (assert-eq (count-noun a 1 "finding" "findings") "1 finding")))

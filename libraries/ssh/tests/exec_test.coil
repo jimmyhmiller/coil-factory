@@ -1,0 +1,108 @@
+(module ssh.exec-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.str" :use *)
+(import "ssh.exec" :use *)
+(import "ssh.sys" :use [write-without-sigpipe EPIPE])
+(import "ssh.target" :use *)
+
+(deftest quotes-shell-words
+         (let [a (malloc-allocator)]
+           (assert-eq (shell-quote a "plain-word_1.txt") "plain-word_1.txt")
+           (assert-eq (shell-quote a "user@host:/p/a,b=c+d%")
+                      "user@host:/p/a,b=c+d%")
+           (assert-eq (shell-quote a "") "''")
+           (assert-eq (shell-quote a "two words") "'two words'")
+           (assert-eq (shell-quote a "it's") "'it'\\''s'")
+           (assert-eq (shell-quote a "$(rm -rf ~)") "'$(rm -rf ~)'")
+           (assert-eq (shell-quote a "a\nb") "'a\nb'")
+           (assert-eq (shell-quote a "*") "'*'")
+           (assert-eq (shell-join a ["printf" "%s\\n" "it's" ""])
+                      "printf '%s\\n' 'it'\\''s' ''")))
+
+(deftest builds-the-ssh-argument-vector
+         (let [a (malloc-allocator)
+               args
+                 (ssh-exec-args a
+                                (target "me" "box" 2222)
+                                (ssh-options)
+                                "uname -a")]
+           (assert-eq (len args) 15)
+           (assert-eq (get args 0) "-o")
+           (assert-eq (get args 1) "BatchMode=yes")
+           (assert-eq (get args 3) "ConnectTimeout=10")
+           (assert-eq (get args 5) "StrictHostKeyChecking=accept-new")
+           (assert-eq (get args 7) "LogLevel=ERROR")
+           (assert-eq (get args 8) "-T")
+           (assert-eq (get args 9) "-e")
+           (assert-eq (get args 10) "none")
+           (assert-eq (get args 11) "-p")
+           (assert-eq (get args 12) "2222")
+           (assert-eq (get args 13) "me@box")
+           (assert-eq (get args 14) "uname -a")))
+
+(deftest identity-and-extra-options-precede-the-destination
+         (let [a (malloc-allocator)
+               (mut opts) (ssh-options)]
+           (set! (.identity-file opts) "/keys/id")
+           (set! (.extra opts) ["-o" "ProxyJump=bastion"])
+           (let [args (ssh-exec-args a (target "" "box" 0) (load opts) "true")]
+             (assert-eq (len args) 17)
+             (assert-eq (get args 8) "-i")
+             (assert-eq (get args 9) "/keys/id")
+             (assert-eq (get args 10) "-o")
+             (assert-eq (get args 11) "ProxyJump=bastion")
+             (assert-eq (get args 12) "-T")
+             (assert-eq (get args 15) "box")
+             (assert-eq (get args 16) "true"))))
+
+(deftest rejects-empty-commands-and-timeouts
+         (let [a (malloc-allocator)]
+           (match (ssh-run a
+                           (target "" "box" 0)
+                           (ssh-options)
+                           "  "
+                           (None [(slice u8)])
+                           1000)
+             (Err [error]
+                  (assert-eq (ssh-error-message a error)
+                             "the remote command is empty"))
+             (Ok [_] (assert false)))
+           (match (ssh-run a
+                           (target "" "box" 0)
+                           (ssh-options)
+                           "true"
+                           (None [(slice u8)])
+                           0)
+             (Err [error]
+                  (assert-eq (ssh-error-message a error)
+                             "the timeout must be positive"))
+             (Ok [_] (assert false)))))
+
+(deftest missing-ssh-binary-is-a-spawn-error
+         (let [a (malloc-allocator)
+               (mut opts) (ssh-options)]
+           (set! (.ssh-binary opts) "/nonexistent/ssh-binary")
+           (match (ssh-run a
+                           (target "" "box" 0)
+                           (load opts)
+                           "true"
+                           (None [(slice u8)])
+                           1000)
+             (Err [error]
+                  (match error
+                    (SshSpawnFailed [code] (assert (> code 0)))
+                    (_ (assert false))))
+             (Ok [_] (assert false)))))
+
+(deftest write-without-sigpipe-reports-epipe
+         (let [fds (primitive/alloc-stack (array i32 2))]
+           (assert-eq (os/pipe (cast (ptr i32) fds)) 0)
+           (os/close (load (index fds 0)))
+           (assert-eq (write-without-sigpipe (load (index fds 1))
+                                             (cast (ptr i8) c"x")
+                                             1)
+                      (- 0 EPIPE))
+           (os/close (load (index fds 1)))))

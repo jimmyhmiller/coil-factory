@@ -1,0 +1,77 @@
+(module factory.spec-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "factory.library" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+
+(defn parsed-or-fail [(a (dyn Allocator)) (text (slice u8))] (-> FactorySpec)
+  (match (parse-factory a text)
+    (SpecOk [spec] spec)
+    (SpecBad [problems]
+             (do (println "unexpected problems:\n{s}" (problems-text a problems))
+                 (assert false)
+                 (parsed-or-fail a text)))))
+
+(defn problems-of [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (parse-factory a text)
+    (SpecOk [spec] "")
+    (SpecBad [problems] (problems-text a problems))))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(deftest every-bundled-factory-parses
+  (let [a (malloc-allocator)]
+    (for bundled (iter (bundled-factories))
+      (let [b bundled
+            (mut spec) (parsed-or-fail a (.text b))]
+        (assert (= (.name spec) (.name b)))
+        (assert (> (station-count (mut spec)) 0))))))
+
+(deftest reads-front-matter-context-stations-and-settings
+  (let [a (malloc-allocator)
+        (mut spec) (parsed-or-fail a "---\nname: fixer\ndescription: Fix things.\ninput: The bug.\nmodel: deepseek/deepseek-v4-pro\ntools: [files, shell]\nattempts: 2\n---\n\n# Fixer\n\nShared context line.\n\n## Station: reproduce\ntools: files, shell\n\nWrite a failing test.\n\n### Detail\n\nNested detail stays in the station.\n\n## Notes\n\nExtra shared context.\n\n## Station: fix\ngate: coil test\nattempts: 5\n\nMake it pass.\n")]
+    (assert (= (.name spec) "fixer"))
+    (assert (= (.description spec) "Fix things."))
+    (assert (= (.model spec) "deepseek/deepseek-v4-pro"))
+    (assert (= (.tools spec) "files, shell"))
+    (assert-eq (.attempts spec) 2)
+    (assert (contains? (.context spec) "Shared context line."))
+    (assert (contains? (.context spec) "## Notes"))
+    (assert (contains? (.context spec) "Extra shared context."))
+    (assert (not (contains? (.context spec) "Write a failing test")))
+    (assert-eq (station-count (mut spec)) 2)
+    (let [first (station-spec (mut spec) 0)
+          second (station-spec (mut spec) 1)]
+      (assert (= (.name first) "reproduce"))
+      (assert (contains? (.instructions first) "Write a failing test."))
+      (assert (contains? (.instructions first) "Nested detail stays in the station."))
+      (assert (= (.gate first) ""))
+      (assert (= (.name second) "fix"))
+      (assert (= (.gate second) "coil test"))
+      (assert-eq (station-attempts (mut spec) second) 5)
+      (assert-eq (station-attempts (mut spec) first) 2)
+      (assert (= (.instructions second) "Make it pass.")))))
+
+(deftest reports-typos-and-mistakes-with-line-numbers
+  (let [a (malloc-allocator)]
+    (let [p (problems-of a "---\nname: x\nmodle: fast\n---\n\n## Station: a\ngates: true\n\nDo it.\n")]
+      (assert (contains? p "line 3: unknown front-matter key \"modle\""))
+      (assert (contains? p "line 7: unknown station setting \"gates\"")))
+    (let [p (problems-of a "---\nname: Bad Name\n---\n\n## Station: a\n\nDo it.\n")]
+      (assert (contains? p "must be lowercase")))
+    (let [p (problems-of a "---\nname: x\n---\n\nNo stations here.\n")]
+      (assert (contains? p "at least one `## Station: name`")))
+    (let [p (problems-of a "---\nname: x\ntools: files, internet\n---\n\n## Station: a\n\nDo it.\n")]
+      (assert (contains? p "unknown tool group \"internet\"")))
+    (let [p (problems-of a "---\nname: x\n---\n\n## Station: a\n\nOne.\n\n## Station: a\n\nTwo.\n")]
+      (assert (contains? p "already a station named \"a\"")))
+    (let [p (problems-of a "---\nname: x\n---\n\n## Station: empty\ngate: true\n")]
+      (assert (contains? p "has no instructions")))
+    (let [p (problems-of a "---\nname: x\nattempts: lots\n---\n\n## Station: a\n\nDo it.\n")]
+      (assert (contains? p "attempts must be a whole number")))
+    (let [p (problems-of a "No front matter.\n\n## Station: a\n\nDo it.\n")]
+      (assert (contains? p "starts with front matter")))))

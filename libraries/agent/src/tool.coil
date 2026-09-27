@@ -1,0 +1,123 @@
+(module agent.tool)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+;;; What the model sees: a name, a description, and a JSON Schema for the
+;;; arguments, written as JSON text. The strings are borrowed from the tool and
+;;; must live as long as it does.
+(defstruct ToolSpec
+  [(name (slice u8))
+   (description (slice u8))
+   (parameters (slice u8))])
+
+;;; One call proposed by the model. `arguments` is the parsed argument object;
+;;; `arguments-json` is the exact text the model produced.
+(defstruct ToolCall
+  [(id (slice u8))
+   (name (slice u8))
+   (arguments JVal)
+   (arguments-json (slice u8))])
+
+;;; A tool either produces text for the model or fails with a message the model
+;;; is shown. A failure is an ordinary outcome, not a crash: the loop continues.
+(defsum ToolOutcome
+  (ToolOk [(output (slice u8))])
+  (ToolFailed [(message (slice u8))]))
+
+;;; What a running tool may ask of the agent that runs it. Long-running tools
+;;; poll `tool-cancelled?` and stop early when it becomes true.
+(deftrait ToolContext [Self]
+  (tool-cancelled? [(self (ptr Self))] (-> bool)))
+
+(deftrait Tool [Self]
+  (tool-spec [(self (ptr Self))] (-> ToolSpec))
+  ;;; One short line a person reads in a dashboard, such as "$ coil test" or
+  ;;; "edit src/game.coil". Allocate it in `a`.
+  (tool-summary [(self (ptr Self)) (a (dyn Allocator)) (call ToolCall)]
+                (-> (slice u8)))
+  (tool-run [(self (ptr Self))
+             (a (dyn Allocator))
+             (call ToolCall)
+             (context (dyn ToolContext))]
+            (-> ToolOutcome)))
+
+;;; A context for tools that are run outside an agent, such as in tests.
+(defstruct NeverCancelled [(unused u8)])
+
+(impl ToolContext NeverCancelled
+  (tool-cancelled? [(self (ptr NeverCancelled))] (-> bool) false))
+
+;;; An ordered set of tools. The registry borrows each tool; the caller keeps
+;;; the concrete tool alive as long as the registry.
+(defstruct ToolRegistry [(tools (ArrayList (dyn Tool)))])
+
+(defn registry-new [(a (dyn Allocator))] (-> ToolRegistry)
+  (let [(mut result) (primitive/zeroed ToolRegistry)]
+    (set! (.tools result) (al-new [(dyn Tool)] a))
+    (load result)))
+
+(defn registry-free! [(registry (ptr ToolRegistry))] (-> i64)
+  (al-free! [(dyn Tool)] (mut (.tools registry))))
+
+(defn registry-count [(registry (ptr ToolRegistry))] (-> i64)
+  (len (.tools registry)))
+
+(defn registry-at [(registry (ptr ToolRegistry)) (index i64)] (-> (dyn Tool))
+  (get (.tools registry) index))
+
+;;; Find a tool by name.
+(defn registry-find [(registry (ptr ToolRegistry)) (name (slice u8))] (-> (Option (dyn Tool)))
+  (let [(mut i) 0
+        count (len (.tools registry))
+        (mut found) (: (None) (Option (dyn Tool)))]
+    (loop (if (>= (load i) count)
+              (break)
+              (let [tool (get (.tools registry) (load i))
+                    spec (tool-spec tool)]
+                (if (= (.name spec) name)
+                    (do (set! found (Some tool)) (break))
+                    (set! i (+ (load i) 1))))))
+    (load found)))
+
+;;; Add a tool. Refuses a second tool with the same name, so a registry is
+;;; always unambiguous.
+(defn registry-add! [(registry (ptr ToolRegistry)) (tool (dyn Tool))] (-> bool)
+  (let [spec (tool-spec tool)]
+    (match (registry-find registry (.name spec))
+      (Some [existing] false)
+      (None [] (do (push! [(dyn Tool)] (mut (.tools registry)) tool) true)))))
+
+;;; The argument text as a string field, or "" when absent or not a string.
+(defn call-string [(call ToolCall) (key (slice u8))] (-> (slice u8))
+  (match (jv-get (.arguments call) key)
+    (JStr [s] s)
+    (_ "")))
+
+;;; Whether the argument object has `key` at all.
+(defn call-has? [(call ToolCall) (key (slice u8))] (-> bool)
+  (not (jv-null? (jv-get (.arguments call) key))))
+
+;;; An integer field, or `default` when absent or not an integer.
+(defn call-int [(call ToolCall) (key (slice u8)) (default i64)] (-> i64)
+  (match (jv-get (.arguments call) key)
+    (JInt [n] n)
+    (_ default)))
+
+;;; A boolean field, or `default` when absent or not a boolean.
+(defn call-bool [(call ToolCall) (key (slice u8)) (default bool)] (-> bool)
+  (match (jv-get (.arguments call) key)
+    (JBool [b] b)
+    (_ default)))
+
+;;; Build a ToolCall directly, which is how tools are tested without a model.
+(defn tool-call [(id (slice u8)) (name (slice u8)) (arguments JVal) (arguments-json (slice u8))] (-> ToolCall)
+  (let [(mut call) (primitive/zeroed ToolCall)]
+    (set! (.id call) id)
+    (set! (.name call) name)
+    (set! (.arguments call) arguments)
+    (set! (.arguments-json call) arguments-json)
+    (load call)))

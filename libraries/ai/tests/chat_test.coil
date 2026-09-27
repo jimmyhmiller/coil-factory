@@ -1,0 +1,133 @@
+(module ai-chat-test)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.chat" :use *)
+(import "ai.openai" :use *)
+(import "sse.core" :as sse)
+
+(defstruct FakeTransport
+  [(seen (ptr bool))
+   (reply (slice u8))])
+
+(impl ChatHttpTransport FakeTransport
+  (send-chat-http [(self (ptr FakeTransport))
+                   (a (dyn Allocator))
+                   (url (slice u8))
+                   (authorization (slice u8))
+                   (body (slice u8))
+                   (timeout-ms i64)]
+                  (-> HttpReply)
+                  (let [(mut result) (primitive/zeroed HttpReply)]
+                    (when (and (= url
+                                  "https://example.test/v1/chat/completions")
+                               (= authorization "Bearer test-key")
+                               (> (slice-len [u8] body) 0))
+                      (set! (load (field self seen)) true)
+                      0)
+                    (set! (.status result) 200)
+                    (set! (.body result) (.reply self))
+                    (set! (.error result) "")
+                    (load result)))
+  (send-chat-http-stream [(self (ptr FakeTransport))
+                          (a (dyn Allocator))
+                          (url (slice u8))
+                          (authorization (slice u8))
+                          (body (slice u8))
+                          (timeout-ms i64)
+                          (decoder (ptr sse/SseDecoder))]
+                         (-> HttpReply)
+                         (let [(mut result) (primitive/zeroed HttpReply)]
+                           (sse/sse-decoder-feed! decoder
+                                                  "data: {\"choices\":[{\"delta\":{\"content\":\"class\"},\"finish_reason\":null}]}\n\n")
+                           (sse/sse-decoder-feed! decoder
+                                                  "data: {\"choices\":[{\"delta\":{\"content\":\"ified\"},\"finish_reason\":\"stop\"}]}\n\n")
+                           (sse/sse-decoder-feed! decoder "data: [DONE]\n\n")
+                           (set! (.status result) 200)
+                           (load result))))
+
+(defstruct TextSink [(text (ptr StrBuf))])
+
+(impl ChatDeltaSink TextSink
+  (on-chat-delta [(self (ptr TextSink)) (delta ChatDelta)]
+                 (-> bool)
+                 (sb-push-str! (mut (load (field self text))) (.text delta))
+                 true))
+
+(deftest generic-chat-client-uses-injected-transport
+         (let [a (malloc-allocator)
+               seen (box! a bool false)
+               transport (primitive/alloc-stack FakeTransport)
+               provider (primitive/alloc-stack OpenAiChat)
+               (mut request) (primitive/zeroed ChatRequest)]
+           (set! (.seen transport) seen)
+           (set! (.reply transport)
+                 "{\"choices\":[{\"message\":{\"content\":\"classified\",\"tool_calls\":null},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1}}")
+           (set! (.url provider) "https://example.test/v1/chat/completions")
+           (set! (.api-key provider) "test-key")
+           (set! (.transport provider) transport)
+           (set! (.model request) "test-model")
+           (set! (.messages request) (user-messages a "Classify this document"))
+           (set! (.tools request) (JNull))
+           (set! (.timeout-ms request) 5000)
+           (match (chat provider a (load request))
+             (ChatFailed [failure] (assert false))
+             (ChatOk [answer]
+                     (let [answer-value answer]
+                       (assert (= (.text answer-value) "classified"))
+                       (assert-eq (.input-tokens answer-value) 7)
+                       (assert (load seen)))))))
+
+(deftest streams-incremental-chat-deltas
+         (let [a (malloc-allocator)
+               seen (box! a bool false)
+               transport (primitive/alloc-stack FakeTransport)
+               provider (primitive/alloc-stack OpenAiChat)
+               collected (box! a StrBuf (sb-new a))
+               sink (primitive/alloc-stack TextSink)
+               (mut request) (primitive/zeroed ChatRequest)]
+           (set! (.seen transport) seen)
+           (set! (.url provider) "https://example.test/v1/chat/completions")
+           (set! (.api-key provider) "test-key")
+           (set! (.transport provider) transport)
+           (set! (.text sink) collected)
+           (set! (.model request) "test-model")
+           (set! (.messages request) (user-messages a "Classify this"))
+           (set! (.tools request) (JNull))
+           (set! (.timeout-ms request) 5000)
+           (match (chat-stream provider a (load request) sink)
+             (StreamFailed [failure] (assert false))
+             (StreamFinished []
+                             (assert (= (sb-str (load collected)) "classified"))))))
+
+(deftest preserves-tool-descriptions-and-model-tool-calls
+         (let [a (malloc-allocator)
+               tools-json
+                 "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Find a note\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]"
+               response-json
+                 "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}"
+               (mut request) (primitive/zeroed ChatRequest)]
+           (set! (.model request) "test-model")
+           (set! (.messages request) (user-messages a "Find the note"))
+           (match (from-json [JVal] a tools-json)
+             (Err [failure] (assert false))
+             (Ok [tools]
+                 (set! (.tools request) tools)
+                 (match (from-json [JVal]
+                                   a
+                                   (openai-payload a (load request) false))
+                   (Err [failure] (assert false))
+                   (Ok [wire]
+                       (assert-eq (jv-len (jv-get wire "tools")) 1)))))
+           (match (decode-response a response-json)
+             (ChatFailed [failure] (assert false))
+             (ChatOk [reply]
+                     (let [value reply
+                           call (jv-nth (.tool-calls value) 0)]
+                       (assert (= (.finish-reason value) "tool_calls"))
+                       (assert (= (jv-str (jv-get (jv-get call "function")
+                                                  "name"))
+                                  "lookup")))))))

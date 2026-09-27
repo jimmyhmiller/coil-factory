@@ -1,0 +1,133 @@
+(module agent_tools.sandbox-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "agent_tools.sandbox" :use *)
+(import "agent_tools.shell")
+(import "agent_tools.workspace")
+(import "agent.tool")
+(import "agent_tools.test-support" :use *)
+
+(defn assert-argv [(actual (ArrayList (slice u8))) (expected (slice (slice u8)))] (-> i64)
+  (when (!= (len actual) (len expected))
+    (println "argv length {} != expected {}" (len actual) (len expected))
+    0)
+  (assert-eq (len actual) (len expected))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len expected))
+              (break)
+              (do (when (!= (get actual (load i)) (get expected (load i)))
+                    (println "argv[{}] = {} but expected {}" (load i) (get actual (load i)) (get expected (load i)))
+                    0)
+                  (assert (= (get actual (load i)) (get expected (load i))))
+                  (set! i (+ (load i) 1))))))
+  0)
+
+(deftest no-sandbox-runs-sh-directly
+  (let [a (malloc-allocator)]
+    (assert-argv (sandbox-argv a (NoSandbox) "/w" "echo hi")
+                 ["/bin/sh" "-c" "echo hi"])))
+
+(deftest bubblewrap-argv-without-network
+  (let [a (malloc-allocator)]
+    (assert-argv (sandbox-argv a (Bubblewrap (sandbox-options false)) "/home/u/ws" "make test")
+                 ["bwrap" "--die-with-parent" "--new-session" "--unshare-pid"
+                  "--ro-bind" "/" "/"
+                  "--dev" "/dev"
+                  "--proc" "/proc"
+                  "--tmpfs" "/tmp"
+                  "--bind" "/home/u/ws" "/home/u/ws"
+                  "--chdir" "/home/u/ws"
+                  "--unshare-net"
+                  "--"
+                  "/bin/sh" "-c" "make test"])))
+
+(deftest bubblewrap-argv-with-network-and-extra-paths
+  (let [a (malloc-allocator)]
+    (assert-argv (sandbox-argv a
+                               (Bubblewrap (sandbox-options-with-paths true ["/srv/repo.git" "/var/cache/x"]))
+                               "/w"
+                               "git commit -m x")
+                 ["bwrap" "--die-with-parent" "--new-session" "--unshare-pid"
+                  "--ro-bind" "/" "/"
+                  "--dev" "/dev"
+                  "--proc" "/proc"
+                  "--tmpfs" "/tmp"
+                  "--bind" "/w" "/w"
+                  "--bind" "/srv/repo.git" "/srv/repo.git"
+                  "--bind" "/var/cache/x" "/var/cache/x"
+                  "--chdir" "/w"
+                  "--"
+                  "/bin/sh" "-c" "git commit -m x"])))
+
+(deftest mac-profile-confines-writes-and-escapes-paths
+  (let [a (malloc-allocator)
+        argv (sandbox-argv a (MacSandbox (sandbox-options-with-paths true ["/x/common.git"])) "/Users/u/w \"q\"\\z" "ls")]
+    (assert-eq (len argv) 6)
+    (assert (= (get argv 0) "/usr/bin/sandbox-exec"))
+    (assert (= (get argv 1) "-p"))
+    (assert (= (get argv 3) "/bin/sh"))
+    (assert (= (get argv 4) "-c"))
+    (assert (= (get argv 5) "ls"))
+    (let [profile (get argv 2)]
+      (assert (contains? profile "(version 1)(allow default)(deny file-write*)(allow file-write*"))
+      (assert (contains? profile "(subpath \"/Users/u/w \\\"q\\\"\\\\z\")"))
+      (assert (contains? profile "(subpath \"/private/var/folders\")"))
+      (assert (contains? profile "(subpath \"/private/tmp\")"))
+      (assert (contains? profile "(literal \"/dev/null\")"))
+      (assert (contains? profile "(subpath \"/x/common.git\")"))
+      (assert (not (contains? profile "network"))))
+    (let [closed (get (sandbox-argv a (MacSandbox (sandbox-options false)) "/w" "ls") 2)]
+      (assert (contains? closed "(deny network-outbound (remote ip))")))))
+
+(deftest detect-finds-the-platform-sandbox
+  (let [a (malloc-allocator)]
+    (match (sandbox-detect a (sandbox-options true))
+      (MacSandbox [_] 0)
+      (Bubblewrap [_] 0)
+      (NoSandbox [] (do (println "no sandbox found on this machine") (assert false))))))
+
+(defn open-ws [(a (dyn Allocator)) (root (slice u8))] (-> agent_tools.workspace/Workspace)
+  (match (agent_tools.workspace/workspace-open a root)
+    (Ok [ws] ws)
+    (Err [message] (do (println "{}" message) (assert false) (agent_tools.workspace/Workspace :root "")))))
+
+(deftest git-worktrees-get-their-common-directory
+  (let [a (malloc-allocator)
+        base (fresh-dir a (cache-dir a) "gitdirs")
+        main (path-join a base "main")
+        tree (path-join a base "tree")]
+    (assert-eq (run-argv a ["/bin/mkdir" main]) 0)
+    (assert-eq (run-argv a ["/usr/bin/env" "git" "-C" main "init" "-q"]) 0)
+    (assert-eq (run-argv a ["/usr/bin/env" "git" "-C" main "-c" "user.email=t@example.com" "-c" "user.name=t"
+                            "commit" "-q" "--allow-empty" "-m" "root"]) 0)
+    (match (workspace-git-dirs a (open-ws a main))
+      (Err [m] (do (println "{}" m) (assert false)))
+      (Ok [dirs] (assert-eq (len dirs) 0)))
+    (assert-eq (run-argv a ["/usr/bin/env" "git" "-C" main "worktree" "add" "-q" "-b" "work" tree]) 0)
+    (let [ws (open-ws a tree)]
+      (match (workspace-git-dirs a ws)
+        (Err [m] (do (println "{}" m) (assert false)))
+        (Ok [dirs] (do (assert-eq (len dirs) 1)
+                       (assert (= (get dirs 0) (path-join a (agent_tools.workspace/workspace-root (open-ws a main)) ".git"))))))
+      (match (workspace-sandbox-options a ws false)
+        (Err [m] (do (println "{}" m) (assert false)))
+        (Ok [options]
+            (let [policy (sandbox-detect a options)
+                  never (box! a agent.tool/NeverCancelled (agent.tool/NeverCancelled :unused 0))]
+              (match (agent_tools.shell/run-command a ws policy
+                                                     "git -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m second && git log --format=%s"
+                                                     30000 never)
+                (Err [m] (do (println "{}" m) (assert false)))
+                (Ok [r] (let [result r]
+                          (when (!= (.exit-code result) 0) (println "{}" (.output result)) 0)
+                          (assert-eq (.exit-code result) 0)
+                          (assert (= (.output result) "second\nroot\n")))))
+              ;; Without the git directory, the sandbox blocks the commit.
+              (match (agent_tools.shell/run-command a ws (sandbox-detect a (sandbox-options false))
+                                                     "git -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m third"
+                                                     30000 never)
+                (Err [m] (do (println "{}" m) (assert false)))
+                (Ok [r] (let [result r] (assert (!= (.exit-code result) 0)))))))))
+    (remove-tree a base)))

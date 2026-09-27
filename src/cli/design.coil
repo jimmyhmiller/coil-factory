@@ -1,0 +1,171 @@
+(module factory.cli.design)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "cli.prompt" :as prompt)
+(import "cli.style" :as style)
+(import "durable.atomic" :as atomic)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.library" :use [resolve-factory list-factories bundled-skills Found NotFound CatalogEntry Bundled])
+(import "factory.proc" :use *)
+(import "factory.spec" :use *)
+(import "factory.specparse" :use *)
+(import "factory.cli.ctx" :use *)
+(import "factory.cli.render" :use *)
+
+;;; Designing factories: the interactive `new`, `check`, the library listing,
+;;; and installing the Claude Code skills.
+
+(defn print-spec-summary [(ctx (ptr Ctx)) (spec (ptr FactorySpec))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut table) (style/table-new a ["" "STATION" "GATE" "TOOLS" "ATTEMPTS"])]
+    (for index (range 0 (station-count spec))
+      (let [s (station-spec spec index)]
+        (style/table-row! (mut table)
+                          [(style/muted a term (int-text a (+ index 1)))
+                           (style/strong a term (.name s))
+                           (if (> (len (.gate s)) 0) (style/accent a term (.gate s)) (style/muted a term "judgment"))
+                           (station-tools spec s)
+                           (int-text a (station-attempts spec s))])))
+    (print "{s}" (style/table-render a term (load table)))
+    0))
+
+(defn cmd-check [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)]
+    (match (resolve-factory a (.home ctx) reference)
+      (NotFound [message] (fail-with ctx message))
+      (Found [found]
+             (let [entry found]
+               (match (parse-factory a (.text entry))
+                 (SpecBad [problems]
+                          (do (say (join a [(style/err a term "✗ ") (style/strong a term reference) " has problems"]))
+                              (for problem (iter problems)
+                                (let [p problem]
+                                  (say (join a ["  " (style/muted a term (join a ["line " (int-text a (.line p))])) "  " (.message p)]))))
+                              1))
+                 (SpecOk [parsed]
+                         (let [(mut spec) parsed]
+                           (say (join a [(style/ok a term "✓ ") (style/strong a term (.name spec))
+                                         (style/muted a term (join a ["  " (.origin entry) (if (> (len (.path entry)) 0) (join a [" · " (.path entry)]) "")]))]))
+                           (when (> (len (.description spec)) 0) (say (join a ["  " (.description spec)])) 0)
+                           (when (> (len (.input spec)) 0) (say (style/muted a term (join a ["  brief: " (.input spec)]))) 0)
+                           (say "")
+                           (print-spec-summary ctx (mut spec))
+                           0))))))))
+
+(defn cmd-factories [(ctx (ptr Ctx))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut table) (style/table-new a ["FACTORY" "STATIONS" "WHERE" "WHAT"])]
+    (for found (iter (list-factories a (.home ctx)))
+      (let [entry found]
+        (match (parse-factory a (.text entry))
+          (SpecOk [parsed]
+                  (let [(mut spec) parsed
+                        (mut chain) (sb-new a)]
+                    (for index (range 0 (station-count (mut spec)))
+                      (when (> index 0) (sb-push-str! (mut chain) " → ") 0)
+                      (sb-push-str! (mut chain) (.name (station-spec (mut spec) index))))
+                    (style/table-row! (mut table) [(style/strong a term (.name entry)) (sb-finish! (mut chain))
+                                                   (style/muted a term (.origin entry)) (truncate a (.description spec) 60)])))
+          (SpecBad [problems]
+                   (style/table-row! (mut table) [(style/strong a term (.name entry)) (style/err a term "invalid")
+                                                  (style/muted a term (.origin entry)) "factory check shows why"])))))
+    (print "{s}" (style/table-render a term (load table)))
+    (say (style/muted a term (join a ["\nyour library: " (factories-dir a (.home ctx)) "     new one: factory new NAME"])))
+    0))
+
+(defn answer [(result (Result (slice u8) prompt/PromptError))] (-> (Option (slice u8)))
+  (match result
+    (Ok [text] (Some text))
+    (Err [e] (None))))
+
+;;; `factory new NAME`: design a factory by answering questions, then write it
+;;; to the library and validate it.
+(defn cmd-new [(ctx (ptr Ctx)) (name (slice u8)) (out (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut p) (prompt/prompter-new a)
+        path (if (> (len out) 0) out (path-join a (factories-dir a (.home ctx)) (join a [name ".md"])))]
+    (block :new
+           (when (not (kebab-name? name))
+             (return-from :new (fail-with ctx "a factory name is lowercase letters, digits, and dashes, like fix-issue")))
+           (match (atomic/file-exists? a path)
+             (Ok [exists] (when exists (return-from :new (fail-with ctx (join a [path " already exists; pick another name or edit it"])))))
+             (Err [e] 0))
+           (say (join a [(paint-bold a term (violet) "◆ New factory ") (style/strong a term name)]))
+           (say (style/muted a term "  A factory is a line of stations. Each station is one agent with tools, and it is not done until"))
+           (say (style/muted a term "  it says so and its gate command passes. Answer a few questions; you can edit the file after.\n"))
+           (let [description (match (answer (prompt/ask (mut p) "What does one run produce? (one sentence)" ""))
+                               (Some [t] t) (None [] (return-from :new 1)))
+                 input (match (answer (prompt/ask (mut p) "What is the brief a run starts with?" "What to build, in plain language."))
+                         (Some [t] t) (None [] (return-from :new 1)))
+                 context (match (answer (prompt/ask-multiline (mut p) "Shared context every station should know (conventions, constraints, taste). End with a line containing only ."))
+                           (Some [t] t) (None [] (return-from :new 1)))
+                 model (match (answer (prompt/ask (mut p) "Model (provider/model; empty for the site default)" ""))
+                         (Some [t] t) (None [] (return-from :new 1)))
+                 (mut stations) (sb-new a)
+                 (mut count) 0]
+             (say (style/muted a term "\n  Stations, in order. Leave the name empty when you are done.\n"))
+             (loop
+               (let [label (join a ["Station " (int-text a (+ (load count) 1)) " name"])
+                     station (match (answer (prompt/ask (mut p) label "")) (Some [t] (str-trim t)) (None [] ""))]
+                 (if (= (len station) 0)
+                     (break)
+                     (if (not (kebab-name? station))
+                         (say (style/warn a term "  station names are lowercase letters, digits, and dashes"))
+                         (let [what (match (answer (prompt/ask-multiline (mut p) (join a ["What does " station " do, and how does it know it is done? End with ."])))
+                                      (Some [t] t) (None [] ""))
+                               gate (match (answer (prompt/ask (mut p) "Command that proves it worked (the gate), or empty for judgment" ""))
+                                      (Some [t] (str-trim t)) (None [] ""))
+                               tools (match (answer (prompt/ask (mut p) "Tools" "files, shell"))
+                                       (Some [t] (str-trim t)) (None [] "files, shell"))]
+                           (sb-push-str! (mut stations) (join a ["\n## Station: " station "\n"]))
+                           (when (> (len gate) 0) (sb-push-str! (mut stations) (join a ["gate: " gate "\n"])) 0)
+                           (sb-push-str! (mut stations) (join a ["tools: " tools "\n\n" (str-trim what) "\n"]))
+                           (set! count (+ (load count) 1))
+                           0)))))
+             (when (= (load count) 0)
+               (return-from :new (fail-with ctx "a factory needs at least one station")))
+             (let [text (join a ["---\nname: " name "\ndescription: " description "\ninput: " input "\n"
+                                 (if (> (len (str-trim model)) 0) (join a ["model: " (str-trim model) "\n"]) "")
+                                 "tools: files, shell\n---\n\n" (str-trim context) "\n" (sb-finish! (mut stations))])]
+               (match (parse-factory a text)
+                 (SpecBad [problems]
+                          (do (fail-with ctx (join a ["the answers do not make a valid factory:\n" (problems-text a problems)]))
+                              (return-from :new 1)))
+                 (SpecOk [parsed] 0))
+               (match (atomic/ensure-dir! a (factories-dir a (.home ctx)) 448) (Ok [m] 0) (Err [e] 0))
+               (match (atomic/write-file-atomic! a path text 420)
+                 (Err [e] (return-from :new (fail-with ctx (join a ["could not write " path]))))
+                 (Ok [written] 0))
+               (say "")
+               (say (join a [(style/ok a term "✓ ") "wrote " (style/strong a term path)
+                             (style/muted a term (join a ["  (" (int-text a (load count)) (if (= (load count) 1) " station)" " stations)")]))]))
+               (say (join a [(style/muted a term "  check  ") (style/accent a term (join a ["factory check " name]))]))
+               (say (join a [(style/muted a term "  run    ") (style/accent a term (join a ["factory start " name " --project . \"<brief>\""]))]))
+               (say (style/muted a term "  refine it with Claude Code: the factory-design skill knows this format (factory skills install)"))
+               0)))))
+
+(defn cmd-skills-install [(ctx (ptr Ctx)) (dir (slice u8))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        root (if (> (len dir) 0) dir (path-join a (env-or a "HOME" "") ".claude/skills"))]
+    (block :install
+           (for skill (iter (bundled-skills))
+             (let [s skill
+                   folder (path-join a root (.name s))
+                   file (path-join a folder "SKILL.md")]
+               (match (atomic/ensure-dir! a folder 493)
+                 (Err [e] (return-from :install (fail-with ctx (join a ["could not create " folder]))))
+                 (Ok [made] 0))
+               (match (atomic/write-file-atomic! a file (.text s) 420)
+                 (Err [e] (return-from :install (fail-with ctx (join a ["could not write " file]))))
+                 (Ok [written] (say (join a [(style/ok a term "✓ ") (style/strong a term (.name s)) (style/muted a term (join a ["  " file]))]))))))
+           (say (style/muted a term "\nClaude Code now knows how to design factories with you, operate runs, and set up sites."))
+           0)))
