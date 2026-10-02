@@ -38,8 +38,8 @@
                              (break)
                              (let [run (jv-nth runs (load i))
                                    status (str-field run "status")
-                                   active (or (= status "running") (= status "paused") (= status "queued") (= status "blocked"))]
-                               (when (= status "blocked") (set! attention (+ (load attention) 1)) 0)
+                                   active (or (= status "running") (= status "paused") (= status "queued") (= status "blocked") (= status "approval"))]
+                               (when (or (= status "blocked") (= status "approval")) (set! attention (+ (load attention) 1)) 0)
                                (if (or all active (< (load shown) 10))
                                    (do (style/table-row! (mut table)
                                                          [(status-glyph a term status)
@@ -105,7 +105,9 @@
                                               " · " (tokens a run) " tokens"])))
                    (when (and (> (len (str-field run "reason")) 0) (not (= status "succeeded")))
                      (say "")
-                     (say (join a [(if (= status "blocked") (paint-bold a term (amber) "Waiting for you: ") (style/warn a term "Reason: "))
+                     (say (join a [(cond (= status "blocked") (paint-bold a term (amber) "Waiting for you: ")
+                                         (= status "approval") (paint-bold a term (amber) "Open on your phone: ")
+                                         :else (style/warn a term "Reason: "))
                                    (str-field run "reason")]))
                      0)
                    (say "")
@@ -356,6 +358,7 @@
                            (say (join a [(style/ok a term "✉ sent") " to " (style/strong a term (join a [(str-field reply "run") "/" (str-field reply "agent")]))
                                          (style/muted a term (cond (or (= status "running") (= status "paused")) "  (read at its next turn)"
                                                                    (= status "blocked") "  (the station resumes with your answer)"
+                                                                   (= status "approval") "  (read when it resumes after your approval)"
                                                                    :else "  (it will answer in its workspace)"))]))
                            0))))))
 

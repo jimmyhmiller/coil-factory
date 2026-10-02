@@ -1,0 +1,78 @@
+(module factory.approval-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "factory.approval" :use *)
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(defn summary-of [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> Summary)
+  (match (parse-summary a kind reply)
+    (Ok [s] s)
+    (Err [why] (do (println "{s}" why) (assert false) (parse-summary-or-fail)))))
+
+(defn parse-summary-or-fail [] (-> Summary)
+  (Summary :title "" :summary "" :proposals (al-new [Proposal] (malloc-allocator)) :questions (al-new [(slice u8)] (malloc-allocator))))
+
+(defn refusal [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> (slice u8))
+  (match (parse-summary a kind reply)
+    (Ok [_] "")
+    (Err [why] why)))
+
+(deftest reads-a-summary-and-refuses-anything-else
+  (let [a (malloc-allocator)
+        s (summary-of a "station"
+                      "Here it is:\n{\"title\": \"plan: host attachment\", \"summary\": \"It says **X**.\", \"proposals\": [{\"title\": \"Accept X\", \"detail\": \"d\", \"evidence\": \"e\"}, {\"title\": \"File a bug\"}], \"questions\": [{\"text\": \"Which category?\"}]}")]
+    (assert (= (.title s) "plan: host attachment"))
+    (assert-eq (len (.proposals s)) 2)
+    (assert (= (.evidence (get (.proposals s) 0)) "e"))
+    (assert (= (.detail (get (.proposals s) 1)) ""))
+    (assert-eq (len (.questions s)) 1))
+  (let [a (malloc-allocator)]
+    (assert (contains? (refusal a "station" "no json here") "not a JSON object"))
+    (assert (contains? (refusal a "station" "{\"title\": \" \", \"proposals\": [{\"title\": \"x\"}]}") "no title"))
+    (assert (contains? (refusal a "station" "{\"title\": \"t\", \"proposals\": [{\"title\": \"\"}]}") "proposal 1 has no title"))
+    (assert (contains? (refusal a "station" "{\"title\": \"t\", \"questions\": [{\"text\": \"q\"}]}") "no proposals for finished work"))
+    (assert (contains? (refusal a "question" "{\"title\": \"t\"}") "nothing to decide"))
+    ;; A stopped agent may only ask.
+    (assert (= (refusal a "question" "{\"title\": \"t\", \"questions\": [{\"text\": \"q\"}]}") ""))))
+
+(deftest reads-a-summarizer
+  (let [a (malloc-allocator)]
+    (match (parse-summarizer a "---\nname: careful\nharness: codex\nmodel: gpt-6.1-sol\ntools: read\n---\n\nSummarize.\n")
+      (SummarizerOk [s] (do (assert (= (.name s) "careful")) (assert (= (.harness s) "codex")) (assert (= (.instructions s) "Summarize."))))
+      (SummarizerBad [_] (assert false)))
+    (match (parse-summarizer a "---\nname: x\ntools: files\nverdicts: a, b\n---\n\nGo.\n")
+      (SummarizerOk [_] (assert false))
+      (SummarizerBad [problems] (assert-eq (len problems) 2)))))
+
+(deftest a-decision-becomes-the-agents-next-instruction
+  (let [a (malloc-allocator)
+        request (match (jv-parse a "{\"proposals\": [{\"title\": \"Accept X\"}, {\"title\": \"Do not boot in JIT\"}], \"questions\": [{\"text\": \"Which category?\"}]}")
+                  (Some [v] v) (None [] (do (assert false) (jv-object a))))
+        decision (match (jv-parse a "{\"approved_all\": false, \"proposals\": [{\"approved\": true, \"comment\": \"\"}, {\"approved\": false, \"comment\": \"Show the probe first.\"}], \"answers\": [\"not-implemented\"], \"comment\": \"Good find.\"}")
+                   (Some [v] v) (None [] (do (assert false) (jv-object a))))
+        text (decision-message a request decision)]
+    (assert (contains? text "1. APPROVED: Accept X"))
+    (assert (contains? text "2. REJECTED: Do not boot in JIT\n   Jimmy: Show the probe first."))
+    (assert (contains? text "Question: Which category?\nAnswer: not-implemented"))
+    (assert (contains? text "Jimmy's note: Good find."))))
+
+(deftest the-request-carries-the-summary-and-the-raw-material
+  (let [a (malloc-allocator)
+        s (summary-of a "station" "{\"title\": \"t\", \"summary\": \"s\", \"proposals\": [{\"title\": \"p\"}]}")
+        (mut evidence) (al-new [Evidence] a)]
+    (push! (mut evidence) (Evidence :name "The agent's own words" :content "I did it" :format "text"))
+    (let [body (request-json a (RequestSource :site "laptop" :run "r-1" :station "plan" :kind "station" :round 2) s (load evidence))]
+      (match (jv-parse a body)
+        (None [] (assert false))
+        (Some [o]
+              (do (assert (= (jv-string-or (jv-get o "title") "") "t"))
+                  (assert (= (jv-string-or (jv-get (jv-get o "source") "station") "") "plan"))
+                  (assert-eq (jv-int (jv-get (jv-get o "source") "round")) 2)
+                  (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "evidence") 0) "content") "") "I did it"))
+                  (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "proposals") 0) "title") "") "p"))))))))

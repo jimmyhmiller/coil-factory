@@ -47,7 +47,7 @@ of them, or anything with the same effect, as `breaks_rules`:
   reported as an internal error.
 - **Emulating a missing compiler feature (§6).** If Coil does not provide
   something (a dependency edge, a redefinition, a retire, freeing native
-  code), the work must stop and say so (a coil-bugs report and a `blocked`
+  code), the work must stop and say so (a report in the `live-coil-factory-bugs` pad and a `blocked`
   finish), not build a workaround. Look hard at any code whose comment or
   name says "workaround", "since Coil does not", "emulate", "fallback",
   "approximate", or "shadow".

@@ -27,12 +27,19 @@
     (for part (iter parts) (sb-push-str! (mut out) part))
     (sb-finish! (mut out))))
 
-;;; Everything one review needs, owned by the review's thread until `done`,
-;;; and its result. Strings live in `arena`.
+;;; Who an asked agent is: its name, and what it runs on. A reviewer is one;
+;;; so is a station's summarizer.
+(defstruct AgentRole [(name (slice u8)) (harness (slice u8)) (model (slice u8)) (tools (slice u8))])
+
+(defn reviewer-role [(spec (ptr ReviewerSpec))] (-> AgentRole)
+  (AgentRole :name (.name spec) :harness (.harness spec) :model (.model spec) :tools (.tools spec)))
+
+;;; Everything one asked agent needs, owned by its thread until `done`, and its
+;;; reply. Strings live in `arena`.
 (defstruct ReviewJob
   [(arena (ptr scratch/ScratchArena))
    (config (ptr SiteConfig))
-   (spec (ptr ReviewerSpec))
+   (role AgentRole)
    (stopping (ptr i64))
    (workspace (slice u8))
    (run-dir (slice u8))
@@ -73,20 +80,20 @@
 (defn review-main [(arg (ptr i8))] (-> (ptr i8))
   (let [job (cast (ptr ReviewJob) arg)
         a (scratch/scratch-allocator (.arena job))
-        spec (.spec job)
+        role (.role job)
         config (.config job)
         control (box! a ReviewControl (ReviewControl :stopping (.stopping job)))
         observer (box! a ReviewObserver (ReviewObserver :input 0 :output 0))
-        harness-name (if (> (len (.harness spec)) 0) (.harness spec) (.default-harness config))
+        harness-name (if (> (len (.harness role)) 0) (.harness role) (.default-harness config))
         request (AgentRequest :harness harness-name
-                              :model (.model spec)
-                              :tools (.tools spec)
+                              :model (.model role)
+                              :tools (.tools role)
                               :finish false
                               :gate ""
                               :workspace (.workspace job)
                               :run-dir (.run-dir job)
-                              :station (text-join a ["review-" (.name spec)])
-                              :state-key (text-join a ["review-" (.name spec)]))]
+                              :station (text-join a ["review-" (.name role)])
+                              :state-key (text-join a ["review-" (.name role)]))]
     (match (station-agent a config request observer control)
       (AgentUnavailable [message] (set! (.failure job) message))
       (AgentReady [ready]
@@ -96,7 +103,7 @@
                     (harness-add-user! agent (.context job))
                     (match (harness-run! agent)
                       (Replied [text] (set! (.reply job) text))
-                      (Finished [call result] (set! (.failure job) "the reviewer called a tool it was never given"))
+                      (Finished [call result] (set! (.failure job) "the agent called a tool it was never given"))
                       (Cancelled [] (set! (.cancelled job) true))
                       (Failed [failure] (let [e failure]
                                           (set! (.failure job) (text-join a ["the model failed (" (.kind e) "): " (first-line a (.message e) 400)]))))))))
@@ -168,7 +175,7 @@
 
 (defn new-job [(stable (dyn Allocator))
                (config (ptr SiteConfig))
-               (spec (ptr ReviewerSpec))
+               (role AgentRole)
                (stopping (ptr i64))
                (workspace (slice u8))
                (run-dir (slice u8))
@@ -179,7 +186,10 @@
     (scratch/scratch-init arena stable)
     (let [ja (scratch/scratch-allocator arena)]
       (box! ja ReviewJob
-            (ReviewJob :arena arena :config config :spec spec :stopping stopping
+            (ReviewJob :arena arena :config config
+                       :role (AgentRole :name (copy-bytes ja (.name role)) :harness (copy-bytes ja (.harness role))
+                                        :model (copy-bytes ja (.model role)) :tools (copy-bytes ja (.tools role)))
+                       :stopping stopping
                        :workspace (copy-bytes ja workspace)
                        :run-dir (copy-bytes ja run-dir)
                        :agent (copy-bytes ja agent)
@@ -188,51 +198,46 @@
                        :done 0 :cancelled false :reply "" :failure "" :label ""
                        :input-tokens 0 :output-tokens 0)))))
 
-(defn outcome-of [(a (dyn Allocator)) (job (ptr ReviewJob))] (-> ReviewOutcome)
-  (let [spec (.spec job)
-        base (ReviewOutcome :reviewer (copy-bytes a (.name spec)) :label (copy-bytes a (.label job))
-                            :verdict "" :level "" :confidence 0.0 :reason "" :advice ""
-                            :failure (copy-bytes a (.failure job))
-                            :input-tokens (.input-tokens job) :output-tokens (.output-tokens job))]
-    (if (> (len (.failure job)) 0)
-        base
-        (match (parse-verdict a spec (.reply job))
-          (VerdictBad [message] (let [(mut o) base] (set! (.failure o) (copy-bytes a message)) (load o)))
-          (VerdictOk [verdict level confidence reason advice]
-                     (let [(mut o) base]
-                       (set! (.verdict o) (copy-bytes a verdict))
-                       (set! (.level o) (copy-bytes a level))
-                       (set! (.confidence o) confidence)
-                       (set! (.reason o) (copy-bytes a reason))
-                       (set! (.advice o) (copy-bytes a advice))
-                       (load o)))))))
+;;; What one asked agent replied, copied out of its job. `failure` is set
+;;; when there is no reply (it could not start, or its model failed).
+(defstruct AgentAnswer
+  [(name (slice u8))
+   (label (slice u8))
+   (reply (slice u8))
+   (failure (slice u8))
+   (input-tokens i64)
+   (output-tokens i64)])
 
-;;; Run every reviewer in `specs` at once, each with its own system prompt and
-;;; context (index for index), and wait for all of them. `control` is polled
-;;; while waiting; when it cancels, every review is cancelled and waited for.
-(defn run-reviews! [(a (dyn Allocator))
-                    (config (ptr SiteConfig))
-                    (specs (slice (ptr ReviewerSpec)))
-                    (systems (slice (slice u8)))
-                    (contexts (slice (slice u8)))
-                    (workspace (slice u8))
-                    (run-dir (slice u8))
-                    (agent (slice u8))
-                    (control (dyn AgentControl))] (-> ReviewsResult)
+(defsum AgentsAsked
+  (AgentsAnswered [(answers (ArrayList AgentAnswer))])
+  (AgentsCancelled))
+
+;;; Ask every role at once, each with its own system prompt and context
+;;; (index for index), and wait for all of them. `control` is polled while
+;;; waiting; when it cancels, every agent is cancelled and waited for.
+(defn ask-agents! [(a (dyn Allocator))
+                   (config (ptr SiteConfig))
+                   (roles (slice AgentRole))
+                   (systems (slice (slice u8)))
+                   (contexts (slice (slice u8)))
+                   (workspace (slice u8))
+                   (run-dir (slice u8))
+                   (agent (slice u8))
+                   (control (dyn AgentControl))] (-> AgentsAsked)
   (let [stopping (box! a i64 0)
         (mut jobs) (al-new [(ptr ReviewJob)] a)
         (mut threads) (al-new [(ptr thread/Thread)] a)
-        (mut outcomes) (al-new [ReviewOutcome] a)
+        (mut answers) (al-new [AgentAnswer] a)
         (mut cancelled) false
         (mut i) 0]
-    (loop (if (>= (load i) (len specs))
+    (loop (if (>= (load i) (len roles))
               (break)
-              (let [job (new-job a config (get specs (load i)) stopping workspace run-dir agent
+              (let [job (new-job a config (get roles (load i)) stopping workspace run-dir agent
                                  (get systems (load i)) (get contexts (load i)))
                     handle (box! a thread/Thread (primitive/zeroed thread/Thread))]
                 (if (= (thread/thread-spawn handle (fnptr-of review-main) (cast (ptr i8) job)) (cast i32 0))
                     (do (push! (mut jobs) job) (push! (mut threads) handle) 0)
-                    (do (set! (.failure job) "could not start a thread for the review")
+                    (do (set! (.failure job) "could not start a thread for the agent")
                         (atomic-ops/atomic-store (field job done) 1)
                         (push! (mut jobs) job)
                         (push! (mut threads) (cast (ptr thread/Thread) 0))
@@ -257,9 +262,56 @@
                   (thread/thread-join handle)
                   (destroy a handle)
                   0)
-                (push! (mut outcomes) (outcome-of a job))
+                (push! (mut answers) (AgentAnswer :name (copy-bytes a (.name (field job role))) :label (copy-bytes a (.label job))
+                                                  :reply (copy-bytes a (.reply job))
+                                                  :failure (if (and (.cancelled job) (= (len (.failure job)) 0))
+                                                               "cancelled"
+                                                               (copy-bytes a (.failure job)))
+                                                  :input-tokens (.input-tokens job) :output-tokens (.output-tokens job)))
                 (let [arena (.arena job)]
                   (scratch/scratch-close! arena)
                   (destroy a arena))
                 (set! i (+ (load i) 1)))))
-    (if (load cancelled) (ReviewsCancelled) (ReviewsDone (load outcomes)))))
+    (if (load cancelled) (AgentsCancelled) (AgentsAnswered (load answers)))))
+
+(defn outcome-of [(a (dyn Allocator)) (spec (ptr ReviewerSpec)) (answer AgentAnswer)] (-> ReviewOutcome)
+  (let [base (ReviewOutcome :reviewer (.name answer) :label (.label answer)
+                            :verdict "" :level "" :confidence 0.0 :reason "" :advice ""
+                            :failure (.failure answer)
+                            :input-tokens (.input-tokens answer) :output-tokens (.output-tokens answer))]
+    (if (> (len (.failure answer)) 0)
+        base
+        (match (parse-verdict a spec (.reply answer))
+          (VerdictBad [message] (let [(mut o) base] (set! (.failure o) (copy-bytes a message)) (load o)))
+          (VerdictOk [verdict level confidence reason advice]
+                     (let [(mut o) base]
+                       (set! (.verdict o) (copy-bytes a verdict))
+                       (set! (.level o) (copy-bytes a level))
+                       (set! (.confidence o) confidence)
+                       (set! (.reason o) (copy-bytes a reason))
+                       (set! (.advice o) (copy-bytes a advice))
+                       (load o)))))))
+
+;;; Run every reviewer in `specs` at once (see `ask-agents!`), and read each
+;;; reply as one of that reviewer's verdicts.
+(defn run-reviews! [(a (dyn Allocator))
+                    (config (ptr SiteConfig))
+                    (specs (slice (ptr ReviewerSpec)))
+                    (systems (slice (slice u8)))
+                    (contexts (slice (slice u8)))
+                    (workspace (slice u8))
+                    (run-dir (slice u8))
+                    (agent (slice u8))
+                    (control (dyn AgentControl))] (-> ReviewsResult)
+  (let [(mut roles) (al-new [AgentRole] a)]
+    (for spec (iter specs) (push! (mut roles) (reviewer-role spec)))
+    (match (ask-agents! a config (al-slice roles) systems contexts workspace run-dir agent control)
+      (AgentsCancelled [] (ReviewsCancelled))
+      (AgentsAnswered [answers]
+                      (let [(mut outcomes) (al-new [ReviewOutcome] a)
+                            (mut i) 0]
+                        (loop (if (>= (load i) (len answers))
+                                  (break)
+                                  (do (push! (mut outcomes) (outcome-of a (get specs (load i)) (get answers (load i))))
+                                      (set! i (+ (load i) 1)))))
+                        (ReviewsDone (load outcomes)))))))

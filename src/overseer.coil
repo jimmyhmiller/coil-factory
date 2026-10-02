@@ -388,7 +388,7 @@
                 job (box! ja ReviewJob
                           (ReviewJob :arena arena
                                      :config (field o config)
-                                     :spec spec
+                                     :role (reviewer-role spec)
                                      :stopping (.stopping o)
                                      :workspace (copy-bytes ja (.workspace subject))
                                      :run-dir (run-dir ja (.home o) (.id w))

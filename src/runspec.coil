@@ -34,6 +34,9 @@
    (station-reviewers (ArrayList ReviewerCopy))
    ;;; Which of `station-reviewers` each station needs, by name.
    (station-reviews (ArrayList StationReview))
+   ;;; The summarizer for stations a person approves, copied in; name "" when
+   ;;; no station needs approval.
+   (summarizer ReviewerCopy)
    (site (slice u8))
    (created i64)])
 
@@ -106,6 +109,10 @@
     (jv-put! out "harness" (JStr (.harness spec)))
     (jv-put! out "reviewers" (copies-json a (.reviewers spec)))
     (jv-put! out "station_reviewers" (copies-json a (.station-reviewers spec)))
+    (let [s (jv-object a)]
+      (jv-put! s "name" (JStr (.name (field spec summarizer))))
+      (jv-put! s "text" (JStr (.text (field spec summarizer))))
+      (jv-put! out "summarizer" s))
     (let [reviews (jv-array a)]
       (for entry (iter (.station-reviews spec))
         (let [item (jv-object a)
@@ -148,6 +155,8 @@
                           (set! (.reviewers spec) (copies-from a (jv-get root "reviewers")))
                           (set! (.station-reviewers spec) (copies-from a (jv-get root "station_reviewers")))
                           (set! (.station-reviews spec) (reviews-from a (jv-get root "station_reviews")))
+                          (set! (.summarizer spec) (ReviewerCopy :name (jv-string-or (jv-get (jv-get root "summarizer") "name") "")
+                                                                 :text (jv-string-or (jv-get (jv-get root "summarizer") "text") "")))
                           (set! (.site spec) (jv-string-or (jv-get root "site") ""))
                           (set! (.created spec) (jv-int (jv-get root "created")))
                           (if (or (not (= (.id spec) run-id)) (= (len (.factory-text spec)) 0))

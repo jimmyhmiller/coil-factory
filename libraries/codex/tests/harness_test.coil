@@ -212,7 +212,7 @@ pwd > \"$dir/pwd.$n\"
         _ (write! a (cat a [(.dir dir-f) "/reply.1"])
                   (cat a [(thread-started a) (turn-started a) (message-event a "working") (command-events a)
                           (edit-event a (.dir dir-f)) (finish-events a) (message-event a "all done")
-                          "sleep 20\necho never\n"]))
+                          (turn-completed a)]))
         f dir-f
         h (.harness f)
         started (sys/monotonic-ms)]
@@ -234,6 +234,9 @@ pwd > \"$dir/pwd.$n\"
       (assert (saw? r "tool edit poem.md"))
       (assert (saw? r "tool finish: done"))
       (assert (saw? r "ok Recorded."))
+      ;; After finish, the closing message and the turn's usage still arrive.
+      (assert (saw? r "said all done"))
+      (assert (saw? r "usage 150/25"))
       (assert (contains? argv "exec\n--json\n--ignore-user-config\n--skip-git-repo-check\n-C\n"))
       (assert (contains? argv "-m\ngpt-6.1-sol\n"))
       (assert (contains? argv "-c\nsandbox_mode=\"workspace-write\"\n"))
@@ -246,6 +249,21 @@ pwd > \"$dir/pwd.$n\"
       (assert (not (contains? argv "resume")))
       (assert (= (read a (cat a [(.dir f) "/stdin.1"])) "Begin.")))
     (assert (= (.session h) "th-1"))))
+
+(deftest new-work-after-finish-is-stopped
+  (let [a (malloc-allocator)
+        f (fixture a "after-finish"
+                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
+                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"rm -rf x\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                            "sleep 20\necho never\n"])]
+                   (script a))
+        h (.harness f)
+        started (sys/monotonic-ms)]
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
+    (assert (< (- (sys/monotonic-ms) started) 8000))
+    (assert (not (saw? (.recorder f) "tool $ rm -rf x")))))
 
 (deftest continues-the-thread-and-replies
   (let [a (malloc-allocator)

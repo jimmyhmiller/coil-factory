@@ -6,6 +6,8 @@ harness: codex
 model: gpt-6.1-sol
 tools: files, shell
 attempts: 5
+approve: yes
+summarizer: /Users/jimmyhmiller/Documents/Code/projects/coil-factory/factories/live-coil/summarizer.md
 review: /Users/jimmyhmiller/Documents/Code/projects/coil-factory/factories/live-coil/reviewers/live-rules.md, /Users/jimmyhmiller/Documents/Code/projects/coil-factory/factories/live-coil/reviewers/live-spec.md
 reviewers: /Users/jimmyhmiller/Documents/Code/projects/coil-factory/factories/live-coil/reviewers/live-watch.md
 ---
@@ -32,6 +34,12 @@ This factory exists so that cannot happen again:
 - Then reviewers read your finished work against RULES.md and SPEC.md. Any
   rejection sends the work back to you with their reasons. A passing gate
   does not make a rule-breaking mechanism acceptable.
+- Then Jimmy decides. Your work, and anything you claim, is summarized into
+  proposals he approves or rejects one by one, on his phone. When you stop to
+  ask (`blocked`), your claims and questions go to him the same way, and his
+  decisions and answers come back to you as an `[approval]` message. A claim
+  that Coil cannot do something is never taken on your word: show the
+  minimal reproduction, the command, and its output.
 
 How to work:
 
@@ -47,16 +55,17 @@ How to work:
   rules forbid. Copy nothing from it without checking it against RULES.md.
 - `../coil-experiments/src/experiments/live-repl` has a working nREPL
   transport (bencode, TCP) in Coil. You may reuse it.
-- When Coil does not give you something the semantic needs, stop. Read the
-  `coil-bugs` pad's instructions (`pad search -n coil-bugs instructions`, or
-  the first cells of `pad export -n coil-bugs md`) and file a report there
-  in its format, with a minimal reproduction. Then finish `blocked`, naming
-  the report. Do not build a workaround.
+- When Coil does not give you something the semantic needs, stop. Write a
+  report in the `live-coil-factory-bugs` pad, in the format its first cell
+  gives (`pad export -n live-coil-factory-bugs md`), with a minimal
+  reproduction kept under `bugs/` in the workspace. Then finish `blocked`,
+  naming the report. Do not build a workaround.
 - When SPEC.md does not decide what an edit should do, finish `blocked` and
   ask. Never pick an answer.
-- Use the `live-coil-2` pad for notes worth keeping: decisions you were given,
-  Coil gaps you found, how things work. Create it if it does not exist, and
-  add it to the `all-projects` pad's index if it is not listed.
+- Your pads are `live-coil-factory` (notes worth keeping between runs: what
+  you tried, what Coil does, decisions you were given, how things work) and
+  `live-coil-factory-bugs` (Coil bug reports). Write every note with the run
+  and station that wrote it.
 
 The probes the gate runs (`gate.sh --probes` lists them):
 

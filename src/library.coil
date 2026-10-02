@@ -21,6 +21,10 @@
 (defstruct Bundled [(name (slice u8)) (text (slice u8))])
 
 (const BUNDLED-JUDGE (include-str "../reviewers/judge.md"))
+(const BUNDLED-SUMMARIZER (include-str "../summarizers/summarizer.md"))
+
+(defn bundled-summarizers [] (-> (array Bundled 1))
+  [(Bundled :name "summarizer" :text BUNDLED-SUMMARIZER)])
 
 (defn bundled-reviewers [] (-> (array Bundled 1))
   [(Bundled :name "judge" :text BUNDLED-JUDGE)])
@@ -55,6 +59,10 @@
 
 (defn resolve-factory [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
   (resolve-in a "factory" "`factory factories`" (factories-dir a home) (bundled-factories) reference))
+
+;;; A summarizer: a path, `~/.factory/summarizers/NAME.md`, or a bundled one.
+(defn resolve-summarizer [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
+  (resolve-in a "summarizer" "the bundled one is `summarizer`;" (summarizers-dir a home) (bundled-summarizers) reference))
 
 (defn resolve-reviewer [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
   (resolve-in a "reviewer" "`factory reviewers`" (reviewers-dir a home) (bundled-reviewers) reference))

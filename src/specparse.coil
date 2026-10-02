@@ -24,10 +24,10 @@
 
 (defn known-front-key? [(key (slice u8))] (-> bool)
   (or (= key "name") (= key "description") (= key "input") (= key "model")
-      (= key "harness") (= key "reviewers") (= key "review") (= key "tools") (= key "attempts")))
+      (= key "harness") (= key "reviewers") (= key "review") (= key "approve") (= key "summarizer") (= key "tools") (= key "attempts")))
 
 (defn known-station-key? [(key (slice u8))] (-> bool)
-  (or (= key "gate") (= key "attempts") (= key "model") (= key "harness") (= key "tools") (= key "review")))
+  (or (= key "gate") (= key "attempts") (= key "model") (= key "harness") (= key "tools") (= key "review") (= key "approve")))
 
 (defn lower-ascii [(c i64)] (-> i64)
   (if (and (>= c 65) (<= c 90)) (+ c 32) c))
@@ -99,6 +99,8 @@
     (set! (.harness spec) "")
     (set! (.reviewers spec) "")
     (set! (.review spec) "")
+    (set! (.approve spec) "")
+    (set! (.summarizer spec) "")
     (set! (.tools spec) "")
     (set! (.context spec) "")
     (match (md/parse-document a text)
@@ -115,7 +117,7 @@
                     key (.key entry)]
                 (cond (not (known-front-key? key))
                         (problem! a (mut problems) (.line entry)
-                                  ["unknown front-matter key \"" key "\"; the keys are name, description, input, model, harness, reviewers, review, tools, attempts"])
+                                  ["unknown front-matter key \"" key "\"; the keys are name, description, input, model, harness, reviewers, review, approve, summarizer, tools, attempts"])
                       (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
                       (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
                       (= key "input") (do (set! (.input spec) (.scalar entry)) 0)
@@ -127,6 +129,13 @@
                           0)
                       (= key "reviewers") (do (set! (.reviewers spec) (front-tools a entry)) 0)
                       (= key "review") (do (set! (.review spec) (front-tools a entry)) 0)
+                      (= key "approve")
+                        (do (set! (.approve spec) (str-trim (.scalar entry)))
+                            (when (not (or (= (.approve spec) "yes") (= (.approve spec) "no")))
+                              (problem! a (mut problems) (.line entry) ["approve is yes or no, not \"" (.scalar entry) "\""])
+                              0)
+                            0)
+                      (= key "summarizer") (do (set! (.summarizer spec) (str-trim (.scalar entry))) 0)
                       (= key "tools")
                         (let [tools (front-tools a entry)
                               trouble (tool-list-problem a tools)]
@@ -171,15 +180,22 @@
                                         (set! (.harness station) "")
                                         (set! (.tools station) "")
                                         (set! (.review station) "")
+                                        (set! (.approve station) "")
                                         (set! (.instructions station) (str-trim (.rest settings)))
                                         (for attribute (iter (.attrs settings))
                                           (let [attr attribute
                                                 key (.key attr)]
                                             (cond (not (known-station-key? key))
                                                     (problem! a (mut problems) (.line attr)
-                                                              ["unknown station setting \"" key "\"; the settings are gate, attempts, model, harness, tools, review"])
+                                                              ["unknown station setting \"" key "\"; the settings are gate, attempts, model, harness, tools, review, approve"])
                                                   (= key "gate") (do (set! (.gate station) (.value attr)) 0)
                                                   (= key "review") (do (set! (.review station) (.value attr)) 0)
+                                                  (= key "approve")
+                                                    (do (set! (.approve station) (str-trim (.value attr)))
+                                                        (when (not (or (= (.approve station) "yes") (= (.approve station) "no")))
+                                                          (problem! a (mut problems) (.line attr) ["approve is yes or no, not \"" (.value attr) "\""])
+                                                          0)
+                                                        0)
                                                   (= key "model") (do (set! (.model station) (.value attr)) 0)
                                                   (= key "harness")
                                                     (let [trouble (harness-problem a (.value attr))]

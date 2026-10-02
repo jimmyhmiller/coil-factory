@@ -1,0 +1,375 @@
+(module factory.approval)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.http.client" :as http)
+(import "durable.atomic" :as atomic)
+(import "mddoc.doc" :as md)
+(import "agent.json" :use *)
+(import "factory.config" :use *)
+(import "factory.proc" :use [env-or])
+(import "factory.reviewer" :use [extract-object first-chars])
+(import "factory.review" :use [AgentRole])
+(import "factory.spec" :use *)
+(import "factory.specparse" :use [problem! front-tools problems-text])
+
+;;; A person's approval, as deterministic steps of a station. Agents propose;
+;;; the factory itself does everything else:
+;;;
+;;; 1. A summarizer agent turns the station's finished work (or a stopped
+;;;    agent's claims and questions) into separate proposals and questions,
+;;;    in a strict JSON shape this module checks.
+;;; 2. The factory builds the request: that summary, plus raw material it
+;;;    attaches itself and the summarizer cannot alter (the agent's own words,
+;;;    the diff, the gate's output, every reviewer's verdict).
+;;; 3. It submits the request to the approvals service (site.json
+;;;    `approvals`) and waits for a decision, which only a person signed in
+;;;    with a passkey can make there.
+;;; 4. It acts on the decision: all approved, the station goes on; otherwise
+;;;    the person's reasons and answers go back to the agent as its next
+;;;    instruction.
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+;; ---------------------------------------------------------------------------
+;; The summarizer
+
+;;; A summarizer, defined in Markdown like a reviewer: front matter `name`,
+;;; `description`, and optionally `harness`, `model`, `tools` (`read` or
+;;; nothing); the body is its instructions. The reply format is added here.
+(defstruct SummarizerSpec
+  [(name (slice u8))
+   (description (slice u8))
+   (harness (slice u8))
+   (model (slice u8))
+   (tools (slice u8))
+   (instructions (slice u8))])
+
+(defsum SummarizerResult
+  (SummarizerOk [(spec SummarizerSpec)])
+  (SummarizerBad [(problems (ArrayList SpecProblem))]))
+
+(defn parse-summarizer [(a (dyn Allocator)) (text (slice u8))] (-> SummarizerResult)
+  (let [(mut problems) (al-new [SpecProblem] a)
+        (mut spec) (SummarizerSpec :name "" :description "" :harness "" :model "" :tools "read" :instructions "")]
+    (match (md/parse-document a text)
+      (Err [failure] (let [e failure] (problem! a (mut problems) (.line e) [(.message e)])))
+      (Ok [parsed]
+          (let [doc parsed]
+            (when (not (md/doc-has-front-matter? doc))
+              (problem! a (mut problems) 1 ["a summarizer starts with front matter: `---`, `name: my-summarizer`, `---`"])
+              0)
+            (for front (iter (md/front-entries doc))
+              (let [entry front
+                    key (.key entry)]
+                (cond (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
+                      (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
+                      (= key "model") (do (set! (.model spec) (.scalar entry)) 0)
+                      (= key "harness")
+                        (let [trouble (harness-problem a (.scalar entry))]
+                          (set! (.harness spec) (.scalar entry))
+                          (when (> (len trouble) 0) (problem! a (mut problems) (.line entry) [trouble]) 0)
+                          0)
+                      (= key "tools")
+                        (let [tools (str-trim (front-tools a entry))]
+                          (set! (.tools spec) tools)
+                          (when (not (or (= tools "") (= tools "read")))
+                            (problem! a (mut problems) (.line entry) ["a summarizer's tools are \"read\" or nothing, not \"" tools "\""])
+                            0)
+                          0)
+                      :else (problem! a (mut problems) (.line entry)
+                                      ["unknown summarizer key \"" key "\"; the keys are name, description, harness, model, tools"]))))
+            (set! (.instructions spec) (str-trim (md/doc-body doc)))
+            (when (and (md/doc-has-front-matter? doc) (not (kebab-name? (.name spec))))
+              (problem! a (mut problems) 1 ["the summarizer needs a name of lowercase letters, digits, and dashes"])
+              0)
+            (when (= (len (.instructions spec)) 0)
+              (problem! a (mut problems) 1 ["a summarizer needs instructions after its front matter"])
+              0)
+            0)))
+    (if (> (len problems) 0) (SummarizerBad (load problems)) (SummarizerOk (load spec)))))
+
+(defn summarizer-role [(spec (ptr SummarizerSpec))] (-> AgentRole)
+  (AgentRole :name (.name spec) :harness (.harness spec) :model (.model spec) :tools (.tools spec)))
+
+;;; The summarizer's instructions and the reply format this module reads.
+(defn summarizer-system-prompt [(a (dyn Allocator)) (spec (ptr SummarizerSpec))] (-> (slice u8))
+  (cat a [(.instructions spec)
+          (if (= (.tools spec) "read")
+              "\n\nYou can read the agent's workspace with your tools to find evidence. Never change anything there."
+              "")
+          "\n\nReply with ONLY a JSON object: {\"title\": one line naming what is to be decided, "
+          "\"summary\": Markdown, \"proposals\": [{\"title\": one line, \"detail\": Markdown, \"evidence\": Markdown}], "
+          "\"questions\": [{\"text\": Markdown}]}. Every proposal needs a title. When you are shown finished work, give at "
+          "least one proposal; when the agent stopped to ask, give at least one proposal or question."]))
+
+;;; What the summarizer is shown. `kind` is `station` (finished work) or
+;;; `question` (the agent stopped and asked).
+(defn summarizer-context [(a (dyn Allocator))
+                          (kind (slice u8))
+                          (brief (slice u8))
+                          (context (slice u8))
+                          (station (slice u8))
+                          (instructions (slice u8))
+                          (agent-words (slice u8))
+                          (material (slice u8))
+                          (workspace (slice u8))] (-> (slice u8))
+  (cat a [(if (= kind "station")
+              "The agent finished this station; its gate passed and its reviewers approved. A person must now approve the work.\n\n"
+              "The agent stopped by calling `finish` with outcome `blocked`, and asked a person. Everything it claims, decided, or wants to do next must be approved, and its questions answered.\n\n")
+          "## Brief\n" (if (> (len (str-trim brief)) 0) brief "(none)")
+          "\n\n## The factory's shared context\n" (if (> (len (str-trim context)) 0) context "(none)")
+          "\n\n## Station `" station "`: its instructions\n" instructions
+          "\n\n## The agent's own words\n" agent-words
+          "\n\n" material
+          "\n\n## Workspace\n`" workspace "`"]))
+
+(defstruct Proposal [(title (slice u8)) (detail (slice u8)) (evidence (slice u8))])
+
+(defstruct Summary
+  [(title (slice u8))
+   (summary (slice u8))
+   (proposals (ArrayList Proposal))
+   (questions (ArrayList (slice u8)))])
+
+(defn string-field [(a (dyn Allocator)) (object JVal) (key (slice u8))] (-> (slice u8))
+  (copy-bytes a (str-trim (jv-string-or (jv-get object key) ""))))
+
+;;; Read a summarizer's reply. Anything but the declared shape is the
+;;; summarizer's failure, reported, never repaired or guessed at.
+(defn parse-summary [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> (Result Summary (slice u8)))
+  (block :parse
+         (match (jv-parse a (extract-object reply))
+           (None [] (Err (cat a ["the summarizer's reply is not a JSON object: " (first-chars (str-trim reply) 200)])))
+           (Some [object]
+                 (let [(mut proposals) (al-new [Proposal] a)
+                       (mut questions) (al-new [(slice u8)] a)
+                       ps (jv-get object "proposals")
+                       qs (jv-get object "questions")
+                       title (string-field a object "title")
+                       (mut i) 0]
+                   (when (= (len title) 0) (return-from :parse (Err "the summarizer's reply has no title")))
+                   (loop (if (>= (load i) (jv-count ps))
+                             (break)
+                             (let [p (jv-nth ps (load i))
+                                   pt (string-field a p "title")]
+                               (when (= (len pt) 0)
+                                 (return-from :parse (Err (cat a ["proposal " (int-text a (+ (load i) 1)) " has no title"]))))
+                               (push! (mut proposals) (Proposal :title pt :detail (string-field a p "detail")
+                                                                :evidence (string-field a p "evidence")))
+                               (set! i (+ (load i) 1)))))
+                   (set! i 0)
+                   (loop (if (>= (load i) (jv-count qs))
+                             (break)
+                             (let [q (string-field a (jv-nth qs (load i)) "text")]
+                               (when (= (len q) 0)
+                                 (return-from :parse (Err (cat a ["question " (int-text a (+ (load i) 1)) " has no text"]))))
+                               (push! (mut questions) q)
+                               (set! i (+ (load i) 1)))))
+                   (cond (and (= kind "station") (= (len proposals) 0))
+                           (Err "the summarizer gave no proposals for finished work")
+                         (and (= (len proposals) 0) (= (len questions) 0))
+                           (Err "the summarizer gave nothing to decide")
+                         :else (Ok (Summary :title title :summary (string-field a object "summary")
+                                            :proposals (load proposals) :questions (load questions)))))))))
+
+;; ---------------------------------------------------------------------------
+;; The request
+
+;;; Raw material the factory attaches itself: `format` is text, markdown, or diff.
+(defstruct Evidence [(name (slice u8)) (content (slice u8)) (format (slice u8))])
+
+(defstruct RequestSource
+  [(site (slice u8))
+   (run (slice u8))
+   (station (slice u8))
+   (kind (slice u8))
+   (round i64)])
+
+(defn request-json [(a (dyn Allocator)) (source RequestSource) (summary Summary) (evidence (ArrayList Evidence))] (-> (slice u8))
+  (let [root (jv-object a)
+        src (jv-object a)
+        ps (jv-array a)
+        qs (jv-array a)
+        es (jv-array a)]
+    (jv-put! src "system" (JStr "factory"))
+    (jv-put! src "site" (JStr (.site source)))
+    (jv-put! src "run" (JStr (.run source)))
+    (jv-put! src "station" (JStr (.station source)))
+    (jv-put! src "kind" (JStr (.kind source)))
+    (jv-put! src "round" (JInt (.round source)))
+    (for p (iter (.proposals summary))
+      (let [o (jv-object a)]
+        (jv-put! o "title" (JStr (.title p)))
+        (jv-put! o "detail" (JStr (.detail p)))
+        (jv-put! o "evidence" (JStr (.evidence p)))
+        (jv-push! ps o)))
+    (for q (iter (.questions summary))
+      (let [o (jv-object a)]
+        (jv-put! o "text" (JStr q))
+        (jv-push! qs o)))
+    (for e (iter evidence)
+      (let [o (jv-object a)]
+        (jv-put! o "name" (JStr (.name e)))
+        (jv-put! o "content" (JStr (.content e)))
+        (jv-put! o "format" (JStr (.format e)))
+        (jv-push! es o)))
+    (jv-put! root "title" (JStr (.title summary)))
+    (jv-put! root "source" src)
+    (jv-put! root "summary" (JStr (.summary summary)))
+    (jv-put! root "proposals" ps)
+    (jv-put! root "questions" qs)
+    (jv-put! root "evidence" es)
+    (jv-encode a root)))
+
+;; ---------------------------------------------------------------------------
+;; The service
+
+(defn expand-home [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (if (or (= path "~") (starts-with path "~/"))
+      (path-join a (env-or a "HOME" "/") (subslice path (if (= path "~") 1 2) (len path)))
+      path))
+
+;;; What is wrong with this site's approvals settings, or "".
+(defn approvals-problem [(config (ptr SiteConfig))] (-> (slice u8))
+  (cond (= (len (.approvals-url config)) 0)
+          "this site has no approvals service: set \"approvals\": {\"url\": ..., \"token_file\": ...} in site.json"
+        (= (len (.approvals-token-file config)) 0)
+          "site.json \"approvals\" has no token_file"
+        :else ""))
+
+(defstruct HttpResult [(status i64) (body (slice u8)) (error (slice u8))])
+
+(defn call-service [(a (dyn Allocator)) (config (ptr SiteConfig)) (method (slice u8)) (path (slice u8)) (body (slice u8))] (-> HttpResult)
+  (block :call
+         (let [token (match (atomic/read-file-if-exists a (expand-home a (.approvals-token-file config)))
+                       (Ok [found] (match found
+                                     (Some [text] (str-trim text))
+                                     (None [] (return-from :call (HttpResult :status 0 :body ""
+                                                                             :error (cat a ["the approvals token file " (.approvals-token-file config) " does not exist"]))))))
+                       (Err [_] (return-from :call (HttpResult :status 0 :body ""
+                                                               :error (cat a ["cannot read the approvals token file " (.approvals-token-file config)])))))
+               (mut headers) (al-new [http/Header] a)
+               request (box! a http/Request (primitive/zeroed http/Request))]
+           (push! (mut headers) (http/Header :name "Authorization" :value (cat a ["Bearer " token])))
+           (push! (mut headers) (http/Header :name "Content-Type" :value "application/json"))
+           (push! (mut headers) (http/Header :name "Accept" :value "application/json"))
+           (set! (.method request) method)
+           (set! (.url request) (cat a [(str-trim-end-slash (.approvals-url config)) path]))
+           (set! (.headers request) (al-slice headers))
+           (set! (.body request) body)
+           (set! (.connect-timeout-ms request) 15000)
+           (set! (.timeout-ms request) 60000)
+           (set! (.follow-redirects request) false)
+           (set! (.ca-info request) "")
+           (match (http/request a request)
+             (Err [failure] (HttpResult :status 0 :body "" :error (cat a ["cannot reach " (.approvals-url config)])))
+             (Ok [response]
+                 (let [result (HttpResult :status (http/response-status response)
+                                          :body (copy-bytes a (http/response-body response))
+                                          :error "")]
+                   (http/response-free a response)
+                   result))))))
+
+(defn str-trim-end-slash [(text (slice u8))] (-> (slice u8))
+  (if (and (> (len text) 0) (= (cast i64 (get text (- (len text) 1))) 47))
+      (subslice text 0 (- (len text) 1))
+      text))
+
+(defn service-error [(a (dyn Allocator)) (result HttpResult)] (-> (slice u8))
+  (if (> (len (.error result)) 0)
+      (.error result)
+      (let [said (match (jv-parse a (.body result))
+                   (Some [o] (jv-string-or (jv-get o "error") ""))
+                   (None [] ""))]
+        (cat a ["the approvals service answered " (int-text a (.status result))
+                (if (> (len said) 0) (cat a [": " said]) "")]))))
+
+;;; A submitted request: its id, and the page a person opens.
+(defstruct Submitted [(id (slice u8)) (url (slice u8))])
+
+(defn approval-submit! [(a (dyn Allocator)) (config (ptr SiteConfig)) (body (slice u8))] (-> (Result Submitted (slice u8)))
+  (let [result (call-service a config "POST" "/v1/requests" body)]
+    (if (!= (.status result) 201)
+        (Err (service-error a result))
+        (match (jv-parse a (.body result))
+          (None [] (Err "the approvals service's reply is not JSON"))
+          (Some [o]
+                (let [id (jv-string-or (jv-get o "id") "")
+                      page (jv-string-or (jv-get o "page") "")]
+                  (if (or (= (len id) 0) (= (len page) 0))
+                      (Err "the approvals service's reply has no id")
+                      (Ok (Submitted :id (copy-bytes a id)
+                                     :url (cat a [(str-trim-end-slash (.approvals-url config)) page]))))))))))
+
+;;; Where a request stands.
+(defsum ApprovalState
+  (Waiting)
+  ;;; `message` is what the agent is told: every rejection's reason, every
+  ;;; answer, and the note. `request` and `decision` are the service's JSON.
+  (Decided [(approved-all bool) (message (slice u8)) (decision JVal)])
+  (Withdrawn [(reason (slice u8))])
+  ;;; The service could not be asked this time; the caller asks again.
+  (Unreachable [(message (slice u8))]))
+
+(defn approval-fetch [(a (dyn Allocator)) (config (ptr SiteConfig)) (id (slice u8))] (-> ApprovalState)
+  (let [result (call-service a config "GET" (cat a ["/v1/requests/" id]) "")]
+    (if (!= (.status result) 200)
+        (Unreachable (service-error a result))
+        (match (jv-parse a (.body result))
+          (None [] (Unreachable "the approvals service's reply is not JSON"))
+          (Some [o]
+                (let [status (jv-string-or (jv-get o "status") "")]
+                  (cond (= status "pending") (Waiting)
+                        (= status "withdrawn") (Withdrawn (copy-bytes a (jv-string-or (jv-get (jv-get o "withdrawal") "reason") "")))
+                        (= status "decided")
+                          (let [d (jv-get o "decision")]
+                            (Decided (match (jv-get d "approved_all") (JBool [b] b) (_ false))
+                                     (decision-message a o d)
+                                     d))
+                        :else (Unreachable (cat a ["the approvals service reports an unknown status \"" status "\""])))))))))
+
+(defn approval-withdraw! [(a (dyn Allocator)) (config (ptr SiteConfig)) (id (slice u8)) (reason (slice u8))] (-> (Result i64 (slice u8)))
+  (let [body (let [o (jv-object a)] (jv-put! o "reason" (JStr reason)) (jv-encode a o))
+        result (call-service a config "POST" (cat a ["/v1/requests/" id "/withdraw"]) body)]
+    (if (= (.status result) 200) (Ok 0) (Err (service-error a result)))))
+
+;;; The decision as the agent's next instruction: what was approved, what was
+;;; rejected and why, the answers, and the note, in the person's own words.
+(defn decision-message [(a (dyn Allocator)) (request JVal) (decision JVal)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        ps (jv-get request "proposals")
+        pds (jv-get decision "proposals")
+        qs (jv-get request "questions")
+        answers (jv-get decision "answers")
+        note (str-trim (jv-string-or (jv-get decision "comment") ""))
+        (mut i) 0]
+    (sb-push-str! (mut out) "[approval] Jimmy decided on what you proposed, item by item. These decisions are his; follow them.\n")
+    (loop (if (>= (load i) (jv-count ps))
+              (break)
+              (let [pd (jv-nth pds (load i))
+                    approved (match (jv-get pd "approved") (JBool [b] b) (_ false))
+                    comment (str-trim (jv-string-or (jv-get pd "comment") ""))]
+                (sb-push-str! (mut out) (cat a ["\n" (int-text a (+ (load i) 1)) ". " (if approved "APPROVED: " "REJECTED: ")
+                                                (jv-string-or (jv-get (jv-nth ps (load i)) "title") "")]))
+                (when (> (len comment) 0) (sb-push-str! (mut out) (cat a ["\n   Jimmy: " comment])) 0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (jv-count qs))
+              (break)
+              (do (sb-push-str! (mut out) (cat a ["\n\nQuestion: " (jv-string-or (jv-get (jv-nth qs (load i)) "text") "")
+                                                  "\nAnswer: " (jv-string-or (jv-nth answers (load i)) "")]))
+                  (set! i (+ (load i) 1)))))
+    (when (> (len note) 0) (sb-push-str! (mut out) (cat a ["\n\nJimmy's note: " note])) 0)
+    (sb-finish! (mut out))))

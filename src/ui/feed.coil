@@ -286,6 +286,15 @@
                                     " — "
                                     (first-line (js record "reason"))])
                            (standing-tone level)))
+          (= kind "approval.requested")
+            (feed--push! feed record "◆" (ToneWarning)
+                         (concat a ["waiting for your approval: " (js record "url")]) (ToneWarning))
+          (= kind "approval.decided")
+            (cond (= (js record "approval_kind") "question")
+                    (feed--push! feed record "◆" (ToneWarning) "Jimmy answered; sent to the agent" (ToneWarning))
+                  (jb record "approved_all")
+                    (feed--push! feed record "✓" (ToneSuccess) "Jimmy approved" (ToneSuccess))
+                  :else (feed--push! feed record "◆" (ToneWarning) "Jimmy sent it back to the agent" (ToneWarning)))
           (= kind "review.started")
             (feed--push! feed
                          record

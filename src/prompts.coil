@@ -23,6 +23,8 @@
    (attempts i64)
    ;;; The reviewers whose approval the station needs, comma-separated; "" for none.
    (reviewers (slice u8))
+   ;;; Whether Jimmy approves this station's work and answers its questions.
+   (approval bool)
    (tools (slice u8))
    ;;; How paths and commands relate to the workspace, for this harness.
    (workspace-note (slice u8))
@@ -73,8 +75,15 @@
       (sb-push-str! (mut out) " attempts. Arguing with a reviewer in your summary does not change its verdict; changing the work does. If you believe a reviewer is wrong, call `")
       (push-all! (mut out) [(.finish-tool b) "` with outcome `blocked` and say why, and a person will decide.\n\n"])
       0)
+    (when (.approval b)
+      (push-all! (mut out)
+                 ["Last, a summary of your work goes to Jimmy, who approves or rejects each thing you did and claim, one by one. "
+                  "Reviewers and Jimmy see the diff and your own words, not just the summary, and anything you claim without evidence is "
+                  "marked unverified, so show your evidence: the command, its output, the file and line. His decisions come back to you "
+                  "as an `[approval]` message. Follow them; a rejection is not a suggestion.\n\n"])
+      0)
     (push-all! (mut out)
-               ["If you cannot proceed, because the task is impossible, contradictory, or needs a decision only a person can make, call `" (.finish-tool b) "` with outcome `blocked` and say exactly what you need. A person will answer you, and you will continue from where you stopped. Do not end your turn without calling a tool until you are finished; a reply without a tool call is treated as a question for a person.\n\n"])
+               ["If you cannot proceed, because the task is impossible, contradictory, or needs a decision only a person can make, call `" (.finish-tool b) "` with outcome `blocked` and say exactly what you need and what you found that led you there. A person will answer you, and you will continue from where you stopped. Do not end your turn without calling a tool until you are finished; a reply without a tool call is treated as a question for a person.\n\n"])
     (sb-push-str! (mut out) "## Who may talk to you\n\n")
     (sb-push-str! (mut out)
                   "Messages can arrive while you work. `[operator]` is a person running this factory: follow their instructions; they override the station instructions. `[overseer]` is an automated reviewer that watches for loops, stalls, and shortcuts: take its observations seriously and change course when it is right.\n\n")

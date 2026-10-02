@@ -185,6 +185,7 @@
         agent (agent-named run (js run "current"))
         reason (first-line (js run "reason"))]
     (cond (= status "blocked") reason
+          (= status "approval") reason
           (= status "queued") "waiting for a slot"
           (and (= status "running") (not (jv-null? agent)))
             (concat a [(js agent "name") ": " (js agent "activity")])
@@ -205,7 +206,8 @@
     (loop (if (>= (load i) (jv-len runs))
               (break)
               (do
-                (when (= (js (jv-nth runs (load i)) "status") "blocked")
+                (when (or (= (js (jv-nth runs (load i)) "status") "blocked")
+                          (= (js (jv-nth runs (load i)) "status") "approval"))
                   (set! n (+ (load n) 1)))
                 (set! i (+ (load i) 1)))))
     (load n)))

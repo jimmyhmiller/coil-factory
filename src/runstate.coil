@@ -16,12 +16,23 @@
 
 (defstruct StationState
   [(name (slice u8))
-   ;;; pending | running | gate | review | passed | blocked | failed
+   ;;; pending | running | gate | review | approval | passed | blocked | failed
    (status (slice u8))
    (attempts i64)
    (gate-failures i64)
    ;;; Review rounds whose reviewers sent the work back.
    (review-rejections i64)
+   ;;; The approval request this station is waiting on ("" when none): its
+   ;;; id, its page, its kind (station or question), and, for finished work,
+   ;;; the agent's finish summary, which a restarted worker commits with.
+   (approval-id (slice u8))
+   (approval-url (slice u8))
+   (approval-kind (slice u8))
+   (approval-summary (slice u8))
+   ;;; Approval requests made so far, and what Jimmy decided in each, as the
+   ;;; agent was told it.
+   (approval-rounds i64)
+   (approval-history (slice u8))
    (summary (slice u8))
    (started-t i64)
    (finished-t i64)])
@@ -112,12 +123,22 @@
     (set! (.pending st) (al-new [PendingMessage] a))
     (load st)))
 
+(defn int-to-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+(defn join-text [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
 (defn terminal-status? [(status (slice u8))] (-> bool)
   (or (= status "succeeded") (= status "failed") (= status "cancelled")
       (= status "blocked") (= status "lost")))
 
 (defn active-status? [(status (slice u8))] (-> bool)
-  (or (= status "running") (= status "paused")))
+  (or (= status "running") (= status "paused") (= status "approval")))
 
 (defn field-str [(record JVal) (key (slice u8))] (-> (slice u8))
   (jv-string-or (jv-get record key) ""))
@@ -301,6 +322,34 @@
             (set! (.status station) "running")
             0)
           0)
+      (= kind "approval.requested")
+        (let [station (station-at st agent-name)
+              agent (agent-at st agent-name)
+              url (field-str record "url")]
+          (set! (.status station) "approval")
+          (set! (.approval-id station) (copy-bytes a (field-str record "id")))
+          (set! (.approval-url station) (copy-bytes a url))
+          (set! (.approval-kind station) (copy-bytes a (field-str record "approval_kind")))
+          (set! (.approval-summary station) (copy-bytes a (field-str record "summary")))
+          (set! (.approval-rounds station) (+ (.approval-rounds station) 1))
+          (when (= (.status st) "running") (set! (.status st) "approval") 0)
+          (set! (.reason st) (copy-bytes a (join-text a ["waiting for your approval: " url])))
+          (set-activity! st agent "waiting" (activity-with-mark a "approval" url) t))
+      (or (= kind "approval.decided") (= kind "approval.withdrawn"))
+        (let [station (station-at st agent-name)
+              message (field-str record "message")]
+          (when (and (= kind "approval.decided") (> (len message) 0))
+            (set! (.approval-history station)
+                  (copy-bytes a (join-text a [(.approval-history station) (if (> (len (.approval-history station)) 0) "\n\n" "")
+                                              "Round " (int-to-text a (jv-int (jv-get record "round"))) ":\n" message])))
+            0)
+          (set! (.approval-id station) "")
+          (set! (.approval-url station) "")
+          (set! (.approval-kind station) "")
+          (set! (.approval-summary station) "")
+          (when (= (.status station) "approval") (set! (.status station) "running") 0)
+          (when (= (.status st) "approval") (set! (.status st) "running") (set! (.reason st) "") 0)
+          0)
       (= kind "review.started")
         (let [station (station-at st agent-name)
               agent (agent-at st agent-name)]
@@ -477,6 +526,8 @@
         (jv-put! entry "attempts" (JInt (.attempts s)))
         (jv-put! entry "gate_failures" (JInt (.gate-failures s)))
         (jv-put! entry "review_rejections" (JInt (.review-rejections s)))
+        (jv-put! entry "approval_url" (JStr (.approval-url s)))
+        (jv-put! entry "approval_rounds" (JInt (.approval-rounds s)))
         (jv-put! entry "summary" (JStr (.summary s)))
         (jv-put! entry "started" (JInt (.started-t s)))
         (jv-put! entry "finished" (JInt (.finished-t s)))

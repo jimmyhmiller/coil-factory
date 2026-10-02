@@ -49,6 +49,7 @@
   (cond (= status "running") (soft-blue)
         (= status "paused") (amber)
         (= status "blocked") (amber)
+        (= status "approval") (amber)
         (= status "succeeded") (soft-green)
         (= status "passed") (soft-green)
         (= status "failed") (soft-red)
@@ -60,6 +61,7 @@
   (cond (= status "running") (pick term "●" "*")
         (= status "paused") (pick term "‖" "=")
         (= status "blocked") (pick term "◆" "!")
+        (= status "approval") (pick term "◆" "!")
         (= status "succeeded") (pick term "✓" "+")
         (= status "passed") (pick term "✓" "+")
         (= status "failed") (pick term "✗" "x")
@@ -72,11 +74,11 @@
 (defn status-glyph [(a (dyn Allocator)) (term style/Term) (status (slice u8))] (-> (slice u8))
   (paint-fg a term (status-color status) (status-glyph-text term status)))
 
-;;; "blocked" reads as a call to action.
+;;; "blocked" and "approval" read as a call to action.
 (defn status-word [(a (dyn Allocator)) (term style/Term) (status (slice u8))] (-> (slice u8))
-  (if (= status "blocked")
-      (paint-bold a term (amber) "needs you")
-      (paint-fg a term (status-color status) status)))
+  (cond (= status "blocked") (paint-bold a term (amber) "needs you")
+        (= status "approval") (paint-bold a term (amber) "needs your approval")
+        :else (paint-fg a term (status-color status) status)))
 
 (defn now-wall-ms [] (-> i64)
   (match (time/wall-now-ms) (Ok [ms] ms) (Err [e] 0)))
@@ -217,6 +219,24 @@
                              :else (style/warn a term (join a ["◉ " verdict]))) "  "
                        (style/muted a term (first-line a (str-field record "reason") 160))])
               ""))
+      (= kind "approval.summarizing")
+        (join a [when "  " who "  " (paint-fg a term (violet) "✍ summarizing for Jimmy")
+                 (style/muted a term (join a [" (" (str-field record "approval_kind") ", round " (int-text a (int-field record "round")) ")"]))])
+      (= kind "approval.requested")
+        (join a [when "  " who "  " (paint-bold a term (amber) "◆ waiting for your approval  ")
+                 (style/accent a term (str-field record "url"))
+                 "\n" (style/muted a term (join a ["            " (first-line a (str-field record "title") 140)]))])
+      (= kind "approval.decided")
+        (cond (= (str-field record "approval_kind") "question")
+                (join a [when "  " who "  " (paint-bold a term (amber) "◆ Jimmy answered; sent to the agent")])
+              (bool-field record "approved_all")
+                (join a [when "  " who "  " (style/ok a term "✓ Jimmy approved")])
+              :else
+                (join a [when "  " who "  " (paint-bold a term (amber) "◆ Jimmy sent it back to the agent")]))
+      (= kind "approval.withdrawn")
+        (join a [when "  " who "  " (style/warn a term "approval withdrawn") "  " (first-line a (str-field record "reason") 160)])
+      (= kind "approval.unreachable")
+        (join a [when "  " who "  " (style/err a term "approvals unreachable (still waiting)") "  " (first-line a (str-field record "message") 160)])
       (= kind "review.started")
         (join a [when "  " who "  " (paint-fg a term (violet) "⚖ review") " "
                  (style/accent a term (str-field record "reviewers"))

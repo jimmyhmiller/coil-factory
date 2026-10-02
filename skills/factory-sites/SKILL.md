@@ -32,6 +32,7 @@ Configuration lives in `~/.factory/site.json` (all optional):
   "opencode_model": "opencode/big-pickle",
   "codex_model": "gpt-6.1-sol",
   "codex_writable": ["~/.pad"],
+  "approvals": { "url": "https://computer.jimmyhmiller.com/approvals", "token_file": "~/.config/gatekeeper/token" },
   "reviewers": ["judge"],
   "overseer": { "policy": "nudge", "interval_seconds": 20 },
   "providers": [
@@ -47,6 +48,11 @@ there is no overseer model (`overseer.model` is refused with a pointer here).
 There is no built-in model: `default_model` (builtin harness), `opencode_model`
 (opencode harness) and `codex_model` (codex harness) are the site's defaults, and
 without them every run must name a model.
+
+`approvals` is where stations with `approve: yes` send their proposals: the
+`approvals` Gatekeeper function's base URL and a file holding a token it accepts
+(a device token from `gatekeeper-login` works; it can submit and read but never
+decide). Without it, a run that needs approval is refused when it is made.
 
 `default_harness` is `builtin`, `opencode`, or `codex`. The `opencode` harness needs OpenCode
 on the site (found on PATH or in `~/.opencode/bin`; `opencode` overrides the path);

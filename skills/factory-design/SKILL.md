@@ -95,7 +95,12 @@ the next one.
 Rules the parser enforces (and `factory check` reports):
 
 - front matter keys: `name` (required, kebab-case), `description`, `input`, `model`,
-  `harness`, `reviewers`, `review`, `tools`, `attempts`;
+  `harness`, `reviewers`, `review`, `approve`, `summarizer`, `tools`, `attempts`;
+- `approve: yes` (front matter, or a station setting) makes a person approve each
+  station's work, item by item, on a phone, and answer the agent whenever it stops
+  to ask; `summarizer:` names who writes those proposals (default: the bundled
+  `summarizer`). The site needs `approvals` in `site.json`. Use it when the person
+  does not want to act on an agent's word;
 - `reviewers:` names the reviewers that judge runs of this factory (`factory
   reviewers` lists them; `judge` is bundled). Leave it out for none, unless the
   person wants judgment; a reviewer is its own Markdown file in
@@ -117,7 +122,7 @@ Rules the parser enforces (and `factory check` reports):
 - tools are `files` and `shell` (comma-separated); a station without `shell` cannot
   run commands, so it cannot verify anything by running it;
 - station settings are `key: value` lines directly under the heading, before the
-  first blank line: `gate`, `attempts`, `model`, `harness`, `tools`, `review`;
+  first blank line: `gate`, `attempts`, `model`, `harness`, `tools`, `review`, `approve`;
 - station names are unique, lowercase, and short — they become agent addresses
   like `7f3a/build`.
 

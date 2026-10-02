@@ -31,6 +31,10 @@ workspace sandbox and cannot change the gates, the probes, or the reviewers.
   - `struct-field-add`: adding a field recompiles none of 80 readers;
   - `diagnostic-verbatim`: Coil's own error message comes back;
   - `ordinary-coil`: an `ArrayList` of the program's own struct works.
+- `summarizer.md` turns every station's work, and every stop to ask, into
+  proposals Jimmy approves or rejects one by one at
+  https://computer.jimmyhmiller.com/approvals (`approve: yes`). Claims about
+  what Coil cannot do always get their own proposal with their reproduction.
 - `reviewers/` holds Codex reviewers on `gpt-6.1-sol`. `live-rules`,
   `live-spec`, and `live-tests` must approve a station's work before it is
   committed, and any rejection sends the work back. `live-watch` watches the

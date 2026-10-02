@@ -133,3 +133,26 @@
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
   (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(deftest folds-approvals-so-a-restart-waits-on-the-same-request
+  (let [a (malloc-allocator)
+        (mut st) (runstate-new a "r-2")]
+    (fold-lines! (mut st)
+                 ["{\"t\":1000,\"kind\":\"run.started\",\"base\":\"abc\"}"
+                  "{\"t\":1100,\"kind\":\"station.started\",\"agent\":\"plan\"}"
+                  "{\"t\":1200,\"kind\":\"approval.requested\",\"agent\":\"plan\",\"id\":\"r1\",\"url\":\"https://h/approvals/r/r1\",\"approval_kind\":\"station\",\"title\":\"t\",\"round\":1,\"summary\":\"did it\"}"])
+    (let [station (station-at (mut st) "plan")]
+      (assert (= (.status st) "approval"))
+      (assert (contains? (.reason st) "https://h/approvals/r/r1"))
+      (assert (= (.status station) "approval"))
+      (assert (= (.approval-id station) "r1"))
+      (assert (= (.approval-kind station) "station"))
+      (assert (= (.approval-summary station) "did it"))
+      (assert-eq (.approval-rounds station) 1))
+    (fold-lines! (mut st)
+                 ["{\"t\":1300,\"kind\":\"approval.decided\",\"agent\":\"plan\",\"id\":\"r1\",\"approved_all\":false,\"approval_kind\":\"station\",\"round\":1,\"message\":\"2. REJECTED: x\"}"])
+    (let [station (station-at (mut st) "plan")]
+      (assert (= (.status st) "running"))
+      (assert (= (.approval-id station) ""))
+      (assert (= (.status station) "running"))
+      (assert (contains? (.approval-history station) "Round 1:\n2. REJECTED: x")))))

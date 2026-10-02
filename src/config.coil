@@ -62,6 +62,9 @@
 (defn reviewers-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
   (path-join a home "reviewers"))
 
+(defn summarizers-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "summarizers"))
+
 ;;; An OpenAI-compatible server declared in site.json.
 (defstruct ProviderDecl
   [(name (slice u8))
@@ -95,6 +98,12 @@
    ;;; (their workspace sandbox) may also write, comma-separated; `~` is the
    ;;; home directory. "" for none.
    (codex-writable (slice u8))
+   ;;; Where approval requests go (see factory.approval): the base URL of the
+   ;;; approvals service, such as https://computer.jimmyhmiller.com/approvals,
+   ;;; and a file holding the bearer token it is submitted with. Both "" when
+   ;;; this site has no approvals, and then a run that needs one is refused.
+   (approvals-url (slice u8))
+   (approvals-token-file (slice u8))
    ;;; The reviewers that watch runs whose run and factory name none, as
    ;;; comma-separated names or paths; "" means none (see factory.reviewer).
    (reviewers (slice u8))
@@ -167,6 +176,8 @@
                 (set! (.codex config) (json-str-or object "codex" ""))
                 (set! (.codex-model config) (json-str-or object "codex_model" ""))
                 (set! (.codex-writable config) (names-text a (jv-get object "codex_writable")))
+                (set! (.approvals-url config) (json-str-or (jv-get object "approvals") "url" ""))
+                (set! (.approvals-token-file config) (json-str-or (jv-get object "approvals") "token_file" ""))
                 (set! (.reviewers config) (names-text a (jv-get object "reviewers")))
                 (let [overseer (jv-get object "overseer")]
                   (set! (.overseer-policy config) (json-str-or overseer "policy" "nudge"))

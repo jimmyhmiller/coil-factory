@@ -128,9 +128,10 @@ Read the diff on this branch as a skeptical reviewer…
 
 Front matter keys: `name` (required), `description`, `input` (what the brief is),
 `model`, `harness` (`builtin`, `opencode`, `codex`), `reviewers` (see the
-overseer), `review` (see station reviews), `tools` (`files`, `shell`), `attempts`.
+overseer), `review` (see station reviews), `approve` and `summarizer` (see
+approval by a person), `tools` (`files`, `shell`), `attempts`.
 Station settings are `key: value` lines directly under the heading: `gate`,
-`attempts`, `model`, `harness`, `tools`, `review`. Everything else is prose for
+`attempts`, `model`, `harness`, `tools`, `review`, `approve`. Everything else is prose for
 the model.
 
 ## Where runs execute
@@ -273,6 +274,51 @@ It is told that its verdict decides whether the work is accepted.
 - A reviewer gives no verdict (it cannot start, its model fails, its reply is
   not one of its verdicts): the station is blocked. Work is never accepted
   without a verdict.
+
+## Approval by a person
+
+A station with `approve: yes` (or a factory with it in front matter) does not
+accept its agent's word: a person approves what it did and claims, item by
+item, from a phone. Every step is the factory's; the only agent involved is the
+summarizer, whose reply is checked.
+
+1. **When.** After the station's agent finishes, its gate passes, and its
+   reviewers approve (`station` kind); and whenever its agent stops to ask, by
+   finishing `blocked` or by replying twice without a tool (`question` kind).
+2. **Summarize.** The run's summarizer (front matter `summarizer:`, a path or
+   a name in `~/.factory/summarizers/`, else the bundled `summarizer`, frozen
+   into `run.json`) is asked to turn the agent's own words and the station's
+   material into a strict JSON shape: a title, a summary, separate proposals
+   (title, detail, evidence), and questions. Anything else is refused; the
+   summarizer gets one more try with its mistake named, then the station stops
+   for a person. Nothing goes out unchecked.
+3. **Attach.** The factory attaches, itself, raw material the summarizer cannot
+   alter: the agent's own words, the gate's output, every reviewer's verdict,
+   the station's diff against the commit it started from, the brief, and every
+   earlier decision at this station in the words the agent was given.
+4. **Submit and wait.** The request goes to the site's approvals service
+   (`site.json` `approvals`: `url` and `token_file`), which is the `approvals`
+   Gatekeeper function (`gatekeeper-functions/funcs/approvals`). The run's
+   status is `approval`, its reason the page's link (`approval.requested`).
+   The worker polls every fifteen seconds; a restarted worker goes back to
+   waiting on the same request. Cancelling the run withdraws it.
+5. **Decide.** On the page, every proposal is approved or rejected (a
+   rejection needs a reason) and every question answered. The service accepts
+   a decision only from a `browser` principal, which the gate grants only to a
+   passkey session: the token the factory submits with, which agents could
+   read, can submit, read, and withdraw, never decide.
+6. **Act.** Finished work with every proposal approved is committed. Anything
+   else, and every answer, goes to the agent as an `[approval]` message (each
+   item APPROVED or REJECTED with Jimmy's reason, each question with its
+   answer), and the station continues. Human decisions do not count against
+   `attempts`.
+
+| kind | writer | meaning |
+| --- | --- | --- |
+| `approval.summarizing` | run | the summarizer was asked (`approval_kind`, `round`) |
+| `approval.requested` | run | a request is waiting (`id`, `url`, `title`, `approval_kind`, `round`) |
+| `approval.decided` | run | the decision (`approved_all`, `decision`, `message` as the agent got it) |
+| `approval.withdrawn` / `approval.unreachable` | run | the request was withdrawn; the service could not be asked (waiting goes on) |
 
 ## The overseer
 

@@ -9,11 +9,12 @@
 (import "durable.atomic" :as atomic)
 (import "agent.json" :use *)
 (import "factory.config" :use *)
-(import "factory.library" :use [resolve-factory list-factories list-reviewers bundled-skills Found NotFound CatalogEntry Bundled])
+(import "factory.library" :use [resolve-factory resolve-summarizer list-factories list-reviewers bundled-skills Found NotFound CatalogEntry Bundled])
 (import "factory.proc" :use *)
 (import "factory.spec" :use *)
 (import "factory.specparse" :use *)
 (import "factory.reviewer" :use *)
+(import "factory.approval" :as approval)
 (import "factory.cli.ctx" :use *)
 (import "factory.cli.render" :use *)
 
@@ -23,7 +24,8 @@
 (defn print-spec-summary [(ctx (ptr Ctx)) (spec (ptr FactorySpec))] (-> i64)
   (let [a (.allocator ctx)
         term (.out ctx)
-        (mut table) (style/table-new a ["" "STATION" "GATE" "REVIEW" "TOOLS" "ATTEMPTS"])
+        (mut table) (style/table-new a ["" "STATION" "GATE" "REVIEW" "APPROVE" "TOOLS" "ATTEMPTS"])
+        (mut approving) false
         (mut problems) (al-new [(slice u8)] a)]
     (for index (range 0 (station-count spec))
       (let [s (station-spec spec index)
@@ -47,9 +49,25 @@
                            (style/strong a term (.name s))
                            (if (> (len (.gate s)) 0) (style/accent a term (.gate s)) (style/muted a term "judgment"))
                            review
+                           (if (station-approves? spec s)
+                               (do (set! approving true) (paint-bold a term (amber) "Jimmy"))
+                               (style/muted a term "no"))
                            (station-tools spec s)
                            (int-text a (station-attempts spec s))])))
     (print "{s}" (style/table-render a term (load table)))
+    (when (load approving)
+      (let [reference (if (> (len (.summarizer spec)) 0) (.summarizer spec) "summarizer")]
+        (match (resolve-summarizer a (.home ctx) reference)
+          (NotFound [message] (do (push! (mut problems) (join a ["summarizer: " message])) 0))
+          (Found [entry]
+                 (match (approval/parse-summarizer a (.text entry))
+                   (approval/SummarizerBad [found] (do (push! (mut problems) (join a ["summarizer " reference ":\n" (problems-text a found)])) 0))
+                   (approval/SummarizerOk [parsed]
+                                          (do (say (style/muted a term (join a ["approvals summarized by " (.name parsed)
+                                                                                (if (> (len (.model parsed)) 0) (join a [" on " (.model parsed)]) "")])))
+                                              0)))))
+        0)
+      0)
     (for problem (iter problems)
       (say (join a [(style/err a term "✗ ") problem])))
     (if (> (len problems) 0) 1 0)))

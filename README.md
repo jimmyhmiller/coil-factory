@@ -50,6 +50,16 @@ Pick one per run (`--harness`), per factory or station (`harness:`), or per site
 steering, pause, cancel, resume, and conversations after a run all work the same
 in all three; see [DESIGN.md](DESIGN.md#harnesses) for how.
 
+## A person approves
+
+`approve: yes` makes a person the last step: a summarizer turns the station's
+work, or a stopped agent's claims and questions, into separate proposals; the
+factory attaches the raw material (the agent's words, the diff, the gate's and
+reviewers' output) and posts it to an approvals page (`site.json` `approvals`);
+the run waits. Only a person signed in with a passkey can decide there. Every
+rejection's reason and every answer goes back to the agent as its next
+instruction. See [DESIGN.md](DESIGN.md#approval-by-a-person).
+
 ## Reviews that send work back
 
 A station can require reviewers' approval before it passes (`review:` on the

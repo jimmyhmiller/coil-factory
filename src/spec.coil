@@ -22,6 +22,9 @@
    ;;; comma-separated names or paths; "" inherits the factory's `review`,
    ;;; "none" turns review off for this station.
    (review (slice u8))
+   ;;; "yes" when a person must approve this station's work (and answer it
+   ;;; when it stops to ask) before it goes on; "no"; "" inherits the factory's.
+   (approve (slice u8))
    (line i64)])
 
 (defstruct FactorySpec
@@ -36,6 +39,11 @@
    ;;; The reviewers every station's work must satisfy unless the station says
    ;;; otherwise (see `station-review`); "" for none.
    (review (slice u8))
+   ;;; "yes" or "no" (the default): whether stations need a person's approval.
+   (approve (slice u8))
+   ;;; Who summarizes a station's work into proposals for that approval: a
+   ;;; summarizer name or path; "" is the bundled `summarizer`.
+   (summarizer (slice u8))
    (tools (slice u8))
    (attempts i64)
    (context (slice u8))
@@ -75,6 +83,14 @@
 (defn review-choice [(factory-review (slice u8)) (station-review (slice u8))] (-> (slice u8))
   (let [chosen (if (> (len (str-trim station-review)) 0) station-review factory-review)]
     (if (= (str-trim chosen) "none") "" chosen)))
+
+;;; Whether a person must approve this station's work: its own `approve`, else
+;;; the factory's, else no.
+(defn station-approves? [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> bool)
+  (approve-choice (.approve spec) (.approve station)))
+
+(defn approve-choice [(factory-approve (slice u8)) (station-approve (slice u8))] (-> bool)
+  (= (if (> (len station-approve) 0) station-approve factory-approve) "yes"))
 
 (defn station-attempts [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> i64)
   (cond (> (.attempts station) 0) (.attempts station)

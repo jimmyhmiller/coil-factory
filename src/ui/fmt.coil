@@ -163,6 +163,7 @@
         (= status "queued") "◌"
         (= status "paused") "‖"
         (= status "blocked") "▲"
+        (= status "approval") "▲"
         (= status "succeeded") "✓"
         (= status "failed") "✗"
         (= status "cancelled") "⊘"
@@ -174,6 +175,7 @@
         (= status "queued") (.muted theme)
         (= status "paused") (.warning theme)
         (= status "blocked") (bold (.warning theme))
+        (= status "approval") (bold (.warning theme))
         (= status "succeeded") (.success theme)
         (= status "failed") (.error theme)
         (= status "cancelled") (.subtle theme)
@@ -184,6 +186,7 @@
 (defn status-color [(status (slice u8))] (-> Color)
   (cond (= status "running") (hex 0x7AA2F7)
         (= status "blocked") (hex 0xE0AF68)
+        (= status "approval") (hex 0xE0AF68)
         (= status "paused") (hex 0xE0AF68)
         (= status "succeeded") (hex 0x9ECE6A)
         (or (= status "failed") (= status "lost")) (hex 0xF7768E)

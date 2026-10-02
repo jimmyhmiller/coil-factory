@@ -371,12 +371,19 @@
     (al-pop! (mut (.open turn)))
     0))
 
-;;; Whether the process should stop at this boundary: the stop tool has been
-;;; called, or an interrupt is due.
+;;; Whether the process should stop before new work starts: the stop tool has
+;;; been called (the agent should not go on working), or an interrupt is due.
 (defn stop-here? [(turn (ptr Turn))] (-> bool)
   (cond (match (.finish turn) (Some [_] true) (None [] false)) true
         (.interrupt turn) (do (set! (.interrupted turn) true) true)
         :else false))
+
+;;; Whether the process should stop as an item completes: only for an
+;;; interrupt. After the stop tool, the agent's closing message and the turn's
+;;; token usage (`turn.completed`) still arrive; it is stopped only if it
+;;; starts new work.
+(defn interrupt-here? [(turn (ptr Turn))] (-> bool)
+  (if (.interrupt turn) (do (set! (.interrupted turn) true) true) false))
 
 ;;; Apply one line of `codex exec --json` output. Returns false when the
 ;;; process should be stopped: an item boundary after the stop tool was
@@ -451,11 +458,7 @@
                                       (set! (.finish-output turn) (copy-bytes a output))
                                       0)
                                     0))))
-                      ;; The stop tool's own completion is not yet a boundary:
-                      ;; the next event is.
-                      (if (and (= item-kind "mcp_tool_call") (stop-call? h item))
-                          true
-                          (not (stop-here? turn))))
+                      (not (interrupt-here? turn)))
                 (= kind "turn.completed")
                   (let [usage (jv-get event "usage")]
                     (observe (.observer h) (UsageReported (jv-int (jv-get usage "input_tokens"))
