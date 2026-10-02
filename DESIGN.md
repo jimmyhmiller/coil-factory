@@ -308,9 +308,11 @@ summarizer, whose reply is checked.
    waiting on the same request. Cancelling the run withdraws it.
 5. **Decide.** `https://…/approvals` is the inbox: the one address to come
    back to, which opens the next undecided item, one per page (oldest
-   request first). Each proposal is approved or rejected (a rejection needs a
-   reason) and each question answered; each decision is saved as it is made,
-   and the next item follows. The request is decided when its last item is.
+   request first). Each proposal is approved or rejected, with a comment
+   (optional to approve, required to reject; the agent is told it either
+   way), and each question answered; each decision is saved as it is made,
+   and the next item follows. Skip puts an item at the back of the inbox, to
+   come back to after everything else. The request is decided when its last item is.
    The service accepts a decision only from a `browser` principal, which the
    gate grants only to a passkey session: the token the factory submits with,
    which agents could read, can submit, read, and withdraw, never decide.
