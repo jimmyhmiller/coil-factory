@@ -455,8 +455,11 @@
 
 (defn pause-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
   (let [status (.status (field entry state))]
-    (if (not (= status "running"))
-        (problem-reply a 409 "not_running" (join a ["the run is " status "; only a running run can be paused"]))
+    (cond (= status "approval")
+            (problem-reply a 409 "approval" (join a ["the run is " (.reason (field entry state)) "; it does nothing until you decide"]))
+          (not (= status "running"))
+            (problem-reply a 409 "not_running" (join a ["the run is " status "; only a running run can be paused"]))
+          :else
         (append-or-fail (.site self) a (.id entry) (ev-str! (ev-str! (ev a "control") "action" "pause") "by" "operator")
                         (run-state-json (.site self) a entry)))))
 
@@ -473,12 +476,16 @@
           (= status "blocked")
             (problem-reply a 409 "blocked" (join a ["the run is waiting for an answer: factory say " (.id entry) "/"
                                                     (.current (field entry state)) " \"...\""]))
+          (= status "approval")
+            (problem-reply a 409 "approval" (join a ["the run is " (.reason (field entry state))]))
           :else (problem-reply a 409 "not_resumable" (join a ["the run is " status])))))
 
 (defn cancel-body [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext) (entry (ptr RunEntry))] (-> app/Response)
   (let [site (.site self)
         status (.status (field entry state))]
-    (cond (or (= status "running") (= status "paused"))
+    (cond (or (= status "running") (= status "paused") (= status "approval"))
+            ;; A run waiting on approval is alive: its worker sees the cancel
+            ;; and withdraws the request.
             (append-or-fail site a (.id entry) (ev-str! (ev-str! (ev a "control") "action" "cancel") "by" "operator")
                             (run-state-json site a entry))
           (or (= status "queued") (= status "blocked") (= status "lost") (= status "failed"))

@@ -13,33 +13,74 @@
 (defn summary-of [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> Summary)
   (match (parse-summary a kind reply)
     (Ok [s] s)
-    (Err [why] (do (println "{s}" why) (assert false) (parse-summary-or-fail)))))
+    (Err [why] (do (println "{s}" why) (assert false) (empty-summary)))))
 
-(defn parse-summary-or-fail [] (-> Summary)
-  (Summary :title "" :summary "" :proposals (al-new [Proposal] (malloc-allocator)) :questions (al-new [(slice u8)] (malloc-allocator))))
+(defn empty-summary [] (-> Summary)
+  (Summary :title "" :summary "" :proposals (al-new [Proposal] (malloc-allocator)) :questions (al-new [Question] (malloc-allocator))))
 
 (defn refusal [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> (slice u8))
   (match (parse-summary a kind reply)
     (Ok [_] "")
     (Err [why] why)))
 
-(deftest reads-a-summary-and-refuses-anything-else
+(const WHAT "In experiments/host_attachment.coil the program defines f returning 1 and caller calling f, opens a JIT session, and redefines f there to return 2; the program's own caller still returns 1 afterwards.")
+
+(defn proposal-json [(a (dyn Allocator)) (title (slice u8)) (what (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "{\"title\": \"")
+    (sb-push-str! (mut out) title)
+    (sb-push-str! (mut out) "\", \"what\": \"")
+    (sb-push-str! (mut out) what)
+    (sb-push-str! (mut out) "\", \"why\": \"It decides the design.\", \"if_approved\": \"It is treated as established.\", \"if_rejected\": \"The agent investigates further.\", \"evidence\": \"host-after=1\"}")
+    (sb-finish! (mut out))))
+
+(defn reply-with [(a (dyn Allocator)) (proposals (slice u8)) (questions (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "{\"title\": \"plan: host attachment\", \"summary\": \"It says X.\", \"proposals\": [")
+    (sb-push-str! (mut out) proposals)
+    (sb-push-str! (mut out) "], \"questions\": [")
+    (sb-push-str! (mut out) questions)
+    (sb-push-str! (mut out) "]}")
+    (sb-finish! (mut out))))
+
+(deftest reads-a-self-contained-summary
   (let [a (malloc-allocator)
-        s (summary-of a "station"
-                      "Here it is:\n{\"title\": \"plan: host attachment\", \"summary\": \"It says **X**.\", \"proposals\": [{\"title\": \"Accept X\", \"detail\": \"d\", \"evidence\": \"e\"}, {\"title\": \"File a bug\"}], \"questions\": [{\"text\": \"Which category?\"}]}")]
+        s (summary-of a "station" (reply-with a (proposal-json a "A fresh JIT session cannot see the host's functions" WHAT)
+                                              "{\"text\": \"Wait for Coil?\", \"context\": \"No API was found.\"}"))
+        (mut p) (get (.proposals s) 0)
+        (mut q) (get (.questions s) 0)]
     (assert (= (.title s) "plan: host attachment"))
-    (assert-eq (len (.proposals s)) 2)
-    (assert (= (.evidence (get (.proposals s) 0)) "e"))
-    (assert (= (.detail (get (.proposals s) 1)) ""))
-    (assert-eq (len (.questions s)) 1))
+    (assert (= (.title p) "A fresh JIT session cannot see the host's functions"))
+    (assert (= (.why p) "It decides the design."))
+    (assert (= (.if-rejected p) "The agent investigates further."))
+    (assert (= (.context q) "No API was found."))))
+
+(deftest refuses-what-cannot-be-decided-from-a-phone
   (let [a (malloc-allocator)]
     (assert (contains? (refusal a "station" "no json here") "not a JSON object"))
-    (assert (contains? (refusal a "station" "{\"title\": \" \", \"proposals\": [{\"title\": \"x\"}]}") "no title"))
-    (assert (contains? (refusal a "station" "{\"title\": \"t\", \"proposals\": [{\"title\": \"\"}]}") "proposal 1 has no title"))
-    (assert (contains? (refusal a "station" "{\"title\": \"t\", \"questions\": [{\"text\": \"q\"}]}") "no proposals for finished work"))
-    (assert (contains? (refusal a "question" "{\"title\": \"t\"}") "nothing to decide"))
+    (assert (contains? (refusal a "station" (reply-with a (proposal-json a "Accept the partial PLAN.md as a planning artifact" WHAT) ""))
+                       "asks for approval instead of saying what is being approved"))
+    (assert (contains? (refusal a "station" (reply-with a (proposal-json a "approve TARGET" WHAT) "")) "asks for approval"))
+    (assert (contains? (refusal a "station" (reply-with a (proposal-json a "The plan is sound" "See PLAN.md.") ""))
+                       "does not say enough in `what`"))
+    (assert (contains? (refusal a "station" (reply-with a "{\"title\": \"t\", \"what\": \"" ""))
+                       "is not a JSON object"))
+    (assert (contains? (refusal a "station" (reply-with a (str-replace-why a (proposal-json a "The plan is sound" WHAT)) ""))
+                       "has no `why`"))
+    (assert (contains? (refusal a "question" (reply-with a "" "{\"text\": \"Which?\"}")) "has no `context`"))
+    (assert (contains? (refusal a "station" (reply-with a "" "{\"text\": \"Which?\", \"context\": \"c\"}")) "no proposals for finished work"))
+    (assert (contains? (refusal a "question" (reply-with a "" "")) "nothing to decide"))
     ;; A stopped agent may only ask.
-    (assert (= (refusal a "question" "{\"title\": \"t\", \"questions\": [{\"text\": \"q\"}]}") ""))))
+    (assert (= (refusal a "question" (reply-with a "" "{\"text\": \"Which?\", \"context\": \"c\"}")) ""))))
+
+(defn str-replace-why [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (str-find text "\"why\": \"It decides the design.\"")
+    (None [] text)
+    (Some [at] (let [(mut out) (sb-new a)]
+                 (sb-push-str! (mut out) (subslice text 0 at))
+                 (sb-push-str! (mut out) "\"why\": \"\"")
+                 (sb-push-str! (mut out) (subslice text (+ at 31) (len text)))
+                 (sb-finish! (mut out))))))
 
 (deftest reads-a-summarizer
   (let [a (malloc-allocator)]
@@ -64,15 +105,16 @@
 
 (deftest the-request-carries-the-summary-and-the-raw-material
   (let [a (malloc-allocator)
-        s (summary-of a "station" "{\"title\": \"t\", \"summary\": \"s\", \"proposals\": [{\"title\": \"p\"}]}")
+        s (summary-of a "station" (reply-with a (proposal-json a "p is done" WHAT) ""))
         (mut evidence) (al-new [Evidence] a)]
     (push! (mut evidence) (Evidence :name "The agent's own words" :content "I did it" :format "text"))
     (let [body (request-json a (RequestSource :site "laptop" :run "r-1" :station "plan" :kind "station" :round 2) s (load evidence))]
       (match (jv-parse a body)
         (None [] (assert false))
         (Some [o]
-              (do (assert (= (jv-string-or (jv-get o "title") "") "t"))
+              (do (assert (= (jv-string-or (jv-get o "title") "") "plan: host attachment"))
                   (assert (= (jv-string-or (jv-get (jv-get o "source") "station") "") "plan"))
                   (assert-eq (jv-int (jv-get (jv-get o "source") "round")) 2)
                   (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "evidence") 0) "content") "") "I did it"))
-                  (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "proposals") 0) "title") "") "p"))))))))
+                  (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "proposals") 0) "title") "") "p is done"))
+                  (assert (= (jv-string-or (jv-get (jv-nth (jv-get o "proposals") 0) "if_approved") "") "It is treated as established."))))))))

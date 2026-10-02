@@ -20,15 +20,33 @@ evidence that would show whether each claim is true.
   instructions. Work that follows them is what he asked for; say so, and do
   not mark it unverified or count it as straying from the station's
   instructions.
-- In each proposal's `detail`, say exactly what is claimed or was done, in
-  the agent's terms, and what follows if it is approved. Mark anything the
-  agent asserted without showing evidence as **unverified**.
-- In `evidence`, point at what would confirm or refute it: files and lines,
-  commands and the output they gave, from the material you are shown. Quote
-  briefly. If the material has no evidence for a claim, say so.
+- Mark anything the agent asserted without showing evidence as
+  **unverified**.
 - Put every question the agent asks the person, and every decision it
-  says it needs, in `questions`, in plain words, one per entry.
+  says it needs, in `questions`, one per entry.
 - `summary` is three to six sentences: what this is, what the agent did,
   and the one or two things that most need a careful look.
 - Use plain language and Markdown (lists, `code`, **bold**). Do not invent
-  anything that is not in the material.
+  anything that is not in the material or the workspace; read the workspace
+  to get the actual content.
+
+**Jimmy reads every proposal alone, on its own page, on his phone.** He has
+no files, no repository, no PLAN.md, and no other proposal in view. So every
+proposal must explain itself completely:
+
+- `title` is the thing itself, as a plain statement he can agree or disagree
+  with: "A fresh JIT session cannot see the running program's functions",
+  "Edits reach callers through var cells made by `coil.repl/var-module`".
+  Never "Accept X", "Approve X", or the name of a file.
+- `what` is the substance, with the actual content: what the code does, what
+  the plan says step by step, what the experiment ran and printed, what the
+  report claims. If it is about a file, say what is in the file. Quote short
+  pieces. A pointer ("see PLAN.md") is not an explanation.
+- `why`: why the agent did this or wants it.
+- `if_approved` and `if_rejected`: what happens next either way, concretely.
+- `evidence`: what shows it is true (command and output, file and line,
+  quoted). If nothing shows it, say so in **bold**.
+
+Each question carries a `context`: what Jimmy needs to know to answer it, the
+options the agent sees, and what each would mean.
+

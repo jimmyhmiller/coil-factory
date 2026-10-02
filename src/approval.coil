@@ -109,10 +109,19 @@
           (if (= (.tools spec) "read")
               "\n\nYou can read the agent's workspace with your tools to find evidence. Never change anything there."
               "")
-          "\n\nReply with ONLY a JSON object: {\"title\": one line naming what is to be decided, "
-          "\"summary\": Markdown, \"proposals\": [{\"title\": one line, \"detail\": Markdown, \"evidence\": Markdown}], "
-          "\"questions\": [{\"text\": Markdown}]}. Every proposal needs a title. When you are shown finished work, give at "
-          "least one proposal; when the agent stopped to ask, give at least one proposal or question."]))
+          "\n\nReply with ONLY a JSON object:\n"
+          "{\"title\": one line naming what is to be decided,\n"
+          " \"summary\": Markdown, three to six sentences,\n"
+          " \"proposals\": [{\"title\": the thing itself, as a statement Jimmy can agree or disagree with (never \"Accept ...\" or \"Approve ...\"),\n"
+          "                \"what\": Markdown: exactly what was done or is claimed, with the actual content (at least a few sentences),\n"
+          "                \"why\": Markdown: why the agent did it or wants it,\n"
+          "                \"if_approved\": Markdown: what happens next if Jimmy approves,\n"
+          "                \"if_rejected\": Markdown: what happens next if he rejects,\n"
+          "                \"evidence\": Markdown: what shows it is true, quoted}],\n"
+          " \"questions\": [{\"text\": the question, \"context\": Markdown: what he needs to know to answer it, and the options}]}\n"
+          "Jimmy reads each proposal alone, on its own page, on his phone, with no files, no repository, and no other proposal in view. "
+          "Every field must make sense on that page by itself. When you are shown finished work, give at least one proposal; "
+          "when the agent stopped to ask, give at least one proposal or question."]))
 
 ;;; What the summarizer is shown. `kind` is `station` (finished work) or
 ;;; `question` (the agent stopped and asked).
@@ -135,46 +144,91 @@
           "\n\n" material
           "\n\n## Workspace\n`" workspace "`"]))
 
-(defstruct Proposal [(title (slice u8)) (detail (slice u8)) (evidence (slice u8))])
+;;; One thing Jimmy approves or rejects, written to be read alone on a phone
+;;; with nothing else open: the thing itself as the title, then what it is
+;;; (with the actual content, not a pointer to a file), why, and what
+;;; follows either way.
+(defstruct Proposal
+  [(title (slice u8))
+   (what (slice u8))
+   (why (slice u8))
+   (if-approved (slice u8))
+   (if-rejected (slice u8))
+   (evidence (slice u8))])
+
+;;; One question, with what Jimmy needs to answer it.
+(defstruct Question [(text (slice u8)) (context (slice u8))])
 
 (defstruct Summary
   [(title (slice u8))
    (summary (slice u8))
    (proposals (ArrayList Proposal))
-   (questions (ArrayList (slice u8)))])
+   (questions (ArrayList Question))])
+
+;;; The shortest `what` that can carry the substance of a proposal.
+(const MIN-WHAT 150)
 
 (defn string-field [(a (dyn Allocator)) (object JVal) (key (slice u8))] (-> (slice u8))
   (copy-bytes a (str-trim (jv-string-or (jv-get object key) ""))))
 
-;;; Read a summarizer's reply. Anything but the declared shape is the
-;;; summarizer's failure, reported, never repaired or guessed at.
+(defn lower-ascii-text [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for byte (iter text)
+      (let [c (cast i64 byte)]
+        (sb-push-byte! (mut out) (cast u8 (if (and (>= c 65) (<= c 90)) (+ c 32) c)))))
+    (sb-finish! (mut out))))
+
+;;; A title that asks for approval ("Accept the plan") instead of stating the
+;;; thing to be approved. The buttons already say approve and reject.
+(defn approval-title? [(a (dyn Allocator)) (title (slice u8))] (-> bool)
+  (let [t (lower-ascii-text a title)]
+    (or (starts-with t "accept") (starts-with t "approve") (starts-with t "approval")
+        (starts-with t "confirm") (starts-with t "sign off"))))
+
+(defn numbered [(a (dyn Allocator)) (what (slice u8)) (i i64) (problem (slice u8))] (-> (slice u8))
+  (cat a [what " " (int-text a (+ i 1)) " " problem]))
+
+;;; Read a summarizer's reply. Anything but the declared shape, or a proposal
+;;; that cannot be decided from what it says, is the summarizer's failure,
+;;; reported (it is asked again with the problem named), never repaired.
 (defn parse-summary [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> (Result Summary (slice u8)))
   (block :parse
          (match (jv-parse a (extract-object reply))
            (None [] (Err (cat a ["the summarizer's reply is not a JSON object: " (first-chars (str-trim reply) 200)])))
            (Some [object]
                  (let [(mut proposals) (al-new [Proposal] a)
-                       (mut questions) (al-new [(slice u8)] a)
+                       (mut questions) (al-new [Question] a)
                        ps (jv-get object "proposals")
                        qs (jv-get object "questions")
                        title (string-field a object "title")
                        (mut i) 0]
-                   (when (= (len title) 0) (return-from :parse (Err "the summarizer's reply has no title")))
+                   (when (= (len title) 0) (return-from :parse (Err "the reply has no title")))
                    (loop (if (>= (load i) (jv-count ps))
                              (break)
-                             (let [p (jv-nth ps (load i))
-                                   pt (string-field a p "title")]
-                               (when (= (len pt) 0)
-                                 (return-from :parse (Err (cat a ["proposal " (int-text a (+ (load i) 1)) " has no title"]))))
-                               (push! (mut proposals) (Proposal :title pt :detail (string-field a p "detail")
-                                                                :evidence (string-field a p "evidence")))
+                             (let [o (jv-nth ps (load i))
+                                   p (Proposal :title (string-field a o "title") :what (string-field a o "what")
+                                               :why (string-field a o "why") :if-approved (string-field a o "if_approved")
+                                               :if-rejected (string-field a o "if_rejected") :evidence (string-field a o "evidence"))
+                                   n (load i)]
+                               (cond (= (len (.title p)) 0) (return-from :parse (Err (numbered a "proposal" n "has no title")))
+                                     (approval-title? a (.title p))
+                                       (return-from :parse (Err (numbered a "proposal" n (cat a ["is titled \"" (.title p) "\", which asks for approval instead of saying what is being approved. Title it with the thing itself, as a statement Jimmy can agree or disagree with."]))))
+                                     (< (len (.what p)) MIN-WHAT)
+                                       (return-from :parse (Err (numbered a "proposal" n (cat a ["(\"" (.title p) "\") does not say enough in `what` to decide from a phone with nothing else open: give the actual content, not a pointer to a file."]))))
+                                     (= (len (.why p)) 0) (return-from :parse (Err (numbered a "proposal" n "has no `why`")))
+                                     (= (len (.if-approved p)) 0) (return-from :parse (Err (numbered a "proposal" n "has no `if_approved`")))
+                                     (= (len (.if-rejected p)) 0) (return-from :parse (Err (numbered a "proposal" n "has no `if_rejected`")))
+                                     :else 0)
+                               (push! (mut proposals) p)
                                (set! i (+ (load i) 1)))))
                    (set! i 0)
                    (loop (if (>= (load i) (jv-count qs))
                              (break)
-                             (let [q (string-field a (jv-nth qs (load i)) "text")]
-                               (when (= (len q) 0)
-                                 (return-from :parse (Err (cat a ["question " (int-text a (+ (load i) 1)) " has no text"]))))
+                             (let [o (jv-nth qs (load i))
+                                   q (Question :text (string-field a o "text") :context (string-field a o "context"))]
+                               (when (= (len (.text q)) 0) (return-from :parse (Err (numbered a "question" (load i) "has no text"))))
+                               (when (= (len (.context q)) 0)
+                                 (return-from :parse (Err (numbered a "question" (load i) "has no `context`: say what Jimmy needs to know to answer it, and the options"))))
                                (push! (mut questions) q)
                                (set! i (+ (load i) 1)))))
                    (cond (and (= kind "station") (= (len proposals) 0))
@@ -212,12 +266,16 @@
     (for p (iter (.proposals summary))
       (let [o (jv-object a)]
         (jv-put! o "title" (JStr (.title p)))
-        (jv-put! o "detail" (JStr (.detail p)))
+        (jv-put! o "what" (JStr (.what p)))
+        (jv-put! o "why" (JStr (.why p)))
+        (jv-put! o "if_approved" (JStr (.if-approved p)))
+        (jv-put! o "if_rejected" (JStr (.if-rejected p)))
         (jv-put! o "evidence" (JStr (.evidence p)))
         (jv-push! ps o)))
     (for q (iter (.questions summary))
       (let [o (jv-object a)]
-        (jv-put! o "text" (JStr q))
+        (jv-put! o "text" (JStr (.text q)))
+        (jv-put! o "context" (JStr (.context q)))
         (jv-push! qs o)))
     (for e (iter evidence)
       (let [o (jv-object a)]
@@ -296,8 +354,10 @@
         (cat a ["the approvals service answered " (int-text a (.status result))
                 (if (> (len said) 0) (cat a [": " said]) "")]))))
 
-;;; A submitted request: its id, and the page a person opens.
-(defstruct Submitted [(id (slice u8)) (url (slice u8))])
+;;; A submitted request: its id; the inbox, the one address Jimmy keeps
+;;; coming back to, which opens the next decision waiting; and the request's
+;;; own page.
+(defstruct Submitted [(id (slice u8)) (url (slice u8)) (page (slice u8))])
 
 (defn approval-submit! [(a (dyn Allocator)) (config (ptr SiteConfig)) (body (slice u8))] (-> (Result Submitted (slice u8)))
   (let [result (call-service a config "POST" "/v1/requests" body)]
@@ -311,7 +371,8 @@
                   (if (or (= (len id) 0) (= (len page) 0))
                       (Err "the approvals service's reply has no id")
                       (Ok (Submitted :id (copy-bytes a id)
-                                     :url (cat a [(str-trim-end-slash (.approvals-url config)) page]))))))))))
+                                     :url (str-trim-end-slash (.approvals-url config))
+                                     :page (cat a [(str-trim-end-slash (.approvals-url config)) page]))))))))))
 
 ;;; Where a request stands.
 (defsum ApprovalState

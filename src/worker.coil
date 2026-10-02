@@ -612,9 +612,10 @@
                          (Err [why] (return-from :approve
                                                  (ApprovalStopped (text-join a ["The approval request could not be submitted: " why]))))
                          (Ok [submitted]
-                             (do (emit! worker (ev-text! a (ev-int! (ev-str! (ev-str! (ev-str! (ev-str! (ev-agent a "approval.requested" name)
-                                                                                                        "id" (.id submitted))
-                                                                                               "url" (.url submitted))
+                             (do (emit! worker (ev-text! a (ev-int! (ev-str! (ev-str! (ev-str! (ev-str! (ev-str! (ev-agent a "approval.requested" name)
+                                                                                                                 "id" (.id submitted))
+                                                                                                        "url" (.url submitted))
+                                                                                               "page" (.page submitted))
                                                                                       "approval_kind" kind)
                                                                              "title" (.title made))
                                                                     "round" round)

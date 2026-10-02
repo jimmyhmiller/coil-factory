@@ -288,10 +288,14 @@ summarizer, whose reply is checked.
 2. **Summarize.** The run's summarizer (front matter `summarizer:`, a path or
    a name in `~/.factory/summarizers/`, else the bundled `summarizer`, frozen
    into `run.json`) is asked to turn the agent's own words and the station's
-   material into a strict JSON shape: a title, a summary, separate proposals
-   (title, detail, evidence), and questions. Anything else is refused; the
-   summarizer gets one more try with its mistake named, then the station stops
-   for a person. Nothing goes out unchecked.
+   material into a strict JSON shape: a title, a summary, separate proposals,
+   and questions. Each proposal is read alone on a phone, so it must stand
+   alone: a `title` stating the thing itself (never "Accept …"/"Approve …"),
+   `what` (the actual content, at least 150 characters), `why`,
+   `if_approved`, `if_rejected`, and `evidence`; each question has the
+   `context` needed to answer it. Anything else is refused; the summarizer
+   gets one more try with its mistake named, then the station stops for a
+   person. Nothing goes out unchecked.
 3. **Attach.** The factory attaches, itself, raw material the summarizer cannot
    alter: the agent's own words, the gate's output, every reviewer's verdict,
    the station's diff against the commit it started from, the brief, and every
@@ -302,11 +306,14 @@ summarizer, whose reply is checked.
    status is `approval`, its reason the page's link (`approval.requested`).
    The worker polls every fifteen seconds; a restarted worker goes back to
    waiting on the same request. Cancelling the run withdraws it.
-5. **Decide.** On the page, every proposal is approved or rejected (a
-   rejection needs a reason) and every question answered. The service accepts
-   a decision only from a `browser` principal, which the gate grants only to a
-   passkey session: the token the factory submits with, which agents could
-   read, can submit, read, and withdraw, never decide.
+5. **Decide.** `https://…/approvals` is the inbox: the one address to come
+   back to, which opens the next undecided item, one per page (oldest
+   request first). Each proposal is approved or rejected (a rejection needs a
+   reason) and each question answered; each decision is saved as it is made,
+   and the next item follows. The request is decided when its last item is.
+   The service accepts a decision only from a `browser` principal, which the
+   gate grants only to a passkey session: the token the factory submits with,
+   which agents could read, can submit, read, and withdraw, never decide.
 6. **Act.** Finished work with every proposal approved is committed. Anything
    else, and every answer, goes to the agent as an `[approval]` message (each
    item APPROVED or REJECTED with Jimmy's reason, each question with its

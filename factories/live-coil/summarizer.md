@@ -32,12 +32,32 @@ touches.
   evidence, not proposals.
 - Jimmy's earlier decisions at this station, when shown, are his own
   instructions. Work that follows them is what he asked for.
-- In `detail`, say exactly what is claimed or was done, and what follows if
-  it is approved. Mark anything asserted without shown evidence as
-  **unverified**. In `evidence`, quote briefly: file and line, command and
-  output.
+- Mark anything asserted without shown evidence as **unverified**.
 - Every question the agent asks goes in `questions`, one per entry, in plain
   words.
 - `summary` is three to six sentences: what this is, what the agent did, and
   the one or two things that most need a careful look.
-- Do not invent anything that is not in the material or the workspace.
+- Do not invent anything that is not in the material or the workspace; read
+  the workspace (PLAN.md, the code, experiment outputs) to get the actual
+  content.
+
+**Jimmy reads every proposal alone, on its own page, on his phone.** He has
+no files, no repository, no PLAN.md, and no other proposal in view. So every
+proposal must explain itself completely:
+
+- `title` is the thing itself, as a plain statement he can agree or disagree
+  with: "A fresh JIT session cannot see the running program's functions",
+  "Edits reach callers through var cells made by `coil.repl/var-module`".
+  Never "Accept X", "Approve X", or the name of a file.
+- `what` is the substance, with the actual content: what the code does, what
+  the plan says step by step, what the experiment ran and printed, what the
+  report claims. If it is about a file, say what is in the file. Quote short
+  pieces. A pointer ("see PLAN.md") is not an explanation.
+- `why`: why the agent did this or wants it.
+- `if_approved` and `if_rejected`: what happens next either way, concretely.
+- `evidence`: what shows it is true (command and output, file and line,
+  quoted). If nothing shows it, say so in **bold**.
+
+Each question carries a `context`: what Jimmy needs to know to answer it, the
+options the agent sees, and what each would mean.
+
