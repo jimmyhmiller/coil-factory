@@ -1,0 +1,8 @@
+# pattern (grep -E) TAB why it is ruled out. Checked over src/ only.
+__g[0-9]	RULES.md §1: generation modules (M__gN) are a regenerated copy of the program; an edit compiles only what was submitted
+__live_was|was-names	RULES.md §2: old code is never kept alive by renaming and re-emitting its source
+code-src	RULES.md §2: a definition's source text never decides what changed or what it depends on
+squeeze-space|canonical-source|normalize-source|generation-source|program-source	RULES.md §1-2: no stored program source to splice, normalize, or compare
+jit-reset!	RULES.md §1: resetting the session recompiles everything
+export-c	RULES.md §4: no C ABI layer; what the lowered program calls is ordinary Coil
+"\((defn|defstruct|defsum|def|let|module|import) 	RULES.md §1-2: Coil code is built as Code (quasiquote), never as source strings

@@ -42,7 +42,7 @@
   (let [a (malloc-allocator)
         home (temp-home a)
         config (match (load-site-config a home) (SiteConfigOk [c] c) (SiteConfigBad [m] (do (assert false) (primitive-zero))))
-        o (overseer/overseer-new a home config)
+        o (overseer/overseer-new a home config (box! a i64 0))
         w (overseer/watch-for o "r-1")
         now 1000000]
     (for i (range 0 5)
@@ -70,7 +70,7 @@
   (let [a (malloc-allocator)
         home (temp-home a)
         config (match (load-site-config a home) (SiteConfigOk [c] c) (SiteConfigBad [m] (do (assert false) (primitive-zero))))
-        o (overseer/overseer-new a home config)
+        o (overseer/overseer-new a home config (box! a i64 0))
         w (overseer/watch-for o "r-1")]
     (for i (range 0 6)
       (let [(mut started) (sb-new a)]

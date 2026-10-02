@@ -1,0 +1,10 @@
+[package]
+name = "mcp"
+source-roots = ["src", "tests"]
+
+[dependencies]
+agent = { path = "../agent" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

@@ -1,0 +1,260 @@
+(module mcp.server)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use [validation-failure])
+(import "agent.tool" :use *)
+(export ServerInfo ServerHooks NoHooks SUPPORTED_VERSIONS handle-message serve-stdio)
+
+;;; A Model Context Protocol server that offers the tools of a `ToolRegistry`
+;;; over stdio: newline-delimited JSON-RPC 2.0 on stdin and stdout. It is how
+;;; an agent program this library does not control (OpenCode, or anything
+;;; else that speaks MCP) gets tools implemented in Coil.
+;;;
+;;; Supported: `initialize`, `ping`, `tools/list`, `tools/call`, and
+;;; notifications (which are never answered). Arguments are validated against
+;;; the tool's schema before it runs, exactly as the agent loop does; a tool
+;;; that fails, or arguments that do not validate, produce a result with
+;;; `isError` so the model can see what went wrong.
+
+(defstruct ServerInfo [(name (slice u8)) (version (slice u8))])
+
+;;; What a server's owner may want to know as it runs.
+(deftrait ServerHooks [Self]
+  ;;; A client finished `initialize` (the reply is about to be sent).
+  (on-initialize [(self (ptr Self)) (client (slice u8)) (version (slice u8))] (-> i64)))
+
+(defstruct NoHooks [(unused u8)])
+
+(impl ServerHooks NoHooks
+  (on-initialize [(self (ptr NoHooks)) (client (slice u8)) (version (slice u8))] (-> i64) 0))
+
+;;; Newest first. A client asking for one of these gets it; any other request
+;;; is answered with the newest, and the client decides whether to go on.
+(const SUPPORTED_VERSIONS ["2025-11-25" "2025-06-18" "2025-03-26" "2024-11-05"])
+
+(const PARSE_ERROR -32700)
+(const INVALID_REQUEST -32600)
+(const METHOD_NOT_FOUND -32601)
+(const INVALID_PARAMS -32602)
+
+(defn response [(a (dyn Allocator)) (id JVal) (result JVal)] (-> JVal)
+  (let [out (jv-object a)]
+    (jv-put! out "jsonrpc" (JStr "2.0"))
+    (jv-put! out "id" id)
+    (jv-put! out "result" result)
+    out))
+
+(defn error-response [(a (dyn Allocator)) (id JVal) (code i64) (message (slice u8))] (-> JVal)
+  (let [out (jv-object a)
+        error (jv-object a)]
+    (jv-put! error "code" (JInt code))
+    (jv-put! error "message" (JStr message))
+    (jv-put! out "jsonrpc" (JStr "2.0"))
+    (jv-put! out "id" id)
+    (jv-put! out "error" error)
+    out))
+
+(defn negotiated-version [(requested (slice u8))] (-> (slice u8))
+  (let [(mut chosen) (get SUPPORTED_VERSIONS 0)]
+    (for version (iter SUPPORTED_VERSIONS)
+      (when (= version requested) (set! chosen version) 0))
+    (load chosen)))
+
+(defn initialize-result [(a (dyn Allocator)) (info ServerInfo) (params JVal)] (-> JVal)
+  (let [out (jv-object a)
+        capabilities (jv-object a)
+        tools (jv-object a)
+        server (jv-object a)]
+    (jv-put! tools "listChanged" (JBool false))
+    (jv-put! capabilities "tools" tools)
+    (jv-put! server "name" (JStr (.name info)))
+    (jv-put! server "version" (JStr (.version info)))
+    (jv-put! out "protocolVersion" (JStr (negotiated-version (jv-string-or (jv-get params "protocolVersion") ""))))
+    (jv-put! out "capabilities" capabilities)
+    (jv-put! out "serverInfo" server)
+    out))
+
+;;; `{"tools": [...]}`. A schema that is not valid JSON is a programming error
+;;; in the tool, reported as an internal error rather than an empty schema.
+(defn tools-list-result [(a (dyn Allocator)) (registry (ptr ToolRegistry))] (-> (Result JVal (slice u8)))
+  (let [tools (jv-array a)
+        n (registry-count registry)
+        (mut problem) ""
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (> (len (load problem)) 0))
+              (break)
+              (let [spec (tool-spec (registry-at registry (load i)))
+                    entry (jv-object a)]
+                (match (jv-parse a (.parameters spec))
+                  (Some [schema]
+                        (do (jv-put! entry "name" (JStr (.name spec)))
+                            (jv-put! entry "description" (JStr (.description spec)))
+                            (jv-put! entry "inputSchema" schema)
+                            (jv-push! tools entry)))
+                  (None [] (do (set! problem (.name spec)) 0)))
+                (set! i (+ (load i) 1)))))
+    (if (> (len (load problem)) 0)
+        (Err (load problem))
+        (let [out (jv-object a)]
+          (jv-put! out "tools" tools)
+          (Ok out)))))
+
+(defn text-result [(a (dyn Allocator)) (text (slice u8)) (is-error bool)] (-> JVal)
+  (let [out (jv-object a)
+        content (jv-array a)
+        item (jv-object a)]
+    (jv-put! item "type" (JStr "text"))
+    (jv-put! item "text" (JStr text))
+    (jv-push! content item)
+    (jv-put! out "content" content)
+    (jv-put! out "isError" (JBool is-error))
+    out))
+
+;;; Run one `tools/call`. Returns a JSON-RPC error only for a tool that does
+;;; not exist; everything that happens inside a tool is a result.
+(defn call-tool [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (id JVal) (params JVal)] (-> JVal)
+  (let [name (jv-string-or (jv-get params "name") "")
+        given (jv-get params "arguments")
+        arguments (if (jv-null? given) (jv-object a) given)
+        arguments-json (jv-encode a arguments)]
+    (match (registry-find registry name)
+      (None [] (error-response a id INVALID_PARAMS (join a ["unknown tool: " name])))
+      (Some [tool]
+            (let [problem (validation-failure a (.parameters (tool-spec tool)) arguments-json)]
+              (if (> (len problem) 0)
+                  (response a id (text-result a problem true))
+                  (match (tool-run tool a (tool-call (jv-string-or id "") name arguments arguments-json)
+                                   (box! a NeverCancelled (NeverCancelled :unused 0)))
+                    (ToolOk [output] (response a id (text-result a output false)))
+                    (ToolFailed [message] (response a id (text-result a message true))))))))))
+
+;;; The answer to one JSON-RPC message (not a batch), or None for a
+;;; notification.
+(defn handle-one [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (info ServerInfo) (hooks (dyn ServerHooks)) (message JVal)] (-> (Option JVal))
+  (match message
+    (JObj [_]
+          (let [id (jv-get message "id")
+                method (jv-string-or (jv-get message "method") "")
+                params (jv-get message "params")
+                notification (match id (JNull [] true) (_ false))]
+            (cond (= (len method) 0)
+                    ;; A response (this server sends no requests, so it has
+                    ;; nothing to match it to), or a malformed request.
+                    (if (or notification
+                            (not (jv-null? (jv-get message "result")))
+                            (not (jv-null? (jv-get message "error"))))
+                        (None)
+                        (Some (error-response a id INVALID_REQUEST "a request needs a method")))
+                  notification (None)
+                  (= method "initialize")
+                    (let [result (initialize-result a info params)]
+                      (on-initialize hooks
+                                     (jv-string-or (jv-get (jv-get params "clientInfo") "name") "")
+                                     (jv-string-or (jv-get result "protocolVersion") ""))
+                      (Some (response a id result)))
+                  (= method "ping") (Some (response a id (jv-object a)))
+                  (= method "tools/list")
+                    (match (tools-list-result a registry)
+                      (Ok [result] (Some (response a id result)))
+                      (Err [name] (Some (error-response a id -32603 (join a ["the schema of tool " name " is not valid JSON"])))))
+                  (= method "tools/call") (Some (call-tool a registry id params))
+                  :else (Some (error-response a id METHOD_NOT_FOUND (join a ["method not found: " method]))))))
+    (_ (Some (error-response a (JNull) INVALID_REQUEST "a message must be a JSON object")))))
+
+;;; The reply line (without its newline) for one line of input, or None when
+;;; nothing is owed: notifications, and batches made only of notifications.
+(defn handle-message [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (info ServerInfo) (hooks (dyn ServerHooks)) (line (slice u8))] (-> (Option (slice u8)))
+  (if (= (len (str-trim line)) 0)
+      (None)
+      (match (jv-parse a line)
+        (None [] (Some (jv-encode a (error-response a (JNull) PARSE_ERROR "the message is not valid JSON"))))
+        (Some [message]
+              (match message
+                (JArr [items]
+                      (if (= (len items) 0)
+                          (Some (jv-encode a (error-response a (JNull) INVALID_REQUEST "an empty batch")))
+                          (let [replies (jv-array a)]
+                            (for item (iter items)
+                              (match (handle-one a registry info hooks item)
+                                (Some [reply] (jv-push! replies reply))
+                                (None [] 0)))
+                            (if (= (jv-count replies) 0) (None) (Some (jv-encode a replies))))))
+                (_ (match (handle-one a registry info hooks message)
+                     (Some [reply] (Some (jv-encode a reply)))
+                     (None [] (None)))))))))
+
+(defn write-all [(fd i32) (bytes (slice u8))] (-> bool)
+  (let [(mut offset) 0
+        (mut ok) true]
+    (loop (if (or (>= (load offset) (len bytes)) (not (load ok)))
+              (break)
+              (let [rest (subslice bytes (load offset) (len bytes))
+                    n (primitive/cast i64 (io/write fd (primitive/cast (ptr i8) (slice-data rest)) (primitive/cast isize (len rest))))]
+                (cond (> n 0) (set! offset (+ (load offset) n))
+                      (and (< n 0) (= (os/os-errno) 4)) 0
+                      :else (set! ok false)))))
+    (load ok)))
+
+;;; Serve `registry` on stdin/stdout until stdin closes. Each message is
+;;; handled in its own arena. Returns 0 at end of input, 1 when stdout or stdin
+;;; fails.
+(defn serve-stdio [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (info ServerInfo) (hooks (dyn ServerHooks))] (-> i64)
+  (let [(mut pending) (al-new [u8] a)
+        chunk (match (alloc [u8] a 65536)
+                (Some [buffer] buffer)
+                (None [] (slice-new (primitive/cast (ptr u8) 0) 0)))
+        (mut arena) (primitive/zeroed scratch/ScratchArena)
+        (mut status) -1]
+    (when (= (len chunk) 0) (set! status 1) 0)
+    (scratch/scratch-init (mut arena) a)
+    (let [turn (scratch/scratch-allocator (mut arena))]
+      (loop (if (>= (load status) 0)
+                (break)
+                (let [n (primitive/cast i64 (io/read (primitive/cast i32 0)
+                                                     (primitive/cast (ptr i8) (slice-data chunk))
+                                                     (primitive/cast isize (len chunk))))]
+                  (cond (and (< n 0) (= (os/os-errno) 4)) 0
+                        (< n 0) (set! status 1)
+                        :else
+                          (let [bytes (subslice chunk 0 n)
+                                (mut i) 0]
+                            (loop (if (or (>= (load i) (len bytes)) (>= (load status) 0))
+                                      (break)
+                                      (let [byte (get bytes (load i))]
+                                        (if (= byte (primitive/cast u8 #\newline))
+                                            (do (match (handle-message turn registry info hooks (al-slice pending))
+                                                  (Some [reply]
+                                                        (when (not (write-all (primitive/cast i32 1) (join turn [reply "\n"])))
+                                                          (set! status 1)
+                                                          0))
+                                                  (None [] 0))
+                                                (al-clear! (mut pending))
+                                                (scratch/scratch-reset! (mut arena))
+                                                0)
+                                            (do (push! (mut pending) byte) 0))
+                                        (set! i (+ (load i) 1)))))
+                            (when (and (= n 0) (< (load status) 0))
+                              ;; End of input; a last message without a newline still counts.
+                              (match (handle-message turn registry info hooks (al-slice pending))
+                                (Some [reply] (write-all (primitive/cast i32 1) (join turn [reply "\n"])))
+                                (None [] true))
+                              (set! status 0)
+                              0)
+                            0))))))
+    (scratch/scratch-close! (mut arena))
+    (al-free! (mut pending))
+    (when (> (len chunk) 0) (free [u8] a chunk) 0)
+    (load status)))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))

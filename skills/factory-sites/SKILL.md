@@ -27,12 +27,41 @@ Configuration lives in `~/.factory/site.json` (all optional):
   "max_runs": 4,
   "isolation": "none",
   "default_model": "deepseek/deepseek-v4-flash",
-  "overseer": { "policy": "nudge", "model": "deepseek/deepseek-v4-pro", "interval_seconds": 20 },
+  "default_harness": "builtin",
+  "opencode": "/Users/me/.opencode/bin/opencode",
+  "opencode_model": "opencode/big-pickle",
+  "codex_model": "gpt-6.1-sol",
+  "codex_writable": ["~/.pad"],
+  "reviewers": ["judge"],
+  "overseer": { "policy": "nudge", "interval_seconds": 20 },
   "providers": [
     { "name": "llama", "base_url": "http://127.0.0.1:8188/v1/chat/completions", "key_env": "" }
   ]
 }
 ```
+
+`reviewers` are the reviewers that watch runs whose run and factory name none
+(default: none, so no judgment). Each reviewer names its own model and harness;
+there is no overseer model (`overseer.model` is refused with a pointer here).
+
+There is no built-in model: `default_model` (builtin harness), `opencode_model`
+(opencode harness) and `codex_model` (codex harness) are the site's defaults, and
+without them every run must name a model.
+
+`default_harness` is `builtin`, `opencode`, or `codex`. The `opencode` harness needs OpenCode
+on the site (found on PATH or in `~/.opencode/bin`; `opencode` overrides the path);
+`opencode_model` is its default model. Under `isolation: "sandbox"` the whole
+OpenCode process runs in the sandbox.
+
+The `codex` harness needs the Codex CLI on the site, logged in (found on PATH;
+`codex` overrides the path); `codex_model` is its default model. Codex runs every
+agent command in its own sandbox: an agent with `files` and `shell` can write
+only its workspace, plus the directories in `codex_writable` (for example `~/.pad`,
+so agents can write pads); a reviewer is read-only. Codex keeps its threads and
+credentials in the operator's CODEX_HOME and always reads its `AGENTS.md`, so
+the operator's global Codex instructions apply to factory agents; every other
+setting is passed on the command line, never read from the operator's
+`config.toml`.
 
 `isolation: "sandbox"` wraps every agent shell command: `sandbox-exec` on macOS,
 `bwrap` on Linux. Writes are confined to the run's workspace (plus temp dirs); file

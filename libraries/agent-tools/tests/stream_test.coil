@@ -1,0 +1,117 @@
+(module agent_tools.stream-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent_tools.stream" :use *)
+(import "agent_tools.sys" :as sys)
+(import "coil.os" :as os)
+
+;;; Records every line; stops at a line equal to `stop-at`, or once `ticks`
+;;; reaches `stop-after-ticks` (when positive).
+(defstruct Recorder
+  [(allocator (dyn Allocator))
+   (lines (ArrayList (slice u8)))
+   (stop-at (slice u8))
+   (ticks i64)
+   (stop-after-ticks i64)])
+
+(impl LineSink Recorder
+  (on-line [(self (ptr Recorder)) (line (slice u8))] (-> bool)
+    (do (push! (mut (.lines self)) (sys/copy-bytes (.allocator self) line))
+        (not (= line (.stop-at self)))))
+  (on-tick [(self (ptr Recorder))] (-> bool)
+    (do (set! (.ticks self) (+ (.ticks self) 1))
+        (or (<= (.stop-after-ticks self) 0) (< (.ticks self) (.stop-after-ticks self))))))
+
+(defn recorder [(a (dyn Allocator)) (stop-at (slice u8)) (stop-after-ticks i64)] (-> (ptr Recorder))
+  (box! a Recorder (Recorder :allocator a :lines (al-new [(slice u8)] a) :stop-at stop-at
+                             :ticks 0 :stop-after-ticks stop-after-ticks)))
+
+(defn sh [(a (dyn Allocator)) (script (slice u8)) (timeout-ms i64) (sink (ptr Recorder))] (-> StreamEnd)
+  (sh-with-input a script "" timeout-ms 64 sink))
+
+(defn sh-with-input [(a (dyn Allocator)) (script (slice u8)) (input (slice u8)) (timeout-ms i64) (max-line i64) (sink (ptr Recorder))] (-> StreamEnd)
+  (match (stream-lines a (StreamSpec :program "/bin/sh" :args ["-c" script] :cwd "/private/tmp" :input input
+                                     :timeout-ms timeout-ms :max-line-bytes max-line :stderr-bytes 1024)
+                       sink)
+    (Ok [end] end)
+    (Err [message] (do (println "stream-lines failed: {}" message) (assert false) (primitive/zeroed StreamEnd)))))
+
+(deftest delivers-each-line-and-keeps-stderr-apart
+  (let [a (malloc-allocator)
+        sink (recorder a "" 0)
+        end (sh a "printf 'one\\ntwo\\r\\n'; echo oops >&2; printf last; exit 3" 10000 sink)]
+    (assert-eq (len (.lines sink)) 3)
+    (assert (= (get (.lines sink) 0) "one"))
+    (assert (= (get (.lines sink) 1) "two"))
+    (assert (= (get (.lines sink) 2) "last"))
+    (assert (= (.errors end) "oops\n"))
+    (assert-eq (.exit-code end) 3)
+    (assert (not (.stopped end)))
+    (assert (not (.timed-out end)))))
+
+(deftest a-sink-stops-the-program-at-a-line
+  (let [a (malloc-allocator)
+        sink (recorder a "ready" 0)
+        started (sys/monotonic-ms)
+        end (sh a "echo ready; sleep 30; echo never" 60000 sink)]
+    (assert (.stopped end))
+    (assert-eq (len (.lines sink)) 1)
+    (assert (< (- (sys/monotonic-ms) started) 10000))))
+
+(deftest a-sink-stops-the-program-between-lines
+  (let [a (malloc-allocator)
+        sink (recorder a "" 3)
+        end (sh a "sleep 30" 60000 sink)]
+    (assert (.stopped end))
+    (assert-eq (.ticks sink) 3)
+    (assert-eq (.signal end) 15)))
+
+(deftest drops-overlong-lines-whole
+  (let [a (malloc-allocator)
+        sink (recorder a "" 0)
+        end (sh a "printf 'short\\n'; head -c 200 /dev/zero | tr '\\0' x; printf '\\nafter\\n'" 10000 sink)]
+    (assert-eq (len (.lines sink)) 2)
+    (assert (= (get (.lines sink) 1) "after"))
+    (assert-eq (.dropped-lines end) 1)))
+
+(deftest times-out
+  (let [a (malloc-allocator)
+        sink (recorder a "" 0)
+        end (sh a "sleep 30" 300 sink)]
+    (assert (.timed-out end))
+    (assert (not (.stopped end)))))
+
+(deftest writes-input-then-closes-stdin
+  (let [a (malloc-allocator)
+        sink (recorder a "" 0)
+        end (sh-with-input a "cat; echo done" "first\nsecond" 10000 64 sink)]
+    (assert-eq (len (.lines sink)) 2)
+    (assert (= (get (.lines sink) 0) "first"))
+    (assert (= (get (.lines sink) 1) "seconddone"))
+    (assert-eq (.exit-code end) 0)))
+
+(deftest input-larger-than-a-pipe-buffer-does-not-deadlock
+  (let [a (malloc-allocator)
+        (mut big) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) 5000)
+              (break)
+              (do (sb-push-str! (mut big) "0123456789012345678901234567890123456789\n")
+                  (set! i (+ (load i) 1)))))
+    (let [sink (recorder a "" 0)
+          end (sh-with-input a "cat" (sb-finish! (mut big)) 20000 64 sink)]
+      (assert-eq (len (.lines sink)) 5000)
+      (assert (not (.timed-out end))))))
+
+(deftest stopping-also-stops-descendants-in-their-own-group
+  (let [a (malloc-allocator)
+        sink (recorder a "ready" 0)
+        end (sh a "perl -e 'setpgrp(0,0); $| = 1; print \"$$\\n\"; sleep 60' & sleep 1; echo ready; sleep 60" 60000 sink)
+        stray (match (str-parse-int (get (.lines sink) 0)) (Some [n] n) (None [] 0))]
+    (assert (.stopped end))
+    (assert (> stray 1))
+    (sys/sleep-ms 300)
+    (assert (!= (os/kill (primitive/cast i32 stray) (primitive/cast i32 0)) (primitive/cast i32 0)))))

@@ -10,8 +10,11 @@ These packages have no dependency on the factory app; each has its own
 | `json-schema` | `json_schema.validate` | A documented, fail-closed JSON Schema subset over `coil.json` documents |
 | `http-app` | `http_app.router`, `.server`, `.sse`, `.json` | Routing, a threaded server with streaming responses and SSE, JSON errors |
 | `ai` | `ai.chat`, `ai.openai` | Provider-neutral chat interface with an OpenAI-compatible HTTP adapter |
-| `agent` | `agent.tool`, `agent.loop`, `agent.json` | Tool-calling agent loop: steering messages, pause/cancel, retries, schema-validated arguments, context compaction, checkpoints |
-| `agent-tools` | `agent_tools.files`, `.shell`, `.sandbox`, `.workspace`, `.bundle` | Workspace-confined file tools and a shell tool, optionally under `sandbox-exec` or `bwrap` |
+| `agent` | `agent.tool`, `agent.loop`, `agent.harness`, `agent.json` | Tool-calling agent loop: steering messages, pause/cancel, retries, schema-validated arguments, context compaction, checkpoints; the `Harness` trait any agent runner implements |
+| `agent-tools` | `agent_tools.files`, `.shell`, `.sandbox`, `.workspace`, `.bundle`, `.stream` | Workspace-confined file tools and a shell tool, optionally under `sandbox-exec` or `bwrap`; a supervised program whose output is read line by line |
+| `mcp` | `mcp.server` | A Model Context Protocol server offering a `ToolRegistry` over stdio |
+| `opencode` | `opencode.harness` | OpenCode driven headlessly as a `Harness` |
+| `codex` | `codex.harness` | the Codex CLI (`codex exec`) driven headlessly as a `Harness` |
 | `durable` | `durable.jsonl`, `.atomic`, `.lock`, `.ids` | Multi-writer JSONL journal with byte cursors; atomic writes; locks and pid files; ids |
 | `mddoc` | `mddoc.doc` | Markdown front matter, heading sections, and settings blocks |
 | `cli` | `cli.args`, `cli.style`, `cli.prompt` | Subcommands and flags with suggestions, terminal styling and tables, prompts |

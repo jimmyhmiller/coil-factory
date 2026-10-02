@@ -1,0 +1,38 @@
+(module factory.config-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.config" :use *)
+(import "factory.proc" :use *)
+
+(defn home-with [(a (dyn Allocator)) (site-json (slice u8))] (-> (slice u8))
+  (let [(mut path) (sb-new a)]
+    (sb-push-str! (mut path) "/tmp/factory-config-test-")
+    (sb-push-i64! (mut path) (pid))
+    (let [home (sb-finish! (mut path))]
+      (capture a "rm" ["-rf" home] "" 10000)
+      (atomic/ensure-dir! a home 448)
+      (atomic/write-file-atomic! a (path-join a home "site.json") site-json 420)
+      home)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(deftest reviewers-are-a-list-or-a-string-and-default-to-none
+  (let [a (malloc-allocator)]
+    (match (load-site-config a (home-with a "{}"))
+      (SiteConfigOk [config] (assert (= (.reviewers config) "")))
+      (SiteConfigBad [message] (assert false)))
+    (match (load-site-config a (home-with a "{\"reviewers\": [\"judge\", \"security\"]}"))
+      (SiteConfigOk [config] (assert (= (.reviewers config) "judge, security")))
+      (SiteConfigBad [message] (assert false)))
+    (match (load-site-config a (home-with a "{\"reviewers\": \"judge\"}"))
+      (SiteConfigOk [config] (assert (= (.reviewers config) "judge")))
+      (SiteConfigBad [message] (assert false)))))
+
+(deftest the-old-overseer-model-is-refused-not-ignored
+  (let [a (malloc-allocator)]
+    (match (load-site-config a (home-with a "{\"overseer\": {\"model\": \"deepseek/deepseek-v4-pro\"}}"))
+      (SiteConfigOk [config] (assert false))
+      (SiteConfigBad [message] (assert (contains? message "overseer.model is gone"))))))

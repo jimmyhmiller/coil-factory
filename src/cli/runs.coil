@@ -150,16 +150,35 @@
                                          severity (str-field f "severity")]
                                      (say (join a ["  " (if (= severity "alert") (style/err a term "✗") (style/warn a term "⚠")) " "
                                                    (style/muted a term (age a (int-field f "t"))) "  "
-                                                   (str-field f "agent") "  " (paint-bold a term (amber) (str-field f "code")) "  "
+                                                   (str-field f "agent") "  " (paint-bold a term (amber) (str-field f "code"))
+                                                   (let [by (str-field f "reviewer")] (if (> (len by) 0) (style/muted a term (join a [" (" by ")"])) "")) "  "
                                                    (str-field f "message")]))
                                      (set! i (+ (load i) 1))))))
                        0)
-                     (when (and (= n 0) (> (len (str-field run "verdict")) 0))
-                       (say "")
-                       (say (join a [(style/strong a term "Overseer  ")
-                                     (if (= (str-field run "verdict") "on_track") (style/ok a term "✓ on track") (style/warn a term (str-field run "verdict")))
-                                     (style/muted a term (join a ["  " (str-field run "verdict_reason")]))]))
-                       0))
+                     0)
+                   (let [reviewers (jv-get run "reviewers")]
+                     (say "")
+                     (if (= (jv-count reviewers) 0)
+                         (say (join a [(style/strong a term "Reviewers  ") (style/muted a term "none")]))
+                         (do (say (style/strong a term "Reviewers"))
+                             (let [(mut i) 0]
+                               (loop (if (>= (load i) (jv-count reviewers))
+                                         (break)
+                                         (let [r (jv-nth reviewers (load i))
+                                               failed (and (> (len (str-field r "failure")) 0)
+                                                           (>= (int-field r "failure_t") (int-field r "t")))
+                                               level (str-field r "level")]
+                                           (say (join a ["  " (style/pad-right a (str-field r "name") 12) "  "
+                                                         (cond failed (style/err a term "✗ failed")
+                                                               (= level "") (style/muted a term "no verdict yet")
+                                                               (= level "ok") (style/ok a term (join a ["✓ " (str-field r "verdict")]))
+                                                               (= level "alert") (style/err a term (join a ["✗ " (str-field r "verdict")]))
+                                                               :else (style/warn a term (join a ["◉ " (str-field r "verdict")])))
+                                                         "  "
+                                                         (style/muted a term (if failed (str-field r "failure") (str-field r "reason")))]))
+                                           (set! i (+ (load i) 1))))))
+                             0))
+                     0)
                    (let [pending (jv-get run "pending_messages")]
                      (when (> (jv-count pending) 0)
                        (say "")

@@ -227,23 +227,52 @@
         (= severity "warn") (.warning theme)
         :else (.info theme)))
 
-(defn verdict-style [(theme Theme) (verdict (slice u8))] (-> Style)
-  (cond (= verdict "on_track") (.success theme)
-        (= verdict "drifting") (.warning theme)
-        (= verdict "stuck") (.warning theme)
-        (= verdict "cheating") (bold (.error theme))
-        :else (.muted theme)))
+;; ---------------------------------------------------------------------------
+;; Reviewers (a run's `reviewers`: name, verdict, level, reason, t, failure, failure_t)
+
+;;; A reviewer's standing: its level (ok, warn, alert), "failed" when its
+;;; latest attempt gave no verdict, or "" before it has said anything.
+(defn reviewer-standing [(r JVal)] (-> (slice u8))
+  (if (and (> (len (js r "failure")) 0) (>= (ji r "failure_t") (ji r "t")))
+      "failed"
+      (js r "level")))
+
+(defn standing-rank [(standing (slice u8))] (-> i64)
+  (cond (= standing "alert") 4
+        (= standing "failed") 3
+        (= standing "warn") 2
+        (= standing "ok") 1
+        :else 0))
+
+;;; The reviewer most worth a person's attention, or JNull when the run has none.
+(defn worst-reviewer [(run JVal)] (-> JVal)
+  (let [reviewers (jv-get run "reviewers")
+        (mut best) (JNull)
+        (mut best-rank) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len reviewers))
+              (break)
+              (let [r (jv-nth reviewers (load i))
+                    rank (standing-rank (reviewer-standing r))]
+                (when (> rank (load best-rank))
+                  (set! best r)
+                  (set! best-rank rank)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load best)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tools
 
 ;;; The glyph for a tool: `$` shell, `✎` writes and edits, `▤` reads and
-;;; listings, `⌕` search, `⚑` finish.
+;;; listings, `⌕` search, `⚑` finish. Knows the builtin harness's tool names
+;;; and OpenCode's (bash, read, edit, write, apply_patch, list, glob, grep).
 (defn tool-glyph [(tool (slice u8))] (-> (slice u8))
-  (cond (= tool "shell") "$"
-        (or (= tool "edit_file") (= tool "write_file")) "✎"
-        (or (= tool "read_file") (= tool "list_dir")) "▤"
-        (= tool "search") "⌕"
+  (cond (or (= tool "shell") (= tool "bash")) "$"
+        (or (= tool "edit_file") (= tool "write_file")
+            (= tool "edit") (= tool "write") (= tool "apply_patch")) "✎"
+        (or (= tool "read_file") (= tool "list_dir") (= tool "read") (= tool "list")) "▤"
+        (or (= tool "search") (= tool "grep") (= tool "glob")) "⌕"
         (= tool "finish") "⚑"
         :else "⚙"))
 
@@ -253,9 +282,12 @@
                     (tool (slice u8))
                     (arguments (slice u8))] (-> (slice u8))
   (let [args (match (jv-parse a arguments) (Some [v] v) (None [] (JNull)))]
-    (cond (= tool "shell") (first-line (js args "command"))
+    (cond (or (= tool "shell") (= tool "bash")) (first-line (js args "command"))
           (or (= tool "edit_file") (= tool "write_file") (= tool "read_file"))
             (js args "path")
+          (or (= tool "edit") (= tool "write") (= tool "read"))
+            (js args "filePath")
+          (or (= tool "grep") (= tool "glob")) (concat a ["\"" (js args "pattern") "\""])
           (= tool "list_dir")
             (let [p (js args "path")] (if (= (len p) 0) "." p))
           (= tool "search") (concat a ["\"" (js args "pattern") "\""])
@@ -298,15 +330,16 @@
         (= severity "warn") (ToneWarning)
         :else (ToneInfo)))
 
-(defn verdict-tone [(verdict (slice u8))] (-> Tone)
-  (cond (= verdict "on_track") (ToneSuccess)
-        (= verdict "cheating") (ToneError)
-        (= verdict "") (ToneMuted)
-        :else (ToneWarning)))
+;;; The tone of a reviewer's standing (see `reviewer-standing`).
+(defn standing-tone [(standing (slice u8))] (-> Tone)
+  (cond (= standing "ok") (ToneSuccess)
+        (= standing "warn") (ToneWarning)
+        (or (= standing "alert") (= standing "failed")) (ToneError)
+        :else (ToneMuted)))
 
 ;;; A journal tool summary without the glyph it already starts with ("$ ").
 (defn tool-summary-text [(tool (slice u8)) (summary (slice u8))] (-> (slice u8))
-  (if (and (= tool "shell")
+  (if (and (or (= tool "shell") (= tool "bash"))
            (>= (len summary) 2)
            (= (subslice summary 0 2) "$ "))
       (subslice summary 2 (len summary))

@@ -1,5 +1,6 @@
 (module factory.runspec)
 (import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
 (import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
@@ -23,12 +24,73 @@
    (base (slice u8))
    (branch (slice u8))
    (model (slice u8))
+   ;;; The harness every station uses; "" leaves it to the factory and site.
+   (harness (slice u8))
+   ;;; The reviewers chosen when the run was made, their Markdown copied in.
+   (reviewers (ArrayList ReviewerCopy))
+   ;;; The reviewers stations name in `review`, copied in the same way. They
+   ;;; judge a station's finished work, and a station passes only with every
+   ;;; one of its reviewers' approval.
+   (station-reviewers (ArrayList ReviewerCopy))
+   ;;; Which of `station-reviewers` each station needs, by name.
+   (station-reviews (ArrayList StationReview))
    (site (slice u8))
    (created i64)])
+
+(defstruct ReviewerCopy [(name (slice u8)) (text (slice u8))])
+
+;;; A station and the names of the reviewers that must approve its work.
+(defstruct StationReview [(station (slice u8)) (names (ArrayList (slice u8)))])
+
+;;; The reviewers `station` needs, by name; empty when it needs none.
+(defn station-review-names [(a (dyn Allocator)) (spec (ptr RunSpec)) (station (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (for entry (iter (.station-reviews spec))
+      (when (= (.station entry) station)
+        (for name (iter (.names entry)) (push! (mut out) name))
+        0))
+    (load out)))
 
 (defsum RunSpecResult
   (RunSpecOk [(spec RunSpec)])
   (RunSpecBad [(message (slice u8))]))
+
+(defn copies-json [(a (dyn Allocator)) (copies (ArrayList ReviewerCopy))] (-> JVal)
+  (let [out (jv-array a)]
+    (for copy (iter copies)
+      (let [entry (jv-object a)]
+        (jv-put! entry "name" (JStr (.name copy)))
+        (jv-put! entry "text" (JStr (.text copy)))
+        (jv-push! out entry)))
+    out))
+
+(defn copies-from [(a (dyn Allocator)) (copies JVal)] (-> (ArrayList ReviewerCopy))
+  (let [(mut out) (al-new [ReviewerCopy] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-count copies))
+              (break)
+              (let [entry (jv-nth copies (load i))]
+                (push! (mut out) (ReviewerCopy :name (jv-string-or (jv-get entry "name") "")
+                                               :text (jv-string-or (jv-get entry "text") "")))
+                (set! i (+ (load i) 1)))))
+    (load out)))
+
+(defn reviews-from [(a (dyn Allocator)) (reviews JVal)] (-> (ArrayList StationReview))
+  (let [(mut out) (al-new [StationReview] a)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-count reviews))
+              (break)
+              (let [item (jv-nth reviews (load i))
+                    list (jv-get item "names")
+                    (mut names) (al-new [(slice u8)] a)
+                    (mut k) 0]
+                (loop (if (>= (load k) (jv-count list))
+                          (break)
+                          (do (push! (mut names) (jv-string-or (jv-nth list (load k)) ""))
+                              (set! k (+ (load k) 1)))))
+                (push! (mut out) (StationReview :station (jv-string-or (jv-get item "station") "") :names (load names)))
+                (set! i (+ (load i) 1)))))
+    (load out)))
 
 (defn run-spec-json [(a (dyn Allocator)) (spec (ptr RunSpec))] (-> JVal)
   (let [out (jv-object a)]
@@ -41,6 +103,18 @@
     (jv-put! out "base" (JStr (.base spec)))
     (jv-put! out "branch" (JStr (.branch spec)))
     (jv-put! out "model" (JStr (.model spec)))
+    (jv-put! out "harness" (JStr (.harness spec)))
+    (jv-put! out "reviewers" (copies-json a (.reviewers spec)))
+    (jv-put! out "station_reviewers" (copies-json a (.station-reviewers spec)))
+    (let [reviews (jv-array a)]
+      (for entry (iter (.station-reviews spec))
+        (let [item (jv-object a)
+              names (jv-array a)]
+          (for name (iter (.names entry)) (jv-push! names (JStr name)))
+          (jv-put! item "station" (JStr (.station entry)))
+          (jv-put! item "names" names)
+          (jv-push! reviews item)))
+      (jv-put! out "station_reviews" reviews))
     (jv-put! out "site" (JStr (.site spec)))
     (jv-put! out "created" (JInt (.created spec)))
     out))
@@ -70,6 +144,10 @@
                           (set! (.base spec) (jv-string-or (jv-get root "base") ""))
                           (set! (.branch spec) (jv-string-or (jv-get root "branch") ""))
                           (set! (.model spec) (jv-string-or (jv-get root "model") ""))
+                          (set! (.harness spec) (jv-string-or (jv-get root "harness") ""))
+                          (set! (.reviewers spec) (copies-from a (jv-get root "reviewers")))
+                          (set! (.station-reviewers spec) (copies-from a (jv-get root "station_reviewers")))
+                          (set! (.station-reviews spec) (reviews-from a (jv-get root "station_reviews")))
                           (set! (.site spec) (jv-string-or (jv-get root "site") ""))
                           (set! (.created spec) (jv-int (jv-get root "created")))
                           (if (or (not (= (.id spec) run-id)) (= (len (.factory-text spec)) 0))

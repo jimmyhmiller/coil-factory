@@ -1,0 +1,351 @@
+(module factory.reviewer)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "mddoc.doc" :as md)
+(import "agent.json" :use *)
+(import "factory.library" :use *)
+(import "factory.runspec" :use [ReviewerCopy])
+(import "factory.spec" :use *)
+(import "factory.specparse" :use [problem! front-tools problems-text])
+
+;;; A reviewer is a role the overseer runs against a working agent, defined in
+;;; Markdown like a factory. Its front matter says which verdicts it can give,
+;;; which of them are fine and which are alerts, how often it looks, and what
+;;; model and harness it runs on; its body is the instructions. The overseer
+;;; gives it the brief, the agent's recent activity, and the branch's changes,
+;;; and asks for one verdict as JSON (the reply format is added here, from the
+;;; declared verdicts, so a reviewer file cannot get it wrong).
+;;;
+;;;     ---
+;;;     name: judge
+;;;     description: Is the agent on track?
+;;;     verdicts: on_track, drifting, stuck, cheating
+;;;     ok: on_track
+;;;     alert: cheating
+;;;     every: 3m
+;;;     model: opencode/big-pickle      (optional; else the site default)
+;;;     harness: opencode               (optional; else the site default)
+;;;     tools: read                     (optional; read-only look at the workspace)
+;;;     min-events: 8                   (optional; journal records between looks)
+;;;     confidence: 0.6                 (optional; below this a verdict is recorded
+;;;     ---                              but raises no finding)
+;;;
+;;;     Instructions...
+;;;
+;;; A verdict that is neither `ok` nor `alert` is a warning.
+
+(defstruct ReviewerSpec
+  [(name (slice u8))
+   (description (slice u8))
+   (model (slice u8))
+   (harness (slice u8))
+   ;;; "" (no tools) or "read".
+   (tools (slice u8))
+   (every-ms i64)
+   (min-events i64)
+   (confidence f64)
+   (verdicts (ArrayList (slice u8)))
+   (ok (ArrayList (slice u8)))
+   (alert (ArrayList (slice u8)))
+   (instructions (slice u8))])
+
+(defsum ReviewerResult
+  (ReviewerOk [(spec ReviewerSpec)])
+  (ReviewerBad [(problems (ArrayList SpecProblem))]))
+
+(defn known-reviewer-key? [(key (slice u8))] (-> bool)
+  (or (= key "name") (= key "description") (= key "model") (= key "harness") (= key "tools")
+      (= key "every") (= key "min-events") (= key "confidence")
+      (= key "verdicts") (= key "ok") (= key "alert")))
+
+(defn word-list [(a (dyn Allocator)) (entry md/FrontEntry)] (-> (ArrayList (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (for raw (iter (str-split a (front-tools a entry) ","))
+      (let [word (str-trim raw)]
+        (when (> (len word) 0) (push! (mut out) word) 0)))
+    (load out)))
+
+(defn member? [(items (ArrayList (slice u8))) (word (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for item (iter items) (when (= item word) (set! found true) 0))
+    (load found)))
+
+;;; Verdict words: lowercase letters, digits, `_` and `-`.
+(defn verdict-word? [(word (slice u8))] (-> bool)
+  (let [(mut ok) (and (> (len word) 0) (<= (len word) 32))]
+    (for byte (iter word)
+      (let [c (cast i64 byte)]
+        (when (not (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95) (= c 45)))
+          (set! ok false)
+          0)))
+    (load ok)))
+
+;;; "90s", "3m", "1h", or plain seconds, in milliseconds; -1 when malformed.
+(defn parse-every [(text (slice u8))] (-> i64)
+  (let [t (str-trim text)
+        n (len t)]
+    (if (= n 0)
+        -1
+        (let [last (cast i64 (get t (- n 1)))
+              unit (cond (= last 115) 1000 (= last 109) 60000 (= last 104) 3600000 :else 0)
+              digits (if (> unit 0) (subslice [u8] t 0 (- n 1)) t)]
+          (match (str-parse-int digits)
+            (Some [v] (if (< v 0) -1 (* v (if (> unit 0) unit 1000))))
+            (None [] -1))))))
+
+;;; A decimal such as "0.6", "1", or ".75"; -1.0 when malformed.
+(defn parse-decimal [(text (slice u8))] (-> f64)
+  (let [t (str-trim text)
+        (mut whole) 0.0
+        (mut scale) 0.0
+        (mut ok) (> (len t) 0)
+        (mut digits) 0]
+    (for byte (iter t)
+      (let [c (cast i64 byte)]
+        (cond (and (>= c 48) (<= c 57))
+                (do (set! digits (+ (load digits) 1))
+                    (if (primitive/fcmp-eq (load scale) 0.0)
+                        (set! whole (+ (* (load whole) 10.0) (cast f64 (- c 48))))
+                        (do (set! whole (+ (load whole) (* (load scale) (cast f64 (- c 48)))))
+                            (set! scale (/ (load scale) 10.0))))
+                    0)
+              (and (= c 46) (primitive/fcmp-eq (load scale) 0.0)) (do (set! scale 0.1) 0)
+              :else (do (set! ok false) 0))))
+    (if (and (load ok) (> (load digits) 0)) (load whole) -1.0)))
+
+(defn parse-reviewer [(a (dyn Allocator)) (text (slice u8))] (-> ReviewerResult)
+  (let [(mut problems) (al-new [SpecProblem] a)
+        (mut spec) (ReviewerSpec :name "" :description "" :model "" :harness "" :tools ""
+                                 :every-ms 180000 :min-events 8 :confidence 0.6
+                                 :verdicts (al-new [(slice u8)] a) :ok (al-new [(slice u8)] a)
+                                 :alert (al-new [(slice u8)] a) :instructions "")
+        (mut verdicts-line) 1]
+    (match (md/parse-document a text)
+      (Err [failure] (let [e failure] (problem! a (mut problems) (.line e) [(.message e)])))
+      (Ok [parsed]
+          (let [doc parsed]
+            (when (not (md/doc-has-front-matter? doc))
+              (problem! a (mut problems) 1 ["a reviewer starts with front matter: a line `---`, then `name: my-reviewer`, then `---`"])
+              0)
+            (for front (iter (md/front-entries doc))
+              (let [entry front
+                    key (.key entry)
+                    line (.line entry)]
+                (cond (not (known-reviewer-key? key))
+                        (problem! a (mut problems) line
+                                  ["unknown reviewer key \"" key "\"; the keys are name, description, model, harness, tools, every, min-events, confidence, verdicts, ok, alert"])
+                      (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
+                      (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
+                      (= key "model") (do (set! (.model spec) (.scalar entry)) 0)
+                      (= key "harness")
+                        (let [trouble (harness-problem a (.scalar entry))]
+                          (set! (.harness spec) (.scalar entry))
+                          (when (> (len trouble) 0) (problem! a (mut problems) line [trouble]) 0)
+                          0)
+                      (= key "tools")
+                        (let [tools (str-trim (front-tools a entry))]
+                          (set! (.tools spec) tools)
+                          (when (not (or (= tools "") (= tools "read")))
+                            (problem! a (mut problems) line ["a reviewer's tools are \"read\" (look at the workspace, never change it) or nothing, not \"" tools "\""])
+                            0)
+                          0)
+                      (= key "every")
+                        (let [ms (parse-every (.scalar entry))]
+                          (if (or (< ms 30000) (> ms 86400000))
+                              (problem! a (mut problems) line ["every must be a duration from 30s to 24h, such as 90s, 3m, or 1h, not \"" (.scalar entry) "\""])
+                              (do (set! (.every-ms spec) ms) 0)))
+                      (= key "min-events")
+                        (match (str-parse-int (str-trim (.scalar entry)))
+                          (Some [n] (if (and (>= n 1) (<= n 1000))
+                                        (do (set! (.min-events spec) n) 0)
+                                        (problem! a (mut problems) line ["min-events must be between 1 and 1000"])))
+                          (None [] (problem! a (mut problems) line ["min-events must be a whole number, not \"" (.scalar entry) "\""])))
+                      (= key "confidence")
+                        (let [c (parse-decimal (.scalar entry))]
+                          (if (or (< c 0.0) (> c 1.0))
+                              (problem! a (mut problems) line ["confidence must be a number from 0 to 1, not \"" (.scalar entry) "\""])
+                              (do (set! (.confidence spec) c) 0)))
+                      (= key "verdicts") (do (set! verdicts-line line) (set! (.verdicts spec) (word-list a entry)) 0)
+                      (= key "ok") (do (set! (.ok spec) (word-list a entry)) 0)
+                      (= key "alert") (do (set! (.alert spec) (word-list a entry)) 0)
+                      :else 0)))
+            (set! (.instructions spec) (str-trim (md/doc-body doc)))
+            (when (md/doc-has-front-matter? doc)
+              (cond (= (len (.name spec)) 0)
+                      (problem! a (mut problems) 1 ["the front matter needs a name, for example `name: judge`"])
+                    (not (kebab-name? (.name spec)))
+                      (problem! a (mut problems) 1 ["the name \"" (.name spec) "\" must be lowercase letters, digits, and dashes"])
+                    :else 0)
+              (when (< (len (.verdicts spec)) 2)
+                (problem! a (mut problems) (load verdicts-line) ["a reviewer needs `verdicts:` with at least two verdicts, such as `on_track, drifting`"])
+                0)
+              (let [(mut seen) (al-new [(slice u8)] a)]
+                (for verdict (iter (.verdicts spec))
+                  (cond (not (verdict-word? verdict))
+                          (problem! a (mut problems) (load verdicts-line) ["verdict \"" verdict "\" must be lowercase letters, digits, `_`, and `-`"])
+                        (member? (load seen) verdict)
+                          (problem! a (mut problems) (load verdicts-line) ["verdict \"" verdict "\" is listed twice"])
+                        :else (do (push! (mut seen) verdict) 0))))
+              (when (= (len (.ok spec)) 0)
+                (problem! a (mut problems) 1 ["a reviewer needs `ok:`, the verdicts that mean all is well"])
+                0)
+              (for verdict (iter (.ok spec))
+                (when (not (member? (.verdicts spec) verdict))
+                  (problem! a (mut problems) 1 ["ok verdict \"" verdict "\" is not one of the verdicts"])
+                  0))
+              (for verdict (iter (.alert spec))
+                (cond (not (member? (.verdicts spec) verdict))
+                        (problem! a (mut problems) 1 ["alert verdict \"" verdict "\" is not one of the verdicts"])
+                      (member? (.ok spec) verdict)
+                        (problem! a (mut problems) 1 ["verdict \"" verdict "\" cannot be both ok and alert"])
+                      :else 0))
+              (when (= (len (.instructions spec)) 0)
+                (problem! a (mut problems) 1 ["a reviewer needs instructions after its front matter"])
+                0)
+              0)
+            0)))
+    (if (> (len problems) 0)
+        (ReviewerBad (load problems))
+        (ReviewerOk (load spec)))))
+
+;;; "ok", "alert", or "warn" for a declared verdict; "" for anything else.
+(defn verdict-level [(spec (ptr ReviewerSpec)) (verdict (slice u8))] (-> (slice u8))
+  (cond (not (member? (.verdicts spec) verdict)) ""
+        (member? (.ok spec) verdict) "ok"
+        (member? (.alert spec) verdict) "alert"
+        :else "warn"))
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn quoted-alternatives [(a (dyn Allocator)) (words (ArrayList (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut first) true]
+    (for word (iter words)
+      (when (not (load first)) (sb-push-str! (mut out) " | ") 0)
+      (sb-push-str! (mut out) "\"")
+      (sb-push-str! (mut out) word)
+      (sb-push-str! (mut out) "\"")
+      (set! first false))
+    (sb-finish! (mut out))))
+
+;;; The reviewer's instructions followed by the reply format.
+(defn reviewer-system-prompt [(a (dyn Allocator)) (spec (ptr ReviewerSpec))] (-> (slice u8))
+  (cat a [(.instructions spec)
+          (if (= (.tools spec) "read")
+              "\n\nYou can look at the agent's workspace with your tools to check what it claims. Never change anything there."
+              "")
+          "\n\nReply with ONLY a JSON object: {\"verdict\": " (quoted-alternatives a (.verdicts spec))
+          ", \"confidence\": a number from 0 to 1, \"reason\": one sentence citing specific evidence, \"advice\": one or two sentences addressed to the agent, or \"\" when nothing needs to change}. "
+          "The verdicts that mean all is well: " (quoted-alternatives a (.ok spec)) "."]))
+
+;;; What the reviewer is shown about the run.
+(defn reviewer-context [(a (dyn Allocator))
+                        (spec (ptr ReviewerSpec))
+                        (brief (slice u8))
+                        (station (slice u8))
+                        (activity (slice u8))
+                        (diffstat (slice u8))
+                        (workspace (slice u8))] (-> (slice u8))
+  (cat a ["## Brief\n" (if (> (len (str-trim brief)) 0) brief "(none)")
+          "\n\n## Station now working\n" (if (> (len station) 0) station "(unknown)")
+          "\n\n## Recent activity (oldest first)\n" activity
+          "\n## Changes on the branch so far\n" (if (> (len (str-trim diffstat)) 0) diffstat "(none)")
+          (if (= (.tools spec) "read") (cat a ["\n\n## Workspace\n`" workspace "`"]) "")]))
+
+;;; The first {...} object in a reply.
+(defn extract-object [(text (slice u8))] (-> (slice u8))
+  (match (str-find text "{")
+    (None [] "")
+    (Some [start]
+          (let [(mut end) (- (len text) 1)]
+            (loop (if (or (<= (load end) start) (= (cast i64 (get text (load end))) 125))
+                      (break)
+                      (set! end (- (load end) 1))))
+            (if (> (load end) start) (subslice [u8] text start (+ (load end) 1)) "")))))
+
+(defsum Verdict
+  (VerdictOk [(verdict (slice u8))
+              (level (slice u8))
+              (confidence f64)
+              (reason (slice u8))
+              (advice (slice u8))])
+  (VerdictBad [(message (slice u8))]))
+
+(defn first-chars [(text (slice u8)) (n i64)] (-> (slice u8))
+  (if (<= (len text) n) text (subslice [u8] text 0 n)))
+
+;;; Read a reviewer's reply. Anything but a JSON object with one of the
+;;; declared verdicts is a failure of the reviewer, reported, never guessed at.
+(defn parse-verdict [(a (dyn Allocator)) (spec (ptr ReviewerSpec)) (reply (slice u8))] (-> Verdict)
+  (match (jv-parse a (extract-object reply))
+    (None [] (VerdictBad (cat a ["the reply is not a JSON object: " (first-chars (str-trim reply) 200)])))
+    (Some [object]
+          (let [verdict (jv-string-or (jv-get object "verdict") "")
+                level (verdict-level spec verdict)
+                confidence (match (jv-get object "confidence")
+                             (JFloat [x] x)
+                             (JInt [n] (cast f64 n))
+                             (_ -1.0))]
+            (cond (= (len level) 0)
+                    (VerdictBad (cat a ["the verdict \"" verdict "\" is not one of " (quoted-alternatives a (.verdicts spec))]))
+                  (or (< confidence 0.0) (> confidence 1.0))
+                    (VerdictBad "the reply has no confidence from 0 to 1")
+                  :else
+                    (VerdictOk :verdict verdict
+                               :level level
+                               :confidence confidence
+                               :reason (jv-string-or (jv-get object "reason") "")
+                               :advice (jv-string-or (jv-get object "advice") "")))))))
+
+(defn reviewer-problems-text [(a (dyn Allocator)) (name (slice u8)) (problems (ArrayList SpecProblem))] (-> (slice u8))
+  (cat a ["reviewer " name ":\n" (problems-text a problems)]))
+
+;; ---------------------------------------------------------------------------
+;; Which reviewers watch a run
+
+;;; The reviewers a run gets, as comma-separated names or paths: the run's
+;;; choice, then the factory's, then the site's. "none" chooses no reviewers
+;;; and stops the search. With nothing chosen anywhere, a run has none.
+(defn chosen-reviewers [(run-choice (slice u8)) (factory-choice (slice u8)) (site-choice (slice u8))] (-> (slice u8))
+  (cond (> (len (str-trim run-choice)) 0) run-choice
+        (> (len (str-trim factory-choice)) 0) factory-choice
+        :else site-choice))
+
+(defsum Chosen
+  (ChosenOk [(copies (ArrayList ReviewerCopy))])
+  (ChosenBad [(message (slice u8))]))
+
+;;; Resolve and check every reviewer in `choice`, keeping each one's Markdown
+;;; so the run is unaffected by later edits to the library.
+(defn load-reviewers [(a (dyn Allocator)) (home (slice u8)) (choice (slice u8))] (-> Chosen)
+  (block :load
+         (let [(mut copies) (al-new [ReviewerCopy] a)
+               (mut names) (al-new [(slice u8)] a)]
+           (for raw (iter (str-split a choice ","))
+             (let [name (str-trim raw)]
+               (when (> (len name) 0) (push! (mut names) name) 0)))
+           (when (member? (load names) "none")
+             (if (= (len names) 1)
+                 (return-from :load (ChosenOk (load copies)))
+                 (return-from :load (ChosenBad "\"none\" means no reviewers; it cannot be listed with others"))))
+           (for reference (iter names)
+             (match (resolve-reviewer a home reference)
+               (NotFound [message] (return-from :load (ChosenBad message)))
+               (Found [found]
+                      (let [entry found]
+                        (match (parse-reviewer a (.text entry))
+                          (ReviewerBad [problems] (return-from :load (ChosenBad (reviewer-problems-text a reference problems))))
+                          (ReviewerOk [spec]
+                                      (do (for copy (iter copies)
+                                            (when (= (.name copy) (.name spec))
+                                              (return-from :load (ChosenBad (cat a ["two reviewers are named \"" (.name spec) "\""])))))
+                                          (push! (mut copies) (ReviewerCopy :name (.name spec) :text (.text entry)))
+                                          0)))))))
+           (ChosenOk (load copies)))))

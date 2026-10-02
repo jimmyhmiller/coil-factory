@@ -15,7 +15,13 @@
    (gate (slice u8))
    (attempts i64)
    (model (slice u8))
+   ;;; Which program runs this station's agent; "" inherits (see `station-harness`).
+   (harness (slice u8))
    (tools (slice u8))
+   ;;; Reviewers whose approval this station's work needs before it passes,
+   ;;; comma-separated names or paths; "" inherits the factory's `review`,
+   ;;; "none" turns review off for this station.
+   (review (slice u8))
    (line i64)])
 
 (defstruct FactorySpec
@@ -23,6 +29,13 @@
    (description (slice u8))
    (input (slice u8))
    (model (slice u8))
+   (harness (slice u8))
+   ;;; The reviewers that watch runs of this factory, comma-separated; "" leaves
+   ;;; it to the run and the site, "none" turns reviewing off.
+   (reviewers (slice u8))
+   ;;; The reviewers every station's work must satisfy unless the station says
+   ;;; otherwise (see `station-review`); "" for none.
+   (review (slice u8))
    (tools (slice u8))
    (attempts i64)
    (context (slice u8))
@@ -52,10 +65,50 @@
         (> (len (.tools spec)) 0) (.tools spec)
         :else "files, shell"))
 
+;;; The reviewers a station's finished work must satisfy, as comma-separated
+;;; names or paths: the station's own `review`, else the factory's. "" (or
+;;; "none") means the station passes on its gate alone.
+(defn station-review [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> (slice u8))
+  (review-choice (.review spec) (.review station)))
+
+;;; The station's own review choice, else the factory's; "none" is "".
+(defn review-choice [(factory-review (slice u8)) (station-review (slice u8))] (-> (slice u8))
+  (let [chosen (if (> (len (str-trim station-review)) 0) station-review factory-review)]
+    (if (= (str-trim chosen) "none") "" chosen)))
+
 (defn station-attempts [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> i64)
   (cond (> (.attempts station) 0) (.attempts station)
         (> (.attempts spec) 0) (.attempts spec)
         :else 3))
+
+;;; The harnesses a station's agent can run in: `builtin`, the factory's own
+;;; agent loop calling the model directly; `opencode`, the OpenCode CLI
+;;; driven headlessly (which reaches models, such as OpenCode Zen's free ones,
+;;; that only answer requests from OpenCode itself); and `codex`, the Codex
+;;; CLI driven headlessly (which reaches the models of the operator's Codex
+;;; login).
+(const HARNESSES ["builtin" "opencode" "codex"])
+
+(defn harness-known? [(name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for known (iter HARNESSES)
+      (when (= known name) (set! found true) 0))
+    (load found)))
+
+(defn harness-problem [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+  (if (harness-known? name)
+      ""
+      (let [(mut out) (sb-new a)]
+        (sb-push-str! (mut out) "unknown harness \"")
+        (sb-push-str! (mut out) name)
+        (sb-push-str! (mut out) "\"; the harnesses are builtin, opencode, and codex")
+        (sb-finish! (mut out)))))
+
+;;; The harness a station uses: its own, the factory's, then `fallback`.
+(defn station-harness [(spec (ptr FactorySpec)) (station (ptr StationSpec)) (fallback (slice u8))] (-> (slice u8))
+  (cond (> (len (.harness station)) 0) (.harness station)
+        (> (len (.harness spec)) 0) (.harness spec)
+        :else fallback))
 
 ;;; The model a station uses: its own, the factory's, then `fallback`.
 (defn station-model [(spec (ptr FactorySpec)) (station (ptr StationSpec)) (fallback (slice u8))] (-> (slice u8))

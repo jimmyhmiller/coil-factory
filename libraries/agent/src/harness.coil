@@ -1,0 +1,42 @@
+(module agent.harness)
+(import "coil.alloc" :use *)
+(import "agent.loop" :use *)
+
+;;; A conversation with an agent, whatever runs it: this library's own loop
+;;; (`Agent`, which calls a chat model directly), or another agent program
+;;; driven headlessly, such as OpenCode (the `harness` library). Code that runs
+;;; agents (a factory station, for example) talks to one only through this
+;;; trait, so any harness can do the work.
+;;;
+;;; Every harness is built with an `AgentObserver`, which it tells what the
+;;; agent does, and an `AgentControl`, which it polls for pause, cancel, and
+;;; messages from people. It has a stop tool: when the agent calls it, a run
+;;; ends with `Finished`.
+(deftrait Harness [Self]
+  ;;; The instructions the agent works under. Called before the first run of
+  ;;; a new conversation (not after a restore).
+  (harness-add-system! [(self (ptr Self)) (text (slice u8))] (-> i64))
+  ;;; A message from the person's side, delivered at the start of the next run.
+  (harness-add-user! [(self (ptr Self)) (text (slice u8))] (-> i64))
+  ;;; Work until the agent calls the stop tool, replies without calling any
+  ;;; tool, is cancelled, or fails.
+  (harness-run! [(self (ptr Self))] (-> AgentStop))
+  ;;; Everything needed to continue this conversation later, as JSON text.
+  (harness-checkpoint [(self (ptr Self)) (a (dyn Allocator))] (-> (slice u8)))
+  ;;; Continue the conversation a checkpoint describes. Returns false, leaving
+  ;;; the harness unchanged, when the text is not one of its checkpoints.
+  (harness-restore! [(self (ptr Self)) (checkpoint (slice u8))] (-> bool)))
+
+;;; The built-in loop. Its checkpoint is the transcript: a JSON array of chat
+;;; messages.
+(impl Harness Agent
+  (harness-add-system! [(self (ptr Agent)) (text (slice u8))] (-> i64)
+                       (agent-add-system! self text))
+  (harness-add-user! [(self (ptr Agent)) (text (slice u8))] (-> i64)
+                     (agent-add-user! self text))
+  (harness-run! [(self (ptr Agent))] (-> AgentStop)
+                (agent-run! self))
+  (harness-checkpoint [(self (ptr Agent)) (a (dyn Allocator))] (-> (slice u8))
+                      (agent-transcript-json self a))
+  (harness-restore! [(self (ptr Agent)) (checkpoint (slice u8))] (-> bool)
+                    (agent-restore! self checkpoint)))

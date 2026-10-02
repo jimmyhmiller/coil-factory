@@ -201,18 +201,43 @@
       (= kind "control") (join a [when "  " who "  " (style/warn a term (join a [(str-field record "action") " requested"]))
                                   (let [by (str-field record "by")] (if (> (len by) 0) (style/muted a term (join a [" by " by])) ""))])
       (= kind "finding")
-        (let [severity (str-field record "severity")]
-          (join a [when "  " (paint-fg a term (amber) (style/pad-right a "overseer" 10)) "  "
+        (let [severity (str-field record "severity")
+              reviewer (str-field record "reviewer")]
+          (join a [when "  " (paint-fg a term (amber) (style/pad-right a (if (> (len reviewer) 0) reviewer "overseer") 10)) "  "
                    (if (= severity "alert") (style/err a term "✗ ") (style/warn a term "⚠ "))
                    (paint-bold a term (if (= severity "alert") (soft-red) (amber)) (str-field record "code")) "  "
                    (first-line a (str-field record "message") 200)]))
       (= kind "oversight")
-        (let [verdict (str-field record "verdict")]
-          (if (or verbose (not (= verdict "on_track")))
-              (join a [when "  " (paint-fg a term (amber) (style/pad-right a "overseer" 10)) "  "
-                       (if (= verdict "on_track") (style/ok a term "✓ on track") (style/warn a term verdict)) "  "
+        (let [verdict (str-field record "verdict")
+              level (str-field record "level")]
+          (if (or verbose (not (= level "ok")))
+              (join a [when "  " (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
+                       (cond (= level "ok") (style/ok a term (join a ["✓ " verdict]))
+                             (= level "alert") (style/err a term (join a ["✗ " verdict]))
+                             :else (style/warn a term (join a ["◉ " verdict]))) "  "
                        (style/muted a term (first-line a (str-field record "reason") 160))])
               ""))
+      (= kind "review.started")
+        (join a [when "  " who "  " (paint-fg a term (violet) "⚖ review") " "
+                 (style/accent a term (str-field record "reviewers"))
+                 (style/muted a term (join a [" (round " (int-text a (int-field record "round")) ")"]))])
+      (= kind "review.verdict")
+        (let [level (str-field record "level")
+              failure (str-field record "failure")]
+          (join a [when "  " who "  "
+                   (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
+                   (cond (> (len failure) 0) (style/err a term "✗ no verdict")
+                         (= level "ok") (style/ok a term (join a ["✓ " (str-field record "verdict")]))
+                         :else (style/err a term (join a ["✗ " (str-field record "verdict")])))
+                   "  " (first-line a (if (> (len failure) 0) failure (str-field record "reason")) 200)]))
+      (= kind "review.round")
+        (if (bool-field record "approved")
+            (join a [when "  " who "  " (style/ok a term "⚖ approved")])
+            (join a [when "  " who "  " (style/err a term "⚖ sent back to the agent")]))
+      (= kind "oversight.failed")
+        (join a [when "  " (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
+                 (style/err a term "✗ reviewer failed") "  "
+                 (first-line a (str-field record "message") 200)])
       :else (if verbose (join a [when "  " who "  " (style/muted a term kind)]) ""))))
 
 ;;; `fancy` on a Unicode terminal, `plain` otherwise.

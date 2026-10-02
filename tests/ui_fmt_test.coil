@@ -42,5 +42,12 @@
                                     "{\"outcome\": \"done\", \"summary\": \"wrote it\\nmore\"}")
                       "done: wrote it"))
            (assert (= (tool-glyph "shell") "$"))
+           ;; OpenCode's tools, as the opencode harness reports them.
+           (assert (= (tool-subject a "bash" "{\"command\": \"ls -la\"}") "ls -la"))
+           (assert (= (tool-subject a "edit" "{\"filePath\": \"/w/poem.md\"}") "/w/poem.md"))
+           (assert (= (tool-subject a "grep" "{\"pattern\": \"TODO\"}") "\"TODO\""))
+           (assert (= (tool-glyph "bash") "$"))
+           (assert (= (tool-glyph "write") "\x270e;"))
+           (assert (= (tool-glyph "glob") "\x2315;"))
            (assert (= (first-line "\n  hello  \nworld") "hello"))
            (assert-eq (line-count "a\nb\n") 2)))

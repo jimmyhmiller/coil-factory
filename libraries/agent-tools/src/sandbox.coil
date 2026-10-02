@@ -8,7 +8,7 @@
 (import "agent_tools.sys" :as sys)
 (import "agent_tools.text" :use *)
 (import "agent_tools.workspace" :use *)
-(export SandboxOptions SandboxPolicy NoSandbox MacSandbox Bubblewrap sandbox-options sandbox-options-with-paths sandbox-name sandbox-argv
+(export SandboxOptions SandboxPolicy NoSandbox MacSandbox Bubblewrap sandbox-options sandbox-options-with-paths sandbox-name sandbox-argv sandbox-program-argv
         sandbox-detect workspace-git-dirs workspace-sandbox-options)
 
 ;;; What a sandbox allows beyond the workspace itself.
@@ -116,6 +116,12 @@
 ;;; under `policy`, with the workspace root as the writable directory. The
 ;;; caller runs it with the working directory set to `root`.
 (defn sandbox-argv [(a (dyn Allocator)) (policy SandboxPolicy) (root (slice u8)) (command (slice u8))] (-> (ArrayList (slice u8)))
+  (sandbox-program-argv a policy root [SHELL "-c" command]))
+
+;;; The complete argv that runs `program` (its own argv, program first) under
+;;; `policy`, with the workspace root as the writable directory: for confining
+;;; a whole program, such as another agent, rather than one shell command.
+(defn sandbox-program-argv [(a (dyn Allocator)) (policy SandboxPolicy) (root (slice u8)) (program (slice (slice u8)))] (-> (ArrayList (slice u8)))
   (let [(mut argv) (al-new [(slice u8)] a)]
     (match policy
       (NoSandbox [] 0)
@@ -141,7 +147,7 @@
                         0)
                       (push! (mut argv) "--")
                       0)))
-    (push-all! (mut argv) [SHELL "-c" command])
+    (push-all! (mut argv) program)
     (load argv)))
 
 (defn linux-code [] (-> Code)

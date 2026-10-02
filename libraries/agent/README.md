@@ -22,6 +22,12 @@ A provider-neutral tool-calling agent loop over `ai.chat`.
   the observer (`TurnStarted`, `MessageDelivered`, `Thought`, `Said`,
   `UsageReported`, `ToolStarted`, `ToolEnded`, `ModelRetrying`, `PausedEvent`,
   `ResumedEvent`, `Compacted`).
+- `agent.harness`: the `Harness` trait, the one interface code that runs agents
+  needs: `harness-add-system!`, `harness-add-user!`, `harness-run!` (returning
+  the same `AgentStop`), `harness-checkpoint`, and `harness-restore!`. `Agent`
+  implements it; so does the `opencode` library's `OpenCodeHarness`, which drives
+  another agent program. A harness is built with an `AgentObserver` and an
+  `AgentControl` and reports the same events.
 - Transient failures (transport, 408/409/425/429/5xx, and a request body the
   provider saw cut off) are retried with exponential backoff, cancellable.
 - Tool arguments are validated with `json-schema` before execution; a bad call is

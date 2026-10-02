@@ -59,6 +59,9 @@
 (defn factories-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
   (path-join a home "factories"))
 
+(defn reviewers-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "reviewers"))
+
 ;;; An OpenAI-compatible server declared in site.json.
 (defstruct ProviderDecl
   [(name (slice u8))
@@ -72,10 +75,31 @@
    (max-runs i64)
    ;;; none | sandbox
    (isolation (slice u8))
+   ;;; The model `builtin` agents use when nothing else names one; "" (the
+   ;;; default) means there is none, and such a run is refused.
    (default-model (slice u8))
+   ;;; The harness stations use when neither the run nor the factory picks one.
+   (default-harness (slice u8))
+   ;;; The OpenCode executable for the `opencode` harness; "" finds it on PATH
+   ;;; or in ~/.opencode/bin.
+   (opencode (slice u8))
+   ;;; The model `opencode` agents use when nothing else names one; "" means
+   ;;; there is none.
+   (opencode-model (slice u8))
+   ;;; The Codex CLI for the `codex` harness; "" finds `codex` on PATH.
+   (codex (slice u8))
+   ;;; The model `codex` agents use when nothing else names one; "" means
+   ;;; there is none.
+   (codex-model (slice u8))
+   ;;; Directories outside the workspace that `codex` agents allowed to write
+   ;;; (their workspace sandbox) may also write, comma-separated; `~` is the
+   ;;; home directory. "" for none.
+   (codex-writable (slice u8))
+   ;;; The reviewers that watch runs whose run and factory name none, as
+   ;;; comma-separated names or paths; "" means none (see factory.reviewer).
+   (reviewers (slice u8))
    ;;; observe | nudge | pause
    (overseer-policy (slice u8))
-   (overseer-model (slice u8))
    (overseer-interval-s i64)
    (providers (ArrayList ProviderDecl))])
 
@@ -99,6 +123,21 @@
     (Some [name] (if (> (len name) 0) name "local"))
     (None [] "local")))
 
+;;; A list of names written as a JSON array of strings or one comma-separated
+;;; string, as comma-separated text.
+(defn names-text [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
+  (match value
+    (JStr [s] s)
+    (JArr [items]
+          (let [(mut out) (sb-new a)
+                (mut first) true]
+            (for item (iter items)
+              (when (not (load first)) (sb-push-str! (mut out) ", ") 0)
+              (sb-push-str! (mut out) (jv-string-or item ""))
+              (set! first false))
+            (sb-finish! (mut out))))
+    (_ "")))
+
 ;;; The site's configuration: site.json when present, otherwise defaults.
 ;;; A malformed site.json is an error the operator must fix, never ignored.
 (defsum SiteConfigResult
@@ -121,12 +160,16 @@
                 (set! (.port config) (json-int-or object "port" 7788))
                 (set! (.max-runs config) (json-int-or object "max_runs" 4))
                 (set! (.isolation config) (json-str-or object "isolation" "none"))
-                (set! (.default-model config)
-                      (json-str-or object "default_model" "deepseek/deepseek-v4-flash"))
+                (set! (.default-model config) (json-str-or object "default_model" ""))
+                (set! (.default-harness config) (json-str-or object "default_harness" "builtin"))
+                (set! (.opencode config) (json-str-or object "opencode" ""))
+                (set! (.opencode-model config) (json-str-or object "opencode_model" ""))
+                (set! (.codex config) (json-str-or object "codex" ""))
+                (set! (.codex-model config) (json-str-or object "codex_model" ""))
+                (set! (.codex-writable config) (names-text a (jv-get object "codex_writable")))
+                (set! (.reviewers config) (names-text a (jv-get object "reviewers")))
                 (let [overseer (jv-get object "overseer")]
                   (set! (.overseer-policy config) (json-str-or overseer "policy" "nudge"))
-                  (set! (.overseer-model config)
-                        (json-str-or overseer "model" (.default-model config)))
                   (set! (.overseer-interval-s config) (json-int-or overseer "interval_seconds" 20)))
                 (let [providers (jv-get object "providers")
                       n (jv-count providers)
@@ -140,12 +183,16 @@
                               (set! (.key-env decl) (json-str-or entry "key_env" ""))
                               (push! [ProviderDecl] (mut (.providers config)) (load decl))
                               (set! i (+ (load i) 1))))))
-                (cond (not (or (= (.isolation config) "none") (= (.isolation config) "sandbox")))
+                (cond (not (jv-null? (jv-get (jv-get object "overseer") "model")))
+                        (SiteConfigBad "site.json: overseer.model is gone. Judging is done by reviewers, each with its own model and harness: name them in site.json \"reviewers\", a factory's `reviewers:`, or `factory start --reviewers`")
+                      (not (or (= (.isolation config) "none") (= (.isolation config) "sandbox")))
                         (SiteConfigBad "site.json: isolation must be \"none\" or \"sandbox\"")
                       (not (or (= (.overseer-policy config) "observe")
                                (= (.overseer-policy config) "nudge")
                                (= (.overseer-policy config) "pause")))
                         (SiteConfigBad "site.json: overseer.policy must be observe, nudge, or pause")
+                      (not (or (= (.default-harness config) "builtin") (= (.default-harness config) "opencode") (= (.default-harness config) "codex")))
+                        (SiteConfigBad "site.json: default_harness must be \"builtin\", \"opencode\", or \"codex\"")
                       (< (.max-runs config) 1)
                         (SiteConfigBad "site.json: max_runs must be at least 1")
                       :else (SiteConfigOk (load config)))))))))

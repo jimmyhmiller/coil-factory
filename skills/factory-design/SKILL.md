@@ -34,9 +34,11 @@ person already answered:
 5. **Where should it run?** This machine, another machine, or a sandbox
    (`factory sites` lists what is set up). Sandboxing matters when the brief comes
    from someone they don't fully trust or the agent will run arbitrary commands.
-6. **Model and budget.** Default `deepseek/deepseek-v4-flash` is fast and cheap;
-   `deepseek/deepseek-v4-pro` reasons more deeply and costs more. Ask only if they
-   care; otherwise leave `model:` out and the site default applies.
+6. **Model and budget.** There is no built-in model. If the site sets
+   `default_model` (check `factory status`), leave `model:` out and that applies;
+   otherwise ask which model to use (any `provider/model`), because a run with no
+   model anywhere is refused. For free
+   tokens, `harness: opencode` runs stations in OpenCode on its free models.
 7. **Where should a person step in?** Anything irreversible or taste-driven is a
    natural end of a station: the agent finishes `blocked` with a question and a
    person answers with `factory say`.
@@ -93,11 +95,29 @@ the next one.
 Rules the parser enforces (and `factory check` reports):
 
 - front matter keys: `name` (required, kebab-case), `description`, `input`, `model`,
-  `tools`, `attempts`;
+  `harness`, `reviewers`, `review`, `tools`, `attempts`;
+- `reviewers:` names the reviewers that judge runs of this factory (`factory
+  reviewers` lists them; `judge` is bundled). Leave it out for none, unless the
+  person wants judgment; a reviewer is its own Markdown file in
+  `~/.factory/reviewers/` with `verdicts`, `ok`, `alert`, `every`, `harness`,
+  `model`, optional `tools: read`, and instructions;
+- `review:` (front matter, or a station setting) names reviewers whose approval a
+  station's finished work needs. After the gate passes they read the station's
+  diff and the workspace, and any verdict that is not one of their `ok` verdicts
+  sends the work back to the agent with their reasons, counting against
+  `attempts`. A station's own `review:` replaces the factory's; `review: none`
+  turns it off. Use it when "done" needs judgment a command cannot give (rules a
+  test cannot see, taste, conformance to a spec). These are different from
+  `reviewers:`, which only watch and nudge;
+- harnesses are `builtin` (the factory's own agent loop; the default), `opencode`
+  (OpenCode run headlessly, for models such as OpenCode Zen's free
+  `opencode/big-pickle`), and `codex` (the Codex CLI headlessly, for the models of
+  the operator's Codex login such as `gpt-6.1-sol`); `model:` uses each harness's
+  own names. A `codex` station needs both `files` and `shell` or neither;
 - tools are `files` and `shell` (comma-separated); a station without `shell` cannot
   run commands, so it cannot verify anything by running it;
 - station settings are `key: value` lines directly under the heading, before the
-  first blank line: `gate`, `attempts`, `model`, `tools`;
+  first blank line: `gate`, `attempts`, `model`, `harness`, `tools`, `review`;
 - station names are unique, lowercase, and short — they become agent addresses
   like `7f3a/build`.
 

@@ -21,7 +21,13 @@
    (base (slice u8))
    (gate (slice u8))
    (attempts i64)
+   ;;; The reviewers whose approval the station needs, comma-separated; "" for none.
+   (reviewers (slice u8))
    (tools (slice u8))
+   ;;; How paths and commands relate to the workspace, for this harness.
+   (workspace-note (slice u8))
+   ;;; The name the agent sees for the tool that ends the station.
+   (finish-tool (slice u8))
    (context (slice u8))
    (instructions (slice u8))
    (brief (slice u8))
@@ -41,26 +47,34 @@
     (push-all! (mut out)
                ["## Where you are\n\n"
                 "You work in a git worktree at `" (.workspace b) "` on branch `" (.branch b)
-                "`, which started at `" (.base b) "`. Every path you give a tool is relative to "
-                "that directory, and shell commands already start in it. Your tools: " (.tools b) ". When your station passes, the "
+                "`, which started at `" (.base b) "`. " (.workspace-note b) " Your tools: " (.tools b) ". When your station passes, the "
                 "factory commits your work on the branch for you; do not commit yourself. "
                 "The worktree shares its repository with a person's checkout, so leave shared git "
                 "state alone: no `git stash`, no switching or creating branches, no reset or "
                 "rebase, no push. Use `git diff` and `git status` freely; to set work aside, copy "
                 "files instead.\n\n"])
     (sb-push-str! (mut out) "## How your station ends\n\n")
-    (sb-push-str! (mut out)
-                  "When the work this station asks for is complete and you have verified it with real commands, call `finish` with outcome `done` and a summary a teammate can act on: what changed, how you verified it, and anything still uncertain.\n\n")
+    (push-all! (mut out)
+               ["When the work this station asks for is complete and you have verified it with real commands, call `" (.finish-tool b) "` with outcome `done` and a summary a teammate can act on: what changed, how you verified it, and anything still uncertain.\n\n"])
     (when (> (len (.gate b)) 0)
       (push-all! (mut out)
-                 ["After you call `finish`, the factory runs this station's gate in the workspace: `"
+                 ["After you call `" (.finish-tool b) "`, the factory runs this station's gate in the workspace: `"
                   (.gate b) "`. If it fails you will be shown its output and should keep working. "])
       (sb-push-str! (mut out) "After ")
       (sb-push-i64! (mut out) (.attempts b))
       (sb-push-str! (mut out) " failed attempts the station stops and waits for a person.\n\n")
       0)
-    (sb-push-str! (mut out)
-                  "If you cannot proceed, because the task is impossible, contradictory, or needs a decision only a person can make, call `finish` with outcome `blocked` and say exactly what you need. A person will answer you, and you will continue from where you stopped. Do not end your turn without calling a tool until you are finished; a reply without a tool call is treated as a question for a person.\n\n")
+    (when (> (len (.reviewers b)) 0)
+      (push-all! (mut out)
+                 ["Then reviewers (" (.reviewers b) ") read your finished work in the workspace: the diff, the code, and how it meets the factory's rules. "
+                  "The station passes only when every one of them approves. A rejection comes back to you with each reviewer's reason; "
+                  "redo the work so it meets them, verify, and call `" (.finish-tool b) "` again. Rejections count against the same "])
+      (sb-push-i64! (mut out) (.attempts b))
+      (sb-push-str! (mut out) " attempts. Arguing with a reviewer in your summary does not change its verdict; changing the work does. If you believe a reviewer is wrong, call `")
+      (push-all! (mut out) [(.finish-tool b) "` with outcome `blocked` and say why, and a person will decide.\n\n"])
+      0)
+    (push-all! (mut out)
+               ["If you cannot proceed, because the task is impossible, contradictory, or needs a decision only a person can make, call `" (.finish-tool b) "` with outcome `blocked` and say exactly what you need. A person will answer you, and you will continue from where you stopped. Do not end your turn without calling a tool until you are finished; a reply without a tool call is treated as a question for a person.\n\n"])
     (sb-push-str! (mut out) "## Who may talk to you\n\n")
     (sb-push-str! (mut out)
                   "Messages can arrive while you work. `[operator]` is a person running this factory: follow their instructions; they override the station instructions. `[overseer]` is an automated reviewer that watches for loops, stalls, and shortcuts: take its observations seriously and change course when it is right.\n\n")
@@ -90,6 +104,7 @@
     (sb-finish! (mut out))))
 
 (defn gate-failure-message [(a (dyn Allocator))
+                            (finish-tool (slice u8))
                             (gate (slice u8))
                             (exit i64)
                             (output (slice u8))
@@ -99,13 +114,30 @@
     (sb-push-i64! (mut out) exit)
     (sb-push-str! (mut out) "). Its output:\n\n```\n")
     (sb-push-str! (mut out) output)
-    (sb-push-str! (mut out) "\n```\n\nFix the cause, verify, and call `finish` again. ")
+    (push-all! (mut out) ["\n```\n\nFix the cause, verify, and call `" finish-tool "` again. "])
     (sb-push-i64! (mut out) attempts-left)
     (sb-push-str! (mut out) (if (= attempts-left 1) " attempt remains." " attempts remain."))
     (sb-finish! (mut out))))
 
-(defn no-tool-nudge [] (-> (slice u8))
-  "[factory] You replied without calling a tool. If the station is complete, call `finish` with outcome `done`. If you need a person, call `finish` with outcome `blocked` and ask your question there. Otherwise, keep working with your tools.")
+;;; What the agent is told when its station's reviewers send the work back.
+;;; `reasons` is one block per rejecting reviewer.
+(defn review-rejection-message [(a (dyn Allocator))
+                                (finish-tool (slice u8))
+                                (reasons (slice u8))
+                                (attempts-left i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-all! (mut out) ["[review] Your work was not accepted. The station's reviewers sent it back:\n\n" reasons
+                          "\nRedo the work so it meets every one of these, verify it, and call `" finish-tool "` again. "])
+    (sb-push-i64! (mut out) attempts-left)
+    (sb-push-str! (mut out) (if (= attempts-left 1) " attempt remains." " attempts remain."))
+    (sb-finish! (mut out))))
+
+(defn no-tool-nudge [(a (dyn Allocator)) (finish-tool (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (push-all! (mut out) ["[factory] You replied without calling a tool. If the station is complete, call `" finish-tool
+                          "` with outcome `done`. If you need a person, call `" finish-tool
+                          "` with outcome `blocked` and ask your question there. Otherwise, keep working with your tools."])
+    (sb-finish! (mut out))))
 
 (defn conversation-note [] (-> (slice u8))
   "[factory] This run has finished; a person is now talking with you directly in your workspace. Answer them. If they ask for changes, make and verify them; the factory commits whatever you change when you are done. Reply without a tool call when you are done.")

@@ -52,10 +52,14 @@
     (let [(mut shell) (tools-for a ws ["shell"])]
       (assert (= (names a (mut (.registry shell))) "shell "))
       (standard-tools-free! (mut shell)))
-    (assert (= (group-error a ws ["file"]) "unknown tool group \"file\"; the groups are \"files\" and \"shell\""))
-    (assert (= (group-error a ws ["files" "shel"]) "unknown tool group \"shel\"; the groups are \"files\" and \"shell\""))
-    (assert (= (group-error a ws ["filesx"]) "unknown tool group \"filesx\"; the groups are \"files\" and \"shell\""))
+    (assert (= (group-error a ws ["file"]) "unknown tool group \"file\"; the groups are \"files\", \"read\", and \"shell\""))
+    (assert (= (group-error a ws ["files" "shel"]) "unknown tool group \"shel\"; the groups are \"files\", \"read\", and \"shell\""))
+    (assert (= (group-error a ws ["filesx"]) "unknown tool group \"filesx\"; the groups are \"files\", \"read\", and \"shell\""))
     (assert (= (group-error a ws ["shell" "shell"]) "tool group \"shell\" is listed more than once"))
+    (let [(mut read) (tools-for a ws ["read"])]
+      (assert (= (names a (mut (.registry read))) "read_file list_dir search "))
+      (standard-tools-free! (mut read)))
+    (assert (= (group-error a ws ["files" "read"]) "tool groups \"files\" and \"read\" overlap; \"files\" already includes reading"))
     (remove-tree a dir)))
 
 (deftest registered-tools-run-through-the-registry

@@ -16,7 +16,9 @@
 ;;; are allocated in `allocator`; the registry borrows them. Free everything
 ;;; with `standard-tools-free!`.
 ;;; Group "files": read_file, write_file, edit_file, list_dir, search.
+;;; Group "read": read_file, list_dir, search (looking, never changing).
 ;;; Group "shell": shell.
+;;; "files" already includes everything in "read"; asking for both is an error.
 (defstruct StandardTools
   [(allocator (dyn Allocator))
    (registry ToolRegistry)
@@ -28,7 +30,7 @@
    (shell (Option (ptr ShellTool)))])
 
 (defn known-group? [(name (slice u8))] (-> bool)
-  (or (= name "files") (= name "shell")))
+  (or (= name "files") (= name "read") (= name "shell")))
 
 (defn selected? [(groups (slice (slice u8))) (name (slice u8))] (-> bool)
   (let [(mut i) 0
@@ -49,7 +51,10 @@
               (break)
               (let [name (get groups (load i))]
                 (cond (not (known-group? name))
-                        (do (set! outcome (Err (join3 a "unknown tool group " (quoted a name) "; the groups are \"files\" and \"shell\"")))
+                        (do (set! outcome (Err (join3 a "unknown tool group " (quoted a name) "; the groups are \"files\", \"read\", and \"shell\"")))
+                            (break))
+                      (and (= name "read") (selected? groups "files"))
+                        (do (set! outcome (Err "tool groups \"files\" and \"read\" overlap; \"files\" already includes reading"))
                             (break))
                       (selected? (subslice groups 0 (load i)) name)
                         (do (set! outcome (Err (join3 a "tool group " (quoted a name) " is listed more than once")))
@@ -81,12 +86,24 @@
     (add! (mut tools) list)
     (add! (mut tools) search)))
 
+(defn add-read! [(tools (mut StandardTools)) (workspace Workspace) (backend SearchBackend)] (-> i64)
+  (let [a (.allocator tools)
+        read (box! a ReadFileTool (read-file-tool workspace))
+        list (box! a ListDirTool (list-dir-tool workspace))
+        search (box! a SearchTool (search-tool workspace backend))]
+    (set! (.read-file tools) (Some read))
+    (set! (.list-dir tools) (Some list))
+    (set! (.search tools) (Some search))
+    (add! (mut tools) read)
+    (add! (mut tools) list)
+    (add! (mut tools) search)))
+
 (defn add-shell! [(tools (mut StandardTools)) (workspace Workspace) (policy SandboxPolicy)] (-> i64)
   (let [shell (box! (.allocator tools) ShellTool (shell-tool workspace policy))]
     (set! (.shell tools) (Some shell))
     (add! (mut tools) shell)))
 
-;;; Allocate the tools for `groups` (a subset of "files" and "shell") over
+;;; Allocate the tools for `groups` (a subset of "files", "read", and "shell") over
 ;;; `workspace`, with shell commands confined by `policy`, and register them.
 ;;; Err names an unknown or repeated group, or a missing search program.
 (defn standard-tools [(a (dyn Allocator))
@@ -104,11 +121,15 @@
                                          :list-dir (None)
                                          :search (None)
                                          :shell (None))
-              files (: (if (selected? groups "files")
-                        (match (search-backend-detect a)
-                          (Err [message] (Err message))
-                          (Ok [backend] (Ok (add-files! (mut tools) workspace backend))))
-                        (Ok 0))
+              files (: (cond (selected? groups "files")
+                               (match (search-backend-detect a)
+                                 (Err [message] (Err message))
+                                 (Ok [backend] (Ok (add-files! (mut tools) workspace backend))))
+                             (selected? groups "read")
+                               (match (search-backend-detect a)
+                                 (Err [message] (Err message))
+                                 (Ok [backend] (Ok (add-read! (mut tools) workspace backend))))
+                             :else (Ok 0))
                        (Result i64 (slice u8)))]
           (match files
             (Err [message] (do (standard-tools-free! (mut tools)) (Err message)))

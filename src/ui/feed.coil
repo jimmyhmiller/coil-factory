@@ -273,17 +273,49 @@
                                     (first-line (js record "message"))])
                            (severity-tone severity)))
           (= kind "oversight")
-            (let [verdict (js record "verdict")]
+            (let [level (js record "level")
+                  reviewer (js record "reviewer")]
               (feed--push! feed
                            record
                            "◉"
-                           (verdict-tone verdict)
+                           (standing-tone level)
                            (concat a
-                                   ["overseer: "
-                                    verdict
+                                   [(if (> (len reviewer) 0) reviewer "overseer")
+                                    ": "
+                                    (js record "verdict")
                                     " — "
                                     (first-line (js record "reason"))])
-                           (verdict-tone verdict)))
+                           (standing-tone level)))
+          (= kind "review.started")
+            (feed--push! feed
+                         record
+                         "⚖"
+                         (ToneAccentAlt)
+                         (concat a ["review: " (js record "reviewers")])
+                         (TonePlain))
+          (= kind "review.verdict")
+            (let [failure (js record "failure")
+                  approved (and (= (len failure) 0) (= (js record "level") "ok"))]
+              (feed--push! feed
+                           record
+                           "⚖"
+                           (if approved (ToneSuccess) (ToneError))
+                           (concat a [(js record "reviewer") ": "
+                                      (if (> (len failure) 0) "no verdict" (js record "verdict"))
+                                      " — "
+                                      (first-line (if (> (len failure) 0) failure (js record "reason")))])
+                           (if approved (ToneSuccess) (ToneError))))
+          (= kind "review.round")
+            (if (jb record "approved")
+                (feed--push! feed record "⚖" (ToneSuccess) "review approved" (ToneSuccess))
+                (feed--push! feed record "⚖" (ToneError) "review sent the work back" (ToneError)))
+          (= kind "oversight.failed")
+            (feed--push! feed
+                         record
+                         "✗"
+                         (ToneError)
+                         (concat a ["reviewer " (js record "reviewer") " failed: " (first-line (js record "message"))])
+                         (ToneError))
           (= kind "control")
             (feed--push! feed
                          record

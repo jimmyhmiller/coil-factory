@@ -1,0 +1,265 @@
+(module factory.review)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.atomic" :as atomic-ops)
+(import "coil.thread" :as thread)
+(import "agent.harness" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.harnesses" :use *)
+(import "factory.reviewer" :use *)
+
+;;; One review: a reviewer's agent, on its own thread, shown a system prompt
+;;; and a context and asked for a verdict. The overseer runs reviews now and
+;;; then over a run's recent activity (findings); the worker runs a station's
+;;; reviews over its finished work, and the station passes only when every
+;;; one of them approves (`run-reviews!`).
+
+(defn text-join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+;;; Everything one review needs, owned by the review's thread until `done`,
+;;; and its result. Strings live in `arena`.
+(defstruct ReviewJob
+  [(arena (ptr scratch/ScratchArena))
+   (config (ptr SiteConfig))
+   (spec (ptr ReviewerSpec))
+   (stopping (ptr i64))
+   (workspace (slice u8))
+   (run-dir (slice u8))
+   (agent (slice u8))
+   (system (slice u8))
+   (context (slice u8))
+   (done i64)
+   (cancelled bool)
+   (reply (slice u8))
+   (failure (slice u8))
+   (label (slice u8))
+   (input-tokens i64)
+   (output-tokens i64)])
+
+;;; A review's control: cancelled when the daemon stops; no messages.
+(defstruct ReviewControl [(stopping (ptr i64))])
+
+(impl AgentControl ReviewControl
+  (control-check [(self (ptr ReviewControl))] (-> Control)
+                 (if (!= (atomic-ops/atomic-load (.stopping self)) 0) (Cancel) (Proceed)))
+  (control-inbox [(self (ptr ReviewControl)) (a (dyn Allocator))] (-> (ArrayList Inbound))
+                 (al-new [Inbound] a))
+  (control-idle [(self (ptr ReviewControl))] (-> i64) (sleep-ms 250)))
+
+;;; A review's observer: it keeps only the token counts.
+(defstruct ReviewObserver [(input i64) (output i64)])
+
+(impl AgentObserver ReviewObserver
+  (observe [(self (ptr ReviewObserver)) (event AgentEvent)] (-> i64)
+           (match event
+             (UsageReported [input output]
+                            (do (set! (.input self) (+ (.input self) input))
+                                (set! (.output self) (+ (.output self) output))
+                                0))
+             (_ 0))))
+
+;;; The body of a review's thread.
+(defn review-main [(arg (ptr i8))] (-> (ptr i8))
+  (let [job (cast (ptr ReviewJob) arg)
+        a (scratch/scratch-allocator (.arena job))
+        spec (.spec job)
+        config (.config job)
+        control (box! a ReviewControl (ReviewControl :stopping (.stopping job)))
+        observer (box! a ReviewObserver (ReviewObserver :input 0 :output 0))
+        harness-name (if (> (len (.harness spec)) 0) (.harness spec) (.default-harness config))
+        request (AgentRequest :harness harness-name
+                              :model (.model spec)
+                              :tools (.tools spec)
+                              :finish false
+                              :gate ""
+                              :workspace (.workspace job)
+                              :run-dir (.run-dir job)
+                              :station (text-join a ["review-" (.name spec)])
+                              :state-key (text-join a ["review-" (.name spec)]))]
+    (match (station-agent a config request observer control)
+      (AgentUnavailable [message] (set! (.failure job) message))
+      (AgentReady [ready]
+                  (let [agent (.harness ready)]
+                    (set! (.label job) (.label ready))
+                    (harness-add-system! agent (.system job))
+                    (harness-add-user! agent (.context job))
+                    (match (harness-run! agent)
+                      (Replied [text] (set! (.reply job) text))
+                      (Finished [call result] (set! (.failure job) "the reviewer called a tool it was never given"))
+                      (Cancelled [] (set! (.cancelled job) true))
+                      (Failed [failure] (let [e failure]
+                                          (set! (.failure job) (text-join a ["the model failed (" (.kind e) "): " (first-line a (.message e) 400)]))))))))
+    (set! (.input-tokens job) (.input observer))
+    (set! (.output-tokens job) (.output observer))
+    (atomic-ops/atomic-store (field job done) 1)
+    (cast (ptr i8) 0)))
+
+;; ---------------------------------------------------------------------------
+;; Reviews that gate a station
+
+;;; How one of a station's reviews ended. `failure` is set when the reviewer
+;;; gave no verdict (it could not start, its model failed, its reply was not
+;;; one of its verdicts); a failed review never counts as an approval.
+(defstruct ReviewOutcome
+  [(reviewer (slice u8))
+   (label (slice u8))
+   (verdict (slice u8))
+   ;;; ok | warn | alert, from the reviewer's declared verdicts.
+   (level (slice u8))
+   (confidence f64)
+   (reason (slice u8))
+   (advice (slice u8))
+   (failure (slice u8))
+   (input-tokens i64)
+   (output-tokens i64)])
+
+(defsum ReviewsResult
+  (ReviewsDone [(outcomes (ArrayList ReviewOutcome))])
+  (ReviewsCancelled))
+
+;;; The instructions a reviewer judges a station's finished work under: its
+;;; own instructions and reply format, and what its verdict does.
+(defn station-review-system-prompt [(a (dyn Allocator)) (spec (ptr ReviewerSpec))] (-> (slice u8))
+  (text-join a ["You are reviewing the finished work of one station of a software factory before it is accepted. "
+                "The station has called `finish` and its gate passed. Your verdict decides what happens next: "
+                "an ok verdict (" (quoted-alternatives a (.ok spec)) ") accepts the work; any other verdict sends it back to the "
+                "agent, with your reason and advice, to be redone. Judge the work in the workspace, not the agent's description of it. "
+                "Reject anything that breaks the rules below, even when the gate passed.\n\n"
+                (reviewer-system-prompt a spec)]))
+
+;;; What a reviewer of a station's finished work is shown.
+(defn station-review-context [(a (dyn Allocator))
+                              (spec (ptr ReviewerSpec))
+                              (brief (slice u8))
+                              (context (slice u8))
+                              (station (slice u8))
+                              (instructions (slice u8))
+                              (summary (slice u8))
+                              (gate (slice u8))
+                              (gate-output (slice u8))
+                              (base (slice u8))
+                              (diff (slice u8))
+                              (workspace (slice u8))
+                              (round i64)] (-> (slice u8))
+  (let [(mut r) (sb-new a)]
+    (sb-push-i64! (mut r) round)
+    (text-join a ["## Brief\n" (if (> (len (str-trim brief)) 0) brief "(none)")
+                  "\n\n## The factory's shared context (rules every station works under)\n" (if (> (len (str-trim context)) 0) context "(none)")
+                  "\n\n## Station `" station "`: its instructions\n" instructions
+                  "\n\n## The agent's finish summary (review round " (sb-finish! (mut r)) ")\n" summary
+                  "\n\n## Gate\n" (if (> (len gate) 0) (text-join a ["`" gate "` passed. Its output ended:\n```\n" gate-output "\n```"]) "(this station has no gate)")
+                  "\n\n## What this station changed (against `" base "`, the commit it started from; untracked files are shown as new)\n```diff\n"
+                  (if (> (len (str-trim diff)) 0) diff "(no changes)")
+                  "\n```"
+                  (if (= (.tools spec) "read")
+                      (text-join a ["\n\n## Workspace\n`" workspace "` (read it, and run `git diff " base "` there for anything the diff above cut off)"])
+                      "")])))
+
+(defn new-job [(stable (dyn Allocator))
+               (config (ptr SiteConfig))
+               (spec (ptr ReviewerSpec))
+               (stopping (ptr i64))
+               (workspace (slice u8))
+               (run-dir (slice u8))
+               (agent (slice u8))
+               (system (slice u8))
+               (context (slice u8))] (-> (ptr ReviewJob))
+  (let [arena (box! stable scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))]
+    (scratch/scratch-init arena stable)
+    (let [ja (scratch/scratch-allocator arena)]
+      (box! ja ReviewJob
+            (ReviewJob :arena arena :config config :spec spec :stopping stopping
+                       :workspace (copy-bytes ja workspace)
+                       :run-dir (copy-bytes ja run-dir)
+                       :agent (copy-bytes ja agent)
+                       :system (copy-bytes ja system)
+                       :context (copy-bytes ja context)
+                       :done 0 :cancelled false :reply "" :failure "" :label ""
+                       :input-tokens 0 :output-tokens 0)))))
+
+(defn outcome-of [(a (dyn Allocator)) (job (ptr ReviewJob))] (-> ReviewOutcome)
+  (let [spec (.spec job)
+        base (ReviewOutcome :reviewer (copy-bytes a (.name spec)) :label (copy-bytes a (.label job))
+                            :verdict "" :level "" :confidence 0.0 :reason "" :advice ""
+                            :failure (copy-bytes a (.failure job))
+                            :input-tokens (.input-tokens job) :output-tokens (.output-tokens job))]
+    (if (> (len (.failure job)) 0)
+        base
+        (match (parse-verdict a spec (.reply job))
+          (VerdictBad [message] (let [(mut o) base] (set! (.failure o) (copy-bytes a message)) (load o)))
+          (VerdictOk [verdict level confidence reason advice]
+                     (let [(mut o) base]
+                       (set! (.verdict o) (copy-bytes a verdict))
+                       (set! (.level o) (copy-bytes a level))
+                       (set! (.confidence o) confidence)
+                       (set! (.reason o) (copy-bytes a reason))
+                       (set! (.advice o) (copy-bytes a advice))
+                       (load o)))))))
+
+;;; Run every reviewer in `specs` at once, each with its own system prompt and
+;;; context (index for index), and wait for all of them. `control` is polled
+;;; while waiting; when it cancels, every review is cancelled and waited for.
+(defn run-reviews! [(a (dyn Allocator))
+                    (config (ptr SiteConfig))
+                    (specs (slice (ptr ReviewerSpec)))
+                    (systems (slice (slice u8)))
+                    (contexts (slice (slice u8)))
+                    (workspace (slice u8))
+                    (run-dir (slice u8))
+                    (agent (slice u8))
+                    (control (dyn AgentControl))] (-> ReviewsResult)
+  (let [stopping (box! a i64 0)
+        (mut jobs) (al-new [(ptr ReviewJob)] a)
+        (mut threads) (al-new [(ptr thread/Thread)] a)
+        (mut outcomes) (al-new [ReviewOutcome] a)
+        (mut cancelled) false
+        (mut i) 0]
+    (loop (if (>= (load i) (len specs))
+              (break)
+              (let [job (new-job a config (get specs (load i)) stopping workspace run-dir agent
+                                 (get systems (load i)) (get contexts (load i)))
+                    handle (box! a thread/Thread (primitive/zeroed thread/Thread))]
+                (if (= (thread/thread-spawn handle (fnptr-of review-main) (cast (ptr i8) job)) (cast i32 0))
+                    (do (push! (mut jobs) job) (push! (mut threads) handle) 0)
+                    (do (set! (.failure job) "could not start a thread for the review")
+                        (atomic-ops/atomic-store (field job done) 1)
+                        (push! (mut jobs) job)
+                        (push! (mut threads) (cast (ptr thread/Thread) 0))
+                        0))
+                (set! i (+ (load i) 1)))))
+    (loop
+      (let [(mut all-done) true]
+        (for job (iter jobs)
+          (when (= (atomic-ops/atomic-load (field job done)) 0) (set! all-done false) 0))
+        (if (load all-done)
+            (break)
+            (do (match (control-check control)
+                  (Cancel [] (do (set! cancelled true) (atomic-ops/atomic-store stopping 1) 0))
+                  (_ 0))
+                (sleep-ms 250)))))
+    (set! i 0)
+    (loop (if (>= (load i) (len jobs))
+              (break)
+              (let [job (get jobs (load i))
+                    handle (get threads (load i))]
+                (when (!= (cast i64 handle) 0)
+                  (thread/thread-join handle)
+                  (destroy a handle)
+                  0)
+                (push! (mut outcomes) (outcome-of a job))
+                (let [arena (.arena job)]
+                  (scratch/scratch-close! arena)
+                  (destroy a arena))
+                (set! i (+ (load i) 1)))))
+    (if (load cancelled) (ReviewsCancelled) (ReviewsDone (load outcomes)))))

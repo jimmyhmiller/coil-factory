@@ -104,9 +104,11 @@
                      (r Rect)
                      (run JVal)] (-> i64)
   (let [theme (.theme d)
-        verdict (js run "verdict")
+        worst (worst-reviewer run)
+        standing (reviewer-standing worst)
+        count (jv-len (jv-get run "reviewers"))
         status (js run "status")
-        x (span! c r (+ (.x r) 3) "overseer  " (.subtle theme))]
+        x (span! c r (+ (.x r) 3) "reviewers  " (.subtle theme))]
     (cond (= status "blocked")
             (put-text-ellipsis! c
                                 r
@@ -117,20 +119,19 @@
                                          (first-line (js run "reason"))
                                          "  (c to answer)"])
                                 (bold (.warning theme)))
-          (> (len verdict) 0)
-            (let [x2
-                    (span! c
-                           r
-                           x
-                           (concat a ["◉ " verdict])
-                           (tone-style theme (verdict-tone verdict)))]
-              (put-text-ellipsis! c
-                                  r
-                                  (+ x2 2)
-                                  (.y r)
-                                  (first-line (js run "verdict_reason"))
-                                  (.muted theme)))
-          :else (put-text! c r x (.y r) "no judgment yet" (.subtle theme)))))
+          (= count 0) (put-text! c r x (.y r) "none" (.subtle theme))
+          (= standing "failed")
+            (let [x2 (span! c r x (concat a ["✗ " (js worst "name") " failed"]) (tone-style theme (standing-tone standing)))]
+              (put-text-ellipsis! c r (+ x2 2) (.y r) (first-line (js worst "failure")) (.muted theme)))
+          (> (len standing) 0)
+            (let [x2 (span! c r x
+                            (concat a ["◉ " (js worst "name") ": " (js worst "verdict")])
+                            (tone-style theme (standing-tone standing)))
+                  x3 (if (> count 1)
+                         (span! c r (+ x2 1) (concat a ["(+" (int-text a (- count 1)) ")"]) (.subtle theme))
+                         x2)]
+              (put-text-ellipsis! c r (+ x3 2) (.y r) (first-line (js worst "reason")) (.muted theme)))
+          :else (put-text! c r x (.y r) (concat a [(js worst "name") (if (> count 1) " and others" "") ": no verdict yet"]) (.subtle theme)))))
 
 (defn draw-pipeline! [(d (ptr Dash))
                       (c (ptr Canvas))

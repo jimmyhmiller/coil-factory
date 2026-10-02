@@ -15,7 +15,9 @@
 (import "agent_tools.sys" :as sys)
 (import "agent_tools.text" :use *)
 (import "agent_tools.workspace" :use *)
-(export CommandResult ExecSpec execute run-command command-report ShellTool shell-tool)
+(export CommandResult ExecSpec execute run-command command-report ShellTool shell-tool
+        OutputCapture capture-new capture-push! capture-render capture-free!
+        exited-unreaped? signal-group ExitParts status-parts subprocess-error-text)
 
 (const SHELL_DEFAULT_TIMEOUT_SECONDS 300)
 (const SHELL_MAX_TIMEOUT_SECONDS 3600)

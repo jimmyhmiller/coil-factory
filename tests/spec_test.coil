@@ -75,3 +75,22 @@
       (assert (contains? p "attempts must be a whole number")))
     (let [p (problems-of a "No front matter.\n\n## Station: a\n\nDo it.\n")]
       (assert (contains? p "starts with front matter")))))
+
+(deftest reads-and-checks-the-harness
+  (let [a (malloc-allocator)
+        (mut spec) (parsed-or-fail a "---\nname: free\nharness: opencode\n---\n\n## Station: a\n\nOne.\n\n## Station: b\nharness: builtin\n\nTwo.\n")]
+    (assert (= (.harness spec) "opencode"))
+    (assert (= (station-harness (mut spec) (station-spec (mut spec) 0) "builtin") "opencode"))
+    (assert (= (station-harness (mut spec) (station-spec (mut spec) 1) "opencode") "builtin")))
+  (let [a (malloc-allocator)
+        p (problems-of a "---\nname: x\nharness: claude\n---\n\n## Station: a\nharness: amp\n\nDo it.\n")]
+    (assert (contains? p "line 3: unknown harness \"claude\"; the harnesses are builtin, opencode, and codex"))
+    (assert (contains? p "line 7: unknown harness \"amp\""))))
+
+(deftest reads-review-for-the-factory-and-each-station
+  (let [a (malloc-allocator)
+        (mut spec) (parsed-or-fail a "---\nname: r\nreview: rules, spec\n---\n\n## Station: a\n\nOne.\n\n## Station: b\nreview: rules\n\nTwo.\n\n## Station: c\nreview: none\n\nThree.\n")]
+    (assert (= (.review spec) "rules, spec"))
+    (assert (= (station-review (mut spec) (station-spec (mut spec) 0)) "rules, spec"))
+    (assert (= (station-review (mut spec) (station-spec (mut spec) 1)) "rules"))
+    (assert (= (station-review (mut spec) (station-spec (mut spec) 2)) ""))))

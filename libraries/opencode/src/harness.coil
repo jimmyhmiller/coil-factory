@@ -1,0 +1,549 @@
+(module opencode.harness)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "ai.chat" :as chat)
+(import "durable.atomic" :as atomic)
+(import "agent.harness" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.stream" :as stream)
+(export OpenCodeOptions OpenCodeHarness opencode-new opencode-argv opencode-config-json
+        apply-event! Turn turn-new)
+
+;;; OpenCode (opencode.ai) driven headlessly as a `Harness`. Each run of the
+;;; harness is one `opencode run --format json` process working in the
+;;; workspace; later runs continue the same OpenCode session with `-s`, so the
+;;; conversation lives in OpenCode and this side keeps only its session id and
+;;; a readable mirror of what happened.
+;;;
+;;; The agent works under a generated OpenCode agent whose `prompt` is the
+;;; system text and whose permissions the caller supplies. The stop tool is an
+;;; MCP tool the caller serves (OpenCode names it `<server>_<tool>`): when the
+;;; agent calls it, the run ends at the end of that step with `Finished`.
+;;;
+;;; Messages and pauses reach a running agent at step boundaries, as in the
+;;; built-in loop: the process is stopped once its current step has finished,
+;;; and the next run continues the session with the messages.
+;;;
+;;; OpenCode's own state is confined: XDG_DATA_HOME and XDG_STATE_HOME are
+;;; `state-dir` (sessions, snapshots), XDG_CONFIG_HOME is `config-home` (so the
+;;; operator's personal OpenCode configuration and plugins are not loaded),
+;;; XDG_CACHE_HOME is `cache-dir`, and the configuration is the generated file
+;;; at `config-path`. OpenCode would otherwise also read the operator's
+;;; ~/.claude/CLAUDE.md and skills into the prompt; that is switched off.
+;;;
+;;; OpenCode quirks this depends on (verified against 1.18): the prompt goes on
+;;; stdin, because argv words containing spaces reach the model wrapped in
+;;; quotes; the working directory comes from $PWD as well as `--dir`, and a
+;;; session continued from another directory hangs; `--agent` and `-m` must be
+;;; repeated on every run; a local MCP server that fails to start leaves its
+;;; tools silently missing, which `ready-file` detects.
+
+(defstruct OpenCodeOptions
+  [;;; The opencode executable.
+   (program (slice u8))
+   ;;; Put in front of the whole command (a sandbox's argv, for example); may be empty.
+   (launcher (slice (slice u8)))
+   (workdir (slice u8))
+   (state-dir (slice u8))
+   (config-home (slice u8))
+   (cache-dir (slice u8))
+   (config-path (slice u8))
+   ;;; `provider/model` as OpenCode names it, such as `opencode/big-pickle`.
+   (model (slice u8))
+   ;;; Name of the generated OpenCode agent; also the session title.
+   (agent-name (slice u8))
+   ;;; OpenCode's `permission` object for the agent.
+   (permission JVal)
+   ;;; OpenCode's `mcp` object: the servers the agent can use.
+   (mcp JVal)
+   ;;; OpenCode's `plugin` array (plugin specifiers, such as file:// URLs).
+   (plugins JVal)
+   ;;; A file the stop tool's MCP server creates when OpenCode initializes it,
+   ;;; so a run that ends without the tool having existed is reported as the
+   ;;; failure it is; "" skips the check.
+   (ready-file (slice u8))
+   ;;; The stop tool as OpenCode reports it (`factory_finish`), and the name
+   ;;; `Finished` carries (`finish`); "" for an agent with no stop tool, whose
+   ;;; runs end with `Replied`.
+   (stop-tool (slice u8))
+   (stop-tool-as (slice u8))
+   ;;; A run that reports nothing for this long is stopped and fails.
+   (idle-timeout-ms i64)])
+
+(defstruct OpenCodeHarness
+  [(allocator (dyn Allocator))
+   (options OpenCodeOptions)
+   (observer (dyn AgentObserver))
+   (control (dyn AgentControl))
+   (session (slice u8))
+   (system (slice u8))
+   ;;; Text for the next run, in order, not yet sent to OpenCode.
+   (pending (ArrayList (slice u8)))
+   ;;; Messages from people, not yet sent; each is acknowledged when it is.
+   (inbound (ArrayList Inbound))
+   ;;; What happened, as chat messages (system, user, assistant with
+   ;;; tool_calls, tool), for people to read. OpenCode holds the real thing.
+   (messages JVal)
+   (turns i64)])
+
+(defn opencode-new [(a (dyn Allocator))
+                    (options OpenCodeOptions)
+                    (observer (dyn AgentObserver))
+                    (control (dyn AgentControl))] (-> OpenCodeHarness)
+  (OpenCodeHarness :allocator a
+                   :options options
+                   :observer observer
+                   :control control
+                   :session ""
+                   :system ""
+                   :pending (al-new [(slice u8)] a)
+                   :inbound (al-new [Inbound] a)
+                   :messages (jv-array a)
+                   :turns 0))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [ms] ms)
+    (Err [failure] 0)))
+
+;; ---------------------------------------------------------------------------
+;; The command and its configuration
+
+;;; The OpenCode configuration file for this harness.
+(defn opencode-config-json [(a (dyn Allocator)) (h (ptr OpenCodeHarness))] (-> (slice u8))
+  (let [options (field h options)
+        root (jv-object a)
+        agents (jv-object a)
+        agent (jv-object a)]
+    (jv-put! agent "mode" (JStr "primary"))
+    (jv-put! agent "description" (JStr "Generated by the factory for one station."))
+    (jv-put! agent "prompt" (JStr (.system h)))
+    (when (> (len (.model options)) 0)
+      (jv-put! agent "model" (JStr (.model options)))
+      0)
+    (jv-put! agent "permission" (.permission options))
+    (jv-put! agents (.agent-name options) agent)
+    (jv-put! root "$schema" (JStr "https://opencode.ai/config.json"))
+    (jv-put! root "autoupdate" (JBool false))
+    (jv-put! root "share" (JStr "disabled"))
+    (jv-put! root "agent" agents)
+    (jv-put! root "mcp" (.mcp options))
+    (jv-put! root "plugin" (.plugins options))
+    (jv-encode a root)))
+
+;;; The complete argv for one run. The prompt itself goes on stdin.
+(defn opencode-argv [(a (dyn Allocator)) (h (ptr OpenCodeHarness))] (-> (ArrayList (slice u8)))
+  (let [options (field h options)
+        (mut argv) (al-new [(slice u8)] a)]
+    (for part (iter (.launcher options)) (push! (mut argv) part))
+    (for part (iter ["/usr/bin/env"
+                     (join a ["XDG_DATA_HOME=" (.state-dir options)])
+                     (join a ["XDG_STATE_HOME=" (.state-dir options)])
+                     (join a ["XDG_CONFIG_HOME=" (.config-home options)])
+                     (join a ["XDG_CACHE_HOME=" (.cache-dir options)])
+                     (join a ["OPENCODE_CONFIG=" (.config-path options)])
+                     (join a ["PWD=" (.workdir options)])
+                     "OPENCODE_DISABLE_CLAUDE_CODE=1"
+                     "OPENCODE_DISABLE_EXTERNAL_SKILLS=1"
+                     "OPENCODE_DISABLE_AUTOUPDATE=1"
+                     "OPENCODE_DISABLE_SHARE=1"
+                     (.program options)
+                     "run" "--format" "json"
+                     ;; Tools run without asking; what is not allowed is denied
+                     ;; by the agent's permissions.
+                     "--auto"
+                     "--agent" (.agent-name options)
+                     "--title" (.agent-name options)
+                     "--dir" (.workdir options)])
+      (push! (mut argv) part))
+    (when (> (len (.model options)) 0)
+      (push! (mut argv) "-m")
+      (push! (mut argv) (.model options))
+      0)
+    (when (> (len (.session h)) 0)
+      (push! (mut argv) "-s")
+      (push! (mut argv) (.session h))
+      0)
+    (load argv)))
+
+;; ---------------------------------------------------------------------------
+;; One run of `opencode run`
+
+(defstruct Turn
+  [(harness (ptr OpenCodeHarness))
+   ;;; Scratch for one event at a time; anything kept is copied to the harness.
+   (allocator (dyn Allocator))
+   ;;; Reset after each line when not null.
+   (arena (ptr scratch/ScratchArena))
+   (finish (Option ToolCall))
+   (finish-output (slice u8))
+   (last-text (slice u8))
+   (error (slice u8))
+   (noise (slice u8))
+   ;;; Stop at the end of the current step (a pause, or messages arrived).
+   (interrupt bool)
+   ;;; The process was stopped at a step boundary for `interrupt`.
+   (interrupted bool)
+   (cancelled bool)
+   (idle bool)
+   (last-event-ms i64)
+   (last-inbox-ms i64)])
+
+(defn turn-new [(a (dyn Allocator)) (h (ptr OpenCodeHarness)) (arena (ptr scratch/ScratchArena))] (-> Turn)
+  (Turn :harness h :allocator a :arena arena :finish (None) :finish-output "" :last-text "" :error ""
+        :noise "" :interrupt false :interrupted false :cancelled false :idle false
+        :last-event-ms (now-ms) :last-inbox-ms 0))
+
+(defn mirror! [(h (ptr OpenCodeHarness)) (message JVal)] (-> i64)
+  (jv-push! (.messages h) message))
+
+(defn mirror-text! [(h (ptr OpenCodeHarness)) (role (slice u8)) (text (slice u8))] (-> i64)
+  (mirror! h (chat-message (.allocator h) role text)))
+
+;;; The assistant's tool call and its result, as the built-in loop records them.
+(defn mirror-tool! [(h (ptr OpenCodeHarness)) (call ToolCall) (output (slice u8))] (-> i64)
+  (let [a (.allocator h)
+        assistant (jv-object a)
+        calls (jv-array a)
+        entry (jv-object a)
+        function (jv-object a)
+        result (jv-object a)]
+    (jv-put! function "name" (JStr (copy-bytes a (.name call))))
+    (jv-put! function "arguments" (JStr (copy-bytes a (.arguments-json call))))
+    (jv-put! entry "id" (JStr (copy-bytes a (.id call))))
+    (jv-put! entry "type" (JStr "function"))
+    (jv-put! entry "function" function)
+    (jv-push! calls entry)
+    (jv-put! assistant "role" (JStr "assistant"))
+    (jv-put! assistant "content" (JStr ""))
+    (jv-put! assistant "tool_calls" calls)
+    (jv-put! result "role" (JStr "tool"))
+    (jv-put! result "tool_call_id" (JStr (copy-bytes a (.id call))))
+    (jv-put! result "content" (JStr (copy-bytes a output)))
+    (mirror! h assistant)
+    (mirror! h result)))
+
+(defn relative-to [(path (slice u8)) (root (slice u8))] (-> (slice u8))
+  (cond (and (> (len root) 0) (= path root)) "."
+        (and (> (len root) 0)
+             (> (len path) (len root))
+             (starts-with path root)
+             (= (cast i64 (get path (len root))) 47))
+          (subslice path (+ (len root) 1) (len path))
+        :else path))
+
+;;; One line a person reads: `$ ls -la`, `write poem.md`, `finish: done`.
+(defn tool-summary-line [(a (dyn Allocator)) (h (ptr OpenCodeHarness)) (tool (slice u8)) (input JVal) (title (slice u8))] (-> (slice u8))
+  (let [options (field h options)
+        path (jv-string-or (jv-get input "filePath") (jv-string-or (jv-get input "path") ""))]
+    (cond (= tool "bash") (join a ["$ " (jv-string-or (jv-get input "command") title)])
+          (and (> (len (.stop-tool options)) 0) (= tool (.stop-tool options))) (join a [(.stop-tool-as options) ": " (jv-string-or (jv-get input "outcome") "")])
+          (> (len path) 0) (join a [tool " " (relative-to path (.workdir options))])
+          (> (len title) 0) (join a [tool " " title])
+          :else tool)))
+
+;;; The message of an `error` event, whatever shape OpenCode gave it.
+(defn error-message [(a (dyn Allocator)) (event JVal)] (-> (slice u8))
+  (let [error (jv-get event "error")
+        data-message (jv-string-or (jv-get (jv-get error "data") "message") "")
+        message (jv-string-or (jv-get error "message") "")
+        name (jv-string-or (jv-get error "name") "")]
+    (cond (> (len data-message) 0) (if (> (len name) 0) (join a [name ": " data-message]) data-message)
+          (> (len message) 0) (if (> (len name) 0) (join a [name ": " message]) message)
+          (jv-null? error) (jv-encode a event)
+          :else (jv-encode a error))))
+
+;;; Apply one line of `opencode run --format json` output. Returns false when
+;;; the process should be stopped: the step that called the stop tool has
+;;; ended, or an interrupt is due at this step boundary.
+(defn apply-event! [(turn (ptr Turn)) (line (slice u8))] (-> bool)
+  (let [h (.harness turn)
+        a (.allocator h)
+        scratch (.allocator turn)]
+    (set! (.last-event-ms turn) (now-ms))
+    (match (jv-parse scratch line)
+      (None [] (do (when (> (len (str-trim line)) 0) (set! (.noise turn) (copy-bytes a line)) 0) true))
+      (Some [event]
+            (let [kind (jv-string-or (jv-get event "type") "")
+                  part (jv-get event "part")
+                  session (jv-string-or (jv-get event "sessionID") "")]
+              (when (and (= (len (.session h)) 0) (> (len session) 0))
+                (set! (.session h) (copy-bytes a session))
+                0)
+              (cond
+                (= kind "step_start")
+                  (do (set! (.turns h) (+ (.turns h) 1))
+                      (observe (.observer h) (TurnStarted (.turns h)))
+                      true)
+                (= kind "text")
+                  (let [text (jv-string-or (jv-get part "text") "")]
+                    (when (> (len (str-trim text)) 0)
+                      (observe (.observer h) (Said text))
+                      (mirror-text! h "assistant" text)
+                      (set! (.last-text turn) (copy-bytes a text))
+                      0)
+                    true)
+                (= kind "reasoning")
+                  (let [text (jv-string-or (jv-get part "text") "")]
+                    (when (> (len (str-trim text)) 0)
+                      (observe (.observer h) (Thought text))
+                      0)
+                    true)
+                (= kind "tool_use")
+                  (let [state (jv-get part "state")
+                        tool (jv-string-or (jv-get part "tool") "")
+                        input (let [given (jv-get state "input")] (if (jv-null? given) (jv-object scratch) given))
+                        status (jv-string-or (jv-get state "status") "")
+                        ok (= status "completed")
+                        output (if ok
+                                   (jv-string-or (jv-get state "output") "")
+                                   (jv-string-or (jv-get state "error") (jv-string-or (jv-get state "output") status)))
+                        ;; The stop tool is reported under the name the caller knows it by.
+                        stop? (and (> (len (.stop-tool (field h options))) 0) (= tool (.stop-tool (field h options))))
+                        call (tool-call (jv-string-or (jv-get part "callID") "")
+                                        (if stop? (.stop-tool-as (field h options)) tool)
+                                        input (jv-encode scratch input))
+                        summary (tool-summary-line scratch h tool input (jv-string-or (jv-get state "title") ""))
+                        started (jv-int (jv-get (jv-get state "time") "start"))
+                        ended (jv-int (jv-get (jv-get state "time") "end"))]
+                    (observe (.observer h) (ToolStarted call summary))
+                    (observe (.observer h) (ToolEnded :call call :summary summary :ok ok :output output
+                                                  :elapsed-ms (if (>= ended started) (- ended started) 0)))
+                    (mirror-tool! h call output)
+                    (when (and ok stop?)
+                      (set! (.finish turn)
+                            (Some (tool-call (copy-bytes a (.id call))
+                                             (copy-bytes a (.stop-tool-as (field h options)))
+                                             (jv-clone a input)
+                                             (copy-bytes a (.arguments-json call)))))
+                      (set! (.finish-output turn) (copy-bytes a output))
+                      0)
+                    true)
+                (= kind "step_finish")
+                  (let [tokens (jv-get part "tokens")
+                        cache (jv-get tokens "cache")]
+                    (observe (.observer h)
+                             (UsageReported (+ (jv-int (jv-get tokens "input"))
+                                               (+ (jv-int (jv-get cache "read")) (jv-int (jv-get cache "write"))))
+                                            (+ (jv-int (jv-get tokens "output")) (jv-int (jv-get tokens "reasoning")))))
+                    (cond (match (.finish turn) (Some [_] true) (None [] false)) false
+                          (.interrupt turn) (do (set! (.interrupted turn) true) false)
+                          :else true))
+                (= kind "error")
+                  (do (set! (.error turn) (copy-bytes a (error-message scratch event)))
+                      true)
+                :else true))))))
+
+(impl stream/LineSink Turn
+  (on-line [(self (ptr Turn)) (line (slice u8))] (-> bool)
+           (let [go (apply-event! self line)]
+             (when (!= (cast i64 (.arena self)) 0)
+               (scratch/scratch-reset! (.arena self))
+               0)
+             go))
+  (on-tick [(self (ptr Turn))] (-> bool)
+           (let [h (.harness self)
+                 now (now-ms)]
+             (block :tick
+                    (match (control-check (.control h))
+                      (Cancel [] (do (set! (.cancelled self) true) (return-from :tick false)))
+                      (Pause [] (do (set! (.interrupt self) true) 0))
+                      (Proceed [] 0))
+                    ;; Messages are read about once a second; any that arrive
+                    ;; interrupt the run at its next step boundary.
+                    (when (>= (- now (.last-inbox-ms self)) 1000)
+                      (set! (.last-inbox-ms self) now)
+                      (let [(mut arrived) (control-inbox (.control h) (.allocator h))]
+                        (for message (iter arrived)
+                          (push! (mut (.inbound h)) message)
+                          (set! (.interrupt self) true))
+                        (al-free! (mut arrived))
+                        0))
+                    (let [idle-limit (.idle-timeout-ms (field h options))]
+                      (when (and (> idle-limit 0) (>= (- now (.last-event-ms self)) idle-limit))
+                        (set! (.idle self) true)
+                        (return-from :tick false)))
+                    true))))
+
+;; ---------------------------------------------------------------------------
+;; The harness
+
+;;; Wait out a pause. False when cancelled.
+(defn await-proceed! [(h (ptr OpenCodeHarness))] (-> bool)
+  (block :await
+         (match (control-check (.control h))
+           (Proceed [] (return-from :await true))
+           (Cancel [] (return-from :await false))
+           (Pause [] 0))
+         (observe (.observer h) (PausedEvent))
+         (loop
+           (control-idle (.control h))
+           (match (control-check (.control h))
+             (Proceed [] (do (observe (.observer h) (ResumedEvent))
+                             (return-from :await true)))
+             (Cancel [] (return-from :await false))
+             (Pause [] 0)))
+         true))
+
+;;; Everything waiting to be said, as one prompt; messages from people are
+;;; acknowledged as delivered. Empty when there is nothing.
+(defn take-prompt! [(h (ptr OpenCodeHarness))] (-> (slice u8))
+  (let [a (.allocator h)
+        (mut arrived) (control-inbox (.control h) a)
+        (mut out) (sb-new a)
+        (mut first) true]
+    (for message (iter arrived) (push! (mut (.inbound h)) message))
+    (al-free! (mut arrived))
+    (for text (iter (.pending h))
+      (when (not (load first)) (sb-push-str! (mut out) "\n\n") 0)
+      (sb-push-str! (mut out) text)
+      (mirror-text! h "user" text)
+      (set! first false))
+    (for message (iter (.inbound h))
+      (let [text (join a ["[" (.from message) "] " (.text message)])]
+        (when (not (load first)) (sb-push-str! (mut out) "\n\n") 0)
+        (sb-push-str! (mut out) text)
+        (mirror-text! h "user" text)
+        (observe (.observer h) (MessageDelivered message))
+        (set! first false)))
+    (al-clear! (mut (.pending h)))
+    (al-clear! (mut (.inbound h)))
+    (sb-finish! (mut out))))
+
+(defn harness-failure [(a (dyn Allocator)) (message (slice u8))] (-> AgentStop)
+  (Failed (chat/chat-error "harness" 0 (copy-bytes a message))))
+
+;;; The last line of `text` that has anything in it.
+(defn last-line [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut result) ""]
+    (for line (iter (str-split a text "\n"))
+      (when (> (len (str-trim line)) 0) (set! result (str-trim line)) 0))
+    (load result)))
+
+(defn run-opencode! [(h (ptr OpenCodeHarness))] (-> AgentStop)
+  (let [a (.allocator h)
+        options (field h options)]
+    (block :run
+           (loop
+             (when (not (await-proceed! h))
+               (return-from :run (Cancelled)))
+             (let [taken (take-prompt! h)
+                   prompt (if (> (len taken) 0)
+                              taken
+                              (let [note "[factory] You were paused and have been resumed. Continue where you left off."]
+                                (mirror-text! h "user" note)
+                                note))]
+               (match (atomic/write-file-atomic! a (.config-path options) (opencode-config-json a h) 384)
+                 (Err [failure] (return-from :run (harness-failure a (join a ["could not write the OpenCode configuration " (.config-path options)]))))
+                 (Ok [written] 0))
+               (when (> (len (.ready-file options)) 0)
+                 (atomic/unlink-path a (.ready-file options))
+                 0)
+               (let [(mut argv) (opencode-argv a h)
+                     all (al-slice argv)
+                     arena (box! a scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))
+                     _ (scratch/scratch-init arena a)
+                     turn (box! a Turn (turn-new (scratch/scratch-allocator arena) h arena))
+                     ended (stream/stream-lines a
+                                                (stream/StreamSpec :program (get all 0)
+                                                                   :args (subslice all 1 (len all))
+                                                                   :cwd (.workdir options)
+                                                                   :input prompt
+                                                                   :timeout-ms 0
+                                                                   :max-line-bytes 67108864
+                                                                   :stderr-bytes 8192)
+                                                turn)]
+                 (al-free! (mut argv))
+                 (scratch/scratch-close! arena)
+                 (match ended
+                   (Err [message] (return-from :run (harness-failure a message)))
+                   (Ok [end]
+                       (cond (.cancelled turn) (return-from :run (Cancelled))
+                             (match (.finish turn) (Some [_] true) (None [] false))
+                               (match (.finish turn)
+                                 (Some [call] (return-from :run (Finished call (.finish-output turn))))
+                                 (None [] (return-from :run (harness-failure a "unreachable: finish vanished"))))
+                             (.interrupted turn) 0
+                             (.idle turn)
+                               (return-from :run (harness-failure a (join a ["OpenCode reported nothing for "
+                                                                             (let [(mut t) (sb-new a)]
+                                                                               (sb-push-i64! (mut t) (/ (.idle-timeout-ms options) 60000))
+                                                                               (sb-finish! (mut t)))
+                                                                             " minutes and was stopped"])))
+                             (> (len (.error turn)) 0) (return-from :run (harness-failure a (.error turn)))
+                             (!= (.exit-code end) 0)
+                               (return-from :run
+                                              (harness-failure a (join a ["opencode exited with status "
+                                                                          (let [(mut t) (sb-new a)]
+                                                                            (sb-push-i64! (mut t) (.exit-code end))
+                                                                            (sb-finish! (mut t)))
+                                                                          ": "
+                                                                          (let [why (last-line a (.errors end))]
+                                                                            (if (> (len why) 0) why (.noise turn)))])))
+                             (= (len (.session h)) 0)
+                               (return-from :run (harness-failure a (join a ["opencode produced no session: " (last-line a (.errors end))])))
+                             (and (> (len (.ready-file options)) 0)
+                                  (match (atomic/file-exists? a (.ready-file options)) (Ok [found] (not found)) (Err [_] true)))
+                               (return-from :run (harness-failure a (join a ["the stop tool `" (.stop-tool options)
+                                                                             "` never started in OpenCode (its MCP server did not initialize), so the agent could not call it"])))
+                             :else (return-from :run (Replied (.last-text turn)))))))))
+           (Cancelled))))
+
+(defn checkpoint-json [(a (dyn Allocator)) (h (ptr OpenCodeHarness))] (-> (slice u8))
+  (let [root (jv-object a)
+        pending (jv-array a)]
+    (for text (iter (.pending h)) (jv-push! pending (JStr text)))
+    (jv-put! root "harness" (JStr "opencode"))
+    (jv-put! root "session" (JStr (.session h)))
+    (jv-put! root "system" (JStr (.system h)))
+    (jv-put! root "pending" pending)
+    (jv-put! root "turns" (JInt (.turns h)))
+    (jv-put! root "messages" (.messages h))
+    (jv-encode a root)))
+
+(defn restore! [(h (ptr OpenCodeHarness)) (text (slice u8))] (-> bool)
+  (let [a (.allocator h)]
+    (match (jv-parse a text)
+      (None [] false)
+      (Some [root]
+            (if (not (= (jv-string-or (jv-get root "harness") "") "opencode"))
+                false
+                (let [messages (jv-get root "messages")]
+                  (set! (.session h) (copy-bytes a (jv-string-or (jv-get root "session") "")))
+                  (set! (.system h) (copy-bytes a (jv-string-or (jv-get root "system") "")))
+                  (set! (.turns h) (jv-int (jv-get root "turns")))
+                  (set! (.messages h) (if (jv-null? messages) (jv-array a) (jv-clone a messages)))
+                  (al-clear! (mut (.pending h)))
+                  (let [pending (jv-get root "pending")
+                        (mut i) 0]
+                    (loop (if (>= (load i) (jv-count pending))
+                              (break)
+                              (do (push! (mut (.pending h)) (copy-bytes a (jv-string-or (jv-nth pending (load i)) "")))
+                                  (set! i (+ (load i) 1))))))
+                  true))))))
+
+(impl Harness OpenCodeHarness
+  (harness-add-system! [(self (ptr OpenCodeHarness)) (text (slice u8))] (-> i64)
+                       (do (set! (.system self) (copy-bytes (.allocator self) text))
+                           (mirror-text! self "system" text)))
+  (harness-add-user! [(self (ptr OpenCodeHarness)) (text (slice u8))] (-> i64)
+                     (do (push! (mut (.pending self)) (copy-bytes (.allocator self) text)) 0))
+  (harness-run! [(self (ptr OpenCodeHarness))] (-> AgentStop)
+                (run-opencode! self))
+  (harness-checkpoint [(self (ptr OpenCodeHarness)) (a (dyn Allocator))] (-> (slice u8))
+                      (checkpoint-json a self))
+  (harness-restore! [(self (ptr OpenCodeHarness)) (checkpoint (slice u8))] (-> bool)
+                    (restore! self checkpoint)))

@@ -14,13 +14,21 @@ If a command says the hub is not running, run `factory up` first.
 ## Start a run
 
 ```sh
-factory start FACTORY [--on SITE] [--project PATH] [--brief TEXT | --brief-file FILE] [--model provider/model]
+factory start FACTORY [--on SITE] [--project PATH] [--brief TEXT | --brief-file FILE] [--model provider/model] [--harness builtin|opencode] [--reviewers NAMES|none]
 ```
 
 - `FACTORY` is a name from the library (`factory factories` lists them) or a path to a `.md` file.
 - `--project PATH` works on an existing git repository; the run gets its own
   worktree and branch `factory/RUN`, so the checkout is never touched. Omit it
   to start from an empty workspace.
+- `--reviewers judge,other` chooses the reviewers that watch the run (`none` for
+  none); without it the factory's and then the site's choice applies.
+- `--model provider/model` is required unless the factory, its stations, or the
+  site (`default_model`) name one; a run with no model is refused with
+  `no_model` and says where to set it.
+- `--harness opencode` runs every station in OpenCode (headless) instead of the
+  factory's own loop; models then use OpenCode's names (`opencode models`), such
+  as the free `opencode/big-pickle`.
 - `--on SITE` runs somewhere else (`factory sites`). The project's current HEAD
   is pushed to that site automatically.
 
@@ -76,10 +84,14 @@ in the wrong direction meanwhile.
 ## The overseer
 
 Each site runs an overseer that reads every active run and records **findings**:
-`stalled`, `looping`, `flailing`, `suspicious` (tests deleted or skipped, stubs that
-return placeholder values, weakened checks), and a periodic judgment from a
-reviewer model (`drifting`, `stuck`, `cheating`). Depending on the site's policy it
-also nudges the agent (`[overseer]` messages) or pauses the run.
+`stalled`, `looping`, `flailing`, and `tests-deleted`. Judgment comes only from the
+run's **reviewers**, chosen with `--reviewers` (else the factory's `reviewers:`,
+else `reviewers` in site.json; a run with none gets no judgment). `factory
+reviewers` lists them and what model and harness each runs on; the bundled `judge`
+says `on_track`, `drifting`, `stuck`, or `cheating`. Each reviewer's latest verdict,
+or its failure, is under **Reviewers** in `factory show`. Depending on the site's
+policy the overseer also nudges the agent (`[overseer]` messages) with a reviewer's
+advice, or pauses the run on an alert.
 
 When `factory show` lists findings:
 

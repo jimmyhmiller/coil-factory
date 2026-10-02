@@ -74,15 +74,20 @@
     (loop (if (stopping? daemon)
               (break)
               (do (let [a (malloc-allocator)
-                        (mut subjects) (overseer-subjects site a)]
+                        (mut subjects) (overseer-subjects site a)
+                        (mut running) (al-new [(slice u8)] a)]
                     (for subject (iter subjects)
+                      (push! (mut running) (.id subject))
                       (overseer/review-run! (.overseer daemon) subject))
+                    (overseer/collect-reviews! (.overseer daemon) (al-slice running))
+                    (al-free! (mut running))
                     (al-free! [overseer/Subject] (mut subjects)))
                   (let [(mut waited) 0]
                     (loop (if (or (>= (load waited) interval) (stopping? daemon))
                               (break)
                               (do (loop/sleep-ms 500) (set! waited (+ (load waited) 500)))))
                     0))))
+    (overseer/overseer-stop! (.overseer daemon) 10000)
     (cast (ptr i8) 0)))
 
 (defn signal-main [(arg (ptr i8))] (-> (ptr i8))
@@ -145,7 +150,7 @@
                  (mut server-config) (server/server-config)]
              (set! (.site daemon) site)
              (set! (.hub daemon) remotes)
-             (set! (.overseer daemon) (overseer/overseer-new a home config))
+             (set! (.overseer daemon) (overseer/overseer-new a home config (field daemon stopping)))
              (set! (.server daemon) http)
              (set! (.port server-config) (.port config))
              (set! (.idle-poll-ms server-config) 200)

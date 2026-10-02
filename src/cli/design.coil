@@ -9,10 +9,11 @@
 (import "durable.atomic" :as atomic)
 (import "agent.json" :use *)
 (import "factory.config" :use *)
-(import "factory.library" :use [resolve-factory list-factories bundled-skills Found NotFound CatalogEntry Bundled])
+(import "factory.library" :use [resolve-factory list-factories list-reviewers bundled-skills Found NotFound CatalogEntry Bundled])
 (import "factory.proc" :use *)
 (import "factory.spec" :use *)
 (import "factory.specparse" :use *)
+(import "factory.reviewer" :use *)
 (import "factory.cli.ctx" :use *)
 (import "factory.cli.render" :use *)
 
@@ -22,17 +23,36 @@
 (defn print-spec-summary [(ctx (ptr Ctx)) (spec (ptr FactorySpec))] (-> i64)
   (let [a (.allocator ctx)
         term (.out ctx)
-        (mut table) (style/table-new a ["" "STATION" "GATE" "TOOLS" "ATTEMPTS"])]
+        (mut table) (style/table-new a ["" "STATION" "GATE" "REVIEW" "TOOLS" "ATTEMPTS"])
+        (mut problems) (al-new [(slice u8)] a)]
     (for index (range 0 (station-count spec))
-      (let [s (station-spec spec index)]
+      (let [s (station-spec spec index)
+            choice (station-review spec s)
+            review (if (= (len (str-trim choice)) 0)
+                       (style/muted a term "none")
+                       (match (load-reviewers a (.home ctx) choice)
+                         (ChosenOk [copies]
+                                   (let [(mut names) (sb-new a)
+                                         (mut first) true]
+                                     (for copy (iter copies)
+                                       (when (not (load first)) (sb-push-str! (mut names) ", ") 0)
+                                       (sb-push-str! (mut names) (.name copy))
+                                       (set! first false))
+                                     (sb-finish! (mut names))))
+                         (ChosenBad [message]
+                                    (do (push! (mut problems) (join a ["station " (.name s) " review: " message]))
+                                        (style/err a term "invalid")))))]
         (style/table-row! (mut table)
                           [(style/muted a term (int-text a (+ index 1)))
                            (style/strong a term (.name s))
                            (if (> (len (.gate s)) 0) (style/accent a term (.gate s)) (style/muted a term "judgment"))
+                           review
                            (station-tools spec s)
                            (int-text a (station-attempts spec s))])))
     (print "{s}" (style/table-render a term (load table)))
-    0))
+    (for problem (iter problems)
+      (say (join a [(style/err a term "✗ ") problem])))
+    (if (> (len problems) 0) 1 0)))
 
 (defn cmd-check [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
   (let [a (.allocator ctx)
@@ -55,8 +75,7 @@
                            (when (> (len (.description spec)) 0) (say (join a ["  " (.description spec)])) 0)
                            (when (> (len (.input spec)) 0) (say (style/muted a term (join a ["  brief: " (.input spec)]))) 0)
                            (say "")
-                           (print-spec-summary ctx (mut spec))
-                           0))))))))
+                           (print-spec-summary ctx (mut spec))))))))))
 
 (defn cmd-factories [(ctx (ptr Ctx))] (-> i64)
   (let [a (.allocator ctx)
@@ -78,6 +97,37 @@
                                                   (style/muted a term (.origin entry)) "factory check shows why"])))))
     (print "{s}" (style/table-render a term (load table)))
     (say (style/muted a term (join a ["\nyour library: " (factories-dir a (.home ctx)) "     new one: factory new NAME"])))
+    0))
+
+;;; `factory reviewers`: the reviewers a run can name, from the library and
+;;; bundled, with what each runs on. A reviewer that does not parse shows why.
+(defn cmd-reviewers [(ctx (ptr Ctx))] (-> i64)
+  (let [a (.allocator ctx)
+        term (.out ctx)
+        (mut table) (style/table-new a ["REVIEWER" "RUNS ON" "EVERY" "WHERE" "WHAT"])]
+    (for found (iter (list-reviewers a (.home ctx)))
+      (let [entry found]
+        (match (parse-reviewer a (.text entry))
+          (ReviewerOk [parsed]
+                      (let [(mut spec) parsed]
+                        (style/table-row! (mut table)
+                                          [(style/strong a term (.name entry))
+                                           (join a [(if (> (len (.harness spec)) 0) (.harness spec) "site harness") " · "
+                                                    (if (> (len (.model spec)) 0) (.model spec) "site model")
+                                                    (if (= (.tools spec) "read") " · reads" "")])
+                                           (join a [(int-text a (/ (.every-ms spec) 1000)) "s"])
+                                           (style/muted a term (.origin entry))
+                                           (truncate a (.description spec) 50)])))
+          (ReviewerBad [problems]
+                       (style/table-row! (mut table)
+                                         [(style/strong a term (.name entry)) (style/err a term "invalid") ""
+                                          (style/muted a term (.origin entry))
+                                          (truncate a (let [text (problems-text a problems)]
+                                                                (match (str-find text "\n") (Some [at] (subslice [u8] text 0 at)) (None [] text)))
+                                                    70)])))))
+    (print "{s}" (style/table-render a term (load table)))
+    (say (style/muted a term (join a ["\nyour library: " (reviewers-dir a (.home ctx))
+                                      "     use one: factory start … --reviewers NAME, or `reviewers:` in a factory"])))
     0))
 
 (defn answer [(result (Result (slice u8) prompt/PromptError))] (-> (Option (slice u8)))

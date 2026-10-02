@@ -31,7 +31,8 @@
     (push! [(slice u8)] (mut cells) (style/muted a term (if (= (str-field site "kind") "ssh") (str-field site "ssh") "this machine")))
     (push! [(slice u8)] (mut cells) (if up (style/ok a term "up") (paint-fg a term (if (= status "connecting") (amber) (soft-red)) status)))
     (push! [(slice u8)] (mut cells) (if up (join a [(int-text a (int-field site "running")) "/" (int-text a (int-field site "max_runs")) " running"]) ""))
-    (push! [(slice u8)] (mut cells) (if up (style/muted a term (join a [(str-field site "isolation") " · " (str-field site "default_model")])) ""))
+    (push! [(slice u8)] (mut cells) (if up (style/muted a term (join a [(str-field site "isolation") " · "
+                                                                         (if (> (len (str-field site "default_model")) 0) (str-field site "default_model") "no default model")])) ""))
     (push! [(slice u8)] (mut cells) (truncate a (style/err a term (str-field site "error")) 60))
     (load cells)))
 

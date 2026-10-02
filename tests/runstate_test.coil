@@ -78,3 +78,58 @@
     ;; "é" is two bytes; cutting inside it backs off to before it.
     (assert (= (preview a "aé" 2) "a…"))
     (assert (= (first-line a "\n\n  first line  \nsecond" 100) "first line"))))
+
+(deftest folds-each-reviewer-separately
+  (let [a (malloc-allocator)
+        (mut st) (runstate-new a "free-1a2b")]
+    (fold-lines! (mut st)
+                 ["{\"t\":1000,\"kind\":\"run.created\",\"factory\":\"free\",\"stations\":[\"build\"],\"reviewers\":[\"judge\",\"security\"]}"
+                  "{\"t\":2000,\"kind\":\"oversight\",\"agent\":\"build\",\"reviewer\":\"judge\",\"verdict\":\"drifting\",\"level\":\"warn\",\"reason\":\"off brief\"}"
+                  "{\"t\":2100,\"kind\":\"oversight.failed\",\"reviewer\":\"security\",\"message\":\"the model failed (provider): 403\"}"
+                  "{\"t\":2200,\"kind\":\"finding\",\"agent\":\"build\",\"severity\":\"warn\",\"code\":\"drifting\",\"reviewer\":\"judge\",\"message\":\"off brief\"}"])
+    (assert-eq (len (.reviewers st)) 2)
+    (let [judge (reviewer-at (mut st) "judge")
+          security (reviewer-at (mut st) "security")]
+      (assert (= (.verdict judge) "drifting"))
+      (assert (= (.level judge) "warn"))
+      (assert (= (.reason judge) "off brief"))
+      (assert (= (.verdict security) ""))
+      (assert (= (.failure security) "the model failed (provider): 403"))
+      (assert-eq (.failure-t security) 2100))
+    (assert (= (.reviewer (get (.findings st) 0)) "judge"))
+    ;; A later verdict clears the failure.
+    (fold-lines! (mut st) ["{\"t\":3000,\"kind\":\"oversight\",\"agent\":\"build\",\"reviewer\":\"security\",\"verdict\":\"clean\",\"level\":\"ok\",\"reason\":\"nothing leaks\"}"])
+    (assert (= (.failure (reviewer-at (mut st) "security")) ""))))
+
+(deftest reads-oversight-from-before-reviewers
+  (let [a (malloc-allocator)
+        (mut st) (runstate-new a "old-0000")]
+    (fold-lines! (mut st)
+                 ["{\"t\":1000,\"kind\":\"run.created\",\"factory\":\"old\",\"stations\":[\"build\"]}"
+                  "{\"t\":2000,\"kind\":\"oversight\",\"agent\":\"build\",\"verdict\":\"cheating\",\"reason\":\"stubbed\"}"])
+    (let [judge (reviewer-at (mut st) "judge")]
+      (assert (= (.verdict judge) "cheating"))
+      (assert (= (.level judge) "alert")))))
+
+(deftest folds-station-reviews
+  (let [a (malloc-allocator)
+        (mut st) (runstate-new a "r-1")]
+    (fold-lines! (mut st)
+                 ["{\"t\":1000,\"kind\":\"station.started\",\"agent\":\"build\"}"
+                  "{\"t\":1100,\"kind\":\"review.started\",\"agent\":\"build\",\"reviewers\":\"rules, spec\",\"round\":1}"])
+    (let [station (station-at (mut st) "build")
+          agent (agent-at (mut st) "build")]
+      (assert (= (.status station) "review"))
+      (assert (contains? (.activity agent) "rules, spec")))
+    (fold-lines! (mut st)
+                 ["{\"t\":1200,\"kind\":\"review.verdict\",\"agent\":\"build\",\"reviewer\":\"rules\",\"verdict\":\"violates\",\"level\":\"alert\"}"
+                  "{\"t\":1300,\"kind\":\"review.round\",\"agent\":\"build\",\"round\":1,\"approved\":false}"])
+    (let [station (station-at (mut st) "build")]
+      (assert (= (.status station) "running"))
+      (assert-eq (.review-rejections station) 1))
+    (fold-lines! (mut st)
+                 ["{\"t\":1400,\"kind\":\"review.round\",\"agent\":\"build\",\"round\":2,\"approved\":true}"])
+    (assert-eq (.review-rejections (station-at (mut st) "build")) 1)))
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))

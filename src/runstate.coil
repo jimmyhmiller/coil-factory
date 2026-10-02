@@ -16,10 +16,12 @@
 
 (defstruct StationState
   [(name (slice u8))
-   ;;; pending | running | gate | passed | blocked | failed
+   ;;; pending | running | gate | review | passed | blocked | failed
    (status (slice u8))
    (attempts i64)
    (gate-failures i64)
+   ;;; Review rounds whose reviewers sent the work back.
+   (review-rejections i64)
    (summary (slice u8))
    (started-t i64)
    (finished-t i64)])
@@ -42,7 +44,19 @@
    (severity (slice u8))
    (code (slice u8))
    (agent (slice u8))
+   (reviewer (slice u8))
    (message (slice u8))])
+
+;;; What one reviewer last said about the run. `level` is ok | warn | alert;
+;;; `failure` is set when its last attempt gave no verdict.
+(defstruct ReviewerState
+  [(name (slice u8))
+   (verdict (slice u8))
+   (level (slice u8))
+   (reason (slice u8))
+   (t i64)
+   (failure (slice u8))
+   (failure-t i64)])
 
 (defstruct PendingMessage [(ref i64) (agent (slice u8)) (from (slice u8)) (text (slice u8)) (t i64)])
 
@@ -55,6 +69,7 @@
    (branch (slice u8))
    (base (slice u8))
    (model (slice u8))
+   (harness (slice u8))
    (brief (slice u8))
    ;;; queued | running | paused | blocked | succeeded | failed | cancelled | lost
    (status (slice u8))
@@ -70,9 +85,8 @@
    (pending (ArrayList PendingMessage))
    (input-tokens i64)
    (output-tokens i64)
-   (verdict (slice u8))
-   (verdict-reason (slice u8))
-   (verdict-t i64)
+   ;;; The reviewers watching the run, in the order it named them.
+   (reviewers (ArrayList ReviewerState))
    (records i64)
    (cursor i64)])
 
@@ -86,12 +100,12 @@
     (set! (.branch st) "")
     (set! (.base st) "")
     (set! (.model st) "")
+    (set! (.harness st) "")
     (set! (.brief st) "")
     (set! (.status st) "queued")
     (set! (.reason st) "")
     (set! (.current st) "")
-    (set! (.verdict st) "")
-    (set! (.verdict-reason st) "")
+    (set! (.reviewers st) (al-new [ReviewerState] a))
     (set! (.stations st) (al-new [StationState] a))
     (set! (.agents st) (al-new [AgentState] a))
     (set! (.findings st) (al-new [Finding] a))
@@ -209,6 +223,7 @@
           (set! (.project st) (copy-bytes a (field-str record "project")))
           (set! (.branch st) (copy-bytes a (field-str record "branch")))
           (set! (.model st) (copy-bytes a (field-str record "model")))
+          (set! (.harness st) (copy-bytes a (field-str record "harness")))
           (set! (.brief st) (first-line a (field-str record "brief") 200))
           (set! (.created-t st) t)
           (set! (.status st) "queued")
@@ -218,6 +233,13 @@
             (loop (if (>= (load i) n)
                       (break)
                       (do (station-at st (jv-string-or (jv-nth names (load i)) ""))
+                          (set! i (+ (load i) 1)))))
+            0)
+          (let [names (jv-get record "reviewers")
+                (mut i) 0]
+            (loop (if (>= (load i) (jv-count names))
+                      (break)
+                      (do (reviewer-at st (jv-string-or (jv-nth names (load i)) ""))
                           (set! i (+ (load i) 1)))))
             0))
       (= kind "run.started")
@@ -279,6 +301,19 @@
             (set! (.status station) "running")
             0)
           0)
+      (= kind "review.started")
+        (let [station (station-at st agent-name)
+              agent (agent-at st agent-name)]
+          (set! (.status station) "review")
+          (set-activity! st agent "gate"
+                         (activity-with-mark a "review" (field-str record "reviewers")) t))
+      (= kind "review.round")
+        (let [station (station-at st agent-name)]
+          (when (not (jv-bool-or (jv-get record "approved") false))
+            (set! (.review-rejections station) (+ (.review-rejections station) 1))
+            (set! (.status station) "running")
+            0)
+          0)
       (= kind "agent.turn")
         (let [agent (agent-at st agent-name)]
           (set! (.turns agent) (+ (.turns agent) 1))
@@ -326,16 +361,25 @@
           (set! (.severity finding) (copy-bytes a (field-str record "severity")))
           (set! (.code finding) (copy-bytes a (field-str record "code")))
           (set! (.agent finding) (copy-bytes a agent-name))
+          (set! (.reviewer finding) (copy-bytes a (field-str record "reviewer")))
           (set! (.message finding) (preview a (field-str record "message") 600))
           (push! [Finding] (mut (.findings st)) (load finding))
           0)
       (= kind "run.requeued")
         (do (set! (.status st) "queued") (set! (.reason st) "") 0)
       (= kind "oversight")
-        (do (set! (.verdict st) (copy-bytes a (field-str record "verdict")))
-            (set! (.verdict-reason st) (first-line a (field-str record "reason") 300))
-            (set! (.verdict-t st) t)
-            0)
+        (let [r (reviewer-at st (oversight-reviewer record))]
+          (set! (.verdict r) (copy-bytes a (field-str record "verdict")))
+          (set! (.level r) (copy-bytes a (oversight-level record)))
+          (set! (.reason r) (first-line a (field-str record "reason") 300))
+          (set! (.t r) t)
+          (set! (.failure r) "")
+          0)
+      (= kind "oversight.failed")
+        (let [r (reviewer-at st (field-str record "reviewer"))]
+          (set! (.failure r) (first-line a (field-str record "message") 300))
+          (set! (.failure-t r) t)
+          0)
       (= kind "conversation.started")
         (set-activity! st (agent-at st agent-name) "thinking" "in conversation" t)
       (= kind "conversation.finished")
@@ -354,6 +398,38 @@
     (JBool [b] b)
     (_ fallback)))
 
+;;; The state of the reviewer named `name`, added when first seen.
+(defn reviewer-at [(st (ptr RunState)) (name (slice u8))] (-> (ptr ReviewerState))
+  (let [(mut found) -1
+        (mut i) 0]
+    (loop (if (>= (load i) (len (.reviewers st)))
+              (break)
+              (do (when (= (.name (al-elem [ReviewerState] (field st reviewers) (load i))) name)
+                    (set! found (load i))
+                    0)
+                  (set! i (+ (load i) 1)))))
+    (when (< (load found) 0)
+      (push! [ReviewerState] (mut (.reviewers st))
+             (ReviewerState :name (copy-bytes (.allocator st) name) :verdict "" :level "" :reason ""
+                            :t 0 :failure "" :failure-t 0))
+      (set! found (- (len (.reviewers st)) 1))
+      0)
+    (al-elem [ReviewerState] (field st reviewers) (load found))))
+
+;;; Journals written before reviewers existed have `oversight` records from
+;;; the built-in judge, without a reviewer or level; read them as that judge.
+(defn oversight-reviewer [(record JVal)] (-> (slice u8))
+  (let [name (field-str record "reviewer")]
+    (if (> (len name) 0) name "judge")))
+
+(defn oversight-level [(record JVal)] (-> (slice u8))
+  (let [level (field-str record "level")
+        verdict (field-str record "verdict")]
+    (cond (> (len level) 0) level
+          (= verdict "on_track") "ok"
+          (= verdict "cheating") "alert"
+          :else "warn")))
+
 ;;; The state as a JSON object for the API. Allocated in `a`.
 (defn runstate-json [(a (dyn Allocator)) (st (ptr RunState))] (-> JVal)
   (let [out (jv-object a)
@@ -368,6 +444,7 @@
     (jv-put! out "branch" (JStr (.branch st)))
     (jv-put! out "base" (JStr (.base st)))
     (jv-put! out "model" (JStr (.model st)))
+    (jv-put! out "harness" (JStr (.harness st)))
     (jv-put! out "brief" (JStr (.brief st)))
     (jv-put! out "status" (JStr (.status st)))
     (jv-put! out "reason" (JStr (.reason st)))
@@ -379,9 +456,19 @@
     (jv-put! out "input_tokens" (JInt (.input-tokens st)))
     (jv-put! out "output_tokens" (JInt (.output-tokens st)))
     (jv-put! out "cursor" (JInt (.cursor st)))
-    (jv-put! out "verdict" (JStr (.verdict st)))
-    (jv-put! out "verdict_reason" (JStr (.verdict-reason st)))
-    (jv-put! out "verdict_t" (JInt (.verdict-t st)))
+    (let [reviewers (jv-array a)]
+      (for reviewer (iter (.reviewers st))
+        (let [r reviewer
+              entry (jv-object a)]
+          (jv-put! entry "name" (JStr (.name r)))
+          (jv-put! entry "verdict" (JStr (.verdict r)))
+          (jv-put! entry "level" (JStr (.level r)))
+          (jv-put! entry "reason" (JStr (.reason r)))
+          (jv-put! entry "t" (JInt (.t r)))
+          (jv-put! entry "failure" (JStr (.failure r)))
+          (jv-put! entry "failure_t" (JInt (.failure-t r)))
+          (jv-push! reviewers entry)))
+      (jv-put! out "reviewers" reviewers))
     (for station (iter (.stations st))
       (let [s station
             entry (jv-object a)]
@@ -389,6 +476,7 @@
         (jv-put! entry "status" (JStr (.status s)))
         (jv-put! entry "attempts" (JInt (.attempts s)))
         (jv-put! entry "gate_failures" (JInt (.gate-failures s)))
+        (jv-put! entry "review_rejections" (JInt (.review-rejections s)))
         (jv-put! entry "summary" (JStr (.summary s)))
         (jv-put! entry "started" (JInt (.started-t s)))
         (jv-put! entry "finished" (JInt (.finished-t s)))
@@ -413,6 +501,7 @@
         (jv-put! entry "severity" (JStr (.severity f)))
         (jv-put! entry "code" (JStr (.code f)))
         (jv-put! entry "agent" (JStr (.agent f)))
+        (jv-put! entry "reviewer" (JStr (.reviewer f)))
         (jv-put! entry "message" (JStr (.message f)))
         (jv-push! findings entry)))
     (for message (iter (.pending st))

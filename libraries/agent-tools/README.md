@@ -15,6 +15,7 @@ agent_tools = { path = "../coil-factory/libraries/agent-tools" }
 | `agent_tools.workspace` | `Workspace`, path resolution and confinement |
 | `agent_tools.files` | `read_file`, `write_file`, `edit_file`, `list_dir`, `search` |
 | `agent_tools.shell` | the `shell` tool, and `run-command` for non-agent callers |
+| `agent_tools.stream` | `stream-lines`: run a program with optional stdin input, hand each stdout line to a `LineSink` as it arrives, keep stderr bounded, and stop it (with any descendants that left its process group) when the sink says so or it times out |
 | `agent_tools.sandbox` | `SandboxPolicy`, the `sandbox-exec` / `bwrap` wrappers |
 | `agent_tools.bundle` | `standard-tools`: every tool for a workspace in a `ToolRegistry` |
 

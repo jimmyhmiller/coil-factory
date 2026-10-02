@@ -15,18 +15,62 @@ coil build                         # writes build/release/factory; put it on you
 ```
 
 Models are named `provider/model` and read their keys from the environment (or
-`~/.factory/secrets.env`): `DEEPSEEK_API_KEY` for the default
-`deepseek/deepseek-v4-flash`; also `openrouter/`, `openai/`, `vercel/` (Vercel AI
-Gateway, `VERCEL_AI_GATEWAY_KEY`), and `zen/` (OpenCode Zen, `OPENCODE_KEY`). Free
-models work like any other, e.g. `--model vercel/poolside/laguna-s-2.1-free`.
+`~/.factory/secrets.env`): `deepseek/` (`DEEPSEEK_API_KEY`), `openrouter/`,
+`openai/`, `vercel/` (Vercel AI Gateway, `VERCEL_AI_GATEWAY_KEY`), and `zen/`
+(OpenCode Zen, `OPENCODE_KEY`). Free models work like any other, e.g.
+`--model vercel/poolside/laguna-s-2.1-free`.
+
+There is no built-in model. Every station needs one, from `--model`, `model:` in
+the factory or station, or the site's default in `~/.factory/site.json`
+(`default_model`, and `opencode_model` for the opencode harness); a run that would
+leave a station without one is refused when it starts, saying where to set it.
+
+## Harnesses
+
+A station's agent runs in a *harness*. `builtin` is the factory's own agent loop,
+calling the model's API directly. `opencode` drives the [OpenCode](https://opencode.ai)
+CLI headlessly, which reaches models that only answer requests from OpenCode
+itself, such as OpenCode Zen's free ones (no key needed):
+
+```sh
+factory start haiku "a lighthouse in fog" --harness opencode --model opencode/big-pickle
+factory start fix --project . --harness opencode --model opencode/hy3-free "…"
+```
+
+`codex` drives the Codex CLI headlessly, which reaches the models of your Codex
+login:
+
+```sh
+factory start fix --project . --harness codex --model gpt-6.1-sol "…"
+```
+
+Pick one per run (`--harness`), per factory or station (`harness:`), or per site
+(`default_harness` in `site.json`; otherwise `builtin`). With `opencode` and
+`codex`, models are named the way that program names them. Gates, `finish`,
+steering, pause, cancel, resume, and conversations after a run all work the same
+in all three; see [DESIGN.md](DESIGN.md#harnesses) for how.
+
+## Reviews that send work back
+
+A station can require reviewers' approval before it passes (`review:` on the
+station or in the front matter). After the agent finishes and the gate passes,
+each reviewer reads the station's diff and its workspace, and any verdict that is
+not `ok` sends the work back to the same agent with every reviewer's reasons. The
+station passes only when all of them approve; a reviewer that gives no verdict
+blocks the station for a person rather than letting it through.
 
 ## Five minutes
 
 ```sh
 factory up                                   # the hub on this machine
-factory start haiku "a lighthouse in fog" -w # a tiny two-station run, watched live
+factory start haiku "a lighthouse in fog" -w --model deepseek/deepseek-v4-flash
+                                             # a tiny two-station run, watched live
 factory                                      # the dashboard: every run, every agent
 ```
+
+Any model works; with no key at all, `--harness opencode --model
+opencode/big-pickle` uses OpenCode's free one. Put your usual choice in
+`~/.factory/site.json` (`{"default_model": "…"}`) to stop passing `--model`.
 
 ```
 ◆ haiku-fc0c  started on laptop
@@ -105,12 +149,45 @@ factory start feature --on box --project . "…"   # ships HEAD over git+ssh; pu
 
 ## The overseer
 
-Every site watches its runs: stalls, loops, streaks of failing tools, deleted
-tests, and every few minutes a reviewer model's verdict (`on_track`, `drifting`,
-`stuck`, `cheating`). Findings appear in `factory show`, the dashboard, and the
-journal. Per site (`~/.factory/site.json` → `overseer.policy`) it only records
-(`observe`), also messages the agent (`nudge`, the default), or pauses the run on
-an alert (`pause`).
+Every site watches its runs for stalls, loops, streaks of failing tools, and
+deleted tests. Those checks need no model.
+
+Judgment comes from **reviewers**, and a run has none unless you choose some. A
+reviewer is a Markdown file: its verdicts, which of them are fine and which are
+alerts, how often it looks, the harness and model it runs on, and its
+instructions. The bundled `judge` asks whether the agent is on track, drifting,
+stuck, or cheating.
+
+```sh
+factory reviewers                                        # what exists and what each runs on
+factory start fix --project . --reviewers judge "…"      # this run
+```
+
+A factory can name its own (`reviewers: judge, security`), and `site.json`
+`reviewers` sets a default for runs that name none; `--reviewers none` turns
+them off. Your own go in `~/.factory/reviewers/NAME.md`:
+
+```markdown
+---
+name: security
+description: Is the agent leaking secrets?
+harness: opencode
+model: opencode/big-pickle
+tools: read          # may look at the workspace, never change it
+every: 5m
+verdicts: clean, risky, leaking
+ok: clean
+alert: leaking
+---
+
+Look for credentials written to files, printed, or committed.
+```
+
+Findings and verdicts appear in `factory show`, the dashboard, and the journal; a
+reviewer that cannot answer (no key, a bad model, an unreadable reply) is shown
+as failed, never skipped quietly. Per site (`~/.factory/site.json` →
+`overseer.policy`) the overseer only records (`observe`), also messages the agent
+(`nudge`, the default), or pauses the run on an alert (`pause`).
 
 ## Everything is a file
 

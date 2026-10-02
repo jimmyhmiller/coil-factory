@@ -10,6 +10,7 @@
 (import "factory.config" :use *)
 (import "factory.proc" :use *)
 (import "factory.worker" :as worker)
+(import "factory.finish" :use [finish-mcp-main])
 (import "factory.daemon" :as daemon)
 (import "factory.cli.ctx" :use *)
 (import "factory.cli.render" :use [join])
@@ -53,6 +54,7 @@
       (args/command-is? inv "new") (design/cmd-new ctx first (args/flag-value-or inv "out" ""))
       (args/command-is? inv "check") (design/cmd-check ctx first)
       (args/command-is? inv "factories") (design/cmd-factories ctx)
+      (args/command-is? inv "reviewers") (design/cmd-reviewers ctx)
       (args/command-is? inv "start")
         (let [brief-file (args/flag-value-or inv "brief-file" "")
               brief (cond (> (len (args/flag-value-or inv "brief" "")) 0) (args/flag-value-or inv "brief" "")
@@ -65,6 +67,8 @@
                                                        :project (args/flag-value-or inv "project" "")
                                                        :brief brief
                                                        :model (args/flag-value-or inv "model" "")
+                                                       :harness (args/flag-value-or inv "harness" "")
+                                                       :reviewers (args/flag-value-or inv "reviewers" "")
                                                        :watch (args/flag? inv "watch")))))
       (args/command-is? inv "ps") (runs/cmd-ps ctx (args/flag? inv "all"))
       (args/command-is? inv "show") (runs/cmd-show ctx first)
@@ -103,6 +107,18 @@
         (let [id (arg argv 2)]
           (become-detached! a (run-file a home id "process.log"))
           (worker/worker-main a home id))
+      (and (>= argc 2) (= (arg argv 1) "_mcp-finish"))
+        (let [(mut gate) false
+              (mut ready) ""
+              (mut i) 2]
+          (loop (if (>= (load i) (cast i64 argc))
+                    (break)
+                    (do (cond (= (arg argv (load i)) "--gate") (set! gate true)
+                              (and (= (arg argv (load i)) "--ready") (< (+ (load i) 1) (cast i64 argc)))
+                                (do (set! i (+ (load i) 1)) (set! ready (arg argv (load i))))
+                              :else 0)
+                        (set! i (+ (load i) 1)))))
+          (finish-mcp-main a (load gate) (load ready)))
       (and (>= argc 2) (= (arg argv 1) "daemon"))
         (do (when (and (>= argc 3) (= (arg argv 2) "--background"))
               (become-detached! a (path-join a home "daemon.log"))
@@ -127,11 +143,14 @@
                                                  (args/flag "brief" #\b "TEXT" "What this run should do")
                                                  (args/flag "brief-file" 0 "FILE" "Read the brief from a file")
                                                  (args/flag "model" #\m "PROVIDER/MODEL" "Use this model for every station")
+                                                 (args/flag "harness" 0 "NAME" "Run every station's agent in this harness: builtin or opencode")
+                                                 (args/flag "reviewers" 0 "NAMES" "Reviewers that watch the run, comma-separated (factory reviewers), or none")
                                                  (args/switch "watch" #\w "Watch the run after starting it")])
                            (args/Command :name "new" :group "Design" :summary "Design a new factory, interactively" :usage ""
                                          :args ["NAME"] :flags [(args/flag "out" #\o "PATH" "Write here instead of the library")])
                            (args/Command :name "check" :group "Design" :summary "Validate a factory (name or path)" :usage "" :args ["FACTORY"] :flags (args/no-flags))
                            (args/Command :name "factories" :group "Design" :summary "The factory library" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "reviewers" :group "Design" :summary "Reviewers that can watch runs, and what each runs on" :usage "" :args (args/no-args) :flags (args/no-flags))
                            (args/Command :name "ps" :group "Watch" :summary "Runs on every site" :usage ""
                                          :args (args/no-args) :flags [(args/switch "all" #\a "Include every finished run")])
                            (args/Command :name "show" :group "Watch" :summary "A run: stations, agents, findings" :usage "" :args ["RUN"] :flags (args/no-flags))

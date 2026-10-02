@@ -8,9 +8,10 @@
 (import "agent.json" :use *)
 (import "factory.config" :use *)
 
-;;; Where factories come from. A name resolves, in order, to a factory in the
-;;; site's library (`~/.factory/factories/NAME.md`) and then to one bundled in
-;;; this executable. Anything containing a `/` or ending in `.md` is a path.
+;;; Where factories and reviewers come from. A name resolves, in order, to one
+;;; in the site's library (`~/.factory/factories/NAME.md`,
+;;; `~/.factory/reviewers/NAME.md`) and then to one bundled in this executable.
+;;; Anything containing a `/` or ending in `.md` is a path.
 
 (const BUNDLED-FEATURE (include-str "../factories/feature.md"))
 (const BUNDLED-FIX (include-str "../factories/fix.md"))
@@ -18,6 +19,11 @@
 (const BUNDLED-HAIKU (include-str "../factories/haiku.md"))
 
 (defstruct Bundled [(name (slice u8)) (text (slice u8))])
+
+(const BUNDLED-JUDGE (include-str "../reviewers/judge.md"))
+
+(defn bundled-reviewers [] (-> (array Bundled 1))
+  [(Bundled :name "judge" :text BUNDLED-JUDGE)])
 
 (defn bundled-factories [] (-> (array Bundled 4))
   [(Bundled :name "feature" :text BUNDLED-FEATURE)
@@ -37,43 +43,60 @@
       (and (> (len reference) 3)
            (= (subslice [u8] reference (- (len reference) 3) (len reference)) ".md"))))
 
-(defn library-file [(a (dyn Allocator)) (home (slice u8)) (name (slice u8))] (-> (slice u8))
+(defn library-file [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))] (-> (slice u8))
   (let [(mut file) (sb-new a)]
     (sb-push-str! (mut file) name)
     (sb-push-str! (mut file) ".md")
-    (path-join a (factories-dir a home) (sb-finish! (mut file)))))
+    (path-join a dir (sb-finish! (mut file)))))
 
 (defsum Resolved
   (Found [(entry CatalogEntry)])
   (NotFound [(message (slice u8))]))
 
 (defn resolve-factory [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
+  (resolve-in a "factory" "`factory factories`" (factories-dir a home) (bundled-factories) reference))
+
+(defn resolve-reviewer [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
+  (resolve-in a "reviewer" "`factory reviewers`" (reviewers-dir a home) (bundled-reviewers) reference))
+
+;;; `reference` as a path, a file in `dir`, or one of `bundled`.
+(defn resolve-in [(a (dyn Allocator))
+                  (kind (slice u8))
+                  (lister (slice u8))
+                  (dir (slice u8))
+                  (bundled (slice Bundled))
+                  (reference (slice u8))] (-> Resolved)
   (if (path-like? reference)
       (match (atomic/read-file-if-exists a reference)
         (Ok [found] (match found
                       (Some [text] (Found (CatalogEntry :name reference :origin "file" :path reference :text text)))
-                      (None [] (NotFound (join a ["no factory file at " reference])))))
+                      (None [] (NotFound (join a ["no " kind " file at " reference])))))
         (Err [failure] (NotFound (join a ["cannot read " reference]))))
-      (let [path (library-file a home reference)]
+      (let [path (library-file a dir reference)]
         (match (atomic/read-file-if-exists a path)
           (Ok [found]
               (match found
                 (Some [text] (Found (CatalogEntry :name reference :origin "library" :path path :text text)))
                 (None []
-                      (let [(mut result) (NotFound (join a ["no factory named \"" reference "\"; `factory factories` lists them"]))]
-                        (for bundled (iter (bundled-factories))
-                          (let [b bundled]
-                            (when (= (.name b) reference)
-                              (set! result (Found (CatalogEntry :name reference :origin "bundled" :path "" :text (.text b))))
-                              0)))
+                      (let [(mut result) (NotFound (join a ["no " kind " named \"" reference "\"; " lister " lists them"]))]
+                        (for b (iter bundled)
+                          (when (= (.name b) reference)
+                            (set! result (Found (CatalogEntry :name reference :origin "bundled" :path "" :text (.text b))))
+                            0))
                         (load result)))))
           (Err [failure] (NotFound (join a ["cannot read " path])))))))
 
 ;;; Every factory available by name: the library, then bundled ones it does
 ;;; not shadow.
 (defn list-factories [(a (dyn Allocator)) (home (slice u8))] (-> (ArrayList CatalogEntry))
-  (let [(mut out) (al-new [CatalogEntry] a)
-        dir (factories-dir a home)]
+  (list-in a (factories-dir a home) (bundled-factories)))
+
+;;; Every reviewer available by name, the same way.
+(defn list-reviewers [(a (dyn Allocator)) (home (slice u8))] (-> (ArrayList CatalogEntry))
+  (list-in a (reviewers-dir a home) (bundled-reviewers)))
+
+(defn list-in [(a (dyn Allocator)) (dir (slice u8)) (bundled (slice Bundled))] (-> (ArrayList CatalogEntry))
+  (let [(mut out) (al-new [CatalogEntry] a)]
     (match (atomic/list-dir a dir)
       (Err [failure] 0)
       (Ok [names]
@@ -91,9 +114,8 @@
                     0)
                   0))
               0)))
-    (for bundled (iter (bundled-factories))
-      (let [b bundled
-            (mut shadowed) false]
+    (for b (iter bundled)
+      (let [(mut shadowed) false]
         (for existing (iter out)
           (let [e existing]
             (when (= (.name e) (.name b)) (set! shadowed true) 0)))

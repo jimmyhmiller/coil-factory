@@ -15,6 +15,9 @@ http_app = { path = "libraries/http-app" }
 ssh = { path = "libraries/ssh" }
 cli = { path = "libraries/cli" }
 tui = { path = "libraries/tui" }
+mcp = { path = "libraries/mcp" }
+opencode = { path = "libraries/opencode" }
+codex = { path = "libraries/codex" }
 
 [test]
 roots = ["tests"]

@@ -235,7 +235,7 @@
               (let [run (jv-nth runs (load i))
                     id (js run "id")
                     findings (jv-get run "findings")
-                    verdict (js run "verdict")
+                    reviewers (jv-get run "reviewers")
                     (mut k) 0]
                 (loop (if (>= (load k) (jv-len findings))
                           (break)
@@ -266,29 +266,33 @@
                                            (concat a ["[" (js f "code") "]"])
                                          :suffix-tone (ToneSubtle))))
                             (set! k (+ (load k) 1)))))
-                (when (and (> (len verdict) 0)
-                           (not (= verdict "on_track"))
-                           (not (finished-status? (js run "status"))))
-                  (let [t (ji run "verdict_t")]
-                    (push! (mut out)
-                           (Notice
-                             :t t
-                             :line
-                               (Line
-                                 :gutter
-                                   (concat a ["◉ " (fmt-clock a t false) " "])
-                                 :gutter-tone (verdict-tone verdict)
-                                 :text
-                                   (concat a
-                                           [id
-                                            "  "
-                                            verdict
-                                            " — "
-                                            (first-line (js run
-                                                            "verdict_reason"))])
-                                 :tone (TonePlain)
-                                 :suffix ""
-                                 :suffix-tone (ToneSubtle))))))
+                (let [(mut k) 0]
+                  (loop (if (or (>= (load k) (jv-len reviewers)) (finished-status? (js run "status")))
+                            (break)
+                            (let [rv (jv-nth reviewers (load k))
+                                  standing (reviewer-standing rv)
+                                  failed (= standing "failed")]
+                              (when (or failed (= standing "warn") (= standing "alert"))
+                                (let [t (if failed (ji rv "failure_t") (ji rv "t"))]
+                                  (push! (mut out)
+                                         (Notice
+                                           :t t
+                                           :line
+                                             (Line
+                                               :gutter (concat a [(if failed "✗ " "◉ ") (fmt-clock a t false) " "])
+                                               :gutter-tone (standing-tone standing)
+                                               :text
+                                                 (concat a
+                                                         [id "  " (js rv "name") ": "
+                                                          (if failed "failed" (js rv "verdict"))
+                                                          " — "
+                                                          (first-line (if failed (js rv "failure") (js rv "reason")))])
+                                               :tone (TonePlain)
+                                               :suffix ""
+                                               :suffix-tone (ToneSubtle))))
+                                  0)
+                                0)
+                              (set! k (+ (load k) 1))))))
                 (set! i (+ (load i) 1)))))
     ;; Newest first (insertion sort: a handful of items).
     (let [(mut j) 1]

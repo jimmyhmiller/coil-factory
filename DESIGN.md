@@ -72,6 +72,9 @@ Every record: `{"t": <ms>, "kind": "...", "agent": "<station>"?, ...}`.
 | `message.received` | run | the agent consumed a message (`ref` = offset of `message.sent`) |
 | `control` | daemon | `action`: `pause` \| `resume` \| `cancel` |
 | `finding` | overseer | `severity`, `code`, `message`, `evidence` |
+| `review.started` | run | a station's reviewers began judging its work (`reviewers`, `round`) |
+| `review.verdict` | run | one reviewer's verdict (`reviewer`, `verdict`, `level`, `reason`, `advice`, or `failure`) |
+| `review.round` | run | `approved`: whether every reviewer approved; if not, the work went back |
 
 The folded view (`factory.runstate`) derives status, current station, what each agent
 is doing *right now*, token totals, pending messages, and open findings — the same fold
@@ -124,9 +127,11 @@ Read the diff on this branch as a skeptical reviewer…
 ```
 
 Front matter keys: `name` (required), `description`, `input` (what the brief is),
-`model`, `tools` (`files`, `shell`), `attempts`. Station settings are `key: value`
-lines directly under the heading: `gate`, `attempts`, `model`, `tools`. Everything else
-is prose for the model.
+`model`, `harness` (`builtin`, `opencode`, `codex`), `reviewers` (see the
+overseer), `review` (see station reviews), `tools` (`files`, `shell`), `attempts`.
+Station settings are `key: value` lines directly under the heading: `gate`,
+`attempts`, `model`, `harness`, `tools`, `review`. Everything else is prose for
+the model.
 
 ## Where runs execute
 
@@ -156,6 +161,119 @@ mirror; `factory pull <run>` fetches the run branch back. Nothing but git and ss
 (`providers: [{name, base_url, key_env}]`). Keys come from the environment or
 `~/.factory/secrets.env` on that site.
 
+There is no built-in model: a station's model is the run's `--model`, then the
+station's `model:`, then the factory's, then the site's `default_model`
+(`opencode_model` for the opencode harness). `POST /v1/runs` refuses a run that
+would leave any station or reviewer without one (`no_model`), naming where to set
+it.
+
+## Harnesses
+
+A station talks to its agent only through the `Harness` trait (`agent.harness`):
+add the system prompt, add a user message, run until the agent calls the stop tool
+(`Finished`), replies without a tool (`Replied`), is cancelled, or fails, and save
+or restore a checkpoint. The harness is picked by the run (`--harness`), then the
+station, then the factory, then the site's `default_harness`.
+
+**builtin** is `agent.loop` with the agent-tools `files`/`shell` tools and the
+`finish` tool. Its checkpoint is the transcript, a JSON array of chat messages.
+
+**opencode** (`opencode.harness`) runs one `opencode run --format json --auto`
+process per harness run in the workspace, and continues the same OpenCode session
+with `-s` on the next (after a gate failure, an operator message, a resume, or in a
+conversation after the run). The station's system prompt becomes a generated
+OpenCode agent (`factory-<station>`) in a per-station config file. The JSON event
+stream becomes the same observer events the builtin loop reports (turns, text,
+tool calls with summaries, token usage), so the journal, dashboard, and overseer
+read both alike, and the harness keeps a chat-message mirror of the conversation
+for `factory transcript`. Its checkpoint is an object: session id, system prompt,
+undelivered text, and that mirror.
+
+- **finish** is served over MCP: `factory _mcp-finish [--gate] --ready FILE` (the
+  `mcp` library) is an OpenCode local MCP server, so the agent sees
+  `factory_finish`. When it calls it, the harness stops OpenCode at the end of that
+  step. `--ready` is written when OpenCode initializes the server; a run that ends
+  without it is a failure, because OpenCode silently drops a server that did not
+  start.
+- **Steering and pause** reach the agent at step boundaries, as in the builtin loop:
+  the process is stopped after its current step ends and the next run continues
+  the session with the messages.
+- **Tools and confinement.** OpenCode's own tools do the work. The agent's
+  permissions deny paths outside the workspace and subagents, and deny file tools
+  to a station without `files`. `bash` and `read` are never denied, because OpenCode
+  Zen's free models reject a request that does not offer both ("OpenCode's free tier
+  can only be used from within OpenCode"). A station without `shell` or `files`
+  gets a generated OpenCode plugin that refuses those calls instead.
+  OpenCode's directory rule does not confine `bash`; `isolation: sandbox` does:
+  the whole OpenCode process runs under `sandbox-exec`/`bwrap`, with the workspace,
+  the run's OpenCode state, and the site's OpenCode cache writable.
+- **State.** XDG_DATA_HOME and XDG_STATE_HOME are `runs/<id>/opencode/state`
+  (sessions); XDG_CONFIG_HOME and XDG_CACHE_HOME are `~/.factory/opencode/`, shared
+  by every run, so the operator's personal OpenCode configuration is never loaded.
+  OpenCode's reading of `~/.claude/CLAUDE.md` and skills into the prompt is
+  switched off. The prompt goes on stdin; OpenCode wraps argv words that contain
+  spaces in quotes.
+- **Stopping.** OpenCode has no signal handler and its shell commands run in their
+  own process groups, so stopping it (cancel, a step-boundary interrupt, an idle
+  timeout of 30 minutes) also finds its descendants in other process groups and
+  stops them (`agent_tools.stream`).
+
+**codex** (`codex.harness`) runs one `codex exec --json` process per harness run
+in the workspace, and continues the same thread with `codex exec resume THREAD`
+on the next. The station's system prompt is Codex's `developer_instructions`.
+Every setting is a `-c` override with `--ignore-user-config`: the model, the
+approval policy (`never`), the sandbox, and the finish tool's MCP server.
+
+- **finish** is the same `factory _mcp-finish` server, registered as Codex MCP
+  server `factory` with `default_tools_approval_mode = "approve"`. Under the
+  `never` approval policy, Codex fails any MCP call that would need approval.
+  When the agent calls it, the process is stopped at the next item boundary.
+- **Steering and pause** reach the agent at item boundaries (a command, an
+  edit, or a message completing), and the next run resumes the thread with
+  the messages.
+- **Tools and confinement.** Codex's own sandbox, not the factory's: an agent
+  with `files` and `shell` gets `workspace-write` (writes confined to the
+  workspace, plus the site's `codex_writable` directories as writable roots);
+  one with neither (a reviewer) gets `read-only`. Codex always offers its shell
+  and its patch tool, so any other tool list is refused rather than widened.
+  Wrapping Codex in `sandbox-exec` would nest two sandboxes, which macOS
+  refuses.
+- **State.** Codex keeps threads and credentials in the operator's
+  CODEX_HOME. A private one would need a copy of the credentials, which Codex
+  rewrites when it refreshes them. The cost is that Codex always reads that
+  home's `AGENTS.md`, so the operator's global Codex instructions apply to
+  factory agents.
+
+## Station reviews
+
+A station may name reviewers whose approval its work needs (`review:` on the
+station, or in the front matter for every station; a station's own replaces
+the factory's, and `review: none` turns it off). They are resolved and checked
+when the run is made and frozen into `run.json` (`station_reviewers`, and
+which station needs which in `station_reviews`), as the overseer's are.
+
+When the agent calls `finish` and the gate passes, the worker runs every one of
+the station's reviewers at once, each on its own thread through the same
+`Harness` the overseer's reviews use (`factory.review`). Each is shown:
+
+- the brief and the factory's shared context;
+- the station's instructions and the agent's finish summary;
+- the gate's output;
+- the station's diff against the commit it started from, with untracked files
+  shown as new;
+- with `tools: read`, the workspace itself.
+
+It is told that its verdict decides whether the work is accepted.
+
+- Every reviewer approves (an `ok` verdict): the station is committed.
+- Any reviewer gives another verdict: whatever its confidence, the work goes
+  back to the same agent with every rejecting reviewer's reason and advice, and
+  counts against the station's `attempts` (separately from gate failures).
+  Running out of attempts blocks the station for a person.
+- A reviewer gives no verdict (it cannot start, its model fails, its reply is
+  not one of its verdicts): the station is blocked. Work is never accepted
+  without a verdict.
+
 ## The overseer
 
 Every site runs one. Every 20 s it reads the tail of each active run and checks:
@@ -163,10 +281,42 @@ Every site runs one. Every 20 s it reads the tail of each active run and checks:
 * **stalled** — no journal activity for too long while running;
 * **looping** — the same tool call repeated with nothing changing between;
 * **flailing** — a streak of failing tool calls, or a gate failing again and again;
-* **suspicious** — deleted or skipped tests, silently-returning stubs, weakened gates
-  (read from the worktree diff);
-* **judgment** — periodically, a reviewer model reads the recent transcript and the
-  diff stat and returns `on_track | drifting | stuck | cheating` with a reason.
+* **tests deleted** — test files deleted on the run branch (read from the worktree
+  diff every three minutes).
+
+These need no model. Everything that takes judgment is done by the run's
+**reviewers**, and a run with none gets no judgment.
+
+A reviewer (`factory.reviewer`) is a Markdown file like a factory: front matter
+with `name`, `verdicts`, `ok` (the verdicts that mean all is well), `alert` (the
+ones that are alerts; the rest are warnings), `every`, `min-events`, `confidence`,
+`harness`, `model`, and `tools` (`read` or nothing), then instructions. The factory
+appends the reply format, generated from the declared verdicts: one JSON object
+with `verdict`, `confidence`, `reason`, and `advice`. Reviewers come from
+`~/.factory/reviewers/`, from those bundled (`judge`), or from a path.
+
+Which reviewers watch a run: `--reviewers` (or `reviewers` in `POST /v1/runs`),
+else the factory's `reviewers:`, else `reviewers` in `site.json`; `none` stops the
+search. They are resolved and checked when the run is made and their Markdown is
+copied into `run.json`, so later edits to the library never change a run.
+
+When a reviewer is due (both `every` and `min-events` have passed), the overseer
+starts it on its own thread, through the same `Harness` a station uses (with no
+`finish` tool, its own OpenCode state directory, and its own model and harness,
+falling back to the site's defaults). It is shown the brief, the station working
+now, the recent activity, the branch's diff stat, and with `tools: read` the
+workspace. The overseer collects finished reviews on its next pass:
+
+* a verdict is an `oversight` record (`reviewer`, `verdict`, `level` ok | warn |
+  alert, `confidence`, `reason`, token counts);
+* a warn or alert verdict at or above the reviewer's `confidence`, while the run is
+  running, is also a finding, with the reviewer's advice as the nudge;
+* a reviewer that gives no verdict (it cannot start, its model fails, its reply is
+  not one of its verdicts) is an `oversight.failed` record, once per failure per
+  ten minutes, shown in `factory show` and the dashboard.
+
+When the daemon stops, reviews in flight are cancelled and waited for up to ten
+seconds.
 
 Findings are journal records. Policy per site: `observe` (record only), `nudge` (also
 send the advice to the agent as an `[overseer]` message), `pause` (alerts pause the run
@@ -181,6 +331,7 @@ agents. Errors are `{"error": {"code": "...", "message": "..."}}`.
 GET  /v1/overview                          every site, run, and open finding (dashboard feed)
 GET  /v1/sites            POST /v1/sites    remote sites
 GET  /v1/factories        POST /v1/factories/check
+GET  /v1/reviewers
 GET  /v1/runs             POST /v1/runs
 GET  /v1/runs/{run}                         folded state
 GET  /v1/runs/{run}/events?after=&limit=    journal page
@@ -206,7 +357,8 @@ factory site secrets NAME VAR...
 factory new NAME                  interactive factory designer
 factory check FACTORY             validate a factory (name or path)
 factory factories                 the library: yours, then bundled
-factory start FACTORY [--on SITE] [--project PATH] [--brief TEXT | --brief-file F] [--model M]
+factory start FACTORY [--on SITE] [--project PATH] [--brief TEXT | --brief-file F] [--model M] [--harness H] [--reviewers R,…|none]
+factory reviewers                 reviewers a run can name, and what each runs on
 factory ps                        runs everywhere
 factory show RUN                  stations, agents, findings
 factory watch RUN                 live, human-readable event stream
@@ -226,8 +378,10 @@ factory skills install            install the Claude Code skills
 | --- | --- | --- |
 | `durable` | `durable.jsonl`, `durable.atomic` | multi-writer JSONL journal with byte cursors; atomic file replace |
 | `mddoc` | `mddoc.doc` | Markdown front matter + heading sections |
-| `agent` | `agent.tool`, `agent.loop`, `agent.transcript` | provider-neutral agent loop: tools, steering, pause/cancel, checkpoints |
-| `agent-tools` | `agent_tools.files`, `agent_tools.shell`, `agent_tools.sandbox` | workspace-confined file tools and a sandboxable shell |
+| `agent` | `agent.tool`, `agent.loop`, `agent.harness` | provider-neutral agent loop: tools, steering, pause/cancel, checkpoints; the `Harness` trait |
+| `agent-tools` | `agent_tools.files`, `agent_tools.shell`, `agent_tools.sandbox`, `agent_tools.stream` | workspace-confined file tools, a sandboxable shell, and a supervised program read line by line |
+| `mcp` | `mcp.server` | a Model Context Protocol server for a `ToolRegistry` over stdio |
+| `opencode` | `opencode.harness` | OpenCode driven headlessly as a `Harness` |
 | `cli` | `cli.args`, `cli.style`, `cli.prompt` | subcommands and flags, terminal styling, interactive prompts |
 | `tui` | `tui.term`, `tui.keys`, `tui.canvas`, `tui.widgets`, `tui.width` | full-screen terminal UI toolkit |
 | `ssh` | `ssh.exec`, `ssh.tunnel` | remote commands and supervised port forwards |

@@ -100,6 +100,27 @@
   (git-output (git a dir ["diff" base])))
 
 ;;; Names of files deleted since `base`.
+;;; Everything in the working tree that differs from `base`, as one diff:
+;;; tracked changes, then each untracked file as a new file. The index is
+;;; left alone. Longer than `limit` bytes, it is cut there with a note.
+(defn git-work-diff [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8)) (limit i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        tracked (git a dir ["diff" base])
+        untracked (git a dir ["ls-files" "--others" "--exclude-standard" "-z"])]
+    (sb-push-str! (mut out) (.output tracked))
+    (for path (iter (str-split a (.output untracked) "\x00;"))
+      (when (> (len path) 0)
+        ;; `--no-index` exits 1 when the files differ, which is the point.
+        (sb-push-str! (mut out) (.output (git a dir ["diff" "--no-index" "--" "/dev/null" path])))
+        0))
+    (let [text (sb-finish! (mut out))]
+      (if (<= (len text) limit)
+          text
+          (let [(mut cut) (sb-new a)]
+            (sb-push-str! (mut cut) (subslice text 0 limit))
+            (sb-push-str! (mut cut) "\n… (the diff is longer than this; it was cut here)\n")
+            (sb-finish! (mut cut)))))))
+
 (defn git-deleted-files [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
   (git-output (git a dir ["diff" "--name-only" "--diff-filter=D" base])))
 

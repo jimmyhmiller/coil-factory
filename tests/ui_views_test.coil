@@ -46,7 +46,7 @@
       {'id': 'haiku-4695', 'factory': 'haiku', 'site': 'ui', 'status': 'running', 'current': 'critique',
        'model': 'deepseek/deepseek-v4-flash', 'branch': 'factory/haiku-4695', 'brief': 'autumn rain on a tin roof', 'cursor': 9000,
        'created': 1790476449080, 'started': 1790476449169, 'finished': 0, 'input_tokens': 18012, 'output_tokens': 2735,
-       'reason': '', 'verdict': 'on_track', 'verdict_reason': 'fine', 'verdict_t': 1790476464971,
+       'reason': '', 'reviewers': [{'name': 'judge', 'verdict': 'on_track', 'level': 'ok', 'reason': 'fine', 't': 1790476464971, 'failure': '', 'failure_t': 0}],
        'stations': [{'name': 'write', 'status': 'passed', 'attempts': 1, 'gate_failures': 0, 'summary': 'Wrote poem.md'},
                     {'name': 'critique', 'status': 'running', 'attempts': 1, 'gate_failures': 0, 'summary': ''}],
        'agents': [{'name': 'write', 'phase': 'done', 'activity': 'Wrote poem.md', 'activity_t': 1790476456072,
@@ -56,8 +56,8 @@
        'findings': [], 'pending_messages': []},
       {'id': 'blocker-73c0', 'factory': 'blocker', 'site': 'ui', 'status': 'blocked', 'current': 'attempt',
        'created': 1790476476302, 'started': 1790476476400, 'finished': 0, 'input_tokens': 5000, 'output_tokens': 700,
-       'reason': 'attempt is waiting for you: the gate keeps failing', 'verdict': 'stuck',
-       'verdict_reason': 'the gate cannot pass', 'verdict_t': 1790476490000,
+       'reason': 'attempt is waiting for you: the gate keeps failing',
+       'reviewers': [{'name': 'judge', 'verdict': 'stuck', 'level': 'warn', 'reason': 'the gate cannot pass', 't': 1790476490000, 'failure': '', 'failure_t': 0}],
        'stations': [{'name': 'attempt', 'status': 'blocked', 'attempts': 1, 'gate_failures': 1, 'summary': 'Wrote note.md'}],
        'agents': [{'name': 'attempt', 'phase': 'waiting', 'activity': 'gate failed', 'activity_t': 1790476480000,
                    'turns': 3, 'tool_calls': 2, 'tool_errors': 0, 'input_tokens': 5000, 'output_tokens': 700}],
@@ -66,7 +66,7 @@
        'pending_messages': []},
       {'id': 'fix-11aa', 'factory': 'fix', 'site': 'ui', 'status': 'succeeded', 'current': '',
        'created': 1790470000000, 'started': 1790470001000, 'finished': 1790471000000, 'input_tokens': 900000,
-       'output_tokens': 40000, 'reason': '', 'verdict': '', 'stations': [], 'agents': [], 'findings': [],
+       'output_tokens': 40000, 'reason': '', 'reviewers': [], 'stations': [], 'agents': [], 'findings': [],
        'pending_messages': []}]}")
 
 (defn dash-for-test [(a (dyn Allocator))] (-> (ptr Dash))
@@ -97,7 +97,7 @@
 │                                                                                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1/3 ─╯
 ╭─ Overseer ───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ◉ 02:34 blocker-73c0  stuck — the gate cannot pass                                                                   │
+│ ◉ 02:34 blocker-73c0  judge: stuck — the gate cannot pass                                                            │
 │ ⚠ 02:34 blocker-73c0/attempt  the gate failed on every attempt  [flailing]                                           │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────── 2 notices ─╯
  ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
@@ -116,7 +116,7 @@
     {'t': 1790476455965, 'kind': 'gate.finished', 'agent': 'write', 'ok': true, 'exit': 0, 'output': ''},
     {'t': 1790476456072, 'kind': 'station.finished', 'agent': 'write', 'outcome': 'passed', 'summary': 'Wrote poem.md'},
     {'t': 1790476460000, 'kind': 'message.sent', 'agent': 'critique', 'from': 'operator', 'text': 'count carefully'},
-    {'t': 1790476464971, 'kind': 'oversight', 'agent': 'critique', 'verdict': 'on_track', 'reason': 'fine'},
+    {'t': 1790476464971, 'kind': 'oversight', 'agent': 'critique', 'reviewer': 'judge', 'verdict': 'on_track', 'level': 'ok', 'reason': 'fine'},
     {'t': 1790476470000, 'kind': 'tool.started', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test'},
     {'t': 1790476472000, 'kind': 'tool.finished', 'agent': 'critique', 'call': 'c9', 'tool': 'shell', 'summary': '$ coil test', 'ok': false, 'ms': 2300, 'output': 'error: 2 tests failed\\nmore'},
     {'t': 1790476480000, 'kind': 'finding', 'agent': 'critique', 'severity': 'warn', 'code': 'flailing', 'message': 'tests keep failing'},
@@ -141,7 +141,7 @@
                         " ◆ factory › haiku › haiku-4695   running                                                               02:35
    50s  ·  deepseek/deepseek-v4-flash  ·  20.7k tokens (↑18.0k ↓2.7k)  ·  factory/haiku-4695  ·  on ui
    brief  autumn rain on a tin roof
-   overseer  ◉ on_track  fine
+   reviewers  ◉ judge: on_track  fine
 ╭─ Stations ─────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ✓ write ──── ⠙ critique                                                                                    │
 │ critique · attempt 1                                                                                       │
@@ -161,7 +161,7 @@
 │ 02:34:15  write     ◈  gate passed                                                                         │
 │ 02:34:16  write     ✓  station passed — Wrote poem.md                                                      │
 │ 02:34:20  critique  ✉  operator → count carefully                                                          │
-│ 02:34:24  critique  ◉  overseer: on_track — fine                                                           │
+│ 02:34:24  critique  ◉  judge: on_track — fine                                                              │
 │ 02:34:30  critique  $  coil test  ✗ 2.3s · error: 2 tests failed                                           │
 │ 02:34:40  critique  ⚠  [flailing] tests keep failing                                                       │
 │ 02:34:57  critique  $  coil test                                                                           │

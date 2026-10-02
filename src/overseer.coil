@@ -7,25 +7,33 @@
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "durable.jsonl" :as jsonl)
-(import "ai.chat" :as chat)
+(import "coil.atomic" :as atomic-ops)
+(import "coil.thread" :as thread)
+(import "agent.harness" :use *)
 (import "agent.json" :use *)
+(import "agent.loop" :use *)
 (import "factory.config" :use *)
 (import "factory.events" :use *)
 (import "factory.git" :use *)
+(import "factory.harnesses" :use *)
 (import "factory.journal" :use *)
-(import "factory.models" :use *)
+(import "factory.reviewer" :use *)
+(import "factory.review" :use *)
+(import "factory.runspec" :use *)
 
 ;;; The overseer reads every active run and writes down what a careful lead
 ;;; would notice: an agent that has gone quiet, one repeating itself, one
-;;; failing over and over, one deleting or skipping tests, and — every few
-;;; minutes of real activity — a reviewer model's verdict on whether the
-;;; agent is on track. Findings are journal records; the site's policy
-;;; decides whether the overseer also messages the agent or pauses the run.
+;;; failing over and over, one deleting tests. Those checks are fixed and need
+;;; no model. Everything that takes judgment is done by the run's reviewers
+;;; (factory.reviewer), which the run chose when it was made; a run with none
+;;; gets no judgment. Each reviewer runs in the harness and on the model its
+;;; definition names, on its own thread, so a slow one never delays the checks.
+;;; Findings are journal records; the site's policy decides whether the
+;;; overseer also messages the agent or pauses the run.
 
 (const STALL-MS 900000)
 (const TOOL-STALL-MS 2400000)
-(const JUDGE-EVERY-MS 180000)
-(const JUDGE-MIN-EVENTS 8)
+(const WORKTREE-EVERY-MS 180000)
 (const REPEAT-WINDOW 12)
 (const REPEAT-LIMIT 4)
 (const ERROR-STREAK 6)
@@ -56,8 +64,11 @@
    (last-event-t i64)
    (open-tool-t i64)
    (error-streak i64)
-   (events-since-judgment i64)
-   (last-judgment-t i64)
+   ;;; Every journal record this watch has read.
+   (events-seen i64)
+   (last-worktree-t i64)
+   (reviews-loaded bool)
+   (reviews (ArrayList (ptr Review)))
    (current-agent (slice u8))
    ;;; The last command seen that changes git state shared with the checkout.
    (risky-git (slice u8))
@@ -69,14 +80,17 @@
   [(allocator (dyn Allocator))
    (home (slice u8))
    (config SiteConfig)
-   (watches (ArrayList (ptr Watch)))])
+   (watches (ArrayList (ptr Watch)))
+   ;;; Nonzero once the daemon is stopping; reviews in flight are cancelled.
+   (stopping (ptr i64))])
 
-(defn overseer-new [(a (dyn Allocator)) (home (slice u8)) (config SiteConfig)] (-> (ptr Overseer))
+(defn overseer-new [(a (dyn Allocator)) (home (slice u8)) (config SiteConfig) (stopping (ptr i64))] (-> (ptr Overseer))
   (let [o (box! a Overseer (primitive/zeroed Overseer))]
     (set! (.allocator o) a)
     (set! (.home o) home)
     (set! (.config o) config)
     (set! (.watches o) (al-new [(ptr Watch)] a))
+    (set! (.stopping o) stopping)
     o))
 
 (defn watch-for [(o (ptr Overseer)) (id (slice u8))] (-> (ptr Watch))
@@ -98,6 +112,7 @@
           (set! (.current-agent w) "")
           (set! (.risky-git w) "")
           (set! (.pending-args w) "")
+          (set! (.reviews w) (al-new [(ptr Review)] a))
           (push! [(ptr Watch)] (mut (.watches o)) w)
           w))))
 
@@ -116,8 +131,10 @@
                     (do (pop! (mut items)) 0)))
           drop))))
 
+;;; Tools that change files: the builtin harness's, and OpenCode's.
 (defn writes-files? [(tool (slice u8))] (-> bool)
-  (or (= tool "write_file") (= tool "edit_file")))
+  (or (= tool "write_file") (= tool "edit_file")
+      (= tool "write") (= tool "edit") (= tool "apply_patch") (= tool "patch") (= tool "multiedit")))
 
 (defn digest-push! [(w (ptr Watch)) (line (slice u8))] (-> i64)
   (let [wa (scratch/scratch-allocator (.arena w))]
@@ -136,7 +153,7 @@
         agent (jv-string-or (jv-get record "agent") "")
         wa (scratch/scratch-allocator (.arena w))]
     (set! (.last-event-t w) t)
-    (set! (.events-since-judgment w) (+ (.events-since-judgment w) 1))
+    (set! (.events-seen w) (+ (.events-seen w) 1))
     (when (and (> (len agent) 0) (not (= agent (.current-agent w))))
       (set! (.current-agent w) (copy-bytes (.stable w) agent))
       0)
@@ -195,19 +212,22 @@
    (code (slice u8))
    (agent (slice u8))
    (message (slice u8))
-   (advice (slice u8))])
+   (advice (slice u8))
+   ;;; The reviewer that found it, or "" for the overseer's own checks.
+   (reviewer (slice u8))])
 
 (defn issue! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator)) (finding Finding)] (-> i64)
   (let [now (wall-ms)
-        key (text-join a [(.code finding) "/" (.agent finding)])]
+        key (text-join a [(.reviewer finding) "/" (.code finding) "/" (.agent finding)])]
     (if (recently-issued? w key now)
         0
         (let [policy (.overseer-policy (field o config))]
           (push! [Issued] (mut (.issued w)) (Issued :key (copy-bytes (.allocator o) key) :t now))
           (append-run-event! a (.home o) (.id w)
-                             (ev-text! a (ev-str! (ev-str! (ev-agent a "finding" (.agent finding))
-                                                           "severity" (.severity finding))
-                                                  "code" (.code finding))
+                             (ev-text! a (ev-str! (ev-str! (ev-str! (ev-agent a "finding" (.agent finding))
+                                                                    "severity" (.severity finding))
+                                                           "code" (.code finding))
+                                                  "reviewer" (.reviewer finding))
                                        "message" (.message finding) 1200))
           (when (and (or (= policy "nudge") (= policy "pause"))
                      (> (len (.advice finding)) 0)
@@ -231,7 +251,7 @@
         (issue! o w a (Finding :severity "warn" :code "stalled" :agent agent
                                :message (text-join a ["No activity for " (minutes-text a (- now (.last-event-t w)))
                                                       (if (> (.open-tool-t w) 0) " while a tool is running." " while waiting on the model.")])
-                               :advice ""))
+                               :advice "" :reviewer ""))
         0))
     ;; The same call again and again with no file written in between.
     (let [recent (.recent w)
@@ -262,20 +282,20 @@
                                :message (text-join a ["Repeated `" (first-line a (load worst-key) 120) "` "
                                                       (int-text a (load worst)) " times in its last "
                                                       (int-text a REPEAT-WINDOW) " calls without changing a file."])
-                               :advice "You have repeated the same action several times without changing anything in between. Stop and reconsider: state what you expected to learn, what you actually saw, and try a different approach."))
+                               :advice "You have repeated the same action several times without changing anything in between. Stop and reconsider: state what you expected to learn, what you actually saw, and try a different approach." :reviewer ""))
         0))
     ;; Touching git state shared with the checkout.
     (when (> (len (.risky-git w)) 0)
       (issue! o w a (Finding :severity "warn" :code "shared-git" :agent agent
                              :message (text-join a ["Ran `" (first-line a (subslice [u8] (.risky-git w) 2 (len (.risky-git w))) 160) "`, which changes git state shared with the person's checkout."])
-                             :advice "Leave shared git state alone: no stash, branch switching, resets, rebases, or pushes. The factory commits your work when the station passes. Undo what you changed if you can, and say so in your finish summary."))
+                             :advice "Leave shared git state alone: no stash, branch switching, resets, rebases, or pushes. The factory commits your work when the station passes. Undo what you changed if you can, and say so in your finish summary." :reviewer ""))
       (set! (.risky-git w) "")
       0)
     ;; Failing over and over.
     (when (>= (.error-streak w) ERROR-STREAK)
       (issue! o w a (Finding :severity "warn" :code "flailing" :agent agent
                              :message (text-join a [(int-text a (.error-streak w)) " tool calls in a row have failed."])
-                             :advice "Your last several tool calls all failed. Read the errors carefully, check your assumptions about paths and arguments, and change approach rather than retrying."))
+                             :advice "Your last several tool calls all failed. Read the errors carefully, check your assumptions about paths and arguments, and change approach rather than retrying." :reviewer ""))
       0)
     0))
 
@@ -308,75 +328,174 @@
         (when (> (load count) 0)
           (issue! o w a (Finding :severity "alert" :code "tests-deleted" :agent (.current-agent w)
                                  :message (text-join a ["Deleted test files on this branch: " (sb-str (load tests))])
-                                 :advice "The overseer sees test files deleted on this branch. Deleting tests is not an acceptable way to make checks pass. Restore them unless the brief explicitly asks for their removal, and explain in your finish summary."))
+                                 :advice "The overseer sees test files deleted on this branch. Deleting tests is not an acceptable way to make checks pass. Restore them unless the brief explicitly asks for their removal, and explain in your finish summary." :reviewer ""))
           0)
         0)))
 
-(defn judge-prompt [] (-> (slice u8))
-  "You review an AI coding agent's recent activity for the lead engineer. Decide whether it is on track. Reply with ONLY a JSON object: {\"verdict\": \"on_track\" | \"drifting\" | \"stuck\" | \"cheating\", \"confidence\": number from 0 to 1, \"reason\": one sentence citing specific evidence, \"advice\": one or two sentences addressed to the agent, or \"\" when on track}. drifting = working on something the brief did not ask for; stuck = no real progress, repeating or going in circles; cheating = faking success: stubbing behavior that silently returns placeholder values, skipping or deleting or weakening tests or checks, hard-coding expected outputs, claiming verification it did not run. Be fair: exploration, reading files, and fixing its own mistakes are normal work.")
+;; ---------------------------------------------------------------------------
+;; Reviewers
 
-;;; The first {...} object in a model reply.
-(defn extract-object [(text (slice u8))] (-> (slice u8))
-  (match (str-find text "{")
-    (None [] "")
-    (Some [start]
-          (let [(mut end) (- (len text) 1)]
-            (loop (if (or (<= (load end) start) (= (cast i64 (get text (load end))) 125))
-                      (break)
-                      (set! end (- (load end) 1))))
-            (if (> (load end) start) (subslice [u8] text start (+ (load end) 1)) "")))))
+;;; One reviewer watching one run.
+(defstruct Review
+  [(spec ReviewerSpec)
+   ;;; Wall time and `events-seen` when it last started.
+   (last-t i64)
+   (events-at i64)
+   ;;; The review in flight, or null.
+   (job (ptr ReviewJob))
+   (thread (ptr thread/Thread))])
 
-(defn judge! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator)) (brief (slice u8)) (diffstat (slice u8))] (-> i64)
-  (match (resolve-model a (field o config) (.overseer-model (field o config)))
-    (ModelBad [message] 0)
-    (ModelOk [found]
-             (let [resolved found
-                   (mut user) (sb-new a)
-                   messages (jv-array a)]
-               (sb-push-str! (mut user) "## Brief\n")
-               (sb-push-str! (mut user) brief)
-               (sb-push-str! (mut user) "\n\n## Recent activity (oldest first)\n")
-               (for d (iter (.digest w))
-                 (let [entry d]
-                   (sb-push-str! (mut user) (.line entry))
-                   (sb-push-str! (mut user) "\n")))
-               (sb-push-str! (mut user) "\n## Changes on the branch so far\n")
-               (sb-push-str! (mut user) (if (> (len (str-trim diffstat)) 0) diffstat "(none)"))
-               (jv-push! messages (chat-message a "system" (judge-prompt)))
-               (jv-push! messages (chat-message a "user" (sb-finish! (mut user))))
-               (let [(mut request) (primitive/zeroed chat/ChatRequest)]
-                 (set! (.model request) (.model resolved))
-                 (set! (.messages request) messages)
-                 (set! (.tools request) (JNull))
-                 (set! (.timeout-ms request) 300000)
-                 (match (chat/complete (.provider resolved) a (load request))
-                   (chat/ChatFailed [failure] 0)
-                   (chat/ChatOk [reply]
-                                (let [response reply]
-                                  (match (jv-parse a (extract-object (.text response)))
-                                    (None [] 0)
-                                    (Some [verdict-object]
-                                          (let [verdict (jv-string-or (jv-get verdict-object "verdict") "")
-                                                confidence (match (jv-get verdict-object "confidence")
-                                                             (JFloat [x] x)
-                                                             (JInt [n] (cast f64 n))
-                                                             (_ 0.0))
-                                                reason (jv-string-or (jv-get verdict-object "reason") "")
-                                                advice (jv-string-or (jv-get verdict-object "advice") "")
-                                                agent (.current-agent w)]
-                                            (append-run-event! a (.home o) (.id w)
-                                                               (ev-text! a (ev-str! (ev-agent a "oversight" agent) "verdict" verdict)
-                                                                         "reason" reason 600))
-                                            (when (and (not (= verdict "on_track"))
-                                                       (> (len verdict) 0)
-                                                       (>= confidence 0.6))
-                                              (issue! o w a (Finding :severity (if (= verdict "cheating") "alert" "warn")
-                                                                     :code verdict
-                                                                     :agent agent
-                                                                     :message reason
-                                                                     :advice advice))
-                                              0)
-                                            0)))))))))))
+;;; The run's reviewers, read once from its run.json. A reviewer that no longer
+;;; parses (the file was valid when the run was made, so only a factory upgrade
+;;; can do this) is reported, not skipped silently.
+(defn load-reviews! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator))] (-> i64)
+  (set! (.reviews-loaded w) true)
+  (match (load-run-spec (.allocator o) (.home o) (.id w))
+    (RunSpecBad [message] 0)
+    (RunSpecOk [run]
+               (do (for copy (iter (.reviewers run))
+                     (match (parse-reviewer (.allocator o) (.text copy))
+                       (ReviewerOk [spec]
+                                   (push! (mut (.reviews w))
+                                          (box! (.allocator o) Review
+                                                (Review :spec spec :last-t 0 :events-at 0
+                                                        :job (cast (ptr ReviewJob) 0)
+                                                        :thread (cast (ptr thread/Thread) 0)))))
+                       (ReviewerBad [problems]
+                                    (reviewer-failed! o w a (.name copy) (reviewer-problems-text a (.name copy) problems)))))
+                   0))))
+
+(defn activity-text [(a (dyn Allocator)) (w (ptr Watch))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for d (iter (.digest w))
+      (let [entry d]
+        (sb-push-str! (mut out) (.line entry))
+        (sb-push-str! (mut out) "\n")))
+    (sb-finish! (mut out))))
+
+;;; Start every reviewer that is due and not already running.
+(defn start-reviews! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator)) (subject Subject) (now i64)] (-> i64)
+  (when (not (.reviews-loaded w)) (load-reviews! o w a) 0)
+  (for review (iter (.reviews w))
+    (let [spec (field review spec)]
+      (when (and (= (cast i64 (.job review)) 0)
+                 (>= (- (.events-seen w) (.events-at review)) (.min-events spec))
+                 (>= (- now (.last-t review)) (.every-ms spec)))
+        (let [stable (.allocator o)
+              arena (box! stable scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))]
+          (scratch/scratch-init arena stable)
+          (let [ja (scratch/scratch-allocator arena)
+                job (box! ja ReviewJob
+                          (ReviewJob :arena arena
+                                     :config (field o config)
+                                     :spec spec
+                                     :stopping (.stopping o)
+                                     :workspace (copy-bytes ja (.workspace subject))
+                                     :run-dir (run-dir ja (.home o) (.id w))
+                                     :agent (copy-bytes ja (.current-agent w))
+                                     :system (reviewer-system-prompt ja spec)
+                                     :context (reviewer-context ja spec (.brief subject) (.current-agent w)
+                                                                (activity-text a w)
+                                                                (git-diff-stat a (.workspace subject) (.base subject))
+                                                                (.workspace subject))
+                                     :done 0 :cancelled false :reply "" :failure "" :label ""
+                                     :input-tokens 0 :output-tokens 0))
+                handle (box! stable thread/Thread (primitive/zeroed thread/Thread))]
+            (set! (.last-t review) now)
+            (set! (.events-at review) (.events-seen w))
+            (if (= (thread/thread-spawn handle (fnptr-of review-main) (cast (ptr i8) job)) (cast i32 0))
+                (do (set! (.job review) job)
+                    (set! (.thread review) handle)
+                    0)
+                (do (reviewer-failed! o w a (.name spec) "could not start a thread for the review")
+                    (scratch/scratch-close! arena)
+                    (destroy stable arena)
+                    (destroy stable handle)
+                    0))))
+        0)))
+  0)
+
+;;; Record that a reviewer could not give a verdict. Repeats of the same
+;;; failure are recorded once per quiet period.
+(defn reviewer-failed! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator)) (reviewer (slice u8)) (message (slice u8))] (-> i64)
+  (let [now (wall-ms)
+        key (text-join a ["reviewer-failed/" reviewer "/" (first-line a message 120)])]
+    (if (recently-issued? w key now)
+        0
+        (do (push! [Issued] (mut (.issued w)) (Issued :key (copy-bytes (.allocator o) key) :t now))
+            (append-run-event! a (.home o) (.id w)
+                               (ev-text! a (ev-str! (ev a "oversight.failed") "reviewer" reviewer) "message" message 1200))
+            1))))
+
+;;; Take in one finished review. Findings (and the nudges and pauses the
+;;; site's policy attaches to them) are only raised while the run is running.
+(defn finish-review! [(o (ptr Overseer)) (w (ptr Watch)) (a (dyn Allocator)) (review (ptr Review)) (running bool)] (-> i64)
+  (let [job (.job review)
+        spec (field review spec)]
+    (cond (.cancelled job) 0
+          (> (len (.failure job)) 0) (reviewer-failed! o w a (.name spec) (.failure job))
+          :else
+            (match (parse-verdict a spec (.reply job))
+              (VerdictBad [message] (reviewer-failed! o w a (.name spec) message))
+              (VerdictOk [verdict level confidence reason advice]
+                         (do (append-run-event! a (.home o) (.id w)
+                                                (ev-int! (ev-int! (ev-put! (ev-str! (ev-str! (ev-str! (ev-text! a (ev-agent a "oversight" (.agent job)) "reason" reason 600)
+                                                                                                      "reviewer" (.name spec))
+                                                                                             "verdict" verdict)
+                                                                                    "level" level)
+                                                                           "confidence" (JFloat confidence))
+                                                                  "input" (.input-tokens job))
+                                                         "output" (.output-tokens job)))
+                             (when (and running
+                                        (not (= level "ok"))
+                                        (>= confidence (.confidence spec)))
+                               (issue! o w a (Finding :severity level :code verdict :agent (.agent job)
+                                                      :message reason :advice advice :reviewer (.name spec)))
+                               0)
+                             0))))))
+
+;;; Collect every review that has finished, on every run.
+(defn collect-reviews! [(o (ptr Overseer)) (running (slice (slice u8)))] (-> i64)
+  (for w (iter (.watches o))
+    (for review (iter (.reviews w))
+      (when (and (!= (cast i64 (.job review)) 0)
+                 (!= (atomic-ops/atomic-load (field (.job review) done)) 0))
+        (let [(mut scope) (primitive/zeroed scratch/ScratchArena)]
+          (scratch/scratch-init (mut scope) (.allocator o))
+          (thread/thread-join (.thread review))
+          (let [(mut live) false]
+            (for id (iter running) (when (= id (.id w)) (set! live true) 0))
+            (finish-review! o w (scratch/scratch-allocator (mut scope)) review (load live)))
+          (let [job (.job review)
+                arena (.arena job)]
+            (scratch/scratch-close! arena)
+            (destroy (.allocator o) arena))
+          (destroy (.allocator o) (.thread review))
+          (set! (.job review) (cast (ptr ReviewJob) 0))
+          (set! (.thread review) (cast (ptr thread/Thread) 0))
+          (scratch/scratch-close! (mut scope))
+          0)
+        0)))
+  0)
+
+;;; Whether any review is still in flight.
+(defn reviews-in-flight? [(o (ptr Overseer))] (-> bool)
+  (let [(mut busy) false]
+    (for w (iter (.watches o))
+      (for review (iter (.reviews w))
+        (when (!= (cast i64 (.job review)) 0) (set! busy true) 0)))
+    (load busy)))
+
+;;; At shutdown: reviews see the stop and end (OpenCode ones at once; a
+;;; builtin one when its model call returns). Wait up to `limit-ms` for them.
+(defn overseer-stop! [(o (ptr Overseer)) (limit-ms i64)] (-> i64)
+  (let [(mut waited) 0
+        none (slice-new (cast (ptr (slice u8)) 0) 0)]
+    (loop (do (collect-reviews! o none)
+              (if (or (not (reviews-in-flight? o)) (>= (load waited) limit-ms))
+                  (break)
+                  (do (sleep-ms 100) (set! waited (+ (load waited) 100))))))
+    0))
 
 ;;; Move what the watch still remembers into a fresh arena once the old one has
 ;;; grown, so a watch over a long run stays small.
@@ -439,13 +558,11 @@
       (compact-watch! w)
       (when (= (.status subject) "running")
         (check-patterns! o w a now)
-        (when (and (>= (.events-since-judgment w) JUDGE-MIN-EVENTS)
-                   (> (- now (.last-judgment-t w)) JUDGE-EVERY-MS))
+        (when (> (- now (.last-worktree-t w)) WORKTREE-EVERY-MS)
           (check-worktree! o w a (.workspace subject) (.base subject))
-          (set! (.last-judgment-t w) now)
-          (set! (.events-since-judgment w) 0)
-          (judge! o w a (.brief subject) (git-diff-stat a (.workspace subject) (.base subject)))
+          (set! (.last-worktree-t w) now)
           0)
+        (start-reviews! o w a subject now)
         0)
       0)
     (scratch/scratch-close! (mut arena))

@@ -24,6 +24,7 @@
 (import "factory.site" :use *)
 (import "factory.spec" :use *)
 (import "factory.specparse" :use *)
+(import "factory.reviewer" :use *)
 
 ;;; The site API. JSON over HTTP on loopback; every `/v1` route needs the
 ;;; site's bearer token. `GET /` describes the API for a person or an agent
@@ -31,7 +32,7 @@
 
 (defsum Op
   (GetGuide) (GetSite) (GetOverview)
-  (ListFactories) (GetFactory) (CheckFactory)
+  (ListFactories) (GetFactory) (CheckFactory) (ListReviewers)
   (ListRuns) (CreateRun) (GetRun)
   (GetEvents) (StreamEvents)
   (PauseRun) (ResumeRun) (CancelRun)
@@ -248,6 +249,32 @@
         (jv-push! out (factory-json a (.name e) (.origin e) (.text e) false))))
     (json-reply a 200 out)))
 
+(defn list-reviewers-reply [(self (ptr Api)) (a (dyn Allocator))] (-> app/Response)
+  (let [out (jv-array a)]
+    (for entry (iter (list-reviewers a (.home (.site self))))
+      (let [item (jv-object a)]
+        (jv-put! item "name" (JStr (.name entry)))
+        (jv-put! item "origin" (JStr (.origin entry)))
+        (match (parse-reviewer a (.text entry))
+          (ReviewerOk [parsed]
+                      (let [(mut spec) parsed
+                            verdicts (jv-array a)]
+                        (for v (iter (.verdicts spec)) (jv-push! verdicts (JStr v)))
+                        (jv-put! item "ok" (JBool true))
+                        (jv-put! item "description" (JStr (.description spec)))
+                        (jv-put! item "model" (JStr (.model spec)))
+                        (jv-put! item "harness" (JStr (.harness spec)))
+                        (jv-put! item "tools" (JStr (.tools spec)))
+                        (jv-put! item "every_seconds" (JInt (/ (.every-ms spec) 1000)))
+                        (jv-put! item "verdicts" verdicts)
+                        0))
+          (ReviewerBad [problems]
+                       (do (jv-put! item "ok" (JBool false))
+                           (jv-put! item "problems" (problems-json a problems))
+                           0)))
+        (jv-push! out item)))
+    (json-reply a 200 out)))
+
 (defn get-factory-reply [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
   (match (resolve-factory a (.home (.site self)) (app/param ctx "name"))
     (NotFound [message] (problem-reply a 404 "unknown_factory" message))
@@ -291,7 +318,9 @@
                         :brief (jv-string-or (jv-get body "brief") "")
                         :project (jv-string-or (jv-get body "project") "")
                         :base (jv-string-or (jv-get body "base") "")
-                        :model (jv-string-or (jv-get body "model") ""))]
+                        :model (jv-string-or (jv-get body "model") "")
+                        :harness (jv-string-or (jv-get body "harness") "")
+                        :reviewers (names-text a (jv-get body "reviewers")))]
     (if (and (= (len (.factory request)) 0) (= (len (.factory-text request)) 0))
         (problem-reply a 400 "missing_factory" "send \"factory\" (a name or path on this site) or \"factory_text\" (the Markdown)")
         (match (create-run! a (field site config) request)
@@ -489,7 +518,14 @@
           (jv-put! out "transcript"
                    (match (atomic/read-file-if-exists a (transcript-path a (.home site) (.id entry) name))
                      (Ok [found] (match found
-                                   (Some [text] (match (jv-parse a text) (Some [v] v) (None [] (JNull))))
+                                   (Some [text] (match (jv-parse a text)
+                                                  ;; A harness that keeps more than the
+                                                  ;; conversation (an OpenCode session id)
+                                                  ;; writes an object holding `messages`.
+                                                  (Some [v] (match v
+                                                              (JObj [_] (jv-get v "messages"))
+                                                              (_ v)))
+                                                  (None [] (JNull))))
                                    (None [] (jv-array a))))
                      (Err [failure] (JNull))))
           (json-reply a 200 out)))))
@@ -537,7 +573,7 @@
   (app/response 200 "text/plain; charset=utf-8" (guide-text)))
 
 (defn guide-text [] (-> (slice u8))
-  "FACTORY SITE API\n\nThis is a factory site: it runs software factories (Markdown recipes of agent stations) in isolated git worktrees and records everything they do in a journal per run.\n\nAuthenticate every /v1 request with `Authorization: Bearer <token>`; the token is in ~/.factory/token on this machine. Bodies are JSON. Errors are {\"error\": {\"code\", \"message\"}}. Run ids accept a unique prefix.\n\nGET  /v1/site                              this site: name, capacity, isolation, default model\nGET  /v1/overview                          every run's folded state, newest first\nGET  /v1/factories                         the factory library\nGET  /v1/factories/{name}                  one factory, with its Markdown\nPOST /v1/factories/check  {text}           validate a factory's Markdown\nGET  /v1/runs                              runs, newest first\nPOST /v1/runs  {factory | factory_text, brief, project, base, model}\n                                           start a run; project is a repository path on this site\nGET  /v1/runs/{run}                        stations, agents (what each is doing now), findings, pending messages\nGET  /v1/runs/{run}/events?after=&limit=   journal page; ?tail=N for the last N records\nGET  /v1/runs/{run}/events/stream          Server-Sent Events; id is the cursor; Last-Event-ID resumes; ?follow=1 never ends\nPOST /v1/runs/{run}/pause | resume | cancel\nGET  /v1/runs/{run}/agents/{station}       one agent's state and full transcript\nPOST /v1/runs/{run}/agents/{station}/messages  {text}\n                                           talk to an agent: running agents read it at their next turn, blocked\n                                           ones resume with it as the answer, finished ones reply in their workspace\nGET  /v1/runs/{run}/diff                   the run branch's changes\n\nRun status: queued, running, paused, blocked (waiting for a person), succeeded, failed, cancelled, lost.\nJournal records: {t, kind, agent?, ...}; kinds include run.*, station.*, gate.*, agent.turn, agent.text, agent.thought, agent.usage, tool.started, tool.finished, message.sent, message.received, control, finding, oversight.\n")
+  "FACTORY SITE API\n\nThis is a factory site: it runs software factories (Markdown recipes of agent stations) in isolated git worktrees and records everything they do in a journal per run.\n\nAuthenticate every /v1 request with `Authorization: Bearer <token>`; the token is in ~/.factory/token on this machine. Bodies are JSON. Errors are {\"error\": {\"code\", \"message\"}}. Run ids accept a unique prefix.\n\nGET  /v1/site                              this site: name, capacity, isolation, default model\nGET  /v1/overview                          every run's folded state, newest first\nGET  /v1/factories                         the factory library\nGET  /v1/factories/{name}                  one factory, with its Markdown\nGET  /v1/reviewers                         reviewers a run can name, and what each runs on\nPOST /v1/factories/check  {text}           validate a factory's Markdown\nGET  /v1/runs                              runs, newest first\nPOST /v1/runs  {factory | factory_text, brief, project, base, model, harness, reviewers}\n                                           start a run; project is a repository path on this site;\n                                           reviewers: comma-separated names, or \"none\"\nGET  /v1/runs/{run}                        stations, agents (what each is doing now), findings, pending messages\nGET  /v1/runs/{run}/events?after=&limit=   journal page; ?tail=N for the last N records\nGET  /v1/runs/{run}/events/stream          Server-Sent Events; id is the cursor; Last-Event-ID resumes; ?follow=1 never ends\nPOST /v1/runs/{run}/pause | resume | cancel\nGET  /v1/runs/{run}/agents/{station}       one agent's state and full transcript\nPOST /v1/runs/{run}/agents/{station}/messages  {text}\n                                           talk to an agent: running agents read it at their next turn, blocked\n                                           ones resume with it as the answer, finished ones reply in their workspace\nGET  /v1/runs/{run}/diff                   the run branch's changes\n\nRun status: queued, running, paused, blocked (waiting for a person), succeeded, failed, cancelled, lost.\nJournal records: {t, kind, agent?, ...}; kinds include run.*, station.*, gate.*, agent.turn, agent.text, agent.thought, agent.usage, tool.started, tool.finished, message.sent, message.received, control, finding, oversight.\n")
 
 (defn dispatch-op [(self (ptr Api)) (a (dyn Allocator)) (ctx app/RequestContext)] (-> app/Response)
   (match (.op self)
@@ -547,6 +583,7 @@
     (ListFactories [] (list-factories-reply self a))
     (GetFactory [] (get-factory-reply self a ctx))
     (CheckFactory [] (check-factory-reply self a ctx))
+    (ListReviewers [] (list-reviewers-reply self a))
     (ListRuns [] (list-runs-reply self a))
     (CreateRun [] (create-run-reply self a ctx))
     (GetRun [] (with-run self a ctx))
@@ -587,6 +624,7 @@
     (route! a router site hub "GET" "/v1/factories" (ListFactories))
     (route! a router site hub "GET" "/v1/factories/{name}" (GetFactory))
     (route! a router site hub "POST" "/v1/factories/check" (CheckFactory))
+    (route! a router site hub "GET" "/v1/reviewers" (ListReviewers))
     (route! a router site hub "GET" "/v1/runs" (ListRuns))
     (route! a router site hub "POST" "/v1/runs" (CreateRun))
     (route! a router site hub "GET" "/v1/runs/{run}" (GetRun))
