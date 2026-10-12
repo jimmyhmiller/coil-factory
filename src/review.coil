@@ -93,7 +93,10 @@
                               :workspace (.workspace job)
                               :run-dir (.run-dir job)
                               :station (text-join a ["review-" (.name role)])
-                              :state-key (text-join a ["review-" (.name role)]))]
+                              :state-key (text-join a ["review-" (.name role)])
+                              :extra-tools (no-extra-tools)
+                              :agent-server (no-agent-server)
+                              :stop-tool "")]
     (match (station-agent a config request observer control)
       (AgentUnavailable [message] (set! (.failure job) message))
       (AgentReady [ready]

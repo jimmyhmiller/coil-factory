@@ -269,7 +269,7 @@
 
 (impl Tool ReadFileTool
   (tool-spec [(self (ptr ReadFileTool))] (-> ToolSpec)
-    (ToolSpec :name "read_file" :description READ_FILE_DESCRIPTION :parameters READ_FILE_SCHEMA))
+    (ToolSpec :name "read_file" :description READ_FILE_DESCRIPTION :parameters READ_FILE_SCHEMA :self-checked false))
   (tool-summary [(self (ptr ReadFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "read " (summary-path call "path" "(no path)")))
   (tool-run [(self (ptr ReadFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
@@ -326,7 +326,7 @@
 
 (impl Tool WriteFileTool
   (tool-spec [(self (ptr WriteFileTool))] (-> ToolSpec)
-    (ToolSpec :name "write_file" :description WRITE_FILE_DESCRIPTION :parameters WRITE_FILE_SCHEMA))
+    (ToolSpec :name "write_file" :description WRITE_FILE_DESCRIPTION :parameters WRITE_FILE_SCHEMA :self-checked false))
   (tool-summary [(self (ptr WriteFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "write " (summary-path call "path" "(no path)")))
   (tool-run [(self (ptr WriteFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
@@ -486,7 +486,7 @@
 
 (impl Tool EditFileTool
   (tool-spec [(self (ptr EditFileTool))] (-> ToolSpec)
-    (ToolSpec :name "edit_file" :description EDIT_FILE_DESCRIPTION :parameters EDIT_FILE_SCHEMA))
+    (ToolSpec :name "edit_file" :description EDIT_FILE_DESCRIPTION :parameters EDIT_FILE_SCHEMA :self-checked false))
   (tool-summary [(self (ptr EditFileTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "edit " (summary-path call "path" "(no path)")))
   (tool-run [(self (ptr EditFileTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
@@ -572,7 +572,7 @@
 
 (impl Tool ListDirTool
   (tool-spec [(self (ptr ListDirTool))] (-> ToolSpec)
-    (ToolSpec :name "list_dir" :description LIST_DIR_DESCRIPTION :parameters LIST_DIR_SCHEMA))
+    (ToolSpec :name "list_dir" :description LIST_DIR_DESCRIPTION :parameters LIST_DIR_SCHEMA :self-checked false))
   (tool-summary [(self (ptr ListDirTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "ls " (summary-path call "path" ".")))
   (tool-run [(self (ptr ListDirTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
@@ -727,7 +727,8 @@
               :description (match (.backend self)
                              (Ripgrep [_] SEARCH_DESCRIPTION_RG)
                              (Grep [_] SEARCH_DESCRIPTION_GREP))
-              :parameters SEARCH_SCHEMA))
+              :parameters SEARCH_SCHEMA
+              :self-checked false))
   (tool-summary [(self (ptr SearchTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "search " (quoted a (utf8-prefix (call-string call "pattern") 80))))
   (tool-run [(self (ptr SearchTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)

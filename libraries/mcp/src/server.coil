@@ -9,7 +9,7 @@
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "agent.json" :use *)
-(import "agent.loop" :use [validation-failure])
+(import "agent.loop" :use [arguments-problem])
 (import "agent.tool" :use *)
 (export ServerInfo ServerHooks NoHooks SUPPORTED_VERSIONS handle-message serve-stdio)
 
@@ -20,7 +20,8 @@
 ;;;
 ;;; Supported: `initialize`, `ping`, `tools/list`, `tools/call`, and
 ;;; notifications (which are never answered). Arguments are validated against
-;;; the tool's schema before it runs, exactly as the agent loop does; a tool
+;;; the tool's schema before it runs, exactly as the agent loop does (a
+;;; `self-checked` tool checks its own); a tool
 ;;; that fails, or arguments that do not validate, produce a result with
 ;;; `isError` so the model can see what went wrong.
 
@@ -128,7 +129,7 @@
     (match (registry-find registry name)
       (None [] (error-response a id INVALID_PARAMS (join a ["unknown tool: " name])))
       (Some [tool]
-            (let [problem (validation-failure a (.parameters (tool-spec tool)) arguments-json)]
+            (let [problem (arguments-problem a (tool-spec tool) arguments-json)]
               (if (> (len problem) 0)
                   (response a id (text-result a problem true))
                   (match (tool-run tool a (tool-call (jv-string-or id "") name arguments arguments-json)

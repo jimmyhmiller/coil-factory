@@ -182,6 +182,8 @@
                (UsageReported [input output]
                               (observe-record! self (ev-int! (ev-int! (ev-agent a "agent.usage" name) "input" input)
                                                              "output" output)))
+               (UsageUnknown [reason]
+                             (observe-record! self (ev-text! a (ev-agent a "agent.usage-unknown" name) "reason" reason 1000)))
                (ToolStarted [started summary]
                             (let [call started]
                               (observe-record! self
@@ -793,7 +795,10 @@
                 :workspace (.workspace worker)
                 :run-dir (run-dir (.allocator worker) (.home worker) (.id (field worker run)))
                 :station (.name station)
-                :state-key ""))
+                :state-key ""
+                :extra-tools (no-extra-tools)
+                :agent-server (no-agent-server)
+                :stop-tool ""))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
   (let [(mut out) (sb-new a)]

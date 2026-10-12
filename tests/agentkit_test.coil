@@ -1,0 +1,455 @@
+(module factory.agentkit-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.chat" :as chat)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+(import "factory.agentkit" :use *)
+(import "factory.agentlib" :use [bundled-agents])
+(import "factory.agentspec" :use *)
+(import "factory.agenttools" :use *)
+(import "factory.config" :use [SiteConfig path-join])
+(import "factory.proc" :use [capture pid real-path])
+(import "durable.atomic" :as atomic)
+(import "factory.specparse" :use [problems-text])
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+;; A model that plays back canned replies and records what it was sent.
+(defstruct Script
+  [(replies (ArrayList (slice u8)))
+   (next i64)
+   (seen (ArrayList (slice u8)))])
+
+(impl chat/ChatProvider Script
+  (complete [(self (ptr Script)) (a (dyn Allocator)) (request chat/ChatRequest)]
+            (-> chat/ChatResult)
+            (let [body (get (.replies self) (.next self))
+                  root (match (jv-parse a body) (Some [v] v) (None [] (JNull)))
+                  message (jv-get (jv-nth (jv-get root "choices") 0) "message")
+                  (mut response) (primitive/zeroed chat/ChatResponse)]
+              (push! [(slice u8)] (mut (.seen self)) (jv-encode (malloc-allocator) (.messages request)))
+              (set! (.next self) (+ (.next self) 1))
+              (set! (.text response) (jv-string-or (jv-get message "content") ""))
+              (set! (.tool-calls response) (jv-get message "tool_calls"))
+              (set! (.input-tokens response) 10)
+              (set! (.output-tokens response) 5)
+              (set! (.raw response) root)
+              (chat/ChatOk (load response)))))
+
+(defn script [(a (dyn Allocator)) (replies (slice (slice u8)))] (-> (ptr Script))
+  (let [s (box! a Script (primitive/zeroed Script))]
+    (set! (.replies s) (al-new [(slice u8)] a))
+    (set! (.seen s) (al-new [(slice u8)] a))
+    (for r (iter replies) (push! [(slice u8)] (mut (.replies s)) r))
+    s))
+
+;; One assistant message calling tools: each call is a name and its
+;; arguments as JSON text.
+(defn calls [(a (dyn Allocator)) (named (slice (slice u8)))] (-> (slice u8))
+  (let [message (jv-object a)
+        list (jv-array a)
+        (mut i) 0]
+    (loop (if (>= (+ (load i) 1) (len named))
+              (break)
+              (let [call (jv-object a)
+                    function (jv-object a)
+                    (mut id) (sb-new a)]
+                (sb-push-str! (mut id) "c")
+                (sb-push-i64! (mut id) (load i))
+                (jv-put! function "name" (JStr (get named (load i))))
+                (jv-put! function "arguments" (JStr (get named (+ (load i) 1))))
+                (jv-put! call "id" (JStr (sb-finish! (mut id))))
+                (jv-put! call "type" (JStr "function"))
+                (jv-put! call "function" function)
+                (jv-push! list call)
+                (set! i (+ (load i) 2)))))
+    (jv-put! message "role" (JStr "assistant"))
+    (jv-put! message "content" (JNull))
+    (jv-put! message "tool_calls" list)
+    (reply-of a message)))
+
+(defn says [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [message (jv-object a)]
+    (jv-put! message "role" (JStr "assistant"))
+    (jv-put! message "content" (JStr text))
+    (reply-of a message)))
+
+(defn reply-of [(a (dyn Allocator)) (message JVal)] (-> (slice u8))
+  (let [choice (jv-object a)
+        choices (jv-array a)
+        root (jv-object a)]
+    (jv-put! choice "message" message)
+    (jv-push! choices choice)
+    (jv-put! root "choices" choices)
+    (jv-encode a root)))
+
+(defn grammar [(a (dyn Allocator))] (-> AgentSpec)
+  (match (parse-agent a (.text (get (bundled-agents) 0)))
+    (AgentSpecOk [spec] spec)
+    (AgentSpecBad [problems] (do (println "{s}" (problems-text a problems)) (assert false) (grammar a)))))
+
+(const INPUT "Their going to the store tomorow.")
+
+(const GOOD-ISSUE "{\"original\":\"Their going\",\"suggestion\":\"They're going\",\"kind\":\"grammar\",\"explanation\":\"They're is they are.\"}")
+(const MADE-UP-ISSUE "{\"original\":\"Its raining\",\"suggestion\":\"It's raining\",\"kind\":\"grammar\",\"explanation\":\"Not in the text.\"}")
+
+(const TOMORROW-ISSUE "{\"original\":\"tomorow\",\"suggestion\":\"tomorrow\",\"kind\":\"spelling\",\"explanation\":\"Misspelled.\"}")
+
+(defn never [(a (dyn Allocator))] (-> (dyn ToolContext))
+  (box! a NeverCancelled (NeverCancelled :unused 0)))
+
+(defn parsed [(a (dyn Allocator)) (text (slice u8))] (-> AgentSpec)
+  (match (parse-agent a text)
+    (AgentSpecOk [spec] spec)
+    (AgentSpecBad [problems] (do (println "{s}" (problems-text a problems)) (assert false) (parsed a text)))))
+
+;; A scratch directory for an agent to work in.
+(defn scratch [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut path) (sb-new a)]
+    (sb-push-str! (mut path) "/tmp/factory-agentkit-test-")
+    (sb-push-str! (mut path) name)
+    (sb-push-str! (mut path) "-")
+    (sb-push-i64! (mut path) (pid))
+    (let [dir (sb-finish! (mut path))]
+      (capture a "rm" ["-rf" dir] "" 10000)
+      (atomic/ensure-dir! a dir 448)
+      (match (real-path a dir) (Some [canonical] canonical) (None [] dir)))))
+
+(defn place-in [(dir (slice u8))] (-> AgentPlace)
+  (AgentPlace :home dir :workdir dir :isolation "none"))
+
+(defn tool-list [(a (dyn Allocator)) (spec (ptr AgentSpec)) (place AgentPlace) (sink (ptr Collected))] (-> AgentTools)
+  (match (agent-tool-list a spec INPUT place sink (never a))
+    (Ok [made] made)
+    (Err [message] (do (println "tools: {s}" message) (assert false) (tool-list a spec place sink)))))
+
+(defn find-tool [(tools (ptr AgentTools)) (name (slice u8))] (-> (dyn Tool))
+  (let [(mut found) (: (None) (Option (dyn Tool)))]
+    (for tool (iter (.tools tools)) (when (= (.name (tool-spec tool)) name) (set! found (Some tool)) 0))
+    (match (load found)
+      (Some [tool] tool)
+      (None [] (do (println "no tool {s}" name) (assert false) (get (.tools tools) 0))))))
+
+(defn run-tool [(a (dyn Allocator)) (tool (dyn Tool)) (arguments (slice u8))] (-> ToolOutcome)
+  (let [given (match (jv-parse a arguments) (Some [v] v) (None [] (JNull)))]
+    (tool-run tool a (tool-call "c1" (.name (tool-spec tool)) given arguments) (never a))))
+
+(defn ok-output [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [output] output)
+    (ToolFailed [message] (do (println "tool failed: {s}" message) (assert false) ""))))
+
+(defn failed-message [(outcome ToolOutcome)] (-> (slice u8))
+  (match outcome
+    (ToolOk [output] (do (println "tool did not fail: {s}" output) (assert false) ""))
+    (ToolFailed [message] message)))
+
+(deftest a-collect-tool-keeps-calls-that-pass-its-checks-and-retract-takes-them-back
+  (let [a (malloc-allocator)
+        (mut spec) (grammar a)
+        sink (box! a Collected (collected-new a))
+        (mut tools) (tool-list a (mut spec) (place-in "") sink)
+        report (find-tool (mut tools) "report_issue")
+        retract (find-tool (mut tools) "retract")]
+    (assert (= (ok-output (run-tool a report GOOD-ISSUE)) "Recorded as #1 (1 kept). `retract` takes it back."))
+    (assert (contains? (failed-message (run-tool a report MADE-UP-ISSUE))
+                       "`original` must be copied exactly from the input, and \"Its raining\" does not appear in it"))
+    (assert (contains? (ok-output (run-tool a report TOMORROW-ISSUE)) "Recorded as #2 (2 kept)"))
+    (assert (= (ok-output (run-tool a retract "{\"number\":1,\"reason\":\"wrong\"}")) "Took back #1."))
+    (assert (contains? (failed-message (run-tool a retract "{\"number\":1,\"reason\":\"again\"}")) "there is no report #1 to take back"))
+    (assert-eq (len (.reports sink)) 1)
+    (let [kept (get (.reports sink) 0)]
+      (assert-eq (.number kept) 2)
+      (assert (= (.tool kept) "report_issue"))
+      (assert (= (jv-string-or (jv-get (.arguments kept) "suggestion") "") "tomorrow")))
+    ;; The tools are offered in the file's order, then retract and done.
+    (let [(mut names) (sb-new a)]
+      (for tool (iter (.tools tools)) (sb-push-str! (mut names) (.name (tool-spec tool))) (sb-push-str! (mut names) " "))
+      (assert (= (sb-str (load names)) "report_issue retract done ")))))
+
+(deftest reports-recorded-in-a-file-read-back-the-same
+  (let [a (malloc-allocator)
+        dir (scratch a "file")
+        file (path-join a dir "results.jsonl")
+        (mut spec) (grammar a)
+        writer (box! a Collected (collected-to-file a file))
+        (mut tools) (tool-list a (mut spec) (place-in "") writer)
+        report (find-tool (mut tools) "report_issue")
+        retract (find-tool (mut tools) "retract")
+        reader (box! a Collected (collected-new a))]
+    (ok-output (run-tool a report GOOD-ISSUE))
+    (ok-output (run-tool a report TOMORROW-ISSUE))
+    (ok-output (run-tool a retract "{\"number\":1,\"reason\":\"wrong\"}"))
+    (match (collected-load! reader file)
+      (Ok [n] (assert-eq n 1))
+      (Err [message] (assert false)))
+    (assert-eq (.number (get (.reports reader) 0)) 2)
+    (assert (= (jv-string-or (jv-get (.arguments (get (.reports reader) 0)) "original") "") "tomorow"))
+    ;; No file yet is no reports.
+    (match (collected-load! reader (path-join a dir "missing.jsonl"))
+      (Ok [n] (assert-eq n 0))
+      (Err [message] (assert false)))))
+
+(deftest tools-started-again-go-on-from-the-reports-in-their-file
+  (let [a (malloc-allocator)
+        dir (scratch a "resume")
+        file (path-join a dir "results.jsonl")
+        (mut spec) (grammar a)
+        first (box! a Collected (collected-to-file a file))
+        (mut tools) (tool-list a (mut spec) (place-in "") first)]
+    (ok-output (run-tool a (find-tool (mut tools) "report_issue") GOOD-ISSUE))
+    (ok-output (run-tool a (find-tool (mut tools) "report_issue") TOMORROW-ISSUE))
+    ;; A second process for the same agent, as Codex starts on a resume.
+    (match (collected-resume! a file)
+      (Err [message] (do (println "resume failed: {s}" message) (assert false)))
+      (Ok [resumed]
+          (let [again (box! a Collected resumed)
+                (mut spec2) (grammar a)
+                (mut tools2) (tool-list a (mut spec2) (place-in "") again)]
+            (assert-eq (len (.reports again)) 2)
+            (assert (= (ok-output (run-tool a (find-tool (mut tools2) "retract") "{\"number\":1,\"reason\":\"wrong\"}")) "Took back #1."))
+            (assert (contains? (ok-output (run-tool a (find-tool (mut tools2) "report_issue") GOOD-ISSUE)) "Recorded as #3 (2 kept)"))
+            (let [reader (box! a Collected (collected-new a))]
+              (match (collected-load! reader file)
+                (Ok [n] (assert-eq n 2))
+                (Err [message] (assert false)))
+              (assert-eq (.number (get (.reports reader) 0)) 2)
+              (assert-eq (.number (get (.reports reader) 1)) 3)))))
+    ;; No file yet: nothing to go on from.
+    (match (collected-resume! a (path-join a dir "missing.jsonl"))
+      (Ok [fresh] (do (assert-eq (len (.reports fresh)) 0) (assert-eq (.next fresh) 1)))
+      (Err [message] (assert false)))))
+
+(const RUNNER "---\nname: runner\n---\n\nLook things up.\n\n## Tool: lookup\nverbatim: word\nrun: printf 'in %s, ' \"$(basename \"$FACTORY_WORKDIR\")\"; cat; echo; echo looked up\n\nLook a word up.\n\n```json\n{\"type\": \"object\", \"properties\": {\"word\": {\"type\": \"string\"}}, \"required\": [\"word\"]}\n```\n\n## Tool: broken\nrun: echo partial; echo the reason >&2; exit 3\n\nAlways fails.\n\n```json\n{\"type\": \"object\"}\n```\n")
+
+(deftest a-run-tool-gets-its-arguments-on-stdin-and-tells-the-agent-what-it-printed
+  (let [a (malloc-allocator)
+        dir (scratch a "run")
+        (mut spec) (parsed a RUNNER)
+        sink (box! a Collected (collected-new a))
+        (mut tools) (tool-list a (mut spec) (place-in dir) sink)
+        lookup (find-tool (mut tools) "lookup")
+        broken (find-tool (mut tools) "broken")]
+    (let [output (ok-output (run-tool a lookup "{\"word\":\"store\"}"))]
+      (assert (contains? output "in factory-agentkit-test-run-"))
+      (assert (contains? output "{\"word\":\"store\"}"))
+      (assert (contains? output "looked up")))
+    (assert (contains? (failed-message (run-tool a lookup "{\"word\":\"moon\"}")) "`word` must be copied exactly from the input"))
+    (let [message (failed-message (run-tool a broken "{}"))]
+      (assert (contains? message "`broken` exited with status 3"))
+      (assert (contains? message "partial"))
+      (assert (contains? message "the reason")))
+    ;; Run tools are not output, so there is no retract.
+    (assert-eq (len (.tools tools)) 3)
+    (assert-eq (len (.reports sink)) 0)))
+
+;; An MCP server in sh: one tool, `shout`, whose schema uses minLength, which
+;; json-schema cannot check, so its calls are the server's to check.
+(const SHOUT-SERVER "
+while IFS= read -r line; do
+  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')
+  case \"$line\" in
+    *'\"method\":\"initialize\"'*)
+      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"shout\",\"version\":\"1\"}}}\\n' \"$id\";;
+    *'\"method\":\"tools/list\"'*)
+      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":[{\"name\":\"shout\",\"description\":\"Shout it.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"text\"]}},{\"name\":\"whisper\",\"description\":\"Whisper it.\"}]}}\\n' \"$id\";;
+    *'\"method\":\"tools/call\"'*)
+      text=$(printf '%s' \"$line\" | sed -n 's/.*\"text\":\"\\([^\"]*\\)\".*/\\1/p')
+      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"%s!\"}]}}\\n' \"$id\" \"$(printf '%s' \"$text\" | tr a-z A-Z)\";;
+    *) ;;
+  esac
+done
+")
+
+(defn mcp-agent [(a (dyn Allocator)) (dir (slice u8)) (only (slice u8))] (-> AgentSpec)
+  (do (atomic/write-file-atomic! a (path-join a dir "shout.sh") SHOUT-SERVER 420)
+      (parsed a (cat a ["---\nname: loud\n---\n\nShout the input, then report it.\n\n## Tool: voice\nmcp: /bin/sh ./shout.sh\n" only "\n"
+                        "## Tool: note\n\nNote it.\n\n```json\n{\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}}}\n```\n"]))))
+
+;; The agent over INPUT in the builtin loop, answering with `model`.
+(defn converse-with [(a (dyn Allocator)) (spec (ptr AgentSpec)) (place AgentPlace) (model (ptr Script)) (gate (dyn ResultGate))] (-> AgentResult)
+  (let [sink (box! a Collected (collected-new a))
+        (mut tools) (tool-list a spec place sink)
+        registry (box! a ToolRegistry (registry-new a))
+        observer (box! a Unobserved (Unobserved :unused 0))
+        control (box! a Unattended (Unattended :unused 0))]
+    (for tool (iter (.tools tools)) (registry-add! registry tool))
+    (let [agent (box! a Agent (agent-new a model (agent-config "test-model" DONE-TOOL) registry observer control))
+          result (converse! a agent spec INPUT (agent-system-prompt a spec "" "" "") sink gate "")]
+      (agent-tools-close! (mut tools))
+      result)))
+
+(defn no-gate [(a (dyn Allocator))] (-> (dyn ResultGate))
+  (box! a NoGate (NoGate :unused 0)))
+
+(deftest an-mcp-server-s-tools-are-offered-and-called-unchecked-by-the-loop
+  (let [a (malloc-allocator)
+        dir (scratch a "mcp")
+        (mut spec) (mcp-agent a dir "only: shout")
+        model (script a [(calls a ["shout" "{\"text\":\"hello\"}"])
+                         (calls a ["note" "{\"text\":\"HELLO!\"}" "done" "{\"summary\":\"Shouted.\"}"])])
+        result (converse-with a (mut spec) (place-in dir) model (no-gate a))]
+    (assert (.ok result))
+    (assert (contains? (get (.seen model) 1) "HELLO!"))
+    ;; only: left whisper out.
+    (assert (not (contains? (get (.seen model) 0) "whisper")))
+    (assert-eq (len (.reports result)) 1)))
+
+(deftest only-must-name-tools-the-server-offers
+  (let [a (malloc-allocator)
+        dir (scratch a "only")
+        (mut spec) (mcp-agent a dir "only: yell")
+        sink (box! a Collected (collected-new a))]
+    (match (agent-tool-list a (mut spec) INPUT (place-in dir) sink (never a))
+      (Ok [tools] (assert false))
+      (Err [message] (assert (contains? message "the MCP server \"voice\": only: names \"yell\", which the MCP server does not offer; it offers shout, whisper"))))))
+
+(deftest an-agent-reports-then-ends-with-done
+  (let [a (malloc-allocator)
+        (mut spec) (grammar a)
+        model (script a [(calls a ["report_issue" GOOD-ISSUE "report_issue" MADE-UP-ISSUE])
+                         (calls a ["report_issue" TOMORROW-ISSUE "done" "{\"summary\":\"Two problems.\"}"])])
+        result (converse-with a (mut spec) (place-in "") model (no-gate a))]
+    (assert (.ok result))
+    (assert (= (.summary result) "Two problems."))
+    (assert (= (.failure result) ""))
+    (assert-eq (len (.reports result)) 2)
+    (assert (= (jv-string-or (jv-get (.arguments (get (.reports result) 1)) "original") "") "tomorow"))
+    (let [first (get (.seen model) 0)
+          second (get (.seen model) 1)]
+      (assert (contains? first "<input>\\nTheir going to the store tomorow.\\n</input>"))
+      (assert (contains? first "`report_issue`'s `original` must be copied exactly from the input"))
+      (assert (contains? second "does not appear in it")))
+    (assert (contains? (.checkpoint result) "Two problems."))))
+
+(deftest a-reply-without-a-tool-gets-one-reminder
+  (let [a (malloc-allocator)
+        (mut spec) (grammar a)
+        model (script a [(says a "The text has a few problems.")
+                         (calls a ["report_issue" GOOD-ISSUE "done" "{\"summary\":\"One.\"}"])])
+        result (converse-with a (mut spec) (place-in "") model (no-gate a))]
+    (assert (.ok result))
+    (assert-eq (len (.reports result)) 1)
+    (assert (contains? (get (.seen model) 1) "You replied without calling a tool"))))
+
+(deftest replying-twice-without-a-tool-is-a-failure-not-an-empty-result
+  (let [a (malloc-allocator)
+        (mut spec) (grammar a)
+        model (script a [(calls a ["report_issue" GOOD-ISSUE]) (says a "Done, I think.") (says a "Really done.")])
+        (mut result) (converse-with a (mut spec) (place-in "") model (no-gate a))]
+    (assert (not (.ok result)))
+    (assert (contains? (.failure result) "the agent replied twice without calling a tool; its last reply: Really done."))
+    (assert-eq (len (.reports result)) 1)
+    (let [json (jv-encode a (agent-result-json a "grammar" (mut result)))]
+      (assert (contains? json "\"ok\":false"))
+      (assert (contains? json "\"failure\":\"the agent replied twice"))
+      (assert (contains? json "\"number\":1")))))
+
+(deftest usage-a-harness-could-not-count-is-marked-incomplete-not-left-low
+  (let [a (malloc-allocator)
+        counting (box! a Counting (counting-new a (as-observer (box! a Unobserved (Unobserved :unused 0)))))]
+    (observe counting (UsageReported 100 7))
+    (observe counting (UsageUnknown "Codex was stopped first"))
+    (observe counting (UsageUnknown "a later reason"))
+    (observe counting (UsageReported 20 3))
+    (assert-eq (.input counting) 120)
+    (assert-eq (.output counting) 10)
+    (assert (= (.unknown counting) "Codex was stopped first"))
+    (let [(mut result) (failed-result a "")]
+      (set! (.ok result) true)
+      (set! (.input-tokens result) (.input counting))
+      (set! (.usage-unknown result) (.unknown counting))
+      (let [usage (jv-get (agent-result-json a "grammar" (mut result)) "usage")]
+        (assert-eq (jv-int (jv-get usage "input_tokens")) 120)
+        (assert (= (jv-string-or (jv-get usage "incomplete") "") "Codex was stopped first"))))
+    ;; Complete counts carry no `incomplete`.
+    (let [(mut whole) (failed-result a "")]
+      (assert (not (contains? (jv-encode a (agent-result-json a "grammar" (mut whole))) "incomplete"))))))
+
+(defn as-observer [(o (dyn AgentObserver))] (-> (dyn AgentObserver)) o)
+
+;; Fails until the results hold `fixes` reports, saying so.
+(defstruct Needs [(reports i64) (seen (ArrayList (slice u8)))])
+
+(impl ResultGate Needs
+  (gate-check [(self (ptr Needs)) (a (dyn Allocator)) (results (slice u8))] (-> GateOutcome)
+              (do (push! (mut (.seen self)) results)
+                  (let [count (match (jv-parse a results) (Some [v] (jv-len (jv-get v "reports"))) (None [] -1))]
+                    (if (>= count (.reports self)) (GatePassed) (GateFailed "there are too few reports"))))))
+
+(deftest a-failing-gate-sends-the-agent-back-until-it-passes
+  (let [a (malloc-allocator)
+        (mut spec) (grammar a)
+        gate (box! a Needs (Needs :reports 2 :seen (al-new [(slice u8)] a)))
+        model (script a [(calls a ["report_issue" GOOD-ISSUE "done" "{\"summary\":\"One.\"}"])
+                         (calls a ["report_issue" TOMORROW-ISSUE "done" "{\"summary\":\"Two.\"}"])])
+        result (converse-with a (mut spec) (place-in "") model gate)]
+    (assert (.ok result))
+    (assert (= (.summary result) "Two."))
+    (assert-eq (len (.seen gate)) 2)
+    (assert (contains? (get (.seen gate) 0) "\"summary\":\"One.\""))
+    (assert (contains? (get (.seen model) 1) "[gate] Your results did not pass the check: there are too few reports"))
+    (assert (contains? (get (.seen model) 1) "`retract` takes a report back"))))
+
+(deftest a-gate-that-keeps-failing-fails-the-agent-after-its-attempts
+  (let [a (malloc-allocator)
+        (mut spec) (parsed a (cat a ["---\nname: picky\nattempts: 2\n---\n\nReport.\n\n## Tool: note\n\nNote it.\n\n```json\n{\"type\": \"object\"}\n```\n"]))
+        gate (box! a Needs (Needs :reports 5 :seen (al-new [(slice u8)] a)))
+        model (script a [(calls a ["done" "{\"summary\":\"a\"}"]) (calls a ["done" "{\"summary\":\"b\"}"])])
+        result (converse-with a (mut spec) (place-in "") model gate)]
+    (assert (not (.ok result)))
+    (assert (contains? (.failure result) "the gate failed 2 times; the last time there are too few reports"))))
+
+(deftest a-command-gate-reads-the-results-on-stdin
+  (let [a (malloc-allocator)
+        dir (scratch a "gate")
+        control (box! a Unattended (Unattended :unused 0))
+        gate (box! a CommandGate (CommandGate :command "grep -q tomorrow || { echo 'tomorow is still misspelled'; exit 1; }"
+                                             :place (place-in dir) :control control))]
+    (match (gate-check gate a "{\"reports\":[{\"arguments\":{\"suggestion\":\"tomorrow\"}}]}")
+      (GatePassed [] 0)
+      (_ (assert false)))
+    (match (gate-check gate a "{\"reports\":[]}")
+      (GateFailed [report] (assert (contains? report "exited with status 1\ntomorow is still misspelled")))
+      (_ (assert false)))))
+
+(defn site-config [(a (dyn Allocator))] (-> SiteConfig)
+  (let [(mut config) (primitive/zeroed SiteConfig)]
+    (set! (.default-harness config) "builtin")
+    (set! (.isolation config) "none")
+    (load config)))
+
+(defn run-with [(a (dyn Allocator)) (text (slice u8)) (call AgentCall)] (-> AgentResult)
+  (let [(mut spec) (parsed a text)
+        (mut config) (site-config a)
+        observer (box! a Unobserved (Unobserved :unused 0))
+        control (box! a Unattended (Unattended :unused 0))]
+    (run-agent! a (mut config) (mut spec) call observer control)))
+
+(defn with-harness [(call AgentCall) (model (slice u8)) (harness (slice u8))] (-> AgentCall)
+  (let [(mut out) call]
+    (set! (.model out) model)
+    (set! (.harness out) harness)
+    (load out)))
+
+(deftest run-agent-refuses-what-it-cannot-do-before-asking-a-model
+  (let [a (malloc-allocator)
+        grammar-text (.text (get (bundled-agents) 0))]
+    (let [result (run-with a grammar-text (agent-call INPUT "" ""))]
+      (assert (not (.ok result)))
+      (assert (contains? (.failure result) "no model is chosen for grammar")))
+    (let [result (run-with a grammar-text (with-harness (agent-call INPUT "" "") "nowhere-model" ""))]
+      (assert (contains? (.failure result) "must be written provider/model")))
+    (let [result (run-with a "---\nname: gated\ngate: ./check.sh\n---\n\nLook.\n" (agent-call INPUT "" ""))]
+      (assert (contains? (.failure result) "agent \"gated\" has commands but was given no directory to work in")))
+    (let [result (run-with a "---\nname: reader\ntools: read\n---\n\nLook.\n" (agent-call INPUT "" ""))]
+      (assert (contains? (.failure result) "agent \"reader\" has the read tools but was given no directory to work in")))
+    (let [result (run-with a RUNNER (agent-call INPUT "/nonexistent-directory-for-test" ""))]
+      (assert (not (.ok result))))))

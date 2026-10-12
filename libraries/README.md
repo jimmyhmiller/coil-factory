@@ -12,7 +12,7 @@ These packages have no dependency on the factory app; each has its own
 | `ai` | `ai.chat`, `ai.openai` | Provider-neutral chat interface with an OpenAI-compatible HTTP adapter |
 | `agent` | `agent.tool`, `agent.loop`, `agent.harness`, `agent.json` | Tool-calling agent loop: steering messages, pause/cancel, retries, schema-validated arguments, context compaction, checkpoints; the `Harness` trait any agent runner implements |
 | `agent-tools` | `agent_tools.files`, `.shell`, `.sandbox`, `.workspace`, `.bundle`, `.stream` | Workspace-confined file tools and a shell tool, optionally under `sandbox-exec` or `bwrap`; a supervised program whose output is read line by line |
-| `mcp` | `mcp.server` | A Model Context Protocol server offering a `ToolRegistry` over stdio |
+| `mcp` | `mcp.server`, `mcp.client` | A Model Context Protocol server offering a `ToolRegistry` over stdio, and a client for a server run as a program |
 | `opencode` | `opencode.harness` | OpenCode driven headlessly as a `Harness` |
 | `codex` | `codex.harness` | the Codex CLI (`codex exec`) driven headlessly as a `Harness` |
 | `durable` | `durable.jsonl`, `.atomic`, `.lock`, `.ids` | Multi-writer JSONL journal with byte cursors; atomic writes; locks and pid files; ids |

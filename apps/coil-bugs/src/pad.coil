@@ -1,0 +1,99 @@
+(module coilbugs.pad)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "coilbugs.model" :use *)
+(import "coilbugs.text" :use *)
+
+;;; A pad notebook's live cells, read from its journal.
+;;;
+;;; A notebook is `~/.pad/notebooks/<name>.jsonl`, an append-only log of
+;;; `update` (write a cell by id), `remove`, and `clear` records. Folding it in
+;;; order gives the cells a reader of the pad sees, in the order they were first
+;;; written. An unknown record is an error: a format change must be noticed,
+;;; not skipped.
+
+(defstruct Slot [(cell Cell) (live bool)])
+
+;;; A cell's text: a markdown, callout or code cell's source, else its JSON.
+(defn cell-text [(a (dyn Allocator)) (cell JVal)] (-> (slice u8))
+  (let [kind (jv-string-or (jv-get cell "type") "")]
+    (match (jv-get cell "source")
+      (JStr [source] (if (or (= kind "markdown") (= kind "callout") (= kind "code"))
+                         (copy-bytes a source)
+                         (jv-encode a cell)))
+      (_ (jv-encode a cell)))))
+
+(defn live-index [(slots (ptr (ArrayList Slot))) (id (slice u8))] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (loop (cond (>= (load i) (len (load slots))) (break)
+                (let [slot (al-elem slots (load i))]
+                  (and (.live slot) (= (.id (field slot cell)) id)))
+                  (do (set! found (load i)) (break))
+                :else (set! i (+ (load i) 1))))
+    (load found)))
+
+(defn record-int [(record JVal) (key (slice u8))] (-> (Option i64))
+  (match (jv-get record key)
+    (JInt [n] (Some n))
+    (JFloat [f] (Some (cast i64 f)))
+    (_ (None))))
+
+;;; The live cells of the notebook journal `text`, in first-written order.
+(defn fold-cells [(a (dyn Allocator)) (text (slice u8)) (path (slice u8))] (-> (Result (ArrayList Cell) (slice u8)))
+  (block :fold
+         (let [(mut slots) (al-new [Slot] a)
+               (mut number) 0]
+           (for line (iter (str-split a text "\n"))
+             (set! number (+ (load number) 1))
+             (when (> (len (str-trim line)) 0)
+               (let [where (join a [path ":" (int-text a (load number))])
+                     record (match (jv-parse a line)
+                              (Some [r] r)
+                              (None [] (return-from :fold (Err (join a [where ": not a JSON record"])))))
+                     op (jv-string-or (jv-get record "op") "")
+                     id (jv-string-or (jv-get record "id") "")]
+                 (cond (= op "update")
+                         (let [cell (jv-get record "cell")
+                               ts (match (record-int record "ts")
+                                    (Some [t] t)
+                                    (None [] (return-from :fold (Err (join a [where ": an update without ts"])))))
+                               value (Cell :id (copy-bytes a id) :ts ts
+                                           :kind (copy-bytes a (jv-string-or (jv-get cell "type") ""))
+                                           :source (cell-text a cell))
+                               at (live-index (mut slots) id)]
+                           (when (= (len id) 0) (return-from :fold (Err (join a [where ": an update without an id"]))))
+                           (if (>= at 0)
+                               (set! (.cell (al-elem [Slot] (mut slots) at)) value)
+                               (push! (mut slots) (Slot :cell value :live true)))
+                           0)
+                       (= op "remove")
+                         (let [at (live-index (mut slots) id)]
+                           (when (>= at 0) (set! (.live (al-elem [Slot] (mut slots) at)) false) 0)
+                           0)
+                       (= op "clear")
+                         (do (for-each-slot-dead! (mut slots)) 0)
+                       :else (return-from :fold (Err (join a [where ": unknown pad record \"" op "\""])))))
+               0))
+           (let [(mut cells) (al-new [Cell] a)]
+             (for slot (iter slots)
+               (when (.live slot) (push! (mut cells) (.cell slot)) 0))
+             (Ok (load cells))))))
+
+(defn for-each-slot-dead! [(slots (mut (ArrayList Slot)))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (load slots)))
+              (break)
+              (do (set! (.live (al-elem [Slot] slots (load i))) false)
+                  (set! i (+ (load i) 1)))))
+    0))
+
+;;; The live cells of the notebook journal at `path`.
+(defn live-cells [(a (dyn Allocator)) (path (slice u8))] (-> (Result (ArrayList Cell) (slice u8)))
+  (match (read-required a path)
+    (Err [why] (Err why))
+    (Ok [text] (fold-cells a text path))))

@@ -1,0 +1,425 @@
+(module mcp.client)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :as io)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+(import "coil.selectors" :as selectors)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.subprocess" :as subprocess)
+(import "agent.json" :use *)
+(import "agent.tool" :use [ToolContext tool-cancelled?])
+(import "agent_tools.shell" :use [signal-group exited-unreaped?])
+(import "agent_tools.sys" :as sys)
+(export McpClient McpToolInfo McpCallResult mcp-connect mcp-request! mcp-list-tools! mcp-call-tool! mcp-close!)
+
+;;; A Model Context Protocol client for a server run as a program:
+;;; newline-delimited JSON-RPC 2.0 on its stdin and stdout, the transport
+;;; `mcp.server` serves. It is how tools an MCP server offers become tools a
+;;; Coil agent can call.
+;;;
+;;; The server runs in its own process group, which `mcp-close!` stops with
+;;; everything left in it. Requests to the client from the server are
+;;; answered (`ping`) or refused (anything else); notifications are ignored.
+;;; While a request waits, the client keeps writing what it has queued and
+;;; reading standard output and standard error, so a server that logs while
+;;; it reads never deadlocks against it. Standard error is kept (its last
+;;; 4 KB) to explain a server that fails.
+
+(const PROTOCOL-VERSION "2025-06-18")
+(const READ-CHUNK-BYTES 65536)
+(const ERRORS-KEPT-BYTES 4096)
+;;; A write of at most PIPE_BUF bytes to a pipe that polled writable never blocks.
+(const WRITE-CHUNK-BYTES 512)
+(const POLL-MS 100)
+(const TERM-GRACE-MS 2000)
+(const SIGTERM 15)
+(const SIGKILL 9)
+(const EAGAIN-DARWIN 35)
+(const EAGAIN-LINUX 11)
+(const STDIN-TOKEN 0)
+(const STDOUT-TOKEN 1)
+(const STDERR-TOKEN 2)
+(const METHOD-NOT-FOUND -32601)
+
+(defstruct McpClient
+  [(allocator (dyn Allocator))
+   (child (ptr subprocess/Child))
+   ;;; How errors name the server, such as its command.
+   (name (slice u8))
+   (next-id i64)
+   ;;; Standard output not yet split into messages.
+   (inbox (ArrayList u8))
+   ;;; Bytes still to write to standard input, from `written` on.
+   (outbox (ArrayList u8))
+   (written i64)
+   (stdin-open bool)
+   (stdout-open bool)
+   (stderr-open bool)
+   (errors (ArrayList u8))
+   (buffer (slice u8))
+   (closed bool)])
+
+;;; One tool the server offers. `schema` is its input schema as JSON text.
+(defstruct McpToolInfo [(name (slice u8)) (description (slice u8)) (schema (slice u8))])
+
+;;; A tool's result: its content as text, and whether it is an error.
+(defstruct McpCallResult [(text (slice u8)) (is-error bool)])
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+(defn transient? [(code i64)] (-> bool)
+  (or (= code sys/EINTR) (= code EAGAIN-DARWIN) (= code EAGAIN-LINUX)))
+
+(defn push-bytes! [(list (ptr (ArrayList u8))) (bytes (slice u8))] (-> i64)
+  (do (for byte (iter bytes) (push! list byte)) 0))
+
+;;; Keep only the last ERRORS-KEPT-BYTES of standard error.
+(defn keep-errors! [(client (ptr McpClient)) (bytes (slice u8))] (-> i64)
+  (let [list (field client errors)]
+    (push-bytes! list bytes)
+    (when (> (len (load list)) ERRORS-KEPT-BYTES)
+      (let [items (al-slice (load list))
+            tail (copy-bytes (.allocator client) (subslice items (- (len items) ERRORS-KEPT-BYTES) (len items)))]
+        (al-clear! list)
+        (push-bytes! list tail)
+        (free-bytes (.allocator client) tail 1)
+        0)
+      0)
+    0))
+
+(defn close-stdin! [(client (ptr McpClient))] (-> i64)
+  (when (.stdin-open client)
+    (subprocess/child-close-stdin (.child client))
+    (set! (.stdin-open client) false)
+    0)
+  0)
+
+(defn read-fd [(fd i32) (buffer (slice u8))] (-> i64)
+  (primitive/cast i64 (io/read fd (primitive/cast (ptr i8) (slice-data buffer)) (primitive/cast isize (len buffer)))))
+
+;;; Wait up to `wait-ms` for one pipe to be ready, and move one chunk.
+(defn pump! [(client (ptr McpClient)) (wait-ms i64)] (-> i64)
+  (let [child (.child client)
+        pending (> (len (.outbox client)) (.written client))
+        (mut watches) [(selectors/watch (.stdin-fd child) (selectors/interest-writable) STDIN-TOKEN)
+                       (selectors/watch (.stdout-fd child) (selectors/interest-readable) STDOUT-TOKEN)
+                       (selectors/watch (.stderr-fd child) (selectors/interest-readable) STDERR-TOKEN)]
+        (mut count) 0]
+    (when (and pending (.stdin-open client))
+      (set! (mut watches) (load count) (selectors/watch (.stdin-fd child) (selectors/interest-writable) STDIN-TOKEN))
+      (set! count (+ (load count) 1))
+      0)
+    (when (.stdout-open client)
+      (set! (mut watches) (load count) (selectors/watch (.stdout-fd child) (selectors/interest-readable) STDOUT-TOKEN))
+      (set! count (+ (load count) 1))
+      0)
+    (when (.stderr-open client)
+      (set! (mut watches) (load count) (selectors/watch (.stderr-fd child) (selectors/interest-readable) STDERR-TOKEN))
+      (set! count (+ (load count) 1))
+      0)
+    (if (= (load count) 0)
+        (sys/sleep-ms wait-ms)
+        (match (selectors/wait-many-for (.allocator client) (subslice watches 0 (load count)) (sys/millis (if (< wait-ms 0) 0 wait-ms)))
+          (Err [error]
+               (match error
+                 (selectors/Timeout [] 0)
+                 (selectors/Syscall [code] (if (= code sys/EINTR)
+                                               0
+                                               (do (set! (.stdout-open client) false) (set! (.stderr-open client) false) (close-stdin! client))))
+                 (selectors/InvalidFd [] (do (set! (.stdout-open client) false) (set! (.stderr-open client) false) (close-stdin! client)))))
+          (Ok [selected]
+              (cond (= (.token selected) STDIN-TOKEN)
+                      (let [items (al-slice (.outbox client))
+                            rest (subslice items (.written client) (len items))
+                            n (if (< (len rest) WRITE-CHUNK-BYTES) (len rest) WRITE-CHUNK-BYTES)
+                            wrote (sys/write-without-sigpipe (.stdin-fd child) (primitive/cast (ptr i8) (slice-data rest)) n)]
+                        (cond (> wrote 0)
+                                (do (set! (.written client) (+ (.written client) wrote))
+                                    (when (>= (.written client) (len (.outbox client)))
+                                      (al-clear! (mut (.outbox client)))
+                                      (set! (.written client) 0)
+                                      0)
+                                    0)
+                              (and (< wrote 0) (transient? (- 0 wrote))) 0
+                              ;; The server stopped reading.
+                              :else (close-stdin! client)))
+                    (= (.token selected) STDOUT-TOKEN)
+                      (let [n (read-fd (.stdout-fd child) (.buffer client))]
+                        (cond (> n 0) (push-bytes! (field client inbox) (subslice (.buffer client) 0 n))
+                              (and (< n 0) (transient? (os/os-errno))) 0
+                              :else (do (set! (.stdout-open client) false) 0)))
+                    :else
+                      (let [n (read-fd (.stderr-fd child) (.buffer client))]
+                        (cond (> n 0) (keep-errors! client (subslice (.buffer client) 0 n))
+                              (and (< n 0) (transient? (os/os-errno))) 0
+                              :else (do (set! (.stderr-open client) false) 0)))))))))
+
+;;; The next complete line of standard output, owned by `a`, or None.
+(defn take-line! [(client (ptr McpClient)) (a (dyn Allocator))] (-> (Option (slice u8)))
+  (let [items (al-slice (.inbox client))
+        (mut at) -1
+        (mut i) 0]
+    (loop (if (or (>= (load i) (len items)) (>= (load at) 0))
+              (break)
+              (do (when (= (get items (load i)) (primitive/cast u8 #\newline)) (set! at (load i)) 0)
+                  (set! i (+ (load i) 1)))))
+    (if (< (load at) 0)
+        (None)
+        (let [line (copy-bytes a (subslice items 0 (load at)))
+              rest (copy-bytes (.allocator client) (subslice items (+ (load at) 1) (len items)))]
+          (al-clear! (mut (.inbox client)))
+          (push-bytes! (field client inbox) rest)
+          (free-bytes (.allocator client) rest 1)
+          (Some line)))))
+
+(defn now-ms [] (-> i64) (sys/monotonic-ms))
+
+;;; Wait up to `ms` for the server to exit, reading what it writes; it is
+;;; not reaped, so its process group id stays its own until `mcp-close!`.
+(defn await-exit! [(client (ptr McpClient)) (ms i64)] (-> bool)
+  (let [info (primitive/alloc-stack (array u8 128))
+        info-ptr (primitive/cast (ptr u8) info)
+        deadline (+ (now-ms) ms)
+        (mut exited) (exited-unreaped? (.pid (.child client)) info-ptr)]
+    (loop (if (or (load exited) (>= (now-ms) deadline))
+              (break)
+              (do (pump! client POLL-MS)
+                  (set! exited (exited-unreaped? (.pid (.child client)) info-ptr)))))
+    (load exited)))
+
+;;; Why the server can no longer answer, with what it last said on standard
+;;; error.
+(defn gone-message [(client (ptr McpClient)) (a (dyn Allocator))] (-> (slice u8))
+  (let [exited (await-exit! client TERM-GRACE-MS)
+        deadline (+ (now-ms) TERM-GRACE-MS)]
+    ;; It may exit before everything it wrote to standard error is read.
+    (loop (if (or (not (.stderr-open client)) (>= (now-ms) deadline))
+              (break)
+              (pump! client POLL-MS)))
+    (gone-text client a exited)))
+
+(defn gone-text [(client (ptr McpClient)) (a (dyn Allocator)) (exited bool)] (-> (slice u8))
+  (let [said (str-trim (al-slice (.errors client)))]
+    (cat a ["the MCP server `" (.name client) "` " (if exited "exited" "closed its output")
+            (if (> (len said) 0) (cat a [": " said]) "")])))
+
+(defn queue! [(client (ptr McpClient)) (a (dyn Allocator)) (message JVal)] (-> i64)
+  (do (push-bytes! (field client outbox) (jv-encode a message))
+      (push! (mut (.outbox client)) (primitive/cast u8 #\newline))
+      0))
+
+(defn notify! [(client (ptr McpClient)) (a (dyn Allocator)) (method (slice u8)) (params JVal)] (-> i64)
+  (let [message (jv-object a)]
+    (jv-put! message "jsonrpc" (JStr "2.0"))
+    (jv-put! message "method" (JStr method))
+    (when (not (jv-null? params)) (jv-put! message "params" params) 0)
+    (queue! client a message)))
+
+;;; Answer a request the server made of us: `ping`, or method not found.
+(defn answer-server! [(client (ptr McpClient)) (a (dyn Allocator)) (request JVal)] (-> i64)
+  (let [reply (jv-object a)]
+    (jv-put! reply "jsonrpc" (JStr "2.0"))
+    (jv-put! reply "id" (jv-get request "id"))
+    (if (= (jv-string-or (jv-get request "method") "") "ping")
+        (jv-put! reply "result" (jv-object a))
+        (let [error (jv-object a)]
+          (jv-put! error "code" (JInt METHOD-NOT-FOUND))
+          (jv-put! error "message" (JStr (cat a ["the client does not support " (jv-string-or (jv-get request "method") "")])))
+          (jv-put! reply "error" error)))
+    (queue! client a reply)))
+
+(defn id-of [(message JVal)] (-> i64)
+  (match (jv-get message "id")
+    (JInt [n] n)
+    (_ -1)))
+
+;;; Send one request and wait for its answer: the result, or why there is
+;;; none (the server's error, its exit, the timeout, or a cancellation, which
+;;; is passed on to the server). `a` owns what is returned.
+(defn mcp-request! [(client (ptr McpClient))
+                    (a (dyn Allocator))
+                    (method (slice u8))
+                    (params JVal)
+                    (timeout-ms i64)
+                    (context (dyn ToolContext))] (-> (Result JVal (slice u8)))
+  (block :request
+         (when (.closed client) (return-from :request (Err (cat a ["the MCP server `" (.name client) "` is closed"]))) 0)
+         (let [id (.next-id client)
+               message (jv-object a)
+               deadline (+ (now-ms) timeout-ms)]
+           (set! (.next-id client) (+ id 1))
+           (jv-put! message "jsonrpc" (JStr "2.0"))
+           (jv-put! message "id" (JInt id))
+           (jv-put! message "method" (JStr method))
+           (jv-put! message "params" (if (jv-null? params) (jv-object a) params))
+           (queue! client a message)
+           (loop
+             (match (take-line! client a)
+               (Some [line]
+                     (match (jv-parse a line)
+                       (None [] 0)
+                       (Some [incoming]
+                             (cond (and (not (jv-null? (jv-get incoming "method"))) (not (jv-null? (jv-get incoming "id"))))
+                                     (answer-server! client a incoming)
+                                   (= (id-of incoming) id)
+                                     (let [error (jv-get incoming "error")]
+                                       (return-from :request
+                                                      (if (jv-null? error)
+                                                          (Ok (jv-get incoming "result"))
+                                                          (Err (cat a ["the MCP server `" (.name client) "` refused " method ": "
+                                                                       (jv-string-or (jv-get error "message") (jv-encode a error))])))))
+                                   :else 0))))
+               (None []
+                     (cond (not (.stdout-open client)) (return-from :request (Err (gone-message client a)))
+                           (tool-cancelled? context)
+                             (let [params (jv-object a)]
+                               (jv-put! params "requestId" (JInt id))
+                               (jv-put! params "reason" (JStr "cancelled"))
+                               (notify! client a "notifications/cancelled" params)
+                               (pump! client 0)
+                               (return-from :request (Err "cancelled")))
+                           (>= (now-ms) deadline)
+                             (return-from :request (Err (cat a ["the MCP server `" (.name client) "` did not answer " method " within "
+                                                                (int-text a (/ timeout-ms 1000)) "s"])))
+                           :else (pump! client (let [left (- deadline (now-ms))] (if (< left POLL-MS) left POLL-MS))))))))))
+
+;;; Start the server `argv` (program first) in `cwd` and complete the MCP
+;;; handshake within `timeout-ms`.
+(defn mcp-connect [(a (dyn Allocator))
+                   (argv (slice (slice u8)))
+                   (cwd (slice u8))
+                   (name (slice u8))
+                   (timeout-ms i64)
+                   (context (dyn ToolContext))] (-> (Result (ptr McpClient) (slice u8)))
+  (let [child (box! a subprocess/Child (primitive/zeroed subprocess/Child))
+        cwd-c (sys/c-string a cwd)
+        spawned (subprocess/spawn-with-options a child (get argv 0) (subslice argv 1 (len argv))
+                                               (subprocess/pipe-stdio) (subprocess/pipe-stdio) (subprocess/pipe-stdio)
+                                               (subprocess/SpawnOptions :cwd cwd-c :new-process-group true))]
+    (sys/c-string-free a cwd cwd-c)
+    (match spawned
+      (Err [error] (Err (cat a ["could not start the MCP server `" name "`"])))
+      (Ok [_]
+          (match (alloc [u8] a READ-CHUNK-BYTES)
+            (None [] (do (subprocess/child-kill-and-wait child) (subprocess/child-close child)
+                         (Err "out of memory starting the MCP server")))
+            (Some [buffer]
+                  (let [client (box! a McpClient (McpClient :allocator a :child child :name (copy-bytes a name) :next-id 1
+                                                            :inbox (al-new [u8] a) :outbox (al-new [u8] a) :written 0
+                                                            :stdin-open true :stdout-open true :stderr-open true
+                                                            :errors (al-new [u8] a) :buffer buffer :closed false))
+                        params (jv-object a)
+                        capabilities (jv-object a)
+                        info (jv-object a)]
+                    (jv-put! info "name" (JStr "factory"))
+                    (jv-put! info "version" (JStr "0.1.0"))
+                    (jv-put! params "protocolVersion" (JStr PROTOCOL-VERSION))
+                    (jv-put! params "capabilities" capabilities)
+                    (jv-put! params "clientInfo" info)
+                    (match (mcp-request! client a "initialize" params timeout-ms context)
+                      (Err [message] (do (mcp-close! client) (Err message)))
+                      (Ok [result]
+                          (do (notify! client a "notifications/initialized" (JNull))
+                              (Ok client)))))))))))
+
+;;; Every tool the server offers, following its pages.
+(defn mcp-list-tools! [(client (ptr McpClient)) (a (dyn Allocator)) (timeout-ms i64) (context (dyn ToolContext))] (-> (Result (ArrayList McpToolInfo) (slice u8)))
+  (block :list
+         (let [(mut out) (al-new [McpToolInfo] a)
+               (mut cursor) ""]
+           (loop
+             (let [params (jv-object a)]
+               (when (> (len (load cursor)) 0) (jv-put! params "cursor" (JStr (load cursor))) 0)
+               (match (mcp-request! client a "tools/list" params timeout-ms context)
+                 (Err [message] (return-from :list (Err message)))
+                 (Ok [result]
+                     (let [tools (jv-get result "tools")
+                           (mut i) 0]
+                       (loop (if (>= (load i) (jv-len tools))
+                                 (break)
+                                 (let [tool (jv-nth tools (load i))
+                                       schema (jv-get tool "inputSchema")]
+                                   (push! (mut out) (McpToolInfo :name (jv-string-or (jv-get tool "name") "")
+                                                                 :description (jv-string-or (jv-get tool "description") "")
+                                                                 :schema (if (jv-null? schema) "{\"type\":\"object\"}" (jv-encode a schema))))
+                                   (set! i (+ (load i) 1)))))
+                       (set! cursor (jv-string-or (jv-get result "nextCursor") ""))
+                       (when (= (len (load cursor)) 0) (return-from :list (Ok (load out))) 0)
+                       0))))))))
+
+;;; A tool result's content as text: text items as they are, and a note for
+;;; what is not text.
+(defn content-text [(a (dyn Allocator)) (result JVal)] (-> (slice u8))
+  (let [content (jv-get result "content")
+        (mut out) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) (jv-len content))
+              (break)
+              (let [item (jv-nth content (load i))
+                    kind (jv-string-or (jv-get item "type") "")]
+                (when (> (load i) 0) (sb-push-str! (mut out) "\n") 0)
+                (cond (= kind "text") (sb-push-str! (mut out) (jv-string-or (jv-get item "text") ""))
+                      (= kind "resource")
+                        (let [resource (jv-get item "resource")
+                              text (jv-string-or (jv-get resource "text") "")]
+                          (if (> (len text) 0)
+                              (sb-push-str! (mut out) text)
+                              (sb-push-str! (mut out) (cat a ["(a resource: " (jv-string-or (jv-get resource "uri") "") ")"]))))
+                      (= kind "resource_link")
+                        (sb-push-str! (mut out) (cat a ["(a link to " (jv-string-or (jv-get item "uri") "") ")"]))
+                      :else (sb-push-str! (mut out) (cat a ["(" kind " content, " (jv-string-or (jv-get item "mimeType") "unknown type")
+                                                             ", which only text can be shown here)"])))
+                (set! i (+ (load i) 1)))))
+    (let [text (sb-finish! (mut out))
+          structured (jv-get result "structuredContent")]
+      (if (and (= (len text) 0) (not (jv-null? structured)))
+          (jv-encode a structured)
+          text))))
+
+;;; Call `name` with `arguments` (an object).
+(defn mcp-call-tool! [(client (ptr McpClient))
+                      (a (dyn Allocator))
+                      (name (slice u8))
+                      (arguments JVal)
+                      (timeout-ms i64)
+                      (context (dyn ToolContext))] (-> (Result McpCallResult (slice u8)))
+  (let [params (jv-object a)]
+    (jv-put! params "name" (JStr name))
+    (jv-put! params "arguments" (if (jv-null? arguments) (jv-object a) arguments))
+    (match (mcp-request! client a "tools/call" params timeout-ms context)
+      (Err [message] (Err message))
+      (Ok [result] (Ok (McpCallResult :text (content-text a result)
+                                      :is-error (match (jv-get result "isError") (JBool [b] b) (_ false))))))))
+
+;;; Stop the server: close its input, give it a moment to exit, then stop
+;;; its whole process group. Idempotent.
+(defn mcp-close! [(client (ptr McpClient))] (-> i64)
+  (if (.closed client)
+      0
+      (let [child (.child client)
+            pid (.pid child)]
+        (set! (.closed client) true)
+        (close-stdin! client)
+        (when (not (await-exit! client TERM-GRACE-MS))
+          (signal-group pid SIGTERM)
+          (when (not (await-exit! client TERM-GRACE-MS)) (signal-group pid SIGKILL) 0)
+          0)
+        ;; Whatever it left behind in its group. The leader is still
+        ;; unreaped, so the group id is its own.
+        (signal-group pid SIGTERM)
+        (signal-group pid SIGKILL)
+        (subprocess/child-wait child)
+        (subprocess/child-close child)
+        (free [u8] (.allocator client) (.buffer client))
+        0)))

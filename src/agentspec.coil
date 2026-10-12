@@ -1,0 +1,461 @@
+(module factory.agentspec)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.json" :as json)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "mddoc.doc" :as md)
+(import "json_schema.validate" :as schema)
+(import "agent.json" :use *)
+(import "factory.spec" :use [SpecProblem harness-problem kebab-name?])
+(import "factory.specparse" :use [problem! front-tools parse-attempts text-before-line lower-ascii])
+
+;;; A standalone agent: one conversation with a model whose output is the
+;;; calls it makes to the tools its file defines. No git branch and no
+;;; station; a caller hands it an input and gets the calls back
+;;; (`factory.agentkit`).
+;;;
+;;;     ---
+;;;     name: grammar
+;;;     description: Find grammar, spelling, and punctuation problems.
+;;;     input: The text to check.
+;;;     model: deepseek/deepseek-v4-flash    (optional; else the site default)
+;;;     harness: builtin                     (optional; else the site default)
+;;;     tools: none                          (optional: none, or files, read, shell)
+;;;     gate: ./check-results.sh             (optional)
+;;;     attempts: 2                          (optional)
+;;;     ---
+;;;
+;;;     Instructions...
+;;;
+;;;     ## Tool: report_issue
+;;;     verbatim: original
+;;;
+;;;     Report one problem.
+;;;
+;;;     ```json
+;;;     {"type": "object", "properties": {...}, ...}
+;;;     ```
+;;;
+;;; A tool section is one of three kinds, by its settings:
+;;;
+;;; collect   (no `run:` or `mcp:`) its calls are the agent's output. Its
+;;;           description is the section's prose and its arguments are the
+;;;           fenced `json` schema. `verbatim:` names string arguments that
+;;;           must be copied word for word from the input.
+;;; run       `run: COMMAND` runs a program with the arguments, and its output
+;;;           is what the agent is told. Prose, schema, and `verbatim:` as for
+;;;           collect.
+;;; mcp       `mcp: COMMAND` offers the tools of an MCP server (`only:` limits
+;;;           them to some names). The heading names the server; no schema.
+;;;
+;;; Every agent also has `done`, which ends it with a summary, and one with
+;;; collect tools has `retract`, which takes a report back. Sections that
+;;; are not tools are part of the instructions, as in a factory.
+
+(defstruct AgentToolSpec
+  [(name (slice u8))
+   ;;; "collect", "run", or "mcp".
+   (kind (slice u8))
+   (description (slice u8))
+   ;;; The JSON Schema of the arguments, as text; "" for an mcp server.
+   (schema (slice u8))
+   ;;; Arguments whose values must appear word for word in the input.
+   (verbatim (ArrayList (slice u8)))
+   ;;; The program a run tool runs, or that serves an mcp server's tools.
+   (command (slice u8))
+   ;;; The mcp server's tools to offer; empty for all of them.
+   (only (ArrayList (slice u8)))
+   (line i64)])
+
+(defstruct AgentSpec
+  [(name (slice u8))
+   (description (slice u8))
+   (input (slice u8))
+   (model (slice u8))
+   (harness (slice u8))
+   ;;; Standard tool groups (`files`, `read`, `shell`), comma-separated; ""
+   ;;; for none.
+   (tools (slice u8))
+   ;;; Runs when the agent calls `done`; "" for none.
+   (gate (slice u8))
+   ;;; How many times a failing gate goes back to the agent; 0 for the default.
+   (attempts i64)
+   (instructions (slice u8))
+   (agent-tools (ArrayList AgentToolSpec))
+   ;;; The file it was read from, for a process that reads it again.
+   (source (slice u8))])
+
+(defsum AgentSpecResult
+  (AgentSpecOk [(spec AgentSpec)])
+  (AgentSpecBad [(problems (ArrayList SpecProblem))]))
+
+;;; The tool every agent has, which ends it.
+(const DONE-TOOL "done")
+
+(defn known-agent-key? [(key (slice u8))] (-> bool)
+  (or (= key "name") (= key "description") (= key "input") (= key "model")
+      (= key "harness") (= key "tools") (= key "gate") (= key "attempts")))
+
+(defn known-tool-key? [(key (slice u8))] (-> bool)
+  (or (= key "run") (= key "mcp") (= key "verbatim") (= key "only")))
+
+(defn agent-attempts [(spec (ptr AgentSpec))] (-> i64)
+  (if (> (.attempts spec) 0) (.attempts spec) 3))
+
+(defn find-agent-tool [(spec (ptr AgentSpec)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (for tool (iter (.agent-tools spec))
+      (when (and (< (load found) 0) (= (.name tool) name)) (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+;;; The title after `prefix` (any case) when `title` starts with it, else None.
+(defn prefixed-title [(title (slice u8)) (prefix (slice u8))] (-> (Option (slice u8)))
+  (let [n (len prefix)]
+    (if (< (len title) n)
+        (None)
+        (let [(mut i) 0
+              (mut same) true]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do (when (!= (lower-ascii (cast i64 (get title (load i))))
+                                  (cast i64 (get prefix (load i))))
+                          (set! same false)
+                          0)
+                        (set! i (+ (load i) 1)))))
+          (if (load same)
+              (Some (str-trim (subslice [u8] title n (len title))))
+              (None))))))
+
+;;; Tool names are what models call: lowercase letters, digits, and
+;;; underscores, starting with a letter, at most 64 characters.
+(defn tool-name? [(name (slice u8))] (-> bool)
+  (let [n (len name)
+        (mut ok) (and (> n 0) (<= n 64))
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (not (load ok)))
+              (break)
+              (let [c (cast i64 (get name (load i)))]
+                (when (not (or (and (>= c 97) (<= c 122))
+                               (and (> (load i) 0) (>= c 48) (<= c 57))
+                               (and (> (load i) 0) (= c 95))))
+                  (set! ok false)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load ok)))
+
+;;; A comma-separated list, trimmed, without empty entries.
+(defn word-list [(a (dyn Allocator)) (text (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (for raw (iter (str-split a text ","))
+      (let [word (str-trim raw)]
+        (when (> (len word) 0) (push! (mut out) word) 0)))
+    (load out)))
+
+;;; The tool groups of `tools:` as canonical text, or a problem. `none` is no
+;;; groups.
+(defn agent-groups [(a (dyn Allocator)) (text (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [words (word-list a text)
+        (mut out) (sb-new a)
+        (mut problem) ""]
+    (if (and (= (len words) 1) (= (get words 0) "none"))
+        (Ok "")
+        (do (for word (iter words)
+              (when (= (len (load problem)) 0)
+                (cond (not (or (= word "files") (= word "read") (= word "shell")))
+                        (set! problem (cat a ["unknown tool group \"" word "\"; the groups are files, read, and shell (or none)"]))
+                      :else (do (when (> (len (sb-str (load out))) 0) (sb-push-str! (mut out) ", ") 0)
+                                (sb-push-str! (mut out) word)
+                                0))
+                0))
+            (if (> (len (load problem)) 0) (Err (load problem)) (Ok (sb-finish! (mut out))))))))
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+;; ---------------------------------------------------------------------------
+;; A tool section's fenced schema
+
+;;; A tool section's text split into its prose and its fenced `json` block.
+;;; `count` is how many json blocks there were; `line` is where the first one
+;;; opens; `unclosed` is set when one never closes.
+(defstruct Fenced
+  [(prose (slice u8))
+   (json (slice u8))
+   (count i64)
+   (line i64)
+   (unclosed bool)])
+
+;;; The fence marker a line opens with (three or more backticks or tildes)
+;;; and its info string, or None.
+(defstruct FenceOpen [(marker u8) (width i64) (info (slice u8))])
+
+(defn fence-at [(line (slice u8))] (-> (Option FenceOpen))
+  (let [s (str-trim line)]
+    (if (< (len s) 3)
+        (None)
+        (let [c (get s 0)]
+          (if (not (or (= (cast i64 c) 96) (= (cast i64 c) 126)))
+              (None)
+              (let [(mut n) 0]
+                (loop (if (or (>= (load n) (len s)) (!= (get s (load n)) c))
+                          (break)
+                          (set! n (+ (load n) 1))))
+                (if (< (load n) 3)
+                    (None)
+                    (Some (FenceOpen :marker c :width (load n) :info (str-trim (subslice [u8] s (load n) (len s))))))))))))
+
+(defn fence-closes? [(line (slice u8)) (open FenceOpen)] (-> bool)
+  (match (fence-at line)
+    (Some [found] (and (= (.marker found) (.marker open))
+                       (>= (.width found) (.width open))
+                       (= (len (.info found)) 0)))
+    (None [] false)))
+
+(defn split-fenced [(a (dyn Allocator)) (text (slice u8)) (first-line i64)] (-> Fenced)
+  (let [lines (str-split a text "\n")
+        (mut prose) (sb-new a)
+        (mut body) (sb-new a)
+        (mut open) (: (None) (Option FenceOpen))
+        (mut in-json) false
+        (mut count) 0
+        (mut at) -1
+        (mut i) 0]
+    (for line (iter lines)
+      (match (load open)
+        (None []
+              (match (fence-at line)
+                (Some [found]
+                      (do (set! open (Some found))
+                          (if (= (.info found) "json")
+                              (do (set! in-json true)
+                                  (set! count (+ (load count) 1))
+                                  (when (< (load at) 0) (set! at (+ first-line (load i))) 0)
+                                  0)
+                              (do (sb-push-str! (mut prose) line) (sb-push-str! (mut prose) "\n") 0))))
+                (None [] (do (sb-push-str! (mut prose) line) (sb-push-str! (mut prose) "\n") 0))))
+        (Some [current]
+              (if (fence-closes? line current)
+                  (do (when (not (load in-json)) (sb-push-str! (mut prose) line) (sb-push-str! (mut prose) "\n") 0)
+                      (set! open (None))
+                      (set! in-json false)
+                      0)
+                  (do (if (load in-json)
+                          (when (= (load count) 1) (sb-push-str! (mut body) line) (sb-push-str! (mut body) "\n") 0)
+                          (do (sb-push-str! (mut prose) line) (sb-push-str! (mut prose) "\n") 0))
+                      0))))
+      (set! i (+ (load i) 1)))
+    (Fenced :prose (str-trim (sb-finish! (mut prose)))
+            :json (str-trim (sb-finish! (mut body)))
+            :count (load count)
+            :line (load at)
+            :unclosed (match (load open) (Some [o] true) (None [] false)))))
+
+;;; Problems with a tool's schema text: it must be JSON, an object schema,
+;;; and use only what argument checking supports. "" when it is fine.
+(defn schema-problem [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (json/parse a text)
+    (Err [failure] "the schema is not valid JSON")
+    (Ok [doc]
+        (let [checked (schema/check-schema-at a doc 0 "$" 0)]
+          (if (not (.ok checked))
+              (cat a ["the schema cannot be used to check arguments: at " (.path checked) ", " (.message checked)])
+              (match (jv-parse a text)
+                (None [] "the schema is not valid JSON")
+                (Some [value]
+                      (if (= (jv-string-or (jv-get value "type") "") "object")
+                          ""
+                          "a tool's arguments are an object: the schema needs \"type\": \"object\""))))))))
+
+;;; `field` is a string property of the schema, as `verbatim:` requires.
+(defn string-property? [(a (dyn Allocator)) (schema-text (slice u8)) (field (slice u8))] (-> bool)
+  (match (jv-parse a schema-text)
+    (None [] false)
+    (Some [value] (= (jv-string-or (jv-get (jv-get (jv-get value "properties") field) "type") "") "string"))))
+
+;; ---------------------------------------------------------------------------
+;; Reading an agent file
+
+(defn parse-tool [(a (dyn Allocator))
+                  (problems (mut (ArrayList SpecProblem)))
+                  (name (slice u8))
+                  (section md/Section)] (-> (Option AgentToolSpec))
+  (match (md/section-attributes a (.body section) (.body-line section))
+    (Err [failure] (let [e failure] (problem! a (mut problems) (.line e) [(.message e)]) (None)))
+    (Ok [found]
+        (let [settings found
+              (mut tool) (primitive/zeroed AgentToolSpec)
+              (mut run) ""
+              (mut mcp) ""
+              (mut verbatim-line) 0
+              (mut only-line) 0]
+          (set! (.name tool) name)
+          (set! (.line tool) (.line section))
+          (set! (.verbatim tool) (al-new [(slice u8)] a))
+          (set! (.only tool) (al-new [(slice u8)] a))
+          (set! (.command tool) "")
+          (set! (.schema tool) "")
+          (for attribute (iter (.attrs settings))
+            (let [attr attribute
+                  key (.key attr)]
+              (cond (not (known-tool-key? key))
+                      (problem! a (mut problems) (.line attr)
+                                ["unknown tool setting \"" key "\"; the settings are run, mcp, verbatim, and only"])
+                    (= key "run") (do (set! run (.value attr)) 0)
+                    (= key "mcp") (do (set! mcp (.value attr)) 0)
+                    (= key "verbatim") (do (set! (.verbatim tool) (word-list a (.value attr))) (set! verbatim-line (.line attr)) 0)
+                    (= key "only") (do (set! (.only tool) (word-list a (.value attr))) (set! only-line (.line attr)) 0)
+                    :else 0)))
+          (let [fenced (split-fenced a (.rest settings) (.rest-line settings))]
+            (set! (.description tool) (.prose fenced))
+            (set! (.schema tool) (.json fenced))
+            (cond (and (> (len (load run)) 0) (> (len (load mcp)) 0))
+                    (problem! a (mut problems) (.line section) ["tool \"" name "\" has both run: and mcp:; it is one or the other"])
+                  (> (len (load mcp)) 0)
+                    (do (set! (.kind tool) "mcp")
+                        (set! (.command tool) (load mcp))
+                        (when (> (.count fenced) 0)
+                          (problem! a (mut problems) (.line fenced) ["the mcp server \"" name "\" describes its own tools, so it takes no schema"])
+                          0)
+                        (when (> (len (.verbatim tool)) 0)
+                          (problem! a (mut problems) (load verbatim-line) ["verbatim: is for collect and run tools; an mcp server's tools check their own arguments"])
+                          0)
+                        0)
+                  :else
+                    (do (set! (.kind tool) (if (> (len (load run)) 0) "run" "collect"))
+                        (set! (.command tool) (load run))
+                        (when (> (len (.only tool)) 0)
+                          (problem! a (mut problems) (load only-line) ["only: chooses among an mcp server's tools; tool \"" name "\" is not an mcp server"])
+                          0)
+                        (when (= (len (.description tool)) 0)
+                          (problem! a (mut problems) (.line section) ["tool \"" name "\" needs a description: the prose under its heading tells the model what it is for"])
+                          0)
+                        (cond (.unclosed fenced)
+                                (problem! a (mut problems) (.line section) ["tool \"" name "\" has a code fence that never closes"])
+                              (= (.count fenced) 0)
+                                (problem! a (mut problems) (.line section)
+                                          ["tool \"" name "\" needs the JSON Schema of its arguments in a ```json block"])
+                              (> (.count fenced) 1)
+                                (problem! a (mut problems) (.line fenced) ["tool \"" name "\" has more than one ```json block; it takes one schema"])
+                              :else
+                                (let [trouble (schema-problem a (.schema tool))]
+                                  (if (> (len trouble) 0)
+                                      (problem! a (mut problems) (.line fenced) ["tool \"" name "\": " trouble])
+                                      (do (for field (iter (.verbatim tool))
+                                            (when (not (string-property? a (.schema tool) field))
+                                              (problem! a (mut problems) (load verbatim-line)
+                                                        ["verbatim: names \"" field "\", which is not a string property of tool \"" name "\"'s schema"])
+                                              0))
+                                          0))))
+                        0)))
+          (Some (load tool))))))
+
+(defn parse-agent [(a (dyn Allocator)) (text (slice u8))] (-> AgentSpecResult)
+  (let [(mut problems) (al-new [SpecProblem] a)
+        (mut spec) (primitive/zeroed AgentSpec)]
+    (set! (.agent-tools spec) (al-new [AgentToolSpec] a))
+    (set! (.name spec) "")
+    (set! (.description spec) "")
+    (set! (.input spec) "")
+    (set! (.model spec) "")
+    (set! (.harness spec) "")
+    (set! (.tools spec) "")
+    (set! (.gate spec) "")
+    (set! (.instructions spec) "")
+    (set! (.source spec) text)
+    (match (md/parse-document a text)
+      (Err [failure]
+           (let [e failure]
+             (problem! a (mut problems) (.line e) [(.message e)])))
+      (Ok [parsed]
+          (let [doc parsed]
+            (when (not (md/doc-has-front-matter? doc))
+              (problem! a (mut problems) 1 ["an agent starts with front matter: a line `---`, then `name: my-agent`, then `---`"])
+              0)
+            (for front (iter (md/front-entries doc))
+              (let [entry front
+                    key (.key entry)]
+                (cond (not (known-agent-key? key))
+                        (problem! a (mut problems) (.line entry)
+                                  ["unknown front-matter key \"" key "\"; the keys are name, description, input, model, harness, tools, gate, attempts"])
+                      (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
+                      (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
+                      (= key "input") (do (set! (.input spec) (.scalar entry)) 0)
+                      (= key "model") (do (set! (.model spec) (.scalar entry)) 0)
+                      (= key "harness")
+                        (let [trouble (harness-problem a (.scalar entry))]
+                          (set! (.harness spec) (.scalar entry))
+                          (when (> (len trouble) 0) (problem! a (mut problems) (.line entry) [trouble]) 0)
+                          0)
+                      (= key "tools")
+                        (match (agent-groups a (front-tools a entry))
+                          (Ok [groups] (do (set! (.tools spec) groups) 0))
+                          (Err [trouble] (problem! a (mut problems) (.line entry) [trouble])))
+                      (= key "gate") (do (set! (.gate spec) (.scalar entry)) 0)
+                      (= key "attempts")
+                        (do (set! (.attempts spec) (parse-attempts a (mut problems) (.scalar entry) (.line entry))) 0)
+                      :else 0)))
+            (when (and (md/doc-has-front-matter? doc) (= (len (.name spec)) 0))
+              (problem! a (mut problems) 1 ["the front matter needs a name, for example `name: grammar`"])
+              0)
+            (when (and (> (len (.name spec)) 0) (not (kebab-name? (.name spec))))
+              (problem! a (mut problems) 1 ["the name \"" (.name spec) "\" must be lowercase letters, digits, and dashes"])
+              0)
+            (let [(mut first-tool-line) -1
+                  (mut extra) (sb-new a)]
+              (for section (iter (md/doc-sections doc))
+                (let [s section]
+                  (match (prefixed-title (.title s) "tool:")
+                    (Some [name]
+                          (if (!= (.level s) 2)
+                              (problem! a (mut problems) (.line s) ["a tool heading must be level 2: `## Tool: " name "`"])
+                              (do (when (< (load first-tool-line) 0) (set! first-tool-line (.line s)) 0)
+                                  (match (parse-tool a (mut problems) name s)
+                                    (None [] 0)
+                                    (Some [tool]
+                                          (do (cond (and (not (= (.kind tool) "mcp")) (not (tool-name? name)))
+                                                      (problem! a (mut problems) (.line s)
+                                                                ["tool name \"" name "\" must be lowercase letters, digits, and underscores, starting with a letter"])
+                                                    (and (= (.kind tool) "mcp") (not (kebab-name? name)))
+                                                      (problem! a (mut problems) (.line s)
+                                                                ["mcp server name \"" name "\" must be lowercase letters, digits, and dashes"])
+                                                    (or (= name DONE-TOOL) (= name "finish"))
+                                                      (problem! a (mut problems) (.line s)
+                                                                ["\"" name "\" is the tool every agent already has for ending; name this tool something else"])
+                                                    (= name "retract")
+                                                      (problem! a (mut problems) (.line s)
+                                                                ["\"retract\" is the tool every agent with collect tools already has for taking a report back; name this tool something else"])
+                                                    (>= (find-agent-tool (mut spec) name) 0)
+                                                      (problem! a (mut problems) (.line s) ["there is already a tool named \"" name "\""])
+                                                    :else 0)
+                                              (push! (mut (.agent-tools spec)) tool)
+                                              0))))))
+                    (None []
+                          ;; Sections after the first tool that are not tools
+                          ;; are instructions too.
+                          (when (and (>= (load first-tool-line) 0) (= (.level s) 2))
+                            (sb-push-str! (mut extra) "\n\n## ")
+                            (sb-push-str! (mut extra) (.title s))
+                            (sb-push-str! (mut extra) "\n\n")
+                            (sb-push-str! (mut extra) (str-trim (.body s)))
+                            0)))))
+              (let [before (if (>= (load first-tool-line) 0)
+                               (text-before-line (md/doc-body doc) (md/doc-body-line doc) (load first-tool-line))
+                               (md/doc-body doc))
+                    (mut instructions) (sb-new a)]
+                (sb-push-str! (mut instructions) (str-trim before))
+                (sb-push-str! (mut instructions) (sb-str (load extra)))
+                (set! (.instructions spec) (str-trim (sb-finish! (mut instructions))))
+                (when (and (md/doc-has-front-matter? doc) (= (len (.instructions spec)) 0))
+                  (problem! a (mut problems) (md/doc-body-line doc) ["an agent needs instructions: the text after the front matter tells it what to do"])
+                  0)
+                0)))))
+    (if (> (len problems) 0)
+        (AgentSpecBad (load problems))
+        (AgentSpecOk (load spec)))))

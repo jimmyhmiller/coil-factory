@@ -1,6 +1,7 @@
 (module codex.harness)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
+(import "coil.fs" :as fs)
 (import "coil.primitive" :as primitive)
 (import "coil.scratch" :as scratch)
 (import "coil.serde.value" :use *)
@@ -14,7 +15,8 @@
 (import "agent.loop" :use *)
 (import "agent.tool" :use *)
 (import "agent_tools.stream" :as stream)
-(export CodexOptions CodexHarness codex-new codex-argv toml-string toml-array apply-event! Turn turn-new)
+(export CodexOptions CodexHarness codex-new codex-argv toml-string toml-array apply-event! Turn turn-new
+        LoggedUsage logged-usage find-session-log)
 
 ;;; The Codex CLI (`codex exec`) driven headlessly as a `Harness`. Each run of
 ;;; the harness is one `codex exec --json` process working in the workspace;
@@ -26,7 +28,9 @@
 ;;; CODEX_HOME, which is left alone: Codex rewrites its credentials when it
 ;;; refreshes them, so a private copy would drift from the operator's. Every
 ;;; setting comes from `-c` overrides with `--ignore-user-config`, so the
-;;; operator's config.toml (model, MCP servers, notifications) is never used.
+;;; operator's config.toml (model, MCP servers, notifications) is never used,
+;;; and Codex's own extras that are on without it are turned off
+;;; (`CLOSED-SETTINGS`).
 ;;;
 ;;; The system text is Codex's `developer_instructions`. The stop tool is a
 ;;; tool on an MCP server the caller names (`stop-server`, `stop-tool`), which
@@ -40,11 +44,22 @@
 ;;; `default_tools_approval_mode = "approve"`; `exec resume` takes neither
 ;;; `-C` nor `-s`, so the directory is the process's and the sandbox is the
 ;;; `sandbox_mode` setting; the prompt goes on stdin as `-`.
+;;;
+;;; Codex reports a turn's token usage only when the turn ends
+;;; (`turn.completed`). A run stopped before that (after the stop tool, a
+;;; pause, a cancel) takes its usage from Codex's session log instead
+;;; (`HOME/sessions/…/rollout-…-THREAD.jsonl`), where every model request's
+;;; usage is written as it completes (verified against codex-cli 0.162.1).
+;;; When even that is not to be had, the run says so with `UsageUnknown`
+;;; rather than counting nothing.
 
 (defstruct CodexOptions
   [;;; The codex executable.
    (program (slice u8))
    (workdir (slice u8))
+   ;;; Codex's home (CODEX_HOME), where it keeps each thread's session log;
+   ;;; "" when not known, and then a run stopped early has unknown usage.
+   (home (slice u8))
    ;;; The model, as Codex names it, such as `gpt-6.1-sol`.
    (model (slice u8))
    ;;; Codex's sandbox for the agent's commands: `workspace-write` or `read-only`.
@@ -150,6 +165,36 @@
     (sb-push-str! (mut out) "]")
     (sb-finish! (mut out))))
 
+;;; Codex's own extras, turned off: an agent gets Codex's shell and patch tool
+;;; and the tools of the MCP server it is given, nothing else.
+;;; `--ignore-user-config` does not do this, because these are on by default:
+;;; the ChatGPT apps of the operator's account (some write to it), plugins,
+;;; the list of the operator's skills (several thousand tokens on every
+;;; request), browser and computer use, image generation, goals, memories,
+;;; tool suggestions, web search, and the first multi-agent tools, with the
+;;; instructions about them.
+;;;
+;;; Two things are left on. Code mode, because some models are served only
+;;; through it (with its host off, Codex refuses every call and never ends the
+;;; turn). And the multi-agent v2 instructions and tools, because the model
+;;; catalog turns them on per model and no setting reaches them (verified
+;;; against codex-cli 0.162.1).
+(const CLOSED-SETTINGS ["features.apps=false"
+                        "features.plugins=false"
+                        "features.browser_use=false"
+                        "features.computer_use=false"
+                        "features.image_generation=false"
+                        "features.goals=false"
+                        "features.memories=false"
+                        "features.tool_suggest=false"
+                        "features.skill_search=false"
+                        "features.multi_agent=false"
+                        "web_search=\"disabled\""
+                        "skills.include_instructions=false"
+                        "skills.bundled.enabled=false"
+                        "include_apps_instructions=false"
+                        "include_collaboration_mode_instructions=false"])
+
 (defn has-stop-tool? [(h (ptr CodexHarness))] (-> bool)
   (> (len (.stop-command (field h options))) 0))
 
@@ -178,6 +223,9 @@
     (setting! a (mut argv) "sandbox_mode" (toml-string a (.sandbox options)))
     (setting! a (mut argv) "approval_policy" (toml-string a "never"))
     (setting! a (mut argv) "developer_instructions" (toml-string a (.system h)))
+    (for closed (iter CLOSED-SETTINGS)
+      (push! (mut argv) "-c")
+      (push! (mut argv) closed))
     (when (has-stop-tool? h)
       (let [command (.stop-command options)
             server (join a ["mcp_servers." (.stop-server options)])]
@@ -212,6 +260,9 @@
    (interrupted bool)
    (cancelled bool)
    (idle bool)
+   ;;; Codex started the turn, and later reported its usage.
+   (started bool)
+   (usage-seen bool)
    ;;; Ids of items Codex reported started and has not completed.
    (open (ArrayList (slice u8)))
    (last-event-ms i64)
@@ -220,6 +271,7 @@
 (defn turn-new [(a (dyn Allocator)) (h (ptr CodexHarness)) (arena (ptr scratch/ScratchArena))] (-> Turn)
   (Turn :harness h :allocator a :arena arena :finish (None) :finish-output "" :last-text "" :error ""
         :noise "" :interrupt false :interrupted false :cancelled false :idle false
+        :started false :usage-seen false
         :open (al-new [(slice u8)] (.allocator h))
         :last-event-ms (now-ms) :last-inbox-ms 0))
 
@@ -337,7 +389,7 @@
     (cond (= kind "command_execution") (join a ["$ " (shown-command (jv-string-or (jv-get item "command") ""))])
           (= kind "file_change") (join a ["edit " (file-change-paths a h item)])
           (and (= kind "mcp_tool_call") (stop-call? h item))
-            (join a [(.stop-tool-as (field h options)) ": " (jv-string-or (jv-get (jv-get item "arguments") "outcome") "")])
+            (join a [(.stop-tool-as (field h options)) ": " (jv-string-or (jv-get (jv-get item "arguments") "outcome") (jv-string-or (jv-get (jv-get item "arguments") "summary") ""))])
           (= kind "mcp_tool_call") (join a [(jv-string-or (jv-get item "server") "") "." (jv-string-or (jv-get item "tool") "")])
           (= kind "web_search") (join a ["search " (jv-string-or (jv-get item "query") "")])
           :else kind)))
@@ -371,10 +423,19 @@
     (al-pop! (mut (.open turn)))
     0))
 
-;;; Whether the process should stop before new work starts: the stop tool has
-;;; been called (the agent should not go on working), or an interrupt is due.
-(defn stop-here? [(turn (ptr Turn))] (-> bool)
-  (cond (match (.finish turn) (Some [_] true) (None [] false)) true
+;;; Items that are not work: what the agent thinks and says.
+(defn quiet-item? [(kind (slice u8))] (-> bool)
+  (or (= kind "agent_message") (= kind "reasoning")))
+
+;;; Whether the process should stop before an item of `kind` starts: the stop
+;;; tool has been called and this is new work (the agent should not go on
+;;; working), or an interrupt is due.
+(defn stop-here? [(turn (ptr Turn)) (kind (slice u8))] (-> bool)
+  (cond (and (match (.finish turn) (Some [_] true) (None [] false)) (not (quiet-item? kind)))
+          (let [h (.harness turn)]
+            (observe (.observer h) (Thought (join (.allocator turn) ["[codex] the agent started new work (" kind
+                                                                      ") after the stop tool, so Codex was stopped"])))
+            true)
         (.interrupt turn) (do (set! (.interrupted turn) true) true)
         :else false))
 
@@ -407,10 +468,11 @@
                       true)
                 (= kind "turn.started")
                   (do (set! (.turns h) (+ (.turns h) 1))
+                      (set! (.started turn) true)
                       (observe (.observer h) (TurnStarted (.turns h)))
                       true)
                 (= kind "item.started")
-                  (if (stop-here? turn)
+                  (if (stop-here? turn item-kind)
                       false
                       (do (match (item-call scratch h item)
                             (None [] 0)
@@ -461,6 +523,7 @@
                       (not (interrupt-here? turn)))
                 (= kind "turn.completed")
                   (let [usage (jv-get event "usage")]
+                    (set! (.usage-seen turn) true)
                     (observe (.observer h) (UsageReported (jv-int (jv-get usage "input_tokens"))
                                                           (jv-int (jv-get usage "output_tokens"))))
                     true)
@@ -503,6 +566,101 @@
                         (set! (.idle self) true)
                         (return-from :tick false)))
                     true))))
+
+;; ---------------------------------------------------------------------------
+;; Token usage from Codex's session log
+
+(defn suffix? [(text (slice u8)) (end (slice u8))] (-> bool)
+  (and (>= (len text) (len end))
+       (= (subslice text (- (len text) (len end)) (len text)) end)))
+
+;;; The names in `dir`; none when it cannot be read.
+(defn names-in [(a (dyn Allocator)) (dir (slice u8))] (-> (slice (slice u8)))
+  (match (fs/dir-list a dir)
+    (Ok [names] (let [(mut found) names] (al-slice found)))
+    (Err [_] (let [(mut none) (al-new [(slice u8)] a)] (al-slice none)))))
+
+;;; Codex's session log for `thread`: `HOME/sessions/YYYY/MM/DD/rollout-…-THREAD.jsonl`.
+(defn find-session-log [(a (dyn Allocator)) (home (slice u8)) (thread (slice u8))] (-> (Option (slice u8)))
+  (let [sessions (join a [home "/sessions"])
+        wanted (join a ["-" thread ".jsonl"])]
+    (block :found
+           (for year (iter (names-in a sessions))
+             (let [y (join a [sessions "/" year])]
+               (for month (iter (names-in a y))
+                 (let [m (join a [y "/" month])]
+                   (for day (iter (names-in a m))
+                     (let [d (join a [m "/" day])]
+                       (for name (iter (names-in a d))
+                         (when (and (starts-with name "rollout-") (suffix? name wanted))
+                           (return-from :found (Some (join a [d "/" name])))))))))))
+           (None))))
+
+;;; What a session log says the last turn in it used. `in-flight` is set when
+;;; a tool's output was the last thing logged: Codex had sent the model
+;;; another request, whose usage was never logged.
+(defstruct LoggedUsage [(found bool) (input i64) (output i64) (in-flight bool)])
+
+(defn logged-usage [(a (dyn Allocator)) (log (slice u8))] (-> LoggedUsage)
+  (let [(mut out) (LoggedUsage :found false :input 0 :output 0 :in-flight false)
+        (mut turn) ""]
+    (for line (iter (str-split a log "\n"))
+      (match (jv-parse a line)
+        (None [] 0)
+        (Some [record]
+              (let [kind (jv-string-or (jv-get record "type") "")
+                    payload (jv-get record "payload")
+                    payload-kind (jv-string-or (jv-get payload "type") "")]
+                (cond (and (= kind "event_msg") (= payload-kind "task_started"))
+                        (do (set! turn (jv-string-or (jv-get payload "turn_id") ""))
+                            (set! out (LoggedUsage :found false :input 0 :output 0 :in-flight false))
+                            0)
+                      (and (= kind "token_usage_record") (= (jv-string-or (jv-get payload "turn_id") "") (load turn)))
+                        (let [usage (jv-get payload "turn_token_usage")]
+                          (set! out (LoggedUsage :found true
+                                                 :input (jv-int (jv-get usage "input_tokens"))
+                                                 :output (jv-int (jv-get usage "output_tokens"))
+                                                 :in-flight false))
+                          0)
+                      (and (= kind "response_item") (suffix? payload-kind "_output"))
+                        (do (set! (.in-flight out) true) 0)
+                      :else 0)))))
+    (load out)))
+
+;;; Report the usage of a run that ended before Codex reported it.
+(defn recover-usage! [(h (ptr CodexHarness))] (-> i64)
+  (let [arena (box! (.allocator h) scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))
+        _ (scratch/scratch-init arena (.allocator h))
+        a (scratch/scratch-allocator arena)
+        home (.home (field h options))
+        stopped "Codex was stopped before it reported the run's token usage"]
+    (cond (= (len home) 0)
+            (observe (.observer h) (UsageUnknown (join a [stopped ", and no Codex home was given to read its session log from"])))
+          (= (len (.session h)) 0)
+            (observe (.observer h) (UsageUnknown (join a [stopped ", and it started no thread"])))
+          :else
+            (match (find-session-log a home (.session h))
+              (None [] (observe (.observer h) (UsageUnknown (join a [stopped ", and no session log for thread " (.session h)
+                                                                     " is under " home "/sessions"]))))
+              (Some [path]
+                    (match (atomic/read-file-if-exists a path)
+                      (Ok [read]
+                          (match read
+                            (Some [text]
+                                  (let [logged (logged-usage a text)]
+                                    (if (not (.found logged))
+                                        (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path
+                                                                                      " records none for the run's turn"])))
+                                        (do (observe (.observer h) (UsageReported (.input logged) (.output logged)))
+                                            (when (.in-flight logged)
+                                              (observe (.observer h)
+                                                       (UsageUnknown "Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))
+                                              0)
+                                            0))))
+                            (None [] (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path " is gone"]))))))
+                      (Err [_] (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path " cannot be read"]))))))))
+    (scratch/scratch-close! arena)
+    0))
 
 ;; ---------------------------------------------------------------------------
 ;; The harness
@@ -591,6 +749,9 @@
                                                 turn)]
                  (al-free! (mut argv))
                  (scratch/scratch-close! arena)
+                 (when (and (.started turn) (not (.usage-seen turn)))
+                   (recover-usage! h)
+                   0)
                  (match ended
                    (Err [message] (return-from :run (harness-failure a message)))
                    (Ok [end]

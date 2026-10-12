@@ -1,0 +1,139 @@
+(module factory.agentspec-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "factory.agentspec" :use *)
+(import "factory.agentlib" :use [bundled-agents])
+(import "factory.specparse" :use [problems-text])
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+(defn parsed-or-fail [(a (dyn Allocator)) (text (slice u8))] (-> AgentSpec)
+  (match (parse-agent a text)
+    (AgentSpecOk [spec] spec)
+    (AgentSpecBad [problems]
+                  (do (println "unexpected problems:\n{s}" (problems-text a problems))
+                      (assert false)
+                      (parsed-or-fail a text)))))
+
+(defn problems-of [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (parse-agent a text)
+    (AgentSpecOk [spec] "")
+    (AgentSpecBad [problems] (problems-text a problems))))
+
+(defn tool-at [(spec (ptr AgentSpec)) (i i64)] (-> (ptr AgentToolSpec))
+  (al-elem [AgentToolSpec] (field spec agent-tools) i))
+
+(const SCHEMA "```json\n{\"type\": \"object\", \"properties\": {\"original\": {\"type\": \"string\"}, \"count\": {\"type\": \"integer\"}}, \"required\": [\"original\"]}\n```\n")
+
+(defn with-tool [(a (dyn Allocator)) (front (slice u8)) (tool (slice u8))] (-> (slice u8))
+  (cat a ["---\nname: probe\n" front "---\n\nFind things.\n\n" tool]))
+
+(deftest the-bundled-grammar-agent-parses
+  (let [a (malloc-allocator)]
+    (for b (iter (bundled-agents))
+      (let [(mut spec) (parsed-or-fail a (.text b))]
+        (assert (= (.name spec) (.name b)))))
+    (let [(mut spec) (parsed-or-fail a (.text (get (bundled-agents) 0)))
+          tool (tool-at (mut spec) 0)]
+      (assert-eq (len (.agent-tools spec)) 1)
+      (assert (= (.tools spec) ""))
+      (assert (= (.name tool) "report_issue"))
+      (assert (= (.kind tool) "collect"))
+      (assert (= (get (.verbatim tool) 0) "original"))
+      (assert (contains? (.description tool) "Report one grammar"))
+      (assert (not (contains? (.description tool) "```")))
+      (assert (contains? (.schema tool) "\"suggestion\""))
+      (assert (contains? (.instructions spec) "careful copy editor"))
+      (assert (not (contains? (.instructions spec) "Tool:"))))))
+
+(deftest reads-every-tool-kind-and-keeps-other-sections-as-instructions
+  (let [a (malloc-allocator)
+        text (cat a ["---\nname: probe\ntools: read, shell\nattempts: 2\n---\n\nFind things.\n\n"
+                     "## Tool: note\nverbatim: original\n\nNote one thing.\n\n" SCHEMA "\n"
+                     "## Style\n\nBe brief.\n\n"
+                     "## Tool: lookup\nrun: ./scripts/lookup.sh --fast\n\nLook a word up.\n\n```sh\nexample only\n```\n\n" SCHEMA "\n"
+                     "## Tool: dictionary\nmcp: dict-server --stdio\nonly: define, spell\n"])
+        (mut spec) (parsed-or-fail a text)]
+    (assert (= (.tools spec) "read, shell"))
+    (assert-eq (.attempts spec) 2)
+    (assert-eq (len (.agent-tools spec)) 3)
+    (assert (= (.kind (tool-at (mut spec) 0)) "collect"))
+    (assert (= (.kind (tool-at (mut spec) 1)) "run"))
+    (assert (= (.command (tool-at (mut spec) 1)) "./scripts/lookup.sh --fast"))
+    ;; A fence that is not json stays in the description.
+    (assert (contains? (.description (tool-at (mut spec) 1)) "example only"))
+    (assert (= (.kind (tool-at (mut spec) 2)) "mcp"))
+    (assert (= (.command (tool-at (mut spec) 2)) "dict-server --stdio"))
+    (assert-eq (len (.only (tool-at (mut spec) 2))) 2)
+    (assert (contains? (.instructions spec) "Find things."))
+    (assert (contains? (.instructions spec) "## Style\n\nBe brief."))
+    (assert (not (contains? (.instructions spec) "Look a word up")))))
+
+(deftest tools-none-is-no-groups
+  (let [a (malloc-allocator)
+        (mut spec) (parsed-or-fail a (with-tool a "tools: none\n" (cat a ["## Tool: note\n\nNote it.\n\n" SCHEMA])))]
+    (assert (= (.tools spec) ""))))
+
+(deftest refuses-what-it-cannot-use-with-line-numbers
+  (let [a (malloc-allocator)]
+    (assert (contains? (problems-of a (with-tool a "colour: red\n" "")) "line 3: unknown front-matter key \"colour\""))
+    (assert (contains? (problems-of a (with-tool a "tools: files, net\n" "")) "unknown tool group \"net\""))
+    (assert (contains? (problems-of a (with-tool a "harness: claude\n" "")) "unknown harness \"claude\""))
+    (assert (contains? (problems-of a "---\nname: Bad Name\n---\n\nHi.\n") "must be lowercase letters, digits, and dashes"))
+    (assert (contains? (problems-of a "---\nname: empty\n---\n") "an agent needs instructions"))
+    (assert (contains? (problems-of a "Just text.\n") "an agent starts with front matter"))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: note\n\nNote it.\n"))
+                       "tool \"note\" needs the JSON Schema of its arguments in a ```json block"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\n\n" SCHEMA])))
+                       "tool \"note\" needs a description"))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: note\n\nNote it.\n\n```json\n{\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"string\", \"minLength\": 2}}}\n```\n"))
+                       "the schema cannot be used to check arguments"))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: note\n\nNote it.\n\n```json\n{\"type\": \"string\"}\n```\n"))
+                       "the schema needs \"type\": \"object\""))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: note\n\nNote it.\n\n```json\n{not json\n```\n"))
+                       "the schema is not valid JSON"))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: note\n\nNote it.\n\n```json\n{\"type\": \"object\"}\n"))
+                       "has a code fence that never closes"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\n\nNote it.\n\n" SCHEMA SCHEMA])))
+                       "more than one ```json block"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\nverbatim: count\n\nNote it.\n\n" SCHEMA])))
+                       "line 8: verbatim: names \"count\", which is not a string property"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\nverbatim: missing\n\nNote it.\n\n" SCHEMA])))
+                       "verbatim: names \"missing\""))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\ncolour: red\n\nNote it.\n\n" SCHEMA])))
+                       "unknown tool setting \"colour\""))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: done\n\nNote it.\n\n" SCHEMA])))
+                       "\"done\" is the tool every agent already has"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: retract\n\nNote it.\n\n" SCHEMA])))
+                       "\"retract\" is the tool every agent with collect tools already has"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: Note-It\n\nNote it.\n\n" SCHEMA])))
+                       "tool name \"Note-It\" must be lowercase letters, digits, and underscores"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\n\nNote it.\n\n" SCHEMA "\n## Tool: note\n\nAgain.\n\n" SCHEMA])))
+                       "there is already a tool named \"note\""))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["### Tool: note\n\nNote it.\n\n" SCHEMA])))
+                       "a tool heading must be level 2"))
+    (assert (contains? (problems-of a (with-tool a "" "## Tool: both\nrun: a\nmcp: b\n\nBoth.\n"))
+                       "has both run: and mcp:"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: server\nmcp: dict\n\n" SCHEMA])))
+                       "describes its own tools, so it takes no schema"))
+    (assert (contains? (problems-of a (with-tool a "" (cat a ["## Tool: note\nonly: a\n\nNote it.\n\n" SCHEMA])))
+                       "only: chooses among an mcp server's tools"))))
+
+(const GUIDE (include-str "../docs/agent-guide.md"))
+
+(deftest the-guide-s-complete-example-is-a-valid-agent
+  (let [a (malloc-allocator)
+        open "````markdown\n"
+        start (match (str-find GUIDE open) (Some [at] (+ at (len open))) (None [] (do (assert false) 0)))
+        rest (subslice GUIDE start (len GUIDE))
+        end (match (str-find rest "\n````") (Some [at] at) (None [] (do (assert false) 0)))
+        (mut spec) (parsed-or-fail a (subslice rest 0 (+ end 1)))]
+    (assert (= (.name spec) "grammar"))
+    (assert-eq (len (.agent-tools spec)) 3)
+    (assert (= (.kind (tool-at (mut spec) 0)) "collect"))
+    (assert (= (.kind (tool-at (mut spec) 1)) "run"))
+    (assert (= (.kind (tool-at (mut spec) 2)) "mcp"))
+    (assert (contains? (.gate spec) "grep -q"))))

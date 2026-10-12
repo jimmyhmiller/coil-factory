@@ -47,6 +47,7 @@
                  (ModelRetrying [attempt error delay] "retry")
                  (PausedEvent [] "paused")
                  (ResumedEvent [] "resumed")
+                 (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
                  (Compacted [n bytes] "compacted"))]
       (push! (mut (.seen self)) line)
       0)))

@@ -47,6 +47,7 @@
                  (ModelRetrying [attempt error delay] "retry")
                  (PausedEvent [] "paused")
                  (ResumedEvent [] "resumed")
+                 (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
                  (Compacted [n bytes] "compacted"))]
       (push! (mut (.seen self)) line)
       0)))
@@ -182,6 +183,7 @@ pwd > \"$dir/pwd.$n\"
                         (codex-new a
                                    (CodexOptions :program program
                                                  :workdir dir
+                                                 :home (cat a [dir "/home"])
                                                  :model "gpt-6.1-sol"
                                                  :sandbox "workspace-write"
                                                  :stop-server "factory"
@@ -193,6 +195,21 @@ pwd > \"$dir/pwd.$n\"
                                                  :idle-timeout-ms 0)
                                    recorder control))]
       (Fixture :dir dir :harness harness :recorder recorder :control control))))
+
+;;; Codex's session log for thread th-1 in the fixture's Codex home: an
+;;; earlier turn, then the run's turn with its usage so far, then `after`.
+(defn session-log! [(a (dyn Allocator)) (f Fixture) (after (slice u8))] (-> i64)
+  (let [day (cat a [(.dir f) "/home/sessions/2026/10/12"])]
+    (run-status a "/bin/mkdir" ["-p" day])
+    (write! a (cat a [day "/rollout-2026-10-12T09-00-00-th-1.jsonl"])
+            (cat a ["{\"type\":\"session_meta\",\"payload\":{\"id\":\"th-1\"}}\n"
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t0\"}}\n"
+                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t0\",\"turn_token_usage\":{\"input_tokens\":999,\"output_tokens\":9}}}\n"
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n"
+                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":30,\"output_tokens\":4}}}\n"
+                    "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"c1\"}}\n"
+                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":40,\"output_tokens\":5}}}\n"
+                    after]))))
 
 (defn script [(a (dyn Allocator))] (-> (ptr Script))
   (box! a Script (Script :cancel-at-ms 0 :message-on 0 :inbox-calls 0)))
@@ -246,6 +263,10 @@ pwd > \"$dir/pwd.$n\"
       (assert (contains? argv "-c\nmcp_servers.factory.args=[\"_mcp-finish\",\"--gate\"]\n"))
       (assert (contains? argv "-c\nmcp_servers.factory.default_tools_approval_mode=\"approve\"\n"))
       (assert (contains? argv "-c\nsandbox_workspace_write.network_access=false\n"))
+      ;; Codex's own extras are off: the operator's ChatGPT apps, skills, web search.
+      (assert (contains? argv "-c\nfeatures.apps=false\n"))
+      (assert (contains? argv "-c\nskills.include_instructions=false\n"))
+      (assert (contains? argv "-c\nweb_search=\"disabled\"\n"))
       (assert (not (contains? argv "resume")))
       (assert (= (read a (cat a [(.dir f) "/stdin.1"])) "Begin.")))
     (assert (= (.session h) "th-1"))))
@@ -261,9 +282,69 @@ pwd > \"$dir/pwd.$n\"
         started (sys/monotonic-ms)]
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
+    (session-log! a f "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c9\"}}\n")
     (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
     (assert (< (- (sys/monotonic-ms) started) 8000))
-    (assert (not (saw? (.recorder f) "tool $ rm -rf x")))))
+    (assert (not (saw? (.recorder f) "tool $ rm -rf x")))
+    (assert (saw? (.recorder f) "thought [codex] the agent started new work (command_execution) after the stop tool, so Codex was stopped"))
+    ;; Stopped before `turn.completed`: the turn's usage comes from Codex's
+    ;; session log, and it is all there (the request that started the new
+    ;; work was logged before the work began).
+    (assert (saw? (.recorder f) "usage 40/5"))
+    (assert (not (saw? (.recorder f) "usage 999/9")))
+    (for line (iter (.seen (.recorder f))) (assert (not (starts-with line "usage unknown"))))))
+
+(deftest after-the-stop-tool-a-closing-message-or-thought-does-not-stop-the-process
+  (let [a (malloc-allocator)
+        f (fixture a "quiet-after-finish"
+                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
+                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"r1\",\"type\":\"reasoning\",\"text\":\"\"}")
+                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"m2\",\"type\":\"agent_message\",\"text\":\"\"}")
+                            (message-event a "all done") (turn-completed a)])]
+                   (script a))
+        h (.harness f)]
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
+    (assert (saw? (.recorder f) "said all done"))
+    (assert (saw? (.recorder f) "usage 150/25"))))
+
+(deftest a-request-cut-off-by-the-stop-makes-the-usage-incomplete
+  (let [a (malloc-allocator)
+        f (fixture a "cut-off"
+                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
+                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                            "sleep 20\n"])]
+                   (script a))
+        h (.harness f)]
+    ;; The last thing logged is a tool's output: Codex had asked the model again.
+    (session-log! a f "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c8\"}}\n")
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
+    (assert (saw? (.recorder f) "usage 40/5"))
+    (assert (saw? (.recorder f) "usage unknown: Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))))
+
+(deftest with-no-session-log-a-stopped-run-s-usage-is-unknown-not-zero
+  (let [a (malloc-allocator)
+        f (fixture a "no-log"
+                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
+                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                            "sleep 20\n"])]
+                   (script a))
+        h (.harness f)]
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
+    (let [(mut said) false]
+      (for line (iter (.seen (.recorder f)))
+        ;; No count is made up: the only usage line says it is unknown.
+        (assert (or (not (starts-with line "usage ")) (starts-with line "usage unknown")))
+        (when (and (starts-with line "usage unknown: Codex was stopped before it reported the run's token usage, and no session log for thread th-1 is under ")
+                   (contains? line "/home/sessions"))
+          (set! said true)
+          0))
+      (assert (load said)))))
 
 (deftest continues-the-thread-and-replies
   (let [a (malloc-allocator)

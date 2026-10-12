@@ -30,11 +30,13 @@ leave a station without one is refused when it starts, saying where to set it.
 A station's agent runs in a *harness*. `builtin` is the factory's own agent loop,
 calling the model's API directly. `opencode` drives the [OpenCode](https://opencode.ai)
 CLI headlessly, which reaches models that only answer requests from OpenCode
-itself, such as OpenCode Zen's free ones (no key needed):
+itself, such as OpenCode Zen's free ones (no key needed). Free models come and go
+within weeks, so check what is offered now with `opencode models opencode --verbose`
+(free ones cost 0) rather than relying on a name:
 
 ```sh
-factory start haiku "a lighthouse in fog" --harness opencode --model opencode/big-pickle
-factory start fix --project . --harness opencode --model opencode/hy3-free "…"
+factory start haiku "a lighthouse in fog" --harness opencode --model opencode/<free-model>
+factory start fix --project . --harness opencode --model opencode/<free-model> "…"
 ```
 
 `codex` drives the Codex CLI headlessly, which reaches the models of your Codex
@@ -79,7 +81,7 @@ factory                                      # the dashboard: every run, every a
 ```
 
 Any model works; with no key at all, `--harness opencode --model
-opencode/big-pickle` uses OpenCode's free one. Put your usual choice in
+opencode/<free-model>` uses one of OpenCode's free models. Put your usual choice in
 `~/.factory/site.json` (`{"default_model": "…"}`) to stop passing `--model`.
 
 ```
@@ -148,6 +150,82 @@ Make the failing test pass by fixing the cause…
 
 Bundled: `feature`, `fix`, `build-coil-program`, `haiku` (`factory factories`).
 
+## Standalone agents
+
+A standalone agent is one conversation, with no branch and no stations: you give
+it an input, and its output is the calls it makes to tools its own file defines.
+Put agents in any project's `.factory/agents/NAME.md`, or in
+`~/.factory/agents/` for every project.
+
+````markdown
+---
+name: grammar
+description: Find grammar, spelling, and punctuation problems in a text.
+input: The text to check.
+tools: none
+---
+
+Report each problem with `report_issue`, then call `done`.
+
+## Tool: report_issue
+verbatim: original
+
+Report one problem in the input.
+
+```json
+{"type": "object",
+ "properties": {"original": {"type": "string"}, "suggestion": {"type": "string"}},
+ "required": ["original", "suggestion"], "additionalProperties": false}
+```
+````
+
+```sh
+factory agent run grammar --input-file essay.txt     # prints {"ok":true,"reports":[…],"summary":…}
+factory agent run grammar "Their going tomorow." -v  # each tool call on stderr as it happens
+factory agent check grammar                          # validates, with line numbers for mistakes
+factory agents                                       # this project's, the site's, and bundled
+factory agent guide                                  # the whole format, for you or an agent you ask to write one
+```
+
+A name resolves to a path, then the project's agent (the nearest
+`.factory/agents/` up to the root of your git repository), then the site's, then
+the bundled `grammar`. `factory agent new NAME` writes a starting one into the
+project (`--site` for every project).
+
+A tool section is one of three kinds:
+
+- **collect** (the default): each call is the agent's output. Arguments are
+  checked against the schema, and `verbatim:` arguments must appear word for
+  word in the input, so the agent cannot report text that is not there; a
+  refused call goes back to the agent with the reason. Each call is numbered,
+  and every agent with collect tools also has `retract` to take one back.
+- **`run: COMMAND`**: the command gets the arguments as JSON on stdin, and what
+  it prints is what the agent is told.
+- **`mcp: COMMAND`**: the tools of that MCP server (`only: a, b` for some of
+  them).
+
+`gate: COMMAND` gets the results as JSON on stdin when the agent calls `done`;
+if it fails, what it printed goes back to the agent, up to `attempts` times.
+Commands run in the agent's home (the project, or the site agent's directory)
+under the site's isolation, with `$FACTORY_WORKDIR` (the project you are in) and
+`$FACTORY_AGENT_HOME` set. Agents run in any harness: in `opencode` and `codex`,
+the agent's tools reach it over MCP from `factory _mcp-agent`. A run that fails
+says so (`"ok": false` and a `failure`, exit 1) rather than looking like an
+agent that found nothing. From Coil, `factory.agentkit`'s `run-agent!` is the
+same thing as a library call.
+
+The research-paper factory also has a [daily macOS scheduler](docs/paper-factory.md).
+It persists each day's archive/inspired coin roll, tries OpenCode's free model,
+escalates failures or rejected work to Codex, and exports independently approved
+implementations with beginner-friendly interactive tutorials.
+
+`apps/coil-bugs` works through the `coil-bugs` pad every day. The Mac posts
+the pad through a Gatekeeper route. On the server, a triage run sorts it into
+open bugs, and each bug is reproduced and fixed one at a time
+(`factories/coil-bugs/`). A fix becomes a pull request; every outcome becomes
+a note the Mac writes back into the pad. See
+[docs/coil-bugs-factory.md](docs/coil-bugs-factory.md).
+
 ## Other machines
 
 ```sh
@@ -182,7 +260,7 @@ them off. Your own go in `~/.factory/reviewers/NAME.md`:
 name: security
 description: Is the agent leaking secrets?
 harness: opencode
-model: opencode/big-pickle
+model: opencode/<free-model>
 tools: read          # may look at the workspace, never change it
 every: 5m
 verdicts: clean, risky, leaking

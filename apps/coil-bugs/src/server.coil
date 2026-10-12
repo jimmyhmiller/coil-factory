@@ -1,0 +1,164 @@
+(module coilbugs.server)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use *)
+(import "coil.serde.json" :use [from-json])
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "durable.lock" :as lock)
+(import "factory.proc" :use [capture-limited env-or])
+(import "coilbugs.controller" :use *)
+(import "coilbugs.model" :use *)
+(import "coilbugs.services" :use *)
+(import "coilbugs.text" :use *)
+
+;;; The server's commands: `controller` (one heartbeat) and `build-base` (one
+;;; base compiler, in its own systemd unit).
+
+(defn config-problem [(a (dyn Allocator)) (config ServerConfig)] (-> (slice u8))
+  (cond (= (len (.model config)) 0) "config.json names no model; there is no default"
+        (= (len (.review-model config)) 0) "config.json names no review_model; there is no default"
+        (not (starts-with (.state-dir config) "/")) "state_dir must be an absolute path"
+        (not (starts-with (.checkout config) "/")) "checkout must be an absolute path"
+        (not (starts-with (.program config) "/")) "program must be an absolute path"
+        (not (starts-with (.recipes config) "/")) "recipes must be an absolute path"
+        (not (starts-with (.scope-file config) "/")) "scope_file must be an absolute path"
+        (= (len (.approvals-url config)) 0) "config.json names no approvals_url: out-of-scope bugs could not be reported"
+        (= (len (.approvals-token-file config)) 0) "config.json names no approvals_token_file"
+        (or (<= (.idle-seconds config) 0) (<= (.gate-idle-seconds config) 0) (<= (.max-seconds config) 0)
+            (<= (.triage-idle-seconds config) 0) (<= (.triage-max-seconds config) 0) (<= (.base-build-max-seconds config) 0))
+          "every *_seconds limit must be positive"
+        :else ""))
+
+(defn read-server-config [(a (dyn Allocator)) (path (slice u8))] (-> (Result ServerConfig (slice u8)))
+  (match (read-json-file [ServerConfig] a path)
+    (Err [why] (Err why))
+    (Ok [config] (let [problem (config-problem a config)]
+                   (if (> (len problem) 0) (Err (join a [path ": " problem])) (Ok config))))))
+
+(defn load-server-state [(a (dyn Allocator)) (config ServerConfig)] (-> (Result ServerState (slice u8)))
+  (let [path (path-join a (.state-dir config) "state.json")]
+    (match (read-text a path)
+      (Err [why] (Err why))
+      (Ok [found] (match found
+                    (None [] (Ok (empty-server-state a)))
+                    (Some [text] (match (from-json [ServerState] a text)
+                                   (Ok [state] (Ok state))
+                                   (Err [e] (Err (decode-error a path e))))))))))
+
+(defn record-error [(a (dyn Allocator)) (dir (slice u8)) (why (slice u8))] (-> i64)
+  (write-text a (path-join a dir "last-error.json")
+              (join a ["{\"time\": \"" (utc-stamp a (now-ms)) "\", \"error\": " (encode a why) "}\n"]) 420)
+  (println "coil-bugs: heartbeat failed; persisted state is kept for the next one: {s}" why)
+  1)
+
+(defn clear-error [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
+  (let [path (path-join a dir "last-error.json")]
+    (when (file-exists? a path) (atomic/unlink-path a path) 0)
+    0))
+
+;;; `coil-bugs controller --config FILE [--resume]`: one heartbeat. A
+;;; heartbeat skips when another holds the lock; `--resume` waits for it, then
+;;; clears a halt whose cause a person has fixed.
+(defn controller-main [(a (dyn Allocator)) (config-path (slice u8)) (resume bool)] (-> i64)
+  (match (read-server-config a config-path)
+    (Err [why] (do (println "coil-bugs: {s}" why) 78))
+    (Ok [config]
+        (let [dir (.state-dir config)]
+          (match (ensure-dir a dir 448)
+            (Err [why] (do (println "coil-bugs: {s}" why) 73))
+            (Ok [_]
+                (match (lock/lock-open! a (path-join a dir "controller.lock"))
+                  (Err [_] (do (println "coil-bugs: cannot open the controller lock") 73))
+                  (Ok [opened]
+                      (let [(mut held) opened
+                            got (if resume
+                                    (match (lock/lock-wait! (mut held)) (Ok [_] true) (Err [_] false))
+                                    (match (lock/lock-try! (mut held)) (Ok [g] g) (Err [_] false)))]
+                        (if (not got)
+                            0
+                            (match (load-server-state a config)
+                              (Err [why] (record-error a dir why))
+                              (Ok [state]
+                                  (let [(mut site) (NativeSite :home (.site-home config) :port (.port config))
+                                        (mut checkout) (Checkout :dir (.checkout config) :repository (.repository config) :branch (.branch config))
+                                        (mut builder) (SystemdBuilder :program (.program config) :config-path config-path
+                                                                      :state-dir dir :memory (.base-build-memory config))
+                                        (mut github) (GitHub :checkout (.checkout config) :gh (.gh config) :repo (.github-repo config)
+                                                             :branch (.branch config) :scratch (path-join a dir "publish"))
+                                        (mut approvals) (approvals-for a (.approvals-url config) (expand-home a (.approvals-token-file config)))
+                                        (mut ctl) (Ctl :a a :config config :state state :native (mut site) :remote (mut checkout)
+                                                       :builder (mut builder) :publisher (mut github) :approver (mut approvals) :now (now-ms))]
+                                    (when resume
+                                      (println "coil-bugs: resumed by the operator; the halt was: {s}" (.reason (.halted (.state ctl))))
+                                      (set! (.halted (field (mut ctl) state)) (Halt :reason "" :time ""))
+                                      0)
+                                    (match (tick (mut ctl))
+                                      (Ok [_] (clear-error a dir))
+                                      (Err [why] (do (save (mut ctl)) (record-error a dir why)))))))))))))))))
+
+;;; One step of a build, its output's tail on stdout (the unit's journal).
+(defn build-step [(a (dyn Allocator)) (dir (slice u8)) (label (slice u8)) (argv (slice (slice u8)))] (-> (Result i64 (slice u8)))
+  (let [result (capture-limited a "env" argv dir 7200000 67108864)]
+    (println "--- {s}\n{s}\n{s}" label (tail (.output result) 20000) (tail (.error result) 20000))
+    (if (.ok result)
+        (Ok 0)
+        (Err (join a [label " failed (exit " (int-text a (.exit result)) ")"])))))
+
+;;; `coil-bugs build-base --config FILE --commit SHA`: check out SHA in the
+;;; controller's clone, build a compiler from the committed seeds (no install),
+;;; and install it with its library under compilers/SHA (bin/coil). Writes
+;;; base-builds/SHA/result.json either way.
+(defn build-base-main [(a (dyn Allocator)) (config-path (slice u8)) (commit (slice u8))] (-> i64)
+  (match (read-server-config a config-path)
+    (Err [why] (do (println "coil-bugs: {s}" why) 78))
+    (Ok [config]
+        (let [checkout (.checkout config)
+              ;; One build at a time in the clone: a second build's checkout would
+              ;; change the sources under the first.
+              (mut held) (match (lock/lock-open! a (path-join a (.state-dir config) "checkout.lock"))
+                           (Ok [opened] opened)
+                           (Err [_] (do (println "coil-bugs: cannot open the checkout lock") (abort) (primitive/zeroed lock/FileLock))))
+              locked (match (lock/lock-wait! (mut held)) (Ok [_] true) (Err [_] false))
+              result-path (path-join a (build-dir a (.state-dir config) commit) "result.json")
+              path (join a ["PATH=" (.llvm-bin config) ":" (env-or a "PATH" "/usr/bin:/bin")])
+              ;; Coil sweeps $TMPDIR/coil-<uid> of directories whose pid looks dead,
+              ;; and a sandboxed agent in another PID namespace sees every host pid
+              ;; as dead (coil-bugs: "The temp-directory sweep deletes live
+              ;; processes' directories across PID namespaces"). A private TMPDIR
+              ;; keeps this build's temporaries out of every other coil's sweep.
+              tmp (path-join a (build-dir a (.state-dir config) commit) "tmp")
+              tmpdir (join a ["TMPDIR=" tmp])
+              compiler (compiler-path a (.state-dir config) commit)
+              built (block :build
+                           (when (not locked) (return-from :build (Err [i64 (slice u8)] "cannot take the checkout lock")))
+                           (for step (iter [["git" "fetch" "-q" "origin" (.branch config)]
+                                            ["git" "checkout" "-q" "--detach" commit]])
+                             (match (build-step a checkout (get step 1) step)
+                               (Err [why] (return-from :build (Err [i64 (slice u8)] why)))
+                               (Ok [_] 0)))
+                           (when (dir-exists? a tmp) (atomic/remove-tree! a tmp) 0)
+                           (match (ensure-dir a tmp 448)
+                             (Err [why] (return-from :build (Err [i64 (slice u8)] why)))
+                             (Ok [_] 0))
+                           (let [old (path-join a checkout "build/bin/coil")]
+                             (when (file-exists? a old) (atomic/unlink-path a old) 0))
+                           (match (build-step a checkout "build-curl.sh" [path tmpdir "scripts/native/build-curl.sh"])
+                             (Err [why] (return-from :build (Err [i64 (slice u8)] why)))
+                             (Ok [_] 0))
+                           (match (build-step a checkout "rebootstrap-linux.sh" [path tmpdir "COIL_SKIP_INSTALL=1" "scripts/compiler/rebootstrap-linux.sh"])
+                             (Err [why] (return-from :build (Err [i64 (slice u8)] why)))
+                             (Ok [_] 0))
+                           ;; A complete toolchain, the binary and the library it was
+                           ;; built from, at a prefix of its own: a bare binary copied
+                           ;; elsewhere finds no library, or another checkout's.
+                           (build-step a checkout "install" [path tmpdir "python3" "scripts/dev.py" "install" "--source" "build/bin/coil"
+                                                             "--dest" compiler "--no-warm-unit"]))]
+          (match built
+            (Ok [_] (do (write-text a result-path "{\"ok\": true}\n" 420)
+                        (println "coil-bugs: base compiler for {s} at {s}" commit compiler)
+                        0))
+            (Err [why] (do (write-text a result-path (join a ["{\"ok\": false, \"error\": " (encode a why) "}\n"]) 420)
+                           (println "coil-bugs: base build for {s} failed: {s}" commit why)
+                           1)))))))

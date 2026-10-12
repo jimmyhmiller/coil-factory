@@ -9,7 +9,7 @@
 
 (impl Tool Upper
   (tool-spec [(self (ptr Upper))] (-> ToolSpec)
-    (ToolSpec :name "upper" :description "Uppercase" :parameters "{\"type\":\"object\"}"))
+    (ToolSpec :name "upper" :description "Uppercase" :parameters "{\"type\":\"object\"}" :self-checked false))
   (tool-summary [(self (ptr Upper)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (call-string call "text"))
   (tool-run [(self (ptr Upper)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)

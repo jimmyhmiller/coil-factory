@@ -38,7 +38,8 @@
 ;;;            (`gpt-6.1-sol`). Codex keeps its threads and credentials in the
 ;;;            operator's CODEX_HOME, whose AGENTS.md it always reads; every
 ;;;            setting is passed on the command line, never read from the
-;;;            operator's config.toml.
+;;;            operator's config.toml, and Codex's own extras (ChatGPT apps,
+;;;            plugins, skills, web search) are turned off.
 
 (defstruct StationAgent
   [(harness (dyn Harness))
@@ -47,6 +48,9 @@
    (label (slice u8))
    ;;; The name the agent sees for the finish tool.
    (finish-tool (slice u8))
+   ;;; What the harness puts in front of the names of tools served to it
+   ;;; over MCP, as the agent sees them ("factory_" for OpenCode).
+   (tool-prefix (slice u8))
    (workspace-note (slice u8))
    (tools-note (slice u8))])
 
@@ -70,7 +74,48 @@
    ;;; Keeps this agent's OpenCode sessions apart from the stations' ("" for a
    ;;; station), so a reviewer never shares a session database with the agent
    ;;; it is watching.
-   (state-key (slice u8))])
+   (state-key (slice u8))
+   ;;; Tools of the agent's own, offered after its tool groups: a standalone
+   ;;; agent's (factory.agenttools). Empty for stations and reviewers.
+   (extra-tools (slice (dyn Tool)))
+   ;;; The command (program first) that serves `extra-tools` over MCP, for a
+   ;;; harness that runs the agent in another program; empty for none. The
+   ;;; harness adds `--ready FILE`.
+   (agent-server (slice (slice u8)))
+   ;;; The name of the extra tool that ends a run, when `finish` is false; ""
+   ;;; for none.
+   (stop-tool (slice u8))])
+
+;;; No tools of an agent's own, for stations and reviewers.
+(defn no-extra-tools [] (-> (slice (dyn Tool)))
+  (slice-new (primitive/cast (ptr (dyn Tool)) 0) 0))
+
+;;; No server for them either.
+(defn no-agent-server [] (-> (slice (slice u8)))
+  (slice-new (primitive/cast (ptr (slice u8)) 0) 0))
+
+;;; The MCP server an outside harness starts for an agent: the finish tool
+;;; for a station, the agent's own tools for a standalone agent, else none.
+(defn tool-server [(a (dyn Allocator)) (request AgentRequest) (ready-file (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut command) (al-new [(slice u8)] a)]
+    (cond (.finish request)
+            (do (push! (mut command) (self-executable a))
+                (push! (mut command) "_mcp-finish")
+                (when (> (len (.gate request)) 0) (push! (mut command) "--gate") 0)
+                0)
+          (> (len (.agent-server request)) 0)
+            (do (for word (iter (.agent-server request)) (push! (mut command) word)) 0)
+          :else 0)
+    (when (> (len command) 0)
+      (push! (mut command) "--ready")
+      (push! (mut command) ready-file)
+      0)
+    (load command)))
+
+;;; The name of the tool that ends the agent's runs, as the harness reports
+;;; it; "" for none.
+(defn stop-name [(request AgentRequest)] (-> (slice u8))
+  (if (.finish request) "finish" (.stop-tool request)))
 
 ;;; The model a request resolves to in its harness: the one it names, else the
 ;;; site's default for that harness. "" when neither exists: the factory has no
@@ -106,6 +151,9 @@
   (cond (= (len (effective-model config (.harness request) (.model request))) 0)
           (AgentUnavailable (cat a ["no model is chosen for " (.station request) " (" (.harness request) " harness); choose one with "
                                     (model-choices (.harness request))]))
+        (and (> (len (.extra-tools request)) 0) (= (len (.agent-server request)) 0) (not (= (.harness request) "builtin")))
+          (AgentUnavailable (cat a ["the " (.harness request) " harness cannot offer " (.station request)
+                                    "'s own tools yet; only the builtin harness can (choose it with --harness builtin or `harness: builtin`)"]))
         (= (.harness request) "builtin") (builtin-agent a config request observer control)
         (= (.harness request) "opencode") (opencode-agent a config request observer control)
         (= (.harness request) "codex") (codex-agent a config request observer control)
@@ -128,15 +176,24 @@
                (match (add-tool-groups! a registry (.workspace request) (.tools request) (.isolation config))
                  (Some [problem] (AgentUnavailable problem))
                  (None []
-                       (do (when (.finish request) (registry-add! registry finish) 0)
-                           (let [agent (box! a Agent (agent-new a (.provider resolved)
-                                                                (agent-config (.model resolved) (if (.finish request) "finish" ""))
-                                                                registry observer control))]
-                             (AgentReady (StationAgent :harness agent
-                                                       :label (.label resolved)
-                                                       :finish-tool "finish"
-                                                       :workspace-note "Every path you give a tool is relative to that directory, and shell commands already start in it."
-                                                       :tools-note (.tools request)))))))))))
+                       (block :tools
+                              (when (.finish request) (registry-add! registry finish) 0)
+                              (for tool (iter (.extra-tools request))
+                                (when (not (registry-add! registry tool))
+                                  (return-from :tools
+                                                 (AgentUnavailable (cat a ["two of " (.station request) "'s tools are named \""
+                                                                           (.name (tool-spec tool)) "\"; rename the agent's own tool"])))
+                                  0))
+                              (let [stop (if (.finish request) "finish" (.stop-tool request))
+                                    agent (box! a Agent (agent-new a (.provider resolved)
+                                                                   (agent-config (.model resolved) stop)
+                                                                   registry observer control))]
+                                (AgentReady (StationAgent :harness agent
+                                                          :label (.label resolved)
+                                                          :finish-tool (if (.finish request) "finish" (.stop-tool request))
+                                                          :tool-prefix ""
+                                                          :workspace-note "Every path you give a tool is relative to that directory, and shell commands already start in it."
+                                                          :tools-note (.tools request)))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; opencode
@@ -289,19 +346,17 @@
                  command (jv-array a)
                  mcp (jv-object a)
                  plugins (jv-array a)
-                 refusals (opencode-refusals a (.tools request))]
+                 refusals (opencode-refusals a (.tools request))
+                 server (tool-server a request ready-file)
+                 stop (stop-name request)]
              (when (> (len refusals) 0)
                (let [guard-path (path-join a root (cat a [(.station request) "-guard.js"]))]
                  (match (atomic/write-file-atomic! a guard-path (opencode-guard a (.station request) (al-slice refusals)) 420)
                    (Ok [_] (jv-push! plugins (JStr (cat a ["file://" guard-path]))))
                    (Err [_] (return-from :setup (AgentUnavailable (cat a ["could not write " guard-path])))))
                  0))
-             (when (.finish request)
-               (jv-push! command (JStr (self-executable a)))
-               (jv-push! command (JStr "_mcp-finish"))
-               (when (> (len (.gate request)) 0) (jv-push! command (JStr "--gate")) 0)
-               (jv-push! command (JStr "--ready"))
-               (jv-push! command (JStr ready-file))
+             (when (> (len server) 0)
+               (for word (iter server) (jv-push! command (JStr word)))
                (jv-put! finish-server "type" (JStr "local"))
                (jv-put! finish-server "command" command)
                (jv-put! finish-server "enabled" (JBool true))
@@ -322,16 +377,17 @@
                                                              :permission (opencode-permission a (.tools request))
                                                              :mcp mcp
                                                              :plugins plugins
-                                                             ;; Without the finish tool there is nothing to
+                                                             ;; Without a tool server there is nothing to
                                                              ;; wait for or stop on.
-                                                             :ready-file (if (.finish request) ready-file "")
-                                                             :stop-tool (if (.finish request) "factory_finish" "")
-                                                             :stop-tool-as (if (.finish request) "finish" "")
+                                                             :ready-file (if (> (len server) 0) ready-file "")
+                                                             :stop-tool (if (> (len stop) 0) (cat a ["factory_" stop]) "")
+                                                             :stop-tool-as stop
                                                              :idle-timeout-ms 1800000)
                                    observer control))]
                (AgentReady (StationAgent :harness harness
                                          :label (cat a [model " via opencode"])
-                                         :finish-tool "factory_finish"
+                                         :finish-tool (cat a ["factory_" (if (> (len stop) 0) stop "finish")])
+                                         :tool-prefix "factory_"
                                          :workspace-note "Your tools work in that directory, and shell commands already start in it. Keep every path inside it: file tools refuse paths outside it."
                                          :tools-note (opencode-tools-note a (.tools request)))))))))
 
@@ -343,6 +399,12 @@
   (if (> (len (.codex config)) 0)
       (real-path a (.codex config))
       (search-path a "codex")))
+
+;;; Codex's home, where it keeps its threads' session logs: CODEX_HOME, else
+;;; `~/.codex`.
+(defn codex-home [(a (dyn Allocator))] (-> (slice u8))
+  (let [given (env-or a "CODEX_HOME" "")]
+    (if (> (len given) 0) given (path-join a (env-or a "HOME" "/") ".codex"))))
 
 ;;; Codex's sandbox for a tool list. Codex always offers its shell and its
 ;;; patch tool and cannot take either away, so only two shapes fit: both
@@ -368,6 +430,9 @@
   (let [(mut out) (al-new [(slice u8)] a)
         (mut roots) (al-new [(slice u8)] a)]
     (when (= sandbox "workspace-write")
+      (when (.codex-network config)
+        (push! (mut out) "sandbox_workspace_write.network_access=true")
+        0)
       (for raw (iter (str-split a (.codex-writable config) ","))
         (let [path (str-trim raw)]
           (when (> (len path) 0)
@@ -399,31 +464,27 @@
            (when (> (len problem) 0) (return-from :setup (AgentUnavailable problem)))
            (let [model (effective-model config "codex" (.model request))
                  ready-file (path-join a root (cat a [(.station request) ".ready"]))
-                 (mut command) (al-new [(slice u8)] a)]
-             (when (.finish request)
-               (push! (mut command) (self-executable a))
-               (push! (mut command) "_mcp-finish")
-               (when (> (len (.gate request)) 0) (push! (mut command) "--gate") 0)
-               (push! (mut command) "--ready")
-               (push! (mut command) ready-file)
-               0)
+                 (mut command) (tool-server a request ready-file)
+                 stop (stop-name request)]
              (let [harness (box! a codex/CodexHarness
                                  (codex/codex-new
                                    a
                                    (codex/CodexOptions :program program
                                                        :workdir (.workspace request)
+                                                       :home (codex-home a)
                                                        :model model
                                                        :sandbox sandbox
                                                        :stop-server "factory"
                                                        :stop-command (al-slice command)
-                                                       :stop-tool "finish"
-                                                       :stop-tool-as "finish"
-                                                       :ready-file (if (.finish request) ready-file "")
+                                                       :stop-tool stop
+                                                       :stop-tool-as stop
+                                                       :ready-file (if (> (len command) 0) ready-file "")
                                                        :settings (codex-settings a config sandbox)
                                                        :idle-timeout-ms 1800000)
                                    observer control))]
                (AgentReady (StationAgent :harness harness
                                          :label (cat a [model " via codex"])
-                                         :finish-tool "finish"
+                                         :finish-tool (if (> (len stop) 0) stop "finish")
+                                         :tool-prefix ""
                                          :workspace-note "Your shell starts in that directory. Keep every change inside it: Codex's sandbox refuses writes outside it."
                                          :tools-note (codex-tools-note sandbox))))))))

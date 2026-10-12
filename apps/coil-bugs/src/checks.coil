@@ -1,0 +1,509 @@
+(module coilbugs.checks)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.json" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.proc" :use [capture capture-limited env-or real-path])
+(import "coilbugs.model" :use *)
+(import "coilbugs.text" :use *)
+
+;;; The station gates, and the checks the controller repeats on their results.
+;;;
+;;; A gate runs in its station's workspace as `coil-bugs gate NAME ...`: this
+;;; program lives outside every workspace, so no agent can change what it
+;;; checks. Each prints `PASS ...` or `FAIL ...` and exits 0 or 1.
+;;;
+;;;   triage   TRIAGE.json places every pad cell once, and every `fixed` quotes
+;;;            its own cells
+;;;   repro    .coil-bug/REPRO.json, and its check against the base compiler:
+;;;            failing for `reproduces`, passing for `does_not_reproduce`
+;;;   fix      against the reproduce station's commit, the record and the tests
+;;;            are unchanged; a candidate built from the workspace passes the
+;;;            check and `dev.py test modernize-fast`
+
+;; ---------------------------------------------------------------------------
+;; Triage
+
+(defn json-text [(value JVal)] (-> (slice u8))
+  (match value (JStr [s] s) (_ "")))
+
+(defn non-empty-string? [(value JVal)] (-> bool)
+  (match value (JStr [s] (> (len (str-trim s)) 0)) (_ false)))
+
+(defstruct CellText [(id (slice u8)) (text (slice u8))])
+
+(defn cell-index [(cells (ArrayList CellText)) (id (slice u8))] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (for cell (iter cells)
+      (when (and (< (load found) 0) (= (.id cell) id)) (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+;;; Everything wrong with `TRIAGE.json` in `workspace`; empty when it holds.
+(defn digits? [(text (slice u8))] (-> bool)
+  (and (> (len text) 0)
+       (let [(mut ok) true]
+         (for b (iter text) (when (or (< (cast i64 b) 48) (> (cast i64 b) 57)) (set! ok false) 0))
+         (load ok))))
+
+;;; The rule numbers of SCOPE.md: its `## N.` headings.
+(defn scope-rules [(a (dyn Allocator)) (text (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut ids) (al-new [(slice u8)] a)]
+    (for line (iter (str-split a text "\n"))
+      (when (starts-with line "## ")
+        (match (str-find line ".")
+          (Some [dot] (let [id (subslice line 3 dot)] (when (digits? id) (push! (mut ids) id) 0)))
+          (None [] 0))
+        0))
+    (load ids)))
+
+;;; Whether `quote` (at least 12 characters, whitespace squashed) is in one of
+;;; the cells named by `members`.
+(defn quoted? [(a (dyn Allocator)) (cells (ArrayList CellText)) (members JVal) (quote (slice u8))] (-> bool)
+  (let [(mut found) false
+        (mut k) 0]
+    (loop (if (>= (load k) (jv-len members))
+              (break)
+              (let [at (cell-index cells (json-text (jv-nth members (load k))))]
+                (when (and (>= at 0) (contains? (squash a (.text (get cells at))) quote)) (set! found true) 0)
+                (set! k (+ (load k) 1)))))
+    (load found)))
+
+(defn triage-problems [(a (dyn Allocator)) (workspace (slice u8)) (rules (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
+  (block :check
+         (let [(mut found) (al-new [(slice u8)] a)
+               (mut cells) (al-new [CellText] a)]
+           (let [listing (match (read-required a (path-join a workspace "CELLS.json"))
+                           (Ok [text] (match (jv-parse a text)
+                                        (Some [v] v)
+                                        (None [] (do (push! (mut found) "CELLS.json is not JSON") (return-from :check (load found))))))
+                           (Err [why] (do (push! (mut found) why) (return-from :check (load found)))))
+                 (mut i) 0]
+             (loop (if (>= (load i) (jv-len listing))
+                       (break)
+                       (let [entry (jv-nth listing (load i))
+                             text (match (read-required a (path-join a workspace (json-text (jv-get entry "file"))))
+                                    (Ok [t] t)
+                                    (Err [why] (do (push! (mut found) why) (return-from :check (load found)))))]
+                         (push! (mut cells) (CellText :id (json-text (jv-get entry "id")) :text text))
+                         (set! i (+ (load i) 1))))))
+           (let [triage (match (read-text a (path-join a workspace "TRIAGE.json"))
+                          (Err [why] (do (push! (mut found) why) (return-from :check (load found))))
+                          (Ok [maybe] (match maybe
+                                        (None [] (do (push! (mut found) "TRIAGE.json is missing") (return-from :check (load found))))
+                                        (Some [text] (match (jv-parse a text)
+                                                       (Some [v] v)
+                                                       (None [] (do (push! (mut found) "TRIAGE.json is not JSON") (return-from :check (load found)))))))))
+                 bugs (jv-get triage "bugs")
+                 (mut placed) (al-new [i64] a)]
+             (when (= (jv-len bugs) 0)
+               (push! (mut found) "TRIAGE.json must be {\"bugs\": [...]} with at least one entry")
+               (return-from :check (load found)))
+             (for _ (iter cells) (push! (mut placed) -1))
+             (let [(mut n) 0]
+               (loop (if (>= (load n) (jv-len bugs))
+                         (break)
+                         (let [bug (jv-nth bugs (load n))
+                               where (join a ["bugs[" (int-text a (load n)) "]"])
+                               members (jv-get bug "cells")
+                               id (json-text (jv-get bug "id"))
+                               status (json-text (jv-get bug "status"))]
+                           (for key (iter ["id" "title" "status" "reason"])
+                             (when (not (non-empty-string? (jv-get bug key)))
+                               (push! (mut found) (join a [where "." key " must be a non-empty string"]))
+                               0))
+                           (if (= (jv-len members) 0)
+                               (do (push! (mut found) (join a [where ".cells must be a non-empty list of cell ids"])) 0)
+                               (let [(mut has-id) false
+                                     (mut m) 0]
+                                 (loop (if (>= (load m) (jv-len members))
+                                           (break)
+                                           (let [member (json-text (jv-nth members (load m)))
+                                                 at (cell-index (load cells) member)]
+                                             (when (= member id) (set! has-id true) 0)
+                                             (cond (outcome-note? member)
+                                                     (do (push! (mut found) (join a [where ": " member " is a factory note; leave notes out"])) 0)
+                                                   (< at 0)
+                                                     (do (push! (mut found) (join a [where ": " member " is not a cell of this snapshot"])) 0)
+                                                   (>= (get placed at) 0)
+                                                     (do (push! (mut found) (join a [where ": " member " is already in bugs[" (int-text a (get placed at)) "]"])) 0)
+                                                   :else (do (set! (mut placed) at (load n)) 0))
+                                             (set! m (+ (load m) 1)))))
+                                 (when (not (load has-id))
+                                   (push! (mut found) (join a [where ": its id \"" id "\" must be one of its cells"]))
+                                   0)
+                                 (cond (not (or (= status "open") (= status "fixed") (= status "not_a_bug")))
+                                         (do (push! (mut found) (join a [where ".status must be open, fixed, or not_a_bug"])) 0)
+                                       (= status "fixed")
+                                         (let [quote (squash a (json-text (jv-get bug "quote")))]
+                                           (cond (< (len quote) 12)
+                                                   (do (push! (mut found) (join a [where ": a fixed bug needs a quote of at least 12 characters from its cells"])) 0)
+                                                 (not (quoted? a (load cells) members quote))
+                                                   (do (push! (mut found) (join a [where ": the quote \"" (first-line quote 80) "\" is not in any of its cells"])) 0)
+                                                 :else 0))
+                                       (= status "open")
+                                         (let [scope (json-text (jv-get bug "scope"))
+                                               rule (json-text (jv-get bug "rule"))
+                                               quote (squash a (json-text (jv-get bug "scope_quote")))]
+                                           (cond (= scope "in") 0
+                                                 (not (= scope "out"))
+                                                   (do (push! (mut found) (join a [where ": an open bug needs scope \"in\" or \"out\""])) 0)
+                                                 (not (listed? rules rule))
+                                                   (do (push! (mut found) (join a [where ": rule \"" rule "\" is not a rule in SCOPE.md"])) 0)
+                                                 (not (non-empty-string? (jv-get bug "scope_reason")))
+                                                   (do (push! (mut found) (join a [where ": an out-of-scope bug needs scope_reason"])) 0)
+                                                 (< (len quote) 12)
+                                                   (do (push! (mut found) (join a [where ": an out-of-scope bug needs a scope_quote of at least 12 characters from its cells"])) 0)
+                                                 (not (quoted? a (load cells) members quote))
+                                                   (do (push! (mut found) (join a [where ": the scope_quote \"" (first-line quote 80) "\" is not in any of its cells"])) 0)
+                                                 :else 0))
+                                       :else 0)))
+                           (set! n (+ (load n) 1))))))
+             (let [(mut missing) (sb-new a)
+                   (mut count) 0
+                   (mut i) 0]
+               (for cell (iter cells)
+                 (when (and (< (get placed (load i)) 0) (not (outcome-note? (.id cell))))
+                   (when (< (load count) 20)
+                     (when (> (load count) 0) (sb-push-str! (mut missing) ", ") 0)
+                     (sb-push-str! (mut missing) (.id cell))
+                     0)
+                   (set! count (+ (load count) 1))
+                   0)
+                 (set! i (+ (load i) 1)))
+               (when (> (load count) 0)
+                 (push! (mut found) (join a [(int-text a (load count)) " cells are in no entry: " (sb-finish! (mut missing))]))
+                 0)))
+           (load found))))
+
+;;; One entry of a TRIAGE.json that passed its gate.
+(defstruct TriageEntry
+  [(id (slice u8))
+   (cells (ArrayList (slice u8)))
+   (title (slice u8))
+   (status (slice u8))
+   (reason (slice u8))
+   ;;; For an open bug: "in" or "out"; for "out", the rule, why, and the quote.
+   (scope (slice u8))
+   (rule (slice u8))
+   (scope-reason (slice u8))
+   (scope-quote (slice u8))])
+
+(defn triage-entries [(a (dyn Allocator)) (workspace (slice u8))] (-> (Result (ArrayList TriageEntry) (slice u8)))
+  (match (read-required a (path-join a workspace "TRIAGE.json"))
+    (Err [why] (Err why))
+    (Ok [text]
+        (match (jv-parse a text)
+          (None [] (Err "TRIAGE.json is not JSON"))
+          (Some [triage]
+                (let [bugs (jv-get triage "bugs")
+                      (mut out) (al-new [TriageEntry] a)
+                      (mut i) 0]
+                  (loop (if (>= (load i) (jv-len bugs))
+                            (break)
+                            (let [bug (jv-nth bugs (load i))
+                                  members (jv-get bug "cells")
+                                  (mut cells) (al-new [(slice u8)] a)
+                                  (mut m) 0]
+                              (loop (if (>= (load m) (jv-len members))
+                                        (break)
+                                        (do (push! (mut cells) (copy-bytes a (json-text (jv-nth members (load m)))))
+                                            (set! m (+ (load m) 1)))))
+                              (push! (mut out) (TriageEntry :id (copy-bytes a (json-text (jv-get bug "id")))
+                                                            :cells (load cells)
+                                                            :title (copy-bytes a (str-trim (json-text (jv-get bug "title"))))
+                                                            :status (copy-bytes a (json-text (jv-get bug "status")))
+                                                            :reason (copy-bytes a (json-text (jv-get bug "reason")))
+                                                            :scope (copy-bytes a (json-text (jv-get bug "scope")))
+                                                            :rule (copy-bytes a (json-text (jv-get bug "rule")))
+                                                            :scope-reason (copy-bytes a (str-trim (json-text (jv-get bug "scope_reason"))))
+                                                            :scope-quote (copy-bytes a (str-trim (json-text (jv-get bug "scope_quote"))))))
+                              (set! i (+ (load i) 1)))))
+                  (Ok (load out))))))))
+
+;; ---------------------------------------------------------------------------
+;; The reproduction record
+
+(defn string-list [(a (dyn Allocator)) (value JVal)] (-> (Option (ArrayList (slice u8))))
+  (match value
+    (JArr [_] (let [(mut out) (al-new [(slice u8)] a)
+                    (mut ok) true
+                    (mut i) 0]
+                (loop (if (>= (load i) (jv-len value))
+                          (break)
+                          (do (match (jv-nth value (load i))
+                                (JStr [s] (if (> (len (str-trim s)) 0) (push! (mut out) (copy-bytes a s)) (set! ok false)))
+                                (_ (set! ok false)))
+                              (set! i (+ (load i) 1)))))
+                (if (load ok) (Some (load out)) (None))))
+    (_ (None))))
+
+;;; `.coil-bug/REPRO.json` for bug `bug`, with every field its verdict needs.
+;;; Anything else is the agent's mistake, named so it can fix it.
+(defn read-repro [(a (dyn Allocator)) (text (slice u8)) (bug (slice u8))] (-> (Result Repro (slice u8)))
+  (block :read
+         (let [repro (match (jv-parse a text)
+                       (Some [v] (match v (JObj [_] v) (_ (return-from :read (Err ".coil-bug/REPRO.json must be an object")))))
+                       (None [] (return-from :read (Err ".coil-bug/REPRO.json is not JSON"))))
+               verdict (json-text (jv-get repro "verdict"))
+               attempts (jv-get repro "attempts")
+               (mut tried) (al-new [Attempt] a)
+               (mut i) 0]
+           (when (!= (json-text (jv-get repro "bug")) bug)
+             (return-from :read (Err (join a [".coil-bug/REPRO.json is about bug \"" (json-text (jv-get repro "bug")) "\", not \"" bug "\""]))))
+           (when (not (or (= verdict "reproduces") (= verdict "does_not_reproduce") (= verdict "cannot_verify")))
+             (return-from :read (Err (join a ["verdict must be reproduces, does_not_reproduce, or cannot_verify, not \"" verdict "\""]))))
+           (when (not (non-empty-string? (jv-get repro "summary")))
+             (return-from :read (Err "summary must say what you found")))
+           (loop (if (>= (load i) (jv-len attempts))
+                     (break)
+                     (let [one (jv-nth attempts (load i))]
+                       (when (not (and (non-empty-string? (jv-get one "what")) (non-empty-string? (jv-get one "command"))
+                                       (non-empty-string? (jv-get one "result"))))
+                         (return-from :read (Err "attempts must list what you tried: [{what, command, result}, ...]")))
+                       (push! (mut tried) (Attempt :what (copy-bytes a (json-text (jv-get one "what")))
+                                                   :command (copy-bytes a (json-text (jv-get one "command")))
+                                                   :result (copy-bytes a (json-text (jv-get one "result")))))
+                       (set! i (+ (load i) 1)))))
+           (when (= (len tried) 0)
+             (return-from :read (Err "attempts must list what you tried: [{what, command, result}, ...]")))
+           (when (and (!= verdict "cannot_verify") (not (non-empty-string? (jv-get repro "check"))))
+             (return-from :read (Err (join a [verdict " needs a check command"]))))
+           (let [tests (if (= verdict "reproduces")
+                           (match (string-list a (jv-get repro "tests"))
+                             (Some [list] (if (= (len list) 0)
+                                              (return-from :read (Err "reproduces needs the regression test files in tests"))
+                                              list))
+                             (None [] (return-from :read (Err "reproduces needs the regression test files in tests"))))
+                           (al-new [(slice u8)] a))]
+             (for test (iter tests)
+               (when (or (starts-with test "/") (contains? test "..") (starts-with test ".coil-bug/") (starts-with test "build/"))
+                 (return-from :read (Err (join a ["test \"" test "\" must be a repository path outside .coil-bug/ and build/"]))))
+               0)
+             (when (and (= verdict "cannot_verify") (not (non-empty-string? (jv-get repro "needs"))))
+               (return-from :read (Err "cannot_verify must say in needs exactly what is missing")))
+             (Ok (Repro :bug (copy-bytes a bug) :verdict (copy-bytes a verdict)
+                        :summary (copy-bytes a (str-trim (json-text (jv-get repro "summary"))))
+                        :check (copy-bytes a (str-trim (json-text (jv-get repro "check"))))
+                        :tests tests :attempts (load tried)
+                        :needs (copy-bytes a (str-trim (json-text (jv-get repro "needs"))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Running things in the workspace
+
+(defn git-lines [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> (Result (ArrayList (slice u8)) (slice u8)))
+  (let [result (capture a "git" args dir 300000)]
+    (if (not (.ok result))
+        (Err (join a ["git " (get args 0) " failed: " (str-trim (.error result))]))
+        (let [(mut out) (al-new [(slice u8)] a)]
+          (for part (iter (str-split a (.output result) "\x00;"))
+            (let [line (str-trim part)]
+              (when (> (len line) 0) (push! (mut out) line) 0)))
+          (Ok (load out))))))
+
+;;; Every path that differs from `since` in the working tree of `dir`, tracked
+;;; or not (ignored files, such as build/, excluded).
+(defn changed-paths [(a (dyn Allocator)) (dir (slice u8)) (since (slice u8))] (-> (Result (ArrayList (slice u8)) (slice u8)))
+  (match (git-lines a dir ["diff" "--name-only" "-z" since])
+    (Err [why] (Err why))
+    (Ok [tracked]
+        (match (git-lines a dir ["ls-files" "--others" "--exclude-standard" "-z"])
+          (Err [why] (Err why))
+          (Ok [untracked] (let [(mut all) tracked]
+                            (for path (iter untracked) (push! (mut all) path))
+                            (Ok (load all))))))))
+
+(defn listed? [(paths (ArrayList (slice u8))) (path (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for p (iter paths) (when (= p path) (set! found true) 0))
+    (load found)))
+
+(const CHECK-TIMEOUT-MS 2700000)
+
+;;; Run `command` with `sh -c` in `dir`, with `compiler` as $COIL and its
+;;; directory first on PATH. Prints the tail of its output; returns its exit
+;;; code, or an error when it could not finish.
+(defn run-check [(a (dyn Allocator)) (dir (slice u8)) (command (slice u8)) (compiler (slice u8)) (label (slice u8))] (-> (Result i64 (slice u8)))
+  (match (real-path a compiler)
+    (None [] (Err (join a [label ": the compiler " compiler " does not exist"])))
+    (Some [coil]
+          (let [path (join a [(dir-name coil) ":" (env-or a "PATH" "/usr/bin:/bin")])
+                result (capture-limited a "env" [(join a ["COIL=" coil]) (join a ["PATH=" path]) "sh" "-c" command]
+                                        dir CHECK-TIMEOUT-MS 16777216)]
+            (println "--- {s}: COIL={s} sh -c '{s}'" label coil command)
+            (println "{s}" (tail (.output result) 6000))
+            (when (> (len (str-trim (.error result))) 0) (println "{s}" (tail (.error result) 3000)) 0)
+            (cond (and (!= (.exit result) 0) (= (.error result) "timed out"))
+                    (Err (join a [label ": the check ran past " (int-text a (/ CHECK-TIMEOUT-MS 60000)) " minutes"]))
+                  (< (.exit result) 0) (Err (join a [label ": the check could not be started"]))
+                  :else (do (println "--- {s}: exit {}" label (.exit result)) (Ok (.exit result))))))))
+
+;; ---------------------------------------------------------------------------
+;; The station gates
+
+(defn gate-triage [(a (dyn Allocator)) (workspace (slice u8)) (scope-file (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (match (read-required a scope-file)
+    (Err [why] (Err why))
+    (Ok [scope] (gate-triage-with a workspace (scope-rules a scope)))))
+
+(defn gate-triage-with [(a (dyn Allocator)) (workspace (slice u8)) (rules (ArrayList (slice u8)))] (-> (Result (slice u8) (slice u8)))
+  (let [problems (triage-problems a workspace rules)]
+    (if (> (len problems) 0)
+        (let [(mut out) (sb-new a)]
+          (sb-push-str! (mut out) "triage:")
+          (for problem (iter problems) (sb-push-str! (mut out) "\n  ") (sb-push-str! (mut out) problem))
+          (Err (sb-finish! (mut out))))
+        (match (triage-entries a workspace)
+          (Err [why] (Err why))
+          (Ok [entries]
+              (let [(mut open) 0 (mut out) 0 (mut fixed) 0 (mut other) 0]
+                (for e (iter entries)
+                  (cond (= (.status e) "open") (do (set! open (+ (load open) 1))
+                                                   (when (= (.scope e) "out") (set! out (+ (load out) 1)) 0))
+                        (= (.status e) "fixed") (set! fixed (+ (load fixed) 1))
+                        :else (set! other (+ (load other) 1))))
+                (Ok (join a ["triage: " (int-text a (load open)) " open (" (int-text a (load out)) " out of scope), "
+                             (int-text a (load fixed)) " fixed, " (int-text a (load other)) " not_a_bug"]))))))))
+
+(defn gate-repro [(a (dyn Allocator)) (workspace (slice u8)) (bug (slice u8)) (base (slice u8)) (compiler (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (block :gate
+         (let [repro (match (read-text a (path-join a workspace ".coil-bug/REPRO.json"))
+                       (Err [why] (return-from :gate (Err why)))
+                       (Ok [maybe] (match maybe
+                                     (None [] (return-from :gate (Err ".coil-bug/REPRO.json is missing")))
+                                     (Some [text] (match (read-repro a text bug)
+                                                    (Ok [r] r)
+                                                    (Err [why] (return-from :gate (Err why))))))))
+               changed (match (changed-paths a workspace base)
+                         (Ok [c] c)
+                         (Err [why] (return-from :gate (Err why))))
+               verdict (.verdict repro)]
+           (if (= verdict "reproduces")
+               (do (for test (iter (.tests repro))
+                     (when (not (file-exists? a (path-join a workspace test)))
+                       (return-from :gate (Err (join a ["test " test " does not exist"]))))
+                     (when (not (listed? changed test))
+                       (return-from :gate (Err (join a ["test " test " is not new or changed on this branch"]))))
+                     0)
+                   (match (run-check a workspace (.check repro) compiler "check against the base compiler")
+                     (Err [why] (Err why))
+                     (Ok [code] (if (= code 0)
+                                    (Err "the check passes with the base compiler, so it does not reproduce the bug")
+                                    (Ok (join a ["reproduces: the check fails with the base compiler (exit " (int-text a code) ")"]))))))
+               (let [(mut stray) (sb-new a)]
+                 (for path (iter changed)
+                   (when (not (starts-with path ".coil-bug/"))
+                     (sb-push-str! (mut stray) " ")
+                     (sb-push-str! (mut stray) path)
+                     0))
+                 (when (> (len (sb-str (load stray))) 0)
+                   (return-from :gate (Err (join a [verdict " must leave the repository as it was; changed:" (sb-finish! (mut stray))]))))
+                 (if (= verdict "does_not_reproduce")
+                     (match (run-check a workspace (.check repro) compiler "check against the base compiler")
+                       (Err [why] (Err why))
+                       (Ok [code] (if (!= code 0)
+                                      (Err (join a ["the check fails with the base compiler (exit " (int-text a code) "), so the bug may still happen"]))
+                                      (Ok "does_not_reproduce: the check passes with the base compiler"))))
+                     (Ok (join a ["cannot_verify: " (first-line (.needs repro) 200)]))))))))
+
+;;; The commit the reproduce station left, between `base` and HEAD of `dir`.
+(defn reproduce-commit [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8)) (head (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (match (git-lines a dir ["log" "-z" "--format=%H %s" (join a [base ".." head])])
+    (Err [why] (Err why))
+    (Ok [lines]
+        (let [(mut found) (al-new [(slice u8)] a)]
+          (for line (iter lines)
+            (when (and (> (len line) 41) (starts-with (subslice line 41 (len line)) "reproduce:"))
+              (push! (mut found) (subslice line 0 40))
+              0))
+          (if (= (len found) 1)
+              (Ok (get found 0))
+              (Err (join a ["expected one reproduce station commit after " base ", found " (int-text a (len found))])))))))
+
+(defn git-show [(a (dyn Allocator)) (dir (slice u8)) (spec (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [result (capture a "git" ["show" spec] dir 60000)]
+    (if (.ok result) (Ok (.output result)) (Err (join a ["git show " spec " failed: " (str-trim (.error result))])))))
+
+(const BUILD-TIMEOUT-MS 3600000)
+(const SUITE-TIMEOUT-MS 5400000)
+
+(defn run-step [(a (dyn Allocator)) (dir (slice u8)) (label (slice u8)) (argv (slice (slice u8))) (timeout-ms i64)] (-> (Result i64 (slice u8)))
+  (let [result (capture-limited a "env" argv dir timeout-ms 16777216)]
+    (println "--- {s}" label)
+    (println "{s}" (tail (.output result) 8000))
+    (when (> (len (str-trim (.error result))) 0) (println "{s}" (tail (.error result) 4000)) 0)
+    (cond (and (!= (.exit result) 0) (= (.error result) "timed out"))
+            (Err (join a [label " ran past " (int-text a (/ timeout-ms 60000)) " minutes"]))
+          (!= (.exit result) 0) (Err (join a [label " exited " (int-text a (.exit result))]))
+          :else (do (println "--- {s}: ok" label) (Ok 0)))))
+
+(const CANDIDATE "build/bin/coil-candidate")
+
+(defn gate-fix [(a (dyn Allocator)) (workspace (slice u8)) (bug (slice u8)) (base (slice u8)) (compiler (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (block :gate
+         (let [reproduced-at (match (reproduce-commit a workspace base "HEAD")
+                               (Ok [sha] sha)
+                               (Err [why] (return-from :gate (Err why))))
+               original (match (git-show a workspace (join a [reproduced-at ":.coil-bug/REPRO.json"]))
+                          (Ok [text] text)
+                          (Err [why] (return-from :gate (Err why))))
+               now (match (read-text a (path-join a workspace ".coil-bug/REPRO.json"))
+                     (Ok [maybe] (match maybe (Some [text] text) (None [] (return-from :gate (Err ".coil-bug/REPRO.json is missing")))))
+                     (Err [why] (return-from :gate (Err why))))
+               repro (match (read-repro a original bug)
+                       (Ok [r] r)
+                       (Err [why] (return-from :gate (Err why))))
+               changed (match (changed-paths a workspace reproduced-at)
+                         (Ok [c] c)
+                         (Err [why] (return-from :gate (Err why))))]
+           (when (!= now original)
+             (return-from :gate (Err ".coil-bug/REPRO.json changed after the reproduce station; it is that station's record")))
+           (when (!= (.verdict repro) "reproduces")
+             (return-from :gate
+               (if (> (len changed) 0)
+                   (Err (join a ["the bug was " (.verdict repro) ", so nothing should change; changed: " (get changed 0)]))
+                   (Ok (join a ["nothing to fix: " (.verdict repro)])))))
+           (for test (iter (.tests repro))
+             (when (listed? changed test)
+               (return-from :gate (Err (join a ["the regression tests must stay as the reproduce station left them; changed: " test]))))
+             0)
+           (let [(mut fixed-something) false]
+             (for path (iter changed)
+               (when (and (not (starts-with path ".coil-bug/")) (not (listed? (.tests repro) path))) (set! fixed-something true) 0))
+             (when (not (load fixed-something))
+               (return-from :gate (Err "nothing outside the tests and .coil-bug/ changed, so nothing was fixed"))))
+           (let [fix (match (read-text a (path-join a workspace ".coil-bug/FIX.md"))
+                       (Ok [maybe] (match maybe (Some [text] (str-trim text)) (None [] "")))
+                       (Err [why] (return-from :gate (Err why))))]
+             (when (< (len fix) 200)
+               (return-from :gate (Err ".coil-bug/FIX.md must explain the root cause, the change, and how it was verified"))))
+           (let [base-compiler (match (real-path a compiler)
+                                 (Some [p] p)
+                                 (None [] (return-from :gate (Err (join a ["the base compiler " compiler " does not exist"])))))
+                 path (join a ["PATH=" (dir-name base-compiler) ":" (env-or a "PATH" "/usr/bin:/bin")])]
+             (atomic-unlink a (path-join a workspace CANDIDATE))
+             (match (run-step a workspace "candidate build" [path "python3" "scripts/dev.py" "build" "candidate"] BUILD-TIMEOUT-MS)
+               (Err [why] (return-from :gate (Err why)))
+               (Ok [_] 0))
+             (match (run-check a workspace (.check repro) (path-join a workspace CANDIDATE) "check against the candidate")
+               (Err [why] (return-from :gate (Err why)))
+               (Ok [code] (when (!= code 0)
+                            (return-from :gate (Err (join a ["the reproduction still fails with the candidate (exit " (int-text a code) ")"]))))))
+             (match (run-step a workspace "focused gate" [path "python3" "scripts/dev.py" "test" "modernize-fast" "--compiler" CANDIDATE] SUITE-TIMEOUT-MS)
+               (Err [why] (Err why))
+               (Ok [_] (Ok "fixed: the reproduction passes with the candidate, and the focused gate passes")))))))
+
+(defn atomic-unlink [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (when (file-exists? a path) (atomic/unlink-path a path) 0)
+  0)
+
+;;; `coil-bugs gate NAME ...` in the current directory: prints PASS or FAIL
+;;; and returns the exit code.
+(defn gate-report [(result (Result (slice u8) (slice u8)))] (-> i64)
+  (match result
+    (Ok [message] (do (println "PASS {s}" message) 0))
+    (Err [message] (do (println "FAIL {s}" message) 1))))

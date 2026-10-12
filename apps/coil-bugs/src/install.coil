@@ -1,0 +1,166 @@
+(module coilbugs.install)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.proc" :use [capture env-or search-path self-executable])
+(import "coilbugs.model" :use *)
+(import "coilbugs.text" :use *)
+
+;;; Installing the two halves: a launchd agent on the Mac, and a factory site
+;;; plus systemd units on the server. Each copies this program somewhere
+;;; stable first, so rebuilding the checkout never changes what is running.
+
+(defn copy-file [(a (dyn Allocator)) (from (slice u8)) (to (slice u8)) (mode i64)] (-> (Result i64 (slice u8)))
+  (match (read-required a from)
+    (Err [why] (Err why))
+    (Ok [bytes] (write-text a to bytes mode))))
+
+(defn run [(a (dyn Allocator)) (program (slice u8)) (args (slice (slice u8)))] (-> (Result (slice u8) (slice u8)))
+  (let [result (capture a program args "" 120000)]
+    (if (.ok result)
+        (Ok (str-trim (.output result)))
+        (Err (join a [program " " (get args 0) " failed: " (str-trim (.error result)) (str-trim (.output result))])))))
+
+(defn xml [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for byte (iter text)
+      (let [c (cast i64 byte)]
+        (cond (= c 38) (sb-push-str! (mut out) "&amp;")
+              (= c 60) (sb-push-str! (mut out) "&lt;")
+              (= c 62) (sb-push-str! (mut out) "&gt;")
+              :else (sb-push-byte! (mut out) byte))))
+    (sb-finish! (mut out))))
+
+(const LABEL "com.jimmyhmiller.coil-bugs-factory")
+
+;;; `coil-bugs install-mac [--gate-url URL] [--token-file FILE]`.
+(defn install-mac [(a (dyn Allocator)) (gate-url (slice u8)) (token-file (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (block :install (try (let [home (env-or a "HOME" "")
+             root (path-join a home ".local/share/coil-bugs-factory")
+             program (path-join a root "bin/coil-bugs")
+             config-path (path-join a root "config.json")
+             log (path-join a root "logs/heartbeat.log")
+             pad (match (search-path a "pad") (Some [p] p) (None [] (return-from :install (Err "pad is not on PATH"))))
+             token (expand-home a token-file)
+             (mut notebooks) (al-new [(slice u8)] a)
+             plist-path (path-join a home (join a ["Library/LaunchAgents/" LABEL ".plist"]))
+             uid (try! (run a "id" ["-u"]))]
+         (when (not (file-exists? a token)) (return-from :install (Err (join a ["no Gatekeeper token at " token]))))
+         (try! (copy-file a (self-executable a) program 493))
+         ;; A stable signing identity, so macOS can attribute the Local Network
+         ;; permission the heartbeat needs (computer.jimmyhmiller.com may resolve
+         ;; to a LAN address) to this program by name.
+         (try! (run a "codesign" ["--force" "--sign" "-" "--identifier" "com.jimmyhmiller.coil-bugs" program]))
+         (push! (mut notebooks) "coil-bugs")
+         (push! (mut notebooks) "coil-factory-coil-bugs")
+         (try! (write-json-file a config-path
+                                (MacConfig :gate-url gate-url :token-file token :pad pad
+                                           :notebook-dir (path-join a home ".pad/notebooks") :notebook "coil-bugs"
+                                           :notebooks (load notebooks) :state-dir (path-join a root "state"))
+                                420))
+         (try! (ensure-dir a (dir-name log) 493))
+         ;; StartInterval runs every fifteen minutes while awake, and a missed
+         ;; interval as soon as the Mac wakes; RunAtLoad covers login.
+         (try! (write-text a plist-path
+                           (join a ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                                    "<plist version=\"1.0\">\n<dict>\n"
+                                    "  <key>Label</key><string>" LABEL "</string>\n"
+                                    "  <key>ProgramArguments</key>\n  <array>\n"
+                                    "    <string>" (xml a program) "</string>\n    <string>mac</string>\n"
+                                    "    <string>--config</string>\n    <string>" (xml a config-path) "</string>\n  </array>\n"
+                                    "  <key>WorkingDirectory</key><string>" (xml a root) "</string>\n"
+                                    "  <key>StartInterval</key><integer>900</integer>\n"
+                                    "  <key>RunAtLoad</key><true/>\n"
+                                    "  <key>ProcessType</key><string>Background</string>\n"
+                                    "  <key>StandardOutPath</key><string>" (xml a log) "</string>\n"
+                                    "  <key>StandardErrorPath</key><string>" (xml a log) "</string>\n"
+                                    "</dict>\n</plist>\n"])
+                           420))
+         (run a "launchctl" ["bootout" (join a ["gui/" uid "/" LABEL])])
+         (try! (run a "launchctl" ["bootstrap" (join a ["gui/" uid]) plist-path]))
+         (Ok (join a ["installed " plist-path "; heartbeat log " log]))))))
+
+(const PORT 7797)
+
+(defn unit-common [(a (dyn Allocator)) (root (slice u8)) (site (slice u8))] (-> (slice u8))
+  (let [home (env-or a "HOME" "")]
+    (join a ["WorkingDirectory=" root "\nEnvironment=\"PATH=" home "/.local/bin:" home "/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\n"
+             "Environment=\"FACTORY_HOME=" site "\"\n"])))
+
+;;; `coil-bugs install-linux --factory BIN --recipes DIR --model M --review-model M [--enable]`.
+(defn install-linux [(a (dyn Allocator)) (factory (slice u8)) (recipes (slice u8)) (model (slice u8)) (review-model (slice u8)) (enable bool)] (-> (Result (slice u8) (slice u8)))
+  (block :install (try (let [home (env-or a "HOME" "")
+             root (path-join a home ".local/share/coil-bugs")
+             program (path-join a root "bin/coil-bugs")
+             site (path-join a root "site")
+             config-path (path-join a root "config.json")
+             installed-recipes (path-join a root "recipes")
+             units (path-join a home ".config/systemd/user")
+             notes-dir "/srv/coil-bugs/notes"
+             probe (path-join a notes-dir ".install-probe")]
+         (for name (iter ["codex" "gh" "git" "systemd-run"])
+           (when (match (search-path a name) (Some [_] false) (None [] true))
+             (return-from :install (Err (join a ["missing executable: " name]))))
+           0)
+         (match (write-text a probe "" 420)
+           (Err [why] (return-from :install (Err (join a [notes-dir " must exist and be writable by this user: " why]))))
+           (Ok [_] (atomic/unlink-path a probe)))
+         (try! (copy-file a (self-executable a) program 493))
+         (try! (copy-file a factory (path-join a root "bin/factory") 493))
+         (for name (iter ["triage.md" "fix.md" "SCOPE.md"])
+           (try! (copy-file a (path-join a recipes name) (path-join a installed-recipes name) 420))
+           0)
+         (for name (iter (try! (list-names a (path-join a recipes "reviewers"))))
+           (when (ends-with? name ".md")
+             (try! (copy-file a (path-join a (path-join a recipes "reviewers") name) (path-join a (path-join a installed-recipes "reviewers") name) 420))
+             0))
+         (try! (write-json-file a config-path
+                                (ServerConfig :enabled true :state-dir (path-join a root "state") :site-home site :port PORT
+                                              :program program :recipes installed-recipes :checkout (path-join a root "coil")
+                                              :repository "git@github.com:jimmyhmiller/coil.git" :github-repo "jimmyhmiller/coil"
+                                              :branch "main" :snapshot-dir "/var/lib/coil-bugs/snapshots" :notes-dir notes-dir
+                                              :notebook "coil-bugs" :status-notebook "coil-factory-coil-bugs"
+                                              :model model :review-model review-model
+                                              :gh (match (search-path a "gh") (Some [p] p) (None [] ""))
+                                              :llvm-bin "/usr/lib/llvm-21/bin"
+                                              :idle-seconds 2700 :gate-idle-seconds 7200 :max-seconds 36000
+                                              :triage-idle-seconds 1200 :triage-max-seconds 7200
+                                              :base-build-max-seconds 7200 :base-build-memory "40G"
+                                              :scope-file (path-join a installed-recipes "SCOPE.md")
+                                              :approvals-url "https://computer.jimmyhmiller.com/approvals"
+                                              :approvals-token-file (path-join a home ".config/gatekeeper/token"))
+                                384))
+         ;; One run at a time: one bug, or one triage. Codex agents get the
+         ;; network (to clone the projects a report came from) and may write
+         ;; nothing outside their workspace.
+         (try! (write-text a (path-join a site "site.json")
+                           (join a ["{\"name\": \"coil-bugs\", \"port\": " (int-text a PORT) ", \"max_runs\": 1, \"isolation\": \"sandbox\", "
+                                    "\"codex\": \"" (match (search-path a "codex") (Some [p] p) (None [] "")) "\", "
+                                    "\"codex_model\": \"" model "\", \"codex_network\": true, \"default_harness\": \"codex\", "
+                                    "\"overseer\": {\"policy\": \"observe\"}}\n"])
+                           420))
+         (let [common (unit-common a root site)]
+           (try! (write-text a (path-join a units "coil-bugs-site.service")
+                             (join a ["[Unit]\nDescription=coil-bugs native factory site\nAfter=network-online.target\nWants=network-online.target\n\n"
+                                      "[Service]\nType=simple\n" common "ExecStart=" root "/bin/factory daemon\nRestart=on-failure\nRestartSec=5\n\n"
+                                      "[Install]\nWantedBy=default.target\n"]) 420))
+           (try! (write-text a (path-join a units "coil-bugs.service")
+                             (join a ["[Unit]\nDescription=coil-bugs controller heartbeat\nAfter=coil-bugs-site.service\nWants=coil-bugs-site.service\n\n"
+                                      "[Service]\nType=oneshot\n" common "ExecStart=" program " controller --config " config-path "\nTimeoutStartSec=300\n"]) 420))
+           ;; A heartbeat is well under a second; every 10s moves runs along promptly.
+           (try! (write-text a (path-join a units "coil-bugs.timer")
+                             "[Unit]\nDescription=Move the coil-bugs factory along every 10 seconds\n\n[Timer]\nOnBootSec=60\nOnUnitActiveSec=10\nAccuracySec=1\nUnit=coil-bugs.service\n\n[Install]\nWantedBy=timers.target\n" 420))
+           ;; Start a heartbeat the moment Gatekeeper commits a snapshot.
+           (try! (write-text a (path-join a units "coil-bugs-snapshots.path")
+                             "[Unit]\nDescription=Start the coil-bugs controller when the Mac posts a snapshot\n\n[Path]\nPathChanged=/var/lib/coil-bugs/snapshots\nUnit=coil-bugs.service\n\n[Install]\nWantedBy=default.target\n" 420)))
+         (try! (run a "systemd-analyze" ["--user" "verify" (path-join a units "coil-bugs-site.service") (path-join a units "coil-bugs.service")
+                                          (path-join a units "coil-bugs.timer") (path-join a units "coil-bugs-snapshots.path")]))
+         (try! (run a "systemctl" ["--user" "daemon-reload"]))
+         (try! (run a "systemctl" ["--user" "enable" "--now" "coil-bugs-site.service"]))
+         (when enable
+           (try! (run a "systemctl" ["--user" "enable" "--now" "coil-bugs.timer" "coil-bugs-snapshots.path"]))
+           0)
+         (Ok (join a ["installed in " root "; site on port " (int-text a PORT) "; heartbeat " (if enable "enabled" "not enabled (pass --enable)")]))))))

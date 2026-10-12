@@ -134,6 +134,64 @@ Station settings are `key: value` lines directly under the heading: `gate`,
 `attempts`, `model`, `harness`, `tools`, `review`, `approve`. Everything else is prose for
 the model.
 
+## Standalone agents
+
+A standalone agent (`factory.agentspec`) is a Markdown file like a factory:
+front matter (`name`, `description`, `input`, `model`, `harness`, `tools`,
+`gate`, `attempts`), instructions, and one `## Tool: NAME` section per tool of
+its own. A tool section's settings say its kind (`factory.agenttools`):
+
+| kind | settings | what a call does |
+| --- | --- | --- |
+| collect | (none), `verbatim:` | checks the arguments, keeps the call as output, numbered |
+| run | `run: COMMAND`, `verbatim:` | runs the command with the arguments as JSON on stdin; its output is the result |
+| mcp | `mcp: COMMAND`, `only:` | offers the tools of the MCP server the command starts |
+
+Collect and run tools take their description from the section's prose and the
+JSON Schema of their arguments from its one ```` ```json ```` block, checked when
+the file is read against what argument checking supports. `verbatim:` names
+string arguments that must appear word for word in the input. Every agent has
+`done`; one with collect tools also has `retract`, which takes a report back by
+number.
+
+An MCP server's schemas may use keywords `json-schema` cannot check, so its
+tools are `self-checked` (`agent.tool/ToolSpec`): the agent loop and
+`mcp.server` pass their arguments to the server unchecked, and the server
+checks them. The client is `mcp.client`: the server runs in its own process
+group, requests the server makes (`ping`) are answered, and its last 4 KB of
+standard error explain a server that fails.
+
+**Commands** (run tools, mcp servers, the gate) run through `/bin/sh -c` in the
+agent's *home*, under the site's isolation with the *work directory* writable,
+with `$FACTORY_WORKDIR` and `$FACTORY_AGENT_HOME` exported.
+
+**Finding one** (`factory.agentlib`): a path; then
+`<project>/.factory/agents/NAME.md`, where the project is the nearest directory
+with `.factory/agents/` searching up from where you are and stopping at the root
+of the git repository (the site's own `~/.factory` never counts); then
+`~/.factory/agents/NAME.md`; then bundled. An agent's home is its project, or
+its file's directory; its work directory is the project it is run from, where
+its tool groups work.
+
+**Running one** (`factory.agentkit/run-agent!`) is a library call: nothing is
+journaled. The agent is shown its instructions, how its output is read, and the
+input between `<input>` and `</input>`. In the builtin harness the tools run in
+the calling process (`AgentRequest.extra-tools`, with `done` as the stop tool).
+OpenCode and Codex run the agent in their own program, so its tools are served
+to them over MCP by `factory _mcp-agent` (`AgentRequest.agent-server`), which
+reads the agent file and input from a state directory, appends each report and
+retraction to `results.jsonl` there, and writes why to `tools-error.txt` if it
+cannot make the tools. The state directory is temporary unless the caller names
+one (`--state-dir`) to continue the conversation later.
+
+The run ends when the agent calls `done` and its gate, if any, passes: the gate
+gets `{"agent", "summary", "reports"}` on stdin, and a failure goes back to the
+agent as a `[gate]` message, up to `attempts` (3 by default) before the agent
+fails. A reply without a tool gets one reminder that only tool calls are kept;
+a second is a failure. The result has the kept reports, the summary, any
+failure, the model, token counts, and the harness checkpoint. `factory agent
+run` prints it as one JSON object.
+
 ## Where runs execute
 
 | site | reach | isolation |
@@ -239,11 +297,24 @@ approval policy (`never`), the sandbox, and the finish tool's MCP server.
   and its patch tool, so any other tool list is refused rather than widened.
   Wrapping Codex in `sandbox-exec` would nest two sandboxes, which macOS
   refuses.
+- **Codex's extras are off.** `--ignore-user-config` leaves Codex's defaults
+  on, and they include the ChatGPT apps of the logged-in account (some write
+  to it), plugins, the operator's skills list (thousands of tokens on every
+  request), web search, browser and computer use, and image generation. The
+  harness turns each off (`CLOSED-SETTINGS` in the codex library). Code mode
+  stays on: some models are served only through it. Codex's multi-agent v2
+  instructions also stay, because its model catalog turns them on per model
+  and no setting reaches them.
 - **State.** Codex keeps threads and credentials in the operator's
   CODEX_HOME. A private one would need a copy of the credentials, which Codex
   rewrites when it refreshes them. The cost is that Codex always reads that
   home's `AGENTS.md`, so the operator's global Codex instructions apply to
   factory agents.
+
+Sites may opt workspace-write Codex agents into networking with
+`"codex_network": true` in `site.json`, for tasks that download research sources
+or install dependencies. It defaults to false and must be a JSON boolean.
+This setting does not enable networking for read-only reviewer agents.
 
 ## Station reviews
 
@@ -412,6 +483,10 @@ factory site secrets NAME VAR...
 factory new NAME                  interactive factory designer
 factory check FACTORY             validate a factory (name or path)
 factory factories                 the library: yours, then bundled
+factory agents                    standalone agents: the project's, the site's, then bundled
+factory agent new NAME [--site]   write a starting agent into the project (or the site)
+factory agent check AGENT         validate an agent (name or path)
+factory agent run AGENT [INPUT…] [--input T | --input-file F] [--model M] [--harness H] [--state-dir D] [-v]
 factory start FACTORY [--on SITE] [--project PATH] [--brief TEXT | --brief-file F] [--model M] [--harness H] [--reviewers R,…|none]
 factory reviewers                 reviewers a run can name, and what each runs on
 factory ps                        runs everywhere
@@ -435,7 +510,7 @@ factory skills install            install the Claude Code skills
 | `mddoc` | `mddoc.doc` | Markdown front matter + heading sections |
 | `agent` | `agent.tool`, `agent.loop`, `agent.harness` | provider-neutral agent loop: tools, steering, pause/cancel, checkpoints; the `Harness` trait |
 | `agent-tools` | `agent_tools.files`, `agent_tools.shell`, `agent_tools.sandbox`, `agent_tools.stream` | workspace-confined file tools, a sandboxable shell, and a supervised program read line by line |
-| `mcp` | `mcp.server` | a Model Context Protocol server for a `ToolRegistry` over stdio |
+| `mcp` | `mcp.server`, `mcp.client` | a Model Context Protocol server for a `ToolRegistry` over stdio, and a client for a server run as a program |
 | `opencode` | `opencode.harness` | OpenCode driven headlessly as a `Harness` |
 | `cli` | `cli.args`, `cli.style`, `cli.prompt` | subcommands and flags, terminal styling, interactive prompts |
 | `tui` | `tui.term`, `tui.keys`, `tui.canvas`, `tui.widgets`, `tui.width` | full-screen terminal UI toolkit |

@@ -1,0 +1,37 @@
+(module coilbugs.test-support)
+(import "coil.alloc" :use *)
+(import "coil.process" :as process)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.proc" :use [capture env-or])
+(import "coilbugs.text" :use *)
+
+;;; A fresh, empty directory for one test. Each deftest runs in its own
+;;; process, so the pid keeps concurrent tests apart.
+(defn temp-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
+  (let [base (env-or a "TMPDIR" "/tmp")
+        path (path-join a base (join a ["coil-bugs-test-" (int-text a (process/id)) "-" label]))]
+    (atomic/remove-tree! a path)
+    (match (ensure-dir a path 448)
+      (Ok [_] path)
+      (Err [why] (do (println "{s}" why) (assert false) path)))))
+
+(defn write! [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> i64)
+  (match (write-text a path text 420)
+    (Ok [_] 0)
+    (Err [why] (do (println "{s}" why) (assert false) 0))))
+
+(defn read! [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (read-required a path)
+    (Ok [text] text)
+    (Err [why] (do (println "{s}" why) (assert false) ""))))
+
+;;; Run `sh -c script` in `dir`; its trimmed stdout, asserting it succeeded.
+(defn sh! [(a (dyn Allocator)) (dir (slice u8)) (script (slice u8))] (-> (slice u8))
+  (let [result (capture a "/bin/sh" ["-c" script] dir 120000)]
+    (when (not (.ok result))
+      (println "sh failed: {s}\n{s}{s}" script (.output result) (.error result))
+      (assert false)
+      0)
+    (str-trim (.output result))))

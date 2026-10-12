@@ -431,7 +431,8 @@
               :description (match (.policy self)
                              (NoSandbox [] SHELL_DESCRIPTION)
                              (_ SHELL_DESCRIPTION_SANDBOXED))
-              :parameters SHELL_SCHEMA))
+              :parameters SHELL_SCHEMA
+              :self-checked false))
   (tool-summary [(self (ptr ShellTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (join2 a "$ " (command-headline a (call-string call "command"))))
   (tool-run [(self (ptr ShellTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)

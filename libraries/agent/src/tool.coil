@@ -12,7 +12,12 @@
 (defstruct ToolSpec
   [(name (slice u8))
    (description (slice u8))
-   (parameters (slice u8))])
+   (parameters (slice u8))
+   ;;; True when the tool checks its own arguments, so callers must not
+   ;;; check them against `parameters` first: a tool that forwards to an MCP
+   ;;; server, whose schema may use keywords `json-schema` cannot check, and
+   ;;; whose server checks what it is given.
+   (self-checked bool)])
 
 ;;; One call proposed by the model. `arguments` is the parsed argument object;
 ;;; `arguments-json` is the exact text the model produced.

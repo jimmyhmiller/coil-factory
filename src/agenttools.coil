@@ -1,0 +1,496 @@
+(module factory.agenttools)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.jsonl" :as jsonl)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.sandbox" :as sandbox)
+(import "agent_tools.stream" :as stream)
+(import "agent_tools.workspace" :as ws)
+(import "mcp.client" :as mcp)
+(import "factory.agentspec" :use *)
+(import "factory.toolkit" :use [policy-for PolicyOk PolicyBad])
+
+;;; The tools an agent file defines, as `Tool`s any harness can offer.
+;;;
+;;; collect   each call that passes its checks is kept in `Collected`, in the
+;;;           order the agent made them; `retract` takes one back.
+;;; run       the command runs with the arguments as JSON on standard input,
+;;;           and what it prints is what the agent is told.
+;;; mcp       the server is started when the agent is, and each of its tools
+;;;           is offered as it is; calls go to the server.
+;;;
+;;; `done` ends the agent. Commands (run tools, mcp servers, the gate) run
+;;; through `/bin/sh -c` in the agent's home (see factory.agentlib), under
+;;; the site's isolation with the work directory writable, and see the
+;;; directories as $FACTORY_WORKDIR and $FACTORY_AGENT_HOME.
+
+(const RETRACT-TOOL "retract")
+(const RUN-TIMEOUT-MS 300000)
+(const MCP-START-TIMEOUT-MS 60000)
+(const MCP-CALL-TIMEOUT-MS 600000)
+;;; What a run tool's output may add to the conversation.
+(const OUTPUT-KEPT-BYTES 65536)
+
+;; ---------------------------------------------------------------------------
+;; What an agent reports
+
+;;; One call the agent made to a collect tool, numbered from 1 in the order
+;;; they were made. Owned by the `Collected` it is in.
+(defstruct Report
+  [(number i64)
+   (tool (slice u8))
+   (arguments JVal)
+   (arguments-json (slice u8))])
+
+;;; The reports an agent has made and not retracted. With `file` set (when
+;;; the tools run in another process for an outside harness), every change is
+;;; also appended to it as a JSON line, and `collected-load!` reads it back.
+(defstruct Collected
+  [(allocator (dyn Allocator))
+   (reports (ArrayList Report))
+   (next i64)
+   (file (slice u8))])
+
+(defn collected-new [(a (dyn Allocator))] (-> Collected)
+  (Collected :allocator a :reports (al-new [Report] a) :next 1 :file ""))
+
+(defn collected-to-file [(a (dyn Allocator)) (file (slice u8))] (-> Collected)
+  (Collected :allocator a :reports (al-new [Report] a) :next 1 :file file))
+
+(defn text-cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for part (iter parts) (sb-push-str! (mut out) part))
+    (sb-finish! (mut out))))
+
+(defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-i64! (mut out) n)
+    (sb-finish! (mut out))))
+
+(defn contains-text? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+;;; The first `n` bytes of `text`, marked when cut.
+(defn clipped [(a (dyn Allocator)) (text (slice u8)) (n i64)] (-> (slice u8))
+  (if (<= (len text) n) text (text-cat a [(subslice [u8] text 0 n) "…"])))
+
+(defn record-line! [(sink (ptr Collected)) (line JVal)] (-> (Result i64 (slice u8)))
+  (if (= (len (.file sink)) 0)
+      (Ok 0)
+      (match (jsonl/journal-append! (.allocator sink) (.file sink) (jv-encode (.allocator sink) line) false)
+        (Ok [n] (Ok 0))
+        (Err [e] (Err (text-cat (.allocator sink) ["could not record the call in " (.file sink)]))))))
+
+(defn add-report! [(sink (ptr Collected)) (tool (slice u8)) (arguments JVal) (arguments-json (slice u8))] (-> (Result i64 (slice u8)))
+  (let [keep (.allocator sink)
+        number (.next sink)
+        report (Report :number number :tool (copy-bytes keep tool) :arguments (jv-clone keep arguments)
+                       :arguments-json (copy-bytes keep arguments-json))
+        line (jv-object keep)]
+    (jv-put! line "report" (JInt number))
+    (jv-put! line "tool" (JStr (.tool report)))
+    (jv-put! line "arguments" (.arguments report))
+    (match (record-line! sink line)
+      (Err [message] (Err message))
+      (Ok [_] (do (push! (mut (.reports sink)) report)
+                  (set! (.next sink) (+ number 1))
+                  (Ok number))))))
+
+(defn report-index [(sink (ptr Collected)) (number i64)] (-> i64)
+  (let [(mut found) -1
+        (mut i) 0]
+    (for report (iter (.reports sink))
+      (when (= (.number report) number) (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
+    (load found)))
+
+(defn drop-report! [(sink (ptr Collected)) (index i64)] (-> i64)
+  (let [(mut kept) (al-new [Report] (.allocator sink))
+        (mut i) 0]
+    (for report (iter (.reports sink))
+      (when (!= (load i) index) (push! (mut kept) report) 0)
+      (set! i (+ (load i) 1)))
+    (set! (.reports sink) (load kept))
+    0))
+
+(defn retract-report! [(sink (ptr Collected)) (number i64)] (-> (Result i64 (slice u8)))
+  (let [index (report-index sink number)]
+    (if (< index 0)
+        (Err (text-cat (.allocator sink) ["there is no report #" (int-text (.allocator sink) number) " to take back"]))
+        (let [line (jv-object (.allocator sink))]
+          (jv-put! line "retract" (JInt number))
+          (match (record-line! sink line)
+            (Err [message] (Err message))
+            (Ok [_] (do (drop-report! sink index) (Ok number))))))))
+
+;;; Replace the reports with those `file` records, as another process made
+;;; them. A missing file is no reports.
+(defn collected-load! [(sink (ptr Collected)) (file (slice u8))] (-> (Result i64 (slice u8)))
+  (block :load
+         (let [a (.allocator sink)
+               (mut from) 0]
+           (set! (.reports sink) (al-new [Report] a))
+           (set! (.next sink) 1)
+           (loop
+             (match (jsonl/journal-read a file (load from) 1000 4194304)
+               (Err [e] (return-from :load (Err (text-cat a ["could not read the agent's reports from " file]))))
+               (Ok [batch]
+                   (do (for record (iter (jsonl/batch-records batch))
+                         (match (jv-parse a (.line record))
+                           (None [] 0)
+                           (Some [line]
+                                 (match (jv-get line "retract")
+                                   (JInt [number] (let [index (report-index sink number)]
+                                                    (when (>= index 0) (drop-report! sink index) 0)
+                                                    0))
+                                   (_ (let [number (jv-int (jv-get line "report"))]
+                                        (push! (mut (.reports sink))
+                                               (Report :number number :tool (jv-string-or (jv-get line "tool") "")
+                                                       :arguments (jv-get line "arguments")
+                                                       :arguments-json (jv-encode a (jv-get line "arguments"))))
+                                        (when (>= number (.next sink)) (set! (.next sink) (+ number 1)) 0)
+                                        0))))))
+                       (if (= (jsonl/batch-next-offset batch) (load from))
+                           (return-from :load (Ok (len (.reports sink))))
+                           (set! from (jsonl/batch-next-offset batch)))))))
+           (Ok 0))))
+
+;;; A `Collected` that goes on from what `file` already records: its reports,
+;;; and its numbering. An outside harness may start the tools' process again
+;;; (Codex does on every resume), and the agent must still be able to retract
+;;; a report it made before, and get new numbers, not repeated ones.
+(defn collected-resume! [(a (dyn Allocator)) (file (slice u8))] (-> (Result Collected (slice u8)))
+  (let [(mut sink) (collected-to-file a file)]
+    (match (collected-load! (mut sink) file)
+      (Err [message] (Err message))
+      (Ok [_] (Ok (load sink))))))
+
+;;; Why a call breaks its tool's `verbatim:` rule, or "": each named argument
+;;; that is present must appear word for word in the input.
+(defn verbatim-problem [(a (dyn Allocator)) (tool (ptr AgentToolSpec)) (input (slice u8)) (call ToolCall)] (-> (slice u8))
+  (let [(mut problem) ""]
+    (for name (iter (.verbatim tool))
+      (when (and (= (len (load problem)) 0) (call-has? call name))
+        (let [value (call-string call name)]
+          (when (or (= (len value) 0) (not (contains-text? input value)))
+            (set! problem (text-cat a ["`" name "` must be copied exactly from the input, and \"" (clipped a value 200)
+                                       "\" does not appear in it. Copy the words as they are written there, with the same spelling, punctuation, and spacing."]))
+            0)
+          0)
+        0))
+    (load problem)))
+
+;; ---------------------------------------------------------------------------
+;; Collect tools, retract, and done
+
+(defstruct CollectTool
+  [(spec (ptr AgentToolSpec))
+   (input (slice u8))
+   (sink (ptr Collected))])
+
+(impl Tool CollectTool
+  (tool-spec [(self (ptr CollectTool))] (-> ToolSpec)
+             (ToolSpec :name (.name (.spec self)) :description (.description (.spec self)) :parameters (.schema (.spec self))
+                       :self-checked false))
+  (tool-summary [(self (ptr CollectTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (text-cat a [(.name (.spec self)) " " (clipped a (.arguments-json call) 120)]))
+  (tool-run [(self (ptr CollectTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (let [unquoted (verbatim-problem a (.spec self) (.input self) call)]
+              (if (> (len unquoted) 0)
+                  (ToolFailed unquoted)
+                  (match (add-report! (.sink self) (.name (.spec self)) (.arguments call) (.arguments-json call))
+                    (Err [message] (ToolFailed message))
+                    (Ok [number] (ToolOk (text-cat a ["Recorded as #" (int-text a number) " (" (int-text a (len (.reports (.sink self))))
+                                                      " kept). `" RETRACT-TOOL "` takes it back."]))))))))
+
+(defstruct RetractTool [(sink (ptr Collected))])
+
+(const RETRACT-SCHEMA "{\"type\":\"object\",\"properties\":{\"number\":{\"type\":\"integer\",\"description\":\"The report's number, from when it was recorded.\"},\"reason\":{\"type\":\"string\",\"description\":\"Why it is wrong.\"}},\"required\":[\"number\",\"reason\"],\"additionalProperties\":false}")
+
+(impl Tool RetractTool
+  (tool-spec [(self (ptr RetractTool))] (-> ToolSpec)
+             (ToolSpec :name RETRACT-TOOL
+                       :description "Take back one of your reports, by the number it was recorded as, when it turns out to be wrong."
+                       :parameters RETRACT-SCHEMA
+                       :self-checked false))
+  (tool-summary [(self (ptr RetractTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (text-cat a ["retract #" (int-text a (call-int call "number" 0)) ": " (clipped a (call-string call "reason") 100)]))
+  (tool-run [(self (ptr RetractTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (match (retract-report! (.sink self) (call-int call "number" 0))
+              (Err [message] (ToolFailed message))
+              (Ok [number] (ToolOk (text-cat a ["Took back #" (int-text a number) "."]))))))
+
+(defstruct DoneTool [(gate (slice u8))])
+
+(const DONE-SCHEMA "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\",\"description\":\"One or two sentences on what you found or did.\"}},\"required\":[\"summary\"],\"additionalProperties\":false}")
+
+(impl Tool DoneTool
+  (tool-spec [(self (ptr DoneTool))] (-> ToolSpec)
+             (ToolSpec :name DONE-TOOL
+                       :description "End your work, once you have done everything your instructions ask and reported it with your tools."
+                       :parameters DONE-SCHEMA
+                       :self-checked false))
+  (tool-summary [(self (ptr DoneTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (text-cat a ["done: " (clipped a (call-string call "summary") 120)]))
+  (tool-run [(self (ptr DoneTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (ToolOk (if (> (len (.gate self)) 0) "Recorded. Your results are being checked now." "Recorded."))))
+
+;; ---------------------------------------------------------------------------
+;; Commands
+
+;;; Where an agent's commands run: `home` (its file's directory, or "" for a
+;;; bundled agent, which then runs them in `workdir`), the work directory,
+;;; and the site's isolation.
+(defstruct AgentPlace [(home (slice u8)) (workdir (slice u8)) (isolation (slice u8))])
+
+(defn command-dir [(place AgentPlace)] (-> (slice u8))
+  (if (> (len (.home place)) 0) (.home place) (.workdir place)))
+
+(defn shell-quote [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "'")
+    (for byte (iter text)
+      (if (= (cast i64 byte) 39) (sb-push-str! (mut out) "'\\''") (sb-push-byte! (mut out) byte)))
+    (sb-push-str! (mut out) "'")
+    (sb-finish! (mut out))))
+
+;;; `command` with the agent's directories in its environment.
+(defn command-text [(a (dyn Allocator)) (place AgentPlace) (command (slice u8))] (-> (slice u8))
+  (text-cat a ["export FACTORY_WORKDIR=" (shell-quote a (.workdir place))
+               " FACTORY_AGENT_HOME=" (shell-quote a (command-dir place)) "; " command]))
+
+;;; The argv that runs `command` for the agent under the site's isolation.
+(defn command-argv [(a (dyn Allocator)) (place AgentPlace) (command (slice u8))] (-> (Result (slice (slice u8)) (slice u8)))
+  (if (= (len (.workdir place)) 0)
+      (Err "the agent has commands but was given no directory to work in")
+      (match (ws/workspace-open a (.workdir place))
+        (Err [message] (Err message))
+        (Ok [workspace]
+            (match (policy-for a workspace (.isolation place))
+              (PolicyBad [message] (Err message))
+              (PolicyOk [policy]
+                        (let [(mut argv) (sandbox/sandbox-argv a policy (ws/workspace-root workspace) (command-text a place command))]
+                          (Ok (al-slice argv)))))))))
+
+(defstruct CommandRun
+  [(exit i64)
+   (timed-out bool)
+   (cancelled bool)
+   ;;; Standard output, at most OUTPUT-KEPT-BYTES of whole lines.
+   (output (slice u8))
+   (dropped-lines i64)
+   (errors (slice u8))])
+
+;;; Keeps the program's output, and stops it when `context` is cancelled.
+(defstruct OutputLines [(out StrBuf) (dropped i64) (context (dyn ToolContext))])
+
+(impl stream/LineSink OutputLines
+  (on-line [(self (ptr OutputLines)) (line (slice u8))] (-> bool)
+           (do (if (<= (+ (len (sb-str (.out self))) (len line) 1) OUTPUT-KEPT-BYTES)
+                   (do (sb-push-str! (mut (.out self)) line) (sb-push-str! (mut (.out self)) "\n") 0)
+                   (set! (.dropped self) (+ (.dropped self) 1)))
+               true))
+  (on-tick [(self (ptr OutputLines))] (-> bool)
+           (not (tool-cancelled? (.context self)))))
+
+;;; Run `command` for the agent with `input` on its standard input.
+(defn run-agent-command [(a (dyn Allocator))
+                         (place AgentPlace)
+                         (command (slice u8))
+                         (input (slice u8))
+                         (timeout-ms i64)
+                         (context (dyn ToolContext))] (-> (Result CommandRun (slice u8)))
+  (match (command-argv a place command)
+    (Err [message] (Err message))
+    (Ok [argv]
+        (let [sink (box! a OutputLines (OutputLines :out (sb-new a) :dropped 0 :context context))]
+          (match (stream/stream-lines a (stream/StreamSpec :program (get argv 0)
+                                                           :args (subslice argv 1 (len argv))
+                                                           :cwd (command-dir place)
+                                                           :input input
+                                                           :timeout-ms timeout-ms
+                                                           :max-line-bytes OUTPUT-KEPT-BYTES
+                                                           :stderr-bytes 8192)
+                                      sink)
+            (Err [message] (Err message))
+            (Ok [ended]
+                (Ok (CommandRun :exit (.exit-code ended)
+                                :timed-out (.timed-out ended)
+                                :cancelled (.stopped ended)
+                                :output (sb-str (.out sink))
+                                :dropped-lines (+ (.dropped sink) (.dropped-lines ended))
+                                :errors (.errors ended)))))))))
+
+(defn command-ok? [(ran (ptr CommandRun))] (-> bool)
+  (and (= (.exit ran) 0) (not (.timed-out ran)) (not (.cancelled ran))))
+
+;;; A failed command's report for the agent or a person: how it ended and
+;;; what it printed.
+(defn command-failure [(a (dyn Allocator)) (ran (ptr CommandRun))] (-> (slice u8))
+  (text-cat a [(cond (.timed-out ran) "timed out"
+                     (.cancelled ran) "was stopped"
+                     :else (text-cat a ["exited with status " (int-text a (.exit ran))]))
+               (if (> (len (str-trim (.output ran))) 0) (text-cat a ["\n" (str-trim (.output ran))]) "")
+               (if (> (len (str-trim (.errors ran))) 0) (text-cat a ["\n" (str-trim (.errors ran))]) "")]))
+
+(defstruct RunTool
+  [(spec (ptr AgentToolSpec))
+   (input (slice u8))
+   (place AgentPlace)])
+
+(impl Tool RunTool
+  (tool-spec [(self (ptr RunTool))] (-> ToolSpec)
+             (ToolSpec :name (.name (.spec self)) :description (.description (.spec self)) :parameters (.schema (.spec self))
+                       :self-checked false))
+  (tool-summary [(self (ptr RunTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (text-cat a [(.name (.spec self)) " " (clipped a (.arguments-json call) 120)]))
+  (tool-run [(self (ptr RunTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (let [unquoted (verbatim-problem a (.spec self) (.input self) call)]
+              (if (> (len unquoted) 0)
+                  (ToolFailed unquoted)
+                  (match (run-agent-command a (.place self) (.command (.spec self)) (.arguments-json call) RUN-TIMEOUT-MS context)
+                    (Err [message] (ToolFailed (text-cat a ["`" (.name (.spec self)) "` could not run: " message])))
+                    (Ok [finished]
+                        (let [(mut ran) finished
+                              more (if (> (.dropped-lines ran) 0)
+                                       (text-cat a ["\n(" (int-text a (.dropped-lines ran)) " more lines were cut)"])
+                                       "")]
+                          (if (command-ok? (mut ran))
+                              (ToolOk (if (> (len (str-trim (.output ran))) 0) (text-cat a [(.output ran) more]) "(no output)"))
+                              (ToolFailed (text-cat a ["`" (.name (.spec self)) "` " (command-failure a (mut ran)) more]))))))))))
+
+;; ---------------------------------------------------------------------------
+;; MCP servers
+
+(defstruct McpTool
+  [(client (ptr mcp/McpClient))
+   (info mcp/McpToolInfo)])
+
+(impl Tool McpTool
+  (tool-spec [(self (ptr McpTool))] (-> ToolSpec)
+             (ToolSpec :name (.name (.info self)) :description (.description (.info self)) :parameters (.schema (.info self))
+                       :self-checked true))
+  (tool-summary [(self (ptr McpTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
+                (text-cat a [(.name (.info self)) " " (clipped a (.arguments-json call) 120)]))
+  (tool-run [(self (ptr McpTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
+            (match (mcp/mcp-call-tool! (.client self) a (.name (.info self)) (.arguments call) MCP-CALL-TIMEOUT-MS context)
+              (Err [message] (ToolFailed message))
+              (Ok [result] (if (.is-error result) (ToolFailed (.text result)) (ToolOk (.text result)))))))
+
+;;; Names a model can call: letters, digits, `_`, and `-`, at most 64.
+(defn callable-name? [(name (slice u8))] (-> bool)
+  (let [(mut ok) (and (> (len name) 0) (<= (len name) 64))]
+    (for byte (iter name)
+      (let [c (cast i64 byte)]
+        (when (not (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 95) (= c 45)))
+          (set! ok false)
+          0)))
+    (load ok)))
+
+(defn names-text [(a (dyn Allocator)) (tools (ArrayList mcp/McpToolInfo))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (for tool (iter tools)
+      (when (> (len (sb-str (load out))) 0) (sb-push-str! (mut out) ", ") 0)
+      (sb-push-str! (mut out) (.name tool)))
+    (sb-finish! (mut out))))
+
+(defn wanted? [(spec (ptr AgentToolSpec)) (name (slice u8))] (-> bool)
+  (let [(mut chosen) (= (len (.only spec)) 0)]
+    (for wanted (iter (.only spec)) (when (= name wanted) (set! chosen true) 0))
+    (load chosen)))
+
+;;; Start the server of `spec`, and offer the tools it chooses.
+(defn connect-server! [(a (dyn Allocator))
+                       (spec (ptr AgentToolSpec))
+                       (place AgentPlace)
+                       (out (ptr (ArrayList (dyn Tool))))
+                       (clients (ptr (ArrayList (ptr mcp/McpClient))))
+                       (context (dyn ToolContext))] (-> (Result i64 (slice u8)))
+  (block :connect
+         (let [argv (match (command-argv a place (.command spec))
+                      (Err [message] (return-from :connect (Err message)))
+                      (Ok [made] made))
+               client (match (mcp/mcp-connect a argv (command-dir place) (.name spec) MCP-START-TIMEOUT-MS context)
+                        (Err [message] (return-from :connect (Err message)))
+                        (Ok [made] made))]
+           (push! clients client)
+           (let [tools (match (mcp/mcp-list-tools! client a MCP-START-TIMEOUT-MS context)
+                         (Err [message] (return-from :connect (Err message)))
+                         (Ok [listed] listed))]
+             (for wanted (iter (.only spec))
+               (let [(mut known) false]
+                 (for tool (iter tools) (when (= (.name tool) wanted) (set! known true) 0))
+                 (when (not (load known))
+                   (return-from :connect (Err (text-cat a ["only: names \"" wanted "\", which the MCP server does not offer; it offers "
+                                                           (names-text a tools)])))
+                   0)))
+             (for tool (iter tools)
+               (when (wanted? spec (.name tool))
+                 (when (not (callable-name? (.name tool)))
+                   (return-from :connect (Err (text-cat a ["the MCP server offers a tool named \"" (.name tool)
+                                                           "\", which models cannot call; leave it out with only:"])))
+                   0)
+                 (push-tool! out (box! a McpTool (McpTool :client client :info tool)))
+                 0))
+             (Ok (len tools))))))
+
+;; ---------------------------------------------------------------------------
+;; All of an agent's tools
+
+;;; An agent's tools, and the MCP servers they need, which `agent-tools-close!`
+;;; stops.
+(defstruct AgentTools
+  [(tools (ArrayList (dyn Tool)))
+   (clients (ArrayList (ptr mcp/McpClient)))])
+
+(defn agent-tools-close! [(tools (ptr AgentTools))] (-> i64)
+  (do (for client (iter (.clients tools)) (mcp/mcp-close! client))
+      0))
+
+;; A concrete tool becomes a `(dyn Tool)` as an argument.
+(defn push-tool! [(out (ptr (ArrayList (dyn Tool)))) (tool (dyn Tool))] (-> i64)
+  (push! out tool))
+
+(defn has-collect? [(spec (ptr AgentSpec))] (-> bool)
+  (let [(mut found) false]
+    (for tool (iter (.agent-tools spec)) (when (= (.kind tool) "collect") (set! found true) 0))
+    (load found)))
+
+;;; The tools of `spec` over `input`, in the order the file lists them, then
+;;; `retract` (when there are collect tools) and `done`. Collect tools keep
+;;; their calls in `sink`. MCP servers are started here; on an error the ones
+;;; already started are stopped.
+(defn agent-tool-list [(a (dyn Allocator))
+                       (spec (ptr AgentSpec))
+                       (input (slice u8))
+                       (place AgentPlace)
+                       (sink (ptr Collected))
+                       (context (dyn ToolContext))] (-> (Result AgentTools (slice u8)))
+  (let [(mut made) (AgentTools :tools (al-new [(dyn Tool)] a) :clients (al-new [(ptr mcp/McpClient)] a))
+        (mut problem) ""
+        (mut i) 0
+        n (len (.agent-tools spec))]
+    (loop (if (or (>= (load i) n) (> (len (load problem)) 0))
+              (break)
+              (let [tool (al-elem [AgentToolSpec] (field spec agent-tools) (load i))]
+                (cond (= (.kind tool) "collect")
+                        (push-tool! (field (mut made) tools) (box! a CollectTool (CollectTool :spec tool :input input :sink sink)))
+                      (= (.kind tool) "run")
+                        (push-tool! (field (mut made) tools) (box! a RunTool (RunTool :spec tool :input input :place place)))
+                      :else
+                        (match (connect-server! a tool place (field (mut made) tools) (field (mut made) clients) context)
+                          (Err [message] (do (set! problem (text-cat a ["the MCP server \"" (.name tool) "\": " message])) 0))
+                          (Ok [_] 0)))
+                (set! i (+ (load i) 1)))))
+    (if (> (len (load problem)) 0)
+        (do (agent-tools-close! (mut made)) (Err (load problem)))
+        (do (when (has-collect? spec)
+              (push-tool! (field (mut made) tools) (box! a RetractTool (RetractTool :sink sink)))
+              0)
+            (push-tool! (field (mut made) tools) (box! a DoneTool (DoneTool :gate (.gate spec))))
+            (Ok (load made))))))

@@ -1,0 +1,220 @@
+(module coilbugs.gates-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coilbugs.checks" :use *)
+(import "coilbugs.text" :use *)
+(import "coilbugs.test-support" :use *)
+
+;;; The station gates, run as the factory runs them: in a git workspace,
+;;; against stand-in compilers.
+
+;; A stand-in compiler: `$COIL check-bug` fails while this build has the bug.
+(defn compiler-script [(code (slice u8))] (-> (slice u8))
+  (if (= code "0") "#!/bin/sh\n[ \"$1\" = check-bug ] && exit 0\nexit 0\n" "#!/bin/sh\n[ \"$1\" = check-bug ] && exit 1\nexit 0\n"))
+
+;; A stand-in for the Coil repository's scripts/dev.py: a candidate is fixed
+;; once src/fixed exists, and the focused suite fails while src/breaks-suite does.
+(const DEV "import pathlib, sys
+if sys.argv[1:3] == ['build', 'candidate']:
+    out = pathlib.Path('build/bin/coil-candidate'); out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text('#!/bin/sh\\n[ \"$1\" = check-bug ] && exit %d\\nexit 0\\n' % (0 if pathlib.Path('src/fixed').exists() else 1))
+    out.chmod(0o755)
+elif sys.argv[1:3] == ['test', 'modernize-fast']:
+    sys.exit(1 if pathlib.Path('src/breaks-suite').exists() else 0)
+")
+
+(defstruct Fixture [(ws (slice u8)) (compiler (slice u8)) (base (slice u8))])
+
+(defn fixture [(a (dyn Allocator)) (label (slice u8))] (-> Fixture)
+  (let [dir (temp-dir a label)
+        ws (path-join a dir "ws")
+        compiler (path-join a dir "base/coil")]
+    (write! a compiler (compiler-script "1"))
+    (sh! a dir "chmod +x base/coil")
+    (write! a (path-join a ws "scripts/dev.py") DEV)
+    (write! a (path-join a ws ".gitignore") "/build\n")
+    (sh! a ws "git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -q -m base")
+    (Fixture :ws ws :compiler compiler :base (sh! a ws "git rev-parse HEAD"))))
+
+(defn set-compiler! [(a (dyn Allocator)) (f Fixture) (code (slice u8))] (-> i64)
+  (write! a (.compiler f) (compiler-script code))
+  (sh! a (.ws f) (join a ["chmod +x " (.compiler f)]))
+  0)
+
+(defn commit! [(a (dyn Allocator)) (f Fixture) (message (slice u8))] (-> i64)
+  (sh! a (.ws f) (join a ["git add -A && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m '" message "'"]))
+  0)
+
+(defn put! [(a (dyn Allocator)) (f Fixture) (path (slice u8)) (text (slice u8))] (-> i64)
+  (write! a (path-join a (.ws f) path) text))
+
+(defn repro! [(a (dyn Allocator)) (f Fixture) (fields (slice u8))] (-> i64)
+  (put! a f ".coil-bug/REPRO.json"
+        (join a ["{\"bug\": \"b1\", \"summary\": \"found it\", \"attempts\": [{\"what\": \"ran\", \"command\": \"c\", \"result\": \"r\"}], " fields "}"])))
+
+(defn passes [(result (Result (slice u8) (slice u8))) (expected (slice u8))] (-> bool)
+  (match result
+    (Ok [message] (if (contains? message expected) true (do (println "passed with: {s}" message) false)))
+    (Err [why] (do (println "failed: {s}" why) false))))
+
+(defn fails [(result (Result (slice u8) (slice u8))) (expected (slice u8))] (-> bool)
+  (match result
+    (Ok [message] (do (println "unexpectedly passed: {s}" message) false))
+    (Err [why] (if (contains? why expected) true (do (println "failed with: {s}" why) false)))))
+
+(defn repro-gate [(a (dyn Allocator)) (f Fixture)] (-> (Result (slice u8) (slice u8)))
+  (gate-repro a (.ws f) "b1" (.base f) (.compiler f)))
+
+(defn fix-gate [(a (dyn Allocator)) (f Fixture)] (-> (Result (slice u8) (slice u8)))
+  (gate-fix a (.ws f) "b1" (.base f) (.compiler f)))
+
+(deftest reproduces-needs-a-check-that-fails-on-the-base-compiler
+  (let [a (malloc-allocator)
+        f (fixture a "repro-fails")]
+    (put! a f "tests/t.sh" "\"$COIL\" check-bug\n")
+    (repro! a f "\"verdict\": \"reproduces\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"]")
+    (assert (passes (repro-gate a f) "reproduces"))
+    (set-compiler! a f "0")
+    (assert (fails (repro-gate a f) "does not reproduce the bug"))))
+
+(deftest reproduces-needs-its-tests-to-be-new-on-the-branch
+  (let [a (malloc-allocator)
+        f0 (fixture a "repro-new")]
+    (put! a f0 "tests/t.sh" "\"$COIL\" check-bug\n")
+    (commit! a f0 "tests existed already")
+    (let [f (Fixture :ws (.ws f0) :compiler (.compiler f0) :base (sh! a (.ws f0) "git rev-parse HEAD"))]
+      (repro! a f "\"verdict\": \"reproduces\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"]")
+      (assert (fails (repro-gate a f) "not new or changed")))))
+
+(deftest a-repro-about-another-bug-is-refused
+  (let [a (malloc-allocator)
+        f (fixture a "repro-other")]
+    (put! a f ".coil-bug/REPRO.json" "{\"bug\": \"b2\", \"verdict\": \"cannot_verify\", \"needs\": \"a Mac\", \"summary\": \"s\", \"attempts\": [{\"what\": \"w\", \"command\": \"c\", \"result\": \"r\"}]}")
+    (assert (fails (repro-gate a f) "not \"b1\""))))
+
+(deftest does-not-reproduce-needs-a-passing-check-and-an-untouched-repository
+  (let [a (malloc-allocator)
+        f (fixture a "repro-gone")]
+    (set-compiler! a f "0")
+    (repro! a f "\"verdict\": \"does_not_reproduce\", \"check\": \"\\\"$COIL\\\" check-bug\"")
+    (assert (passes (repro-gate a f) "does_not_reproduce"))
+    (put! a f "src/x.coil" "stray")
+    (assert (fails (repro-gate a f) "src/x.coil"))))
+
+(deftest cannot-verify-must-say-what-is-missing
+  (let [a (malloc-allocator)
+        f (fixture a "repro-cannot")]
+    (repro! a f "\"verdict\": \"cannot_verify\", \"needs\": \"\"")
+    (assert (fails (repro-gate a f) "needs"))
+    (put! a f ".coil-bug/REPRO.json" "{\"bug\": \"b1\", \"verdict\": \"cannot_verify\", \"needs\": \"an arm64 Mac\", \"summary\": \"s\", \"attempts\": []}")
+    (assert (fails (repro-gate a f) "attempts"))
+    (repro! a f "\"verdict\": \"cannot_verify\", \"needs\": \"an arm64 Mac\"")
+    (assert (passes (repro-gate a f) "cannot_verify: an arm64 Mac"))))
+
+(defn reproduced [(a (dyn Allocator)) (label (slice u8))] (-> Fixture)
+  (let [f (fixture a label)]
+    (put! a f "tests/t.sh" "\"$COIL\" check-bug\n")
+    (repro! a f "\"verdict\": \"reproduces\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"]")
+    (commit! a f "reproduce: a failing test")
+    f))
+
+(deftest a-fix-must-pass-the-check-with-a-candidate-and-the-focused-gate
+  (let [a (malloc-allocator)
+        f (reproduced a "fix-ok")]
+    (put! a f "src/fixed" "")
+    (put! a f ".coil-bug/FIX.md" (join a ["The root cause was a missing case. The root cause was a missing case. "
+                                          "The root cause was a missing case. The root cause was a missing case. "
+                                          "The root cause was a missing case. The root cause was a missing case. "]))
+    (assert (passes (fix-gate a f) "fixed"))
+    (put! a f "src/breaks-suite" "")
+    (assert (fails (fix-gate a f) "focused gate exited 1"))))
+
+(defn long-fix [(a (dyn Allocator))] (-> (slice u8))
+  (let [(mut out) (sb-new a) (mut i) 0]
+    (loop (if (>= (load i) 30) (break) (do (sb-push-str! (mut out) "explained ") (set! i (+ (load i) 1)))))
+    (sb-finish! (mut out))))
+
+(deftest a-fix-that-does-not-fix-is-refused
+  (let [a (malloc-allocator)
+        f (reproduced a "fix-none")]
+    (put! a f "src/other" "")
+    (put! a f ".coil-bug/FIX.md" (long-fix a))
+    (assert (fails (fix-gate a f) "still fails with the candidate"))))
+
+(deftest a-fix-may-not-touch-the-regression-test-or-the-repro
+  (let [a (malloc-allocator)
+        f (reproduced a "fix-tamper")]
+    (put! a f "src/fixed" "")
+    (put! a f ".coil-bug/FIX.md" (long-fix a))
+    (put! a f "tests/t.sh" "exit 0\n")
+    (assert (fails (fix-gate a f) "regression tests must stay"))
+    (put! a f "tests/t.sh" "\"$COIL\" check-bug\n")
+    (repro! a f "\"verdict\": \"reproduces\", \"check\": \"true\", \"tests\": [\"tests/t.sh\"]")
+    (assert (fails (fix-gate a f) "REPRO.json changed"))))
+
+(deftest a-fix-needs-an-explanation
+  (let [a (malloc-allocator)
+        f (reproduced a "fix-why")]
+    (put! a f "src/fixed" "")
+    (assert (fails (fix-gate a f) "FIX.md"))))
+
+(deftest nothing-to-fix-means-nothing-changes
+  (let [a (malloc-allocator)
+        f (fixture a "fix-nothing")]
+    (set-compiler! a f "0")
+    (repro! a f "\"verdict\": \"does_not_reproduce\", \"check\": \"\\\"$COIL\\\" check-bug\"")
+    (commit! a f "reproduce: it is gone")
+    (assert (passes (fix-gate a f) "nothing to fix"))
+    (put! a f "src/x" "")
+    (assert (fails (fix-gate a f) "nothing should change"))))
+
+(defn triage-workspace [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
+  (let [ws (temp-dir a label)]
+    (write! a (path-join a ws "cells/0.md") "# heading")
+    (write! a (path-join a ws "cells/1.md") "### A crash\nFIXED in 1234abcd")
+    (write! a (path-join a ws "cells/2.md") "note")
+    (write! a (path-join a ws "CELLS.json")
+            "[{\"id\": \"a\", \"ts\": 1, \"file\": \"cells/0.md\"}, {\"id\": \"b\", \"ts\": 1, \"file\": \"cells/1.md\"}, {\"id\": \"coil-bugs-factory-b\", \"ts\": 1, \"file\": \"cells/2.md\"}]")
+    ws))
+
+(const HEADING "{\"id\": \"a\", \"cells\": [\"a\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"heading\"}")
+
+(defn triage-with [(a (dyn Allocator)) (ws (slice u8)) (bugs (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (write! a (path-join a ws "TRIAGE.json") (join a ["{\"bugs\": [" bugs "]}"]))
+  (write! a (path-join a ws "../SCOPE.md") "# Rules\n\n## 1. No live coding in the core\n\nText.\n\n## 2. Another\n")
+  (gate-triage a ws (path-join a ws "../SCOPE.md")))
+
+(defn fixed-entry [(a (dyn Allocator)) (cells (slice u8)) (status (slice u8)) (quote (slice u8))] (-> (slice u8))
+  (join a ["{\"id\": \"b\", \"cells\": [" cells "], \"title\": \"A crash\", \"status\": \"" status "\", \"reason\": \"r\", \"quote\": \"" quote "\"}"]))
+
+(deftest triage-places-every-cell-once-and-quotes-from-the-cells
+  (let [a (malloc-allocator)
+        ws (triage-workspace a "triage")
+        good (fixed-entry a "\"b\"" "fixed" "FIXED  in 1234abcd")]
+    (assert (passes (triage-with a ws (join a [HEADING ", " good])) "1 fixed"))
+    (assert (fails (triage-with a ws good) "1 cells are in no entry: a"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " good ", " good])) "already in bugs[1]"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (fixed-entry a "\"b\"" "fixed" "fixed upstream long ago")])) "is not in any of its cells"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (fixed-entry a "\"b\", \"coil-bugs-factory-b\"" "fixed" "FIXED in 1234abcd")])) "factory note"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (fixed-entry a "\"b\"" "maybe" "")])) "status must be"))
+    ;; A bug an agent found is a report: it must be placed.
+    (write! a (path-join a ws "cells/3.md") "### Found: a crash")
+    (write! a (path-join a ws "CELLS.json")
+            "[{\"id\": \"a\", \"ts\": 1, \"file\": \"cells/0.md\"}, {\"id\": \"b\", \"ts\": 1, \"file\": \"cells/1.md\"}, {\"id\": \"coil-bugs-factory-b\", \"ts\": 1, \"file\": \"cells/2.md\"}, {\"id\": \"coil-bugs-factory-found-b\", \"ts\": 1, \"file\": \"cells/3.md\"}]")
+    (assert (fails (triage-with a ws (join a [HEADING ", " good])) "1 cells are in no entry: coil-bugs-factory-found-b"))
+    (assert (passes (triage-with a ws (join a [HEADING ", " good ", {\"id\": \"coil-bugs-factory-found-b\", \"cells\": [\"coil-bugs-factory-found-b\"], \"title\": \"A crash\", \"status\": \"open\", \"reason\": \"r\", \"scope\": \"in\"}"])) "1 open"))))
+
+(defn open-entry [(a (dyn Allocator)) (scope-fields (slice u8))] (-> (slice u8))
+  (join a ["{\"id\": \"b\", \"cells\": [\"b\"], \"title\": \"A crash\", \"status\": \"open\", \"reason\": \"r\"" scope-fields "}"]))
+
+(deftest an-open-bug-is-judged-in-or-out-of-scope-against-a-real-rule
+  (let [a (malloc-allocator)
+        ws (triage-workspace a "triage-scope")]
+    (assert (fails (triage-with a ws (join a [HEADING ", " (open-entry a "")])) "needs scope"))
+    (assert (passes (triage-with a ws (join a [HEADING ", " (open-entry a ", \"scope\": \"in\"")])) "1 open (0 out of scope)"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (open-entry a ", \"scope\": \"out\", \"rule\": \"7\", \"scope_reason\": \"r\", \"scope_quote\": \"FIXED in 1234abcd\"")])) "rule \"7\" is not a rule"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (open-entry a ", \"scope\": \"out\", \"rule\": \"1\", \"scope_reason\": \"\", \"scope_quote\": \"FIXED in 1234abcd\"")])) "needs scope_reason"))
+    (assert (fails (triage-with a ws (join a [HEADING ", " (open-entry a ", \"scope\": \"out\", \"rule\": \"1\", \"scope_reason\": \"r\", \"scope_quote\": \"the JIT should update types\"")])) "scope_quote"))
+    (assert (passes (triage-with a ws (join a [HEADING ", " (open-entry a ", \"scope\": \"out\", \"rule\": \"1\", \"scope_reason\": \"live coding\", \"scope_quote\": \"A crash FIXED in\"")])) "1 open (1 out of scope)"))))

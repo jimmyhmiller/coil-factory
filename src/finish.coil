@@ -18,7 +18,8 @@
   (tool-spec [(self (ptr FinishTool))] (-> ToolSpec)
              (ToolSpec :name "finish"
                        :description "End this station. outcome \"done\" when the work is complete and verified (the factory then runs the station's gate, if any); outcome \"blocked\" when you need a person, with your question in the summary."
-                       :parameters "{\"type\":\"object\",\"properties\":{\"outcome\":{\"type\":\"string\",\"enum\":[\"done\",\"blocked\"],\"description\":\"done or blocked\"},\"summary\":{\"type\":\"string\",\"description\":\"What changed and how you verified it; or, when blocked, exactly what you need.\"}},\"required\":[\"outcome\",\"summary\"],\"additionalProperties\":false}"))
+                       :parameters "{\"type\":\"object\",\"properties\":{\"outcome\":{\"type\":\"string\",\"enum\":[\"done\",\"blocked\"],\"description\":\"done or blocked\"},\"summary\":{\"type\":\"string\",\"description\":\"What changed and how you verified it; or, when blocked, exactly what you need.\"}},\"required\":[\"outcome\",\"summary\"],\"additionalProperties\":false}"
+                       :self-checked false))
   (tool-summary [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
                 (let [(mut out) (sb-new a)]
                   (sb-push-str! (mut out) "finish: ")

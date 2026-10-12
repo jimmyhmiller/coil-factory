@@ -1,0 +1,169 @@
+(module coilbugs.mac)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.serde.json" :use [from-json])
+(import "durable.atomic" :as atomic)
+(import "durable.lock" :as lock)
+(import "factory.proc" :use [capture])
+(import "coilbugs.gatekeeper" :use *)
+(import "coilbugs.model" :use *)
+(import "coilbugs.pad" :use *)
+(import "coilbugs.text" :use *)
+
+;;; The Mac's half of the coil-bugs factory: one bounded heartbeat.
+;;;
+;;; launchd runs it every fifteen minutes while the Mac is awake, at login,
+;;; and as soon as the Mac wakes, so nothing depends on the Mac being up at a
+;;; particular time. Each heartbeat:
+;;;
+;;; 1. writes every note the server has left (a pull request, a bug it could
+;;;    not reproduce) into the pad, under the note's own cell id, and tells the
+;;;    function it is there. Writing a note twice replaces its cell, so a
+;;;    heartbeat that dies between the two steps repeats harmlessly;
+;;; 2. on the first heartbeat of each local day, posts every live cell of the
+;;;    coil-bugs pad, which the server then works through while the Mac sleeps.
+
+;;; Writes one cell into a pad; tests supply their own.
+(deftrait PadWriter [Self]
+  (write-cell [(self (ptr Self)) (a (dyn Allocator)) (notebook (slice u8)) (cell-id (slice u8)) (markdown (slice u8))] (-> (Result i64 (slice u8)))))
+
+;;; The `pad` program: `pad md -n NOTEBOOK --id CELL -- MARKDOWN`, which
+;;; replaces the cell when it exists.
+(defstruct PadProgram [(program (slice u8))])
+
+(impl PadWriter PadProgram
+  (write-cell [(self (ptr PadProgram)) (a (dyn Allocator)) (notebook (slice u8)) (cell-id (slice u8)) (markdown (slice u8))] (-> (Result i64 (slice u8)))
+              (let [result (capture a (.program self) ["md" "-n" notebook "--id" cell-id "--" markdown] "" 30000)]
+                (if (.ok result)
+                    (Ok 0)
+                    (Err (join a ["pad md -n " notebook " --id " cell-id " failed: " (str-trim (.error result))]))))))
+
+(defstruct HeartbeatResult [(delivered (ArrayList (slice u8))) (snapshot (slice u8))])
+
+(defn empty-mac-state [(a (dyn Allocator))] (-> MacState)
+  (MacState :last-snapshot-day "" :last-heartbeat "" :snapshots (al-new [SnapshotRecord] a)))
+
+(defn state-path [(a (dyn Allocator)) (config MacConfig)] (-> (slice u8))
+  (path-join a (expand-home a (.state-dir config)) "state.json"))
+
+(defn load-mac-state [(a (dyn Allocator)) (config MacConfig)] (-> (Result MacState (slice u8)))
+  (match (read-text a (state-path a config))
+    (Err [why] (Err why))
+    (Ok [found] (match found
+                  (None [] (Ok (empty-mac-state a)))
+                  (Some [text] (match (from-json [MacState] a text)
+                                 (Ok [state] (Ok state))
+                                 (Err [e] (Err (decode-error a (state-path a config) e)))))))))
+
+(defn allowed-notebook? [(config MacConfig) (notebook (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for name (iter (.notebooks config)) (when (= name notebook) (set! found true) 0))
+    (load found)))
+
+;;; Write every undelivered note into its pad, then mark it delivered.
+(defn deliver-notes [(a (dyn Allocator)) (config MacConfig) (gate (dyn MacGate)) (pad (dyn PadWriter))] (-> (Result (ArrayList (slice u8)) (slice u8)))
+  (block :deliver
+         (let [(mut delivered) (al-new [(slice u8)] a)
+               notes (match (gate-notes gate a)
+                       (Ok [found] found)
+                       (Err [why] (return-from :deliver (Err why))))]
+           (for note (iter notes)
+             (match (.delivered note)
+               (Some [_] 0)
+               (None []
+                     ;; The function checks these too; the pad is ours, so check again.
+                     (do (when (not (allowed-notebook? config (.notebook note)))
+                           (return-from :deliver (Err (join a ["note " (.id note) " targets the pad " (.notebook note) ", which this Mac does not write"]))))
+                         (when (not (starts-with (.cell-id note) NOTE-CELL-PREFIX))
+                           (return-from :deliver (Err (join a ["note " (.id note) " targets cell " (.cell-id note) ", not one of the factory's own"]))))
+                         (match (write-cell pad a (.notebook note) (.cell-id note) (.markdown note))
+                           (Err [why] (return-from :deliver (Err why)))
+                           (Ok [_] 0))
+                         (match (gate-deliver gate a (.id note) (.cell-id note))
+                           (Err [why] (return-from :deliver (Err why)))
+                           (Ok [_] 0))
+                         (println "coil-bugs: wrote note {s} into {s} as {s}" (.id note) (.notebook note) (.cell-id note))
+                         (push! (mut delivered) (.id note))
+                         0))))
+           (Ok (load delivered)))))
+
+;;; Post the pad unless it was already posted today (local time). Returns the
+;;; snapshot's id, or "" when none was due.
+(defn post-snapshot-if-due [(a (dyn Allocator)) (config MacConfig) (gate (dyn MacGate)) (state (mut MacState)) (now i64)] (-> (Result (slice u8) (slice u8)))
+  (let [day (local-date a now)]
+    (if (= (.last-snapshot-day state) day)
+        (Ok "")
+        (match (live-cells a (path-join a (expand-home a (.notebook-dir config)) (join a [(.notebook config) ".jsonl"])))
+          (Err [why] (Err why))
+          (Ok [cells]
+              (if (= (len cells) 0)
+                  (Err (join a ["the " (.notebook config) " pad has no cells; refusing to post an empty snapshot"]))
+                  (match (gate-snapshot gate a (SnapshotUpload :notebook (.notebook config) :taken now :cells cells))
+                    (Err [why] (Err why))
+                    (Ok [receipt]
+                        (let [(mut kept) (al-new [SnapshotRecord] a)
+                              earlier (.snapshots state)
+                              start (if (> (len earlier) 29) (- (len earlier) 29) 0)
+                              (mut i) start]
+                          (loop (if (>= (load i) (len earlier))
+                                    (break)
+                                    (do (push! (mut kept) (get earlier (load i)))
+                                        (set! i (+ (load i) 1)))))
+                          (push! (mut kept) (SnapshotRecord :day day :id (.id receipt) :cells (.cells receipt)))
+                          (set! (.last-snapshot-day state) day)
+                          (set! (.snapshots state) (load kept))
+                          (println "coil-bugs: posted snapshot {s} of {s} ({} cells)" (.id receipt) (.notebook config) (.cells receipt))
+                          (Ok (.id receipt)))))))))))
+
+;;; One heartbeat. The state is saved whatever happens after a step that
+;;; changed it, so a failure later in the beat does not repeat earlier work.
+(defn heartbeat [(a (dyn Allocator)) (config MacConfig) (gate (dyn MacGate)) (pad (dyn PadWriter)) (now i64)] (-> (Result HeartbeatResult (slice u8)))
+  (match (load-mac-state a config)
+    (Err [why] (Err why))
+    (Ok [loaded]
+        (let [(mut state) loaded]
+          (match (deliver-notes a config gate pad)
+            (Err [why] (Err why))
+            (Ok [delivered]
+                (let [posted (post-snapshot-if-due a config gate (mut state) now)]
+                  (set! (.last-heartbeat state) (utc-stamp a now))
+                  (match (write-json-file a (state-path a config) (load state) 420)
+                    (Err [why] (Err why))
+                    (Ok [_] (match posted
+                              (Err [why] (Err why))
+                              (Ok [id] (Ok (HeartbeatResult :delivered delivered :snapshot id)))))))))))))
+
+;;; `coil-bugs mac --config FILE`: one heartbeat, holding a lock so two never
+;;; overlap. A failure is written to `last-error.json` and the exit is nonzero;
+;;; the next heartbeat tries again.
+(defn mac-main [(a (dyn Allocator)) (config-path (slice u8))] (-> i64)
+  (match (read-json-file [MacConfig] a config-path)
+    (Err [why] (do (println "coil-bugs: {s}" why) 78))
+    (Ok [config]
+        (let [dir (expand-home a (.state-dir config))]
+          (match (ensure-dir a dir 448)
+            (Err [why] (do (println "coil-bugs: {s}" why) 73))
+            (Ok [_]
+                (match (lock/lock-open! a (path-join a dir "heartbeat.lock"))
+                  (Err [_] (do (println "coil-bugs: cannot open the heartbeat lock") 73))
+                  (Ok [opened]
+                      (let [(mut held) opened]
+                        (match (lock/lock-try! (mut held))
+                          (Ok [got] (if (not got)
+                                        0
+                                        (let [(mut gate) (gatekeeper-for a config)
+                                              (mut pad) (PadProgram :program (.pad config))
+                                              error-path (path-join a dir "last-error.json")]
+                                          (match (heartbeat a config (mut gate) (mut pad) (now-ms))
+                                            (Ok [result]
+                                                (do (when (file-exists? a error-path) (atomic/unlink-path a error-path) 0)
+                                                    (println "coil-bugs: heartbeat done: {} notes written, snapshot {s}" (len (.delivered result))
+                                                             (if (> (len (.snapshot result)) 0) (.snapshot result) "not due"))
+                                                    0))
+                                            (Err [why]
+                                                 (do (write-text a error-path (join a ["{\"time\": \"" (utc-stamp a (now-ms)) "\", \"error\": " (encode a why) "}\n"]) 420)
+                                                     (println "coil-bugs: heartbeat failed; the next one retries: {s}" why)
+                                                     1))))))
+                          (Err [_] (do (println "coil-bugs: cannot take the heartbeat lock") 73))))))))))))

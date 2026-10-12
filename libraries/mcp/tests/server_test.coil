@@ -14,7 +14,8 @@
   (tool-spec [(self (ptr Shout))] (-> ToolSpec)
     (ToolSpec :name "shout"
               :description "Say it louder"
-              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"))
+              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"
+              :self-checked false))
   (tool-summary [(self (ptr Shout)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "shout")
   (tool-run [(self (ptr Shout)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
     (do (set! (.calls self) (+ (.calls self) 1))

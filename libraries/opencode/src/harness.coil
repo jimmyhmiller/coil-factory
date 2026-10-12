@@ -250,7 +250,7 @@
   (let [options (field h options)
         path (jv-string-or (jv-get input "filePath") (jv-string-or (jv-get input "path") ""))]
     (cond (= tool "bash") (join a ["$ " (jv-string-or (jv-get input "command") title)])
-          (and (> (len (.stop-tool options)) 0) (= tool (.stop-tool options))) (join a [(.stop-tool-as options) ": " (jv-string-or (jv-get input "outcome") "")])
+          (and (> (len (.stop-tool options)) 0) (= tool (.stop-tool options))) (join a [(.stop-tool-as options) ": " (jv-string-or (jv-get input "outcome") (jv-string-or (jv-get input "summary") ""))])
           (> (len path) 0) (join a [tool " " (relative-to path (.workdir options))])
           (> (len title) 0) (join a [tool " " title])
           :else tool)))

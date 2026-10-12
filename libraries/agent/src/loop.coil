@@ -48,6 +48,9 @@
   (Thought [(text (slice u8))])
   (Said [(text (slice u8))])
   (UsageReported [(input-tokens i64) (output-tokens i64)])
+  ;;; Tokens were spent that no `UsageReported` counts, and the harness could
+  ;;; not find out how many: totals that include this run are too low.
+  (UsageUnknown [(reason (slice u8))])
   (ToolStarted [(call ToolCall) (summary (slice u8))])
   (ToolEnded [(call ToolCall)
               (summary (slice u8))
@@ -387,6 +390,11 @@
                       (sb-push-str! (mut text) (.message result))
                       (sb-finish! (mut text))))))))))
 
+;;; Why `arguments-text` does not fit the tool's schema, or "": nothing for
+;;; a tool that checks its own arguments (`self-checked`).
+(defn arguments-problem [(a (dyn Allocator)) (spec ToolSpec) (arguments-text (slice u8))] (-> (slice u8))
+  (if (.self-checked spec) "" (validation-failure a (.parameters spec) arguments-text)))
+
 (defstruct ToolRun [(ok bool) (output (slice u8))])
 
 ;;; Execute one call from the model. The returned text lives in `turn-allocator`.
@@ -403,9 +411,7 @@
               (ToolRun :ok false :output output))))
     (Some [tool]
           (let [spec (tool-spec tool)
-                problem (validation-failure turn-allocator
-                                            (.parameters spec)
-                                            (.arguments-json call))]
+                problem (arguments-problem turn-allocator spec (.arguments-json call))]
             (if (> (len problem) 0)
                 (ToolRun :ok false :output problem)
                 (match (tool-run tool turn-allocator call context)

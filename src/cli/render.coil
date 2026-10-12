@@ -187,6 +187,8 @@
       (= kind "agent.retry") (join a [when "  " who "  " (style/warn a term (join a ["model retry " (int-text a (int-field record "attempt")) ": "]))
                                       (first-line a (str-field record "message") 120)])
       (= kind "agent.usage") ""
+      (= kind "agent.usage-unknown") (join a [when "  " who "  " (style/warn a term "token usage unknown, totals are low: ")
+                                              (first-line a (str-field record "reason") 160)])
       (= kind "agent.paused") (join a [when "  " who "  " (style/warn a term "‖ paused")])
       (= kind "agent.resumed") (join a [when "  " who "  " (style/ok a term "▶ resumed")])
       (= kind "tool.started") (if (= (str-field record "tool") "finish") ""

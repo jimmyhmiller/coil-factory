@@ -6,3 +6,6 @@
 **/build/
 # Worktrees made by agents working on this repository
 /.worktrees/
+# Python orchestration/test bytecode
+__pycache__/
+*.pyc

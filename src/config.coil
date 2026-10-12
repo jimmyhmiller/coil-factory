@@ -17,6 +17,7 @@
 ;;;       token                bearer token for this site's API
 ;;;       sites.json           remote sites this hub reaches
 ;;;       factories/*.md       the site's factory library
+;;;       agents/*.md          the site's standalone agents
 ;;;       runs/<id>/…          one directory per run
 
 (defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))] (-> (slice u8))
@@ -65,6 +66,10 @@
 (defn summarizers-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
   (path-join a home "summarizers"))
 
+;;; The site's standalone agents, which every project can use.
+(defn agents-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (path-join a home "agents"))
+
 ;;; An OpenAI-compatible server declared in site.json.
 (defstruct ProviderDecl
   [(name (slice u8))
@@ -98,6 +103,9 @@
    ;;; (their workspace sandbox) may also write, comma-separated; `~` is the
    ;;; home directory. "" for none.
    (codex-writable (slice u8))
+   ;;; Allow networking in Codex workspace-write agents; false by default.
+   ;;; Read-only reviewers retain their normal network policy.
+   (codex-network bool)
    ;;; Where approval requests go (see factory.approval): the base URL of the
    ;;; approvals service, such as https://computer.jimmyhmiller.com/approvals,
    ;;; and a file holding the bearer token it is submitted with. Both "" when
@@ -176,6 +184,8 @@
                 (set! (.codex config) (json-str-or object "codex" ""))
                 (set! (.codex-model config) (json-str-or object "codex_model" ""))
                 (set! (.codex-writable config) (names-text a (jv-get object "codex_writable")))
+                (set! (.codex-network config)
+                      (match (jv-get object "codex_network") (JBool [allowed] allowed) (_ false)))
                 (set! (.approvals-url config) (json-str-or (jv-get object "approvals") "url" ""))
                 (set! (.approvals-token-file config) (json-str-or (jv-get object "approvals") "token_file" ""))
                 (set! (.reviewers config) (names-text a (jv-get object "reviewers")))
@@ -194,7 +204,10 @@
                               (set! (.key-env decl) (json-str-or entry "key_env" ""))
                               (push! [ProviderDecl] (mut (.providers config)) (load decl))
                               (set! i (+ (load i) 1))))))
-                (cond (not (jv-null? (jv-get (jv-get object "overseer") "model")))
+                (cond (not (match (jv-get object "codex_network")
+                             (JNull [] true) (JBool [allowed] true) (_ false)))
+                        (SiteConfigBad "site.json: codex_network must be a boolean")
+                      (not (jv-null? (jv-get (jv-get object "overseer") "model")))
                         (SiteConfigBad "site.json: overseer.model is gone. Judging is done by reviewers, each with its own model and harness: name them in site.json \"reviewers\", a factory's `reviewers:`, or `factory start --reviewers`")
                       (not (or (= (.isolation config) "none") (= (.isolation config) "sandbox")))
                         (SiteConfigBad "site.json: isolation must be \"none\" or \"sandbox\"")

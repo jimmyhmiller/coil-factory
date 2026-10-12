@@ -4,6 +4,7 @@ source-roots = ["src", "tests"]
 
 [dependencies]
 agent = { path = "../agent" }
+agent_tools = { path = "../agent-tools" }
 
 [test]
 roots = ["tests"]

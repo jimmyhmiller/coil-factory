@@ -19,6 +19,8 @@
 (import "factory.cli.start" :as start)
 (import "factory.cli.design" :as design)
 (import "factory.cli.chat" :as chat)
+(import "factory.cli.agents" :as agents)
+(import "factory.agentkit" :as agentkit)
 
 ;;; factory — run software factories anywhere, watch everything, talk to any agent.
 
@@ -70,6 +72,24 @@
                                                        :harness (args/flag-value-or inv "harness" "")
                                                        :reviewers (args/flag-value-or inv "reviewers" "")
                                                        :watch (args/flag? inv "watch")))))
+      (args/command-is? inv "agents") (agents/cmd-agents ctx (args/flag-value-or inv "project" ""))
+      (args/command-is? inv "agent guide") (agents/cmd-agent-guide)
+      (args/command-is? inv "agent new")
+        (agents/cmd-agent-new ctx first (args/flag-value-or inv "project" "") (args/flag? inv "site") (args/flag-value-or inv "out" ""))
+      (args/command-is? inv "agent check") (agents/cmd-agent-check ctx first (args/flag-value-or inv "project" ""))
+      (args/command-is? inv "agent run")
+        (match (agents/gather-input a (args/flag-value-or inv "input" "") (args/flag-value-or inv "input-file" "") (rest-from a inv 1))
+          (Err [message] (fail-with ctx message))
+          (Ok [input]
+              (if (= (len (str-trim input)) 0)
+                  (fail-with ctx "the input is empty; give it as words after the agent's name, --input, --input-file, or on stdin")
+                  (agents/cmd-agent-run ctx (agents/AgentRunOptions :reference first
+                                                                    :project (args/flag-value-or inv "project" "")
+                                                                    :input input
+                                                                    :model (args/flag-value-or inv "model" "")
+                                                                    :harness (args/flag-value-or inv "harness" "")
+                                                                    :state-dir (args/flag-value-or inv "state-dir" "")
+                                                                    :verbose (args/flag? inv "verbose"))))))
       (args/command-is? inv "ps") (runs/cmd-ps ctx (args/flag? inv "all"))
       (args/command-is? inv "show") (runs/cmd-show ctx first)
       (args/command-is? inv "watch") (runs/cmd-watch ctx first (args/flag? inv "verbose") (args/flag? inv "follow"))
@@ -119,6 +139,10 @@
                               :else 0)
                         (set! i (+ (load i) 1)))))
           (finish-mcp-main a (load gate) (load ready)))
+      (and (>= argc 2) (= (arg argv 1) "_mcp-agent"))
+        (let [(mut rest) (al-new [(slice u8)] a)]
+          (for i (range 2 (cast i64 argc)) (push! (mut rest) (arg argv i)))
+          (agentkit/agent-server-main a (al-slice rest)))
       (and (>= argc 2) (= (arg argv 1) "daemon"))
         (do (when (and (>= argc 3) (= (arg argv 2) "--background"))
               (become-detached! a (path-join a home "daemon.log"))
@@ -151,6 +175,25 @@
                            (args/Command :name "check" :group "Design" :summary "Validate a factory (name or path)" :usage "" :args ["FACTORY"] :flags (args/no-flags))
                            (args/Command :name "factories" :group "Design" :summary "The factory library" :usage "" :args (args/no-args) :flags (args/no-flags))
                            (args/Command :name "reviewers" :group "Design" :summary "Reviewers that can watch runs, and what each runs on" :usage "" :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "agents" :group "Agents" :summary "Standalone agents: this project's, the site's, and bundled (factory agent guide: how to write one)" :usage ""
+                                         :args (args/no-args) :flags [(args/flag "project" #\p "PATH" "Look for the project from here (default: where you are)")])
+                           (args/Command :name "agent guide" :group "Agents" :summary "How to write an agent file: the whole format, for people and agents" :usage ""
+                                         :args (args/no-args) :flags (args/no-flags))
+                           (args/Command :name "agent new" :group "Agents" :summary "Write a starting agent into this project (or the site)" :usage ""
+                                         :args ["NAME"] :flags [(args/flag "project" #\p "PATH" "Look for the project from here (default: where you are)")
+                                                                (args/switch "site" 0 "Write it to the site's agents, for every project")
+                                                                (args/flag "out" #\o "PATH" "Write it here instead")])
+                           (args/Command :name "agent check" :group "Agents" :summary "Validate an agent (name or path)" :usage ""
+                                         :args ["AGENT"] :flags [(args/flag "project" #\p "PATH" "Look for the project from here (default: where you are)")])
+                           (args/Command :name "agent run" :group "Agents" :summary "Run an agent on an input; print its results as JSON" :usage "agent run AGENT [INPUT...] [flags]"
+                                         :args ["AGENT" "[INPUT...]"]
+                                         :flags [(args/flag "input" #\i "TEXT" "The input (default: the words after AGENT, else stdin)")
+                                                 (args/flag "input-file" #\f "FILE" "Read the input from a file")
+                                                 (args/flag "project" #\p "PATH" "Look for the project from here (default: where you are)")
+                                                 (args/flag "model" #\m "PROVIDER/MODEL" "Use this model")
+                                                 (args/flag "harness" 0 "NAME" "Run the agent in this harness")
+                                                 (args/flag "state-dir" 0 "DIR" "Keep an outside harness's state here (default: a temporary directory)")
+                                                 (args/switch "verbose" #\v "Show each tool call on stderr")])
                            (args/Command :name "ps" :group "Watch" :summary "Runs on every site" :usage ""
                                          :args (args/no-args) :flags [(args/switch "all" #\a "Include every finished run")])
                            (args/Command :name "show" :group "Watch" :summary "A run: stations, agents, findings" :usage "" :args ["RUN"] :flags (args/no-flags))

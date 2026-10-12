@@ -44,7 +44,8 @@
   (tool-spec [(self (ptr Echo))] (-> ToolSpec)
     (ToolSpec :name "echo"
               :description "Echo text back"
-              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"))
+              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"
+              :self-checked false))
   (tool-summary [(self (ptr Echo)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
     (call-string call "text"))
   (tool-run [(self (ptr Echo)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
@@ -57,7 +58,8 @@
   (tool-spec [(self (ptr Finish))] (-> ToolSpec)
     (ToolSpec :name "finish"
               :description "Finish"
-              :parameters "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"]}"))
+              :parameters "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"]}"
+              :self-checked false))
   (tool-summary [(self (ptr Finish)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "finish")
   (tool-run [(self (ptr Finish)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
     (ToolOk "recorded")))
@@ -88,6 +90,7 @@
       (ModelRetrying [attempt error delay] (do (set! (.retries self) (+ (.retries self) 1)) 0))
       (PausedEvent [] (sb-push-str! (mut (.text self)) "paused,"))
       (ResumedEvent [] (sb-push-str! (mut (.text self)) "resumed,"))
+      (UsageUnknown [reason] (sb-push-str! (mut (.text self)) "usage-unknown,"))
       (Compacted [n bytes] (sb-push-str! (mut (.text self)) "compacted,")))))
 
 ;; Delivers one queued message on the first inbox check.

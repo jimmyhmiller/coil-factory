@@ -1,0 +1,11 @@
+[package]
+name = "coil-bugs"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+
+[dependencies]
+factory = { path = "../.." }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

@@ -1,0 +1,146 @@
+(module factory.agentlib-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.agentlib" :use *)
+(import "factory.config" :use [path-join])
+(import "factory.library" :use [join])
+(import "factory.proc" :use [capture pid real-path])
+
+(defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (str-find hay needle) (Some [at] true) (None [] false)))
+
+;; A scratch tree:
+;;
+;;     root/home/.factory/agents/{shared,grammar}.md     the site
+;;     root/home/loose/                                   no project
+;;     root/home/repo/.git/
+;;     root/home/repo/.factory/agents/{shared,mine}.md
+;;     root/home/repo/src/deep/
+;;     root/home/bare/.git                                (a file, as in a worktree)
+;;     root/home/bare/sub/
+(defn temp-root [(a (dyn Allocator))] (-> (slice u8))
+  (let [(mut path) (sb-new a)]
+    (sb-push-str! (mut path) "/tmp/factory-agentlib-test-")
+    (sb-push-i64! (mut path) (pid))
+    (let [made (sb-finish! (mut path))]
+      (capture a "rm" ["-rf" made] "" 10000)
+      (atomic/ensure-dir! a made 448)
+      (match (real-path a made) (Some [canonical] canonical) (None [] made)))))
+
+(defn write! [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> i64)
+  (match (atomic/write-file-atomic! a path text 420)
+    (Ok [n] 0)
+    (Err [e] (do (assert false) 0))))
+
+(defn agent-text [(a (dyn Allocator)) (name (slice u8)) (what (slice u8))] (-> (slice u8))
+  (join a ["---\nname: " name "\ndescription: " what "\n---\n\nDo it.\n"]))
+
+(defstruct Tree [(root (slice u8)) (home (slice u8)) (site (slice u8)) (repo (slice u8))])
+
+(defn make-tree [(a (dyn Allocator))] (-> Tree)
+  (let [root (temp-root a)
+        home (path-join a root "home")
+        site (path-join a home ".factory")
+        repo (path-join a home "repo")]
+    (for dir (iter [(path-join a site "agents") (path-join a home "loose") (path-join a repo ".git")
+                    (path-join a repo ".factory/agents") (path-join a repo "src/deep") (path-join a home "bare/sub")])
+      (atomic/ensure-dir! a dir 448))
+    (write! a (path-join a site "agents/shared.md") (agent-text a "shared" "from the site"))
+    (write! a (path-join a site "agents/grammar.md") (agent-text a "grammar" "the site's grammar"))
+    (write! a (path-join a repo ".factory/agents/shared.md") (agent-text a "shared" "from the project"))
+    (write! a (path-join a repo ".factory/agents/mine.md") (agent-text a "mine" "only here"))
+    (write! a (path-join a home "bare/.git") "gitdir: elsewhere\n")
+    (Tree :root root :home home :site site :repo repo)))
+
+(deftest finds-the-project-from-anywhere-inside-it
+  (let [a (malloc-allocator)
+        tree (make-tree a)]
+    (match (find-project a (path-join a (.repo tree) "src/deep") (.site tree))
+      (Some [project] (do (assert (= (.root project) (.repo tree))) (assert (.has-agents project))))
+      (None [] (assert false)))
+    (assert (= (project-agents-root a (.repo tree) (.site tree)) (.repo tree)))
+    ;; A repository without agents is still the project an agent works in.
+    (match (find-project a (path-join a (.home tree) "bare/sub") (.site tree))
+      (Some [project] (do (assert (= (.root project) (path-join a (.home tree) "bare")))
+                          (assert (not (.has-agents project)))))
+      (None [] (assert false)))
+    (assert (= (project-agents-root a (path-join a (.home tree) "bare/sub") (.site tree)) ""))
+    (assert (= (work-directory a (path-join a (.home tree) "bare/sub") (.site tree)) (path-join a (.home tree) "bare")))))
+
+(deftest the-site-home-is-never-a-project
+  (let [a (malloc-allocator)
+        tree (make-tree a)
+        loose (path-join a (.home tree) "loose")]
+    ;; Searching up from loose/ passes home/, whose .factory/agents is the site's.
+    (match (find-project a loose (.site tree))
+      (Some [project] (assert (not (= (.root project) (.home tree)))))
+      (None [] 0))
+    (assert (= (project-agents-root a loose (.site tree)) ""))
+    (assert (= (work-directory a loose (.site tree)) loose))))
+
+(defn found-entry [(found AgentFound)] (-> AgentEntry)
+  (match found
+    (AgentFoundOk [entry] entry)
+    (AgentNotFound [message] (do (println "not found: {s}" message) (assert false) (found-entry found)))))
+
+(deftest names-resolve-project-then-site-then-bundled
+  (let [a (malloc-allocator)
+        tree (make-tree a)
+        project (.repo tree)
+        site-agents (path-join a (.site tree) "agents")]
+    (let [entry (found-entry (find-agent a (.site tree) project "shared"))]
+      (assert (= (.origin entry) "project"))
+      (assert (contains? (.text entry) "from the project"))
+      (assert (= (.home entry) project)))
+    (let [entry (found-entry (find-agent a (.site tree) project "mine"))]
+      (assert (= (.origin entry) "project")))
+    (let [entry (found-entry (find-agent a (.site tree) project "grammar"))]
+      (assert (= (.origin entry) "site"))
+      (assert (= (.home entry) site-agents)))
+    ;; Outside the project, its agents are out of reach.
+    (let [entry (found-entry (find-agent a (.site tree) "" "shared"))]
+      (assert (= (.origin entry) "site")))
+    (match (find-agent a (.site tree) "" "mine")
+      (AgentNotFound [message] (assert (contains? message "no agent named \"mine\"; `factory agents` lists them")))
+      (AgentFoundOk [entry] (assert false)))
+    ;; With nothing of the same name on the site, the bundled one.
+    (let [entry (found-entry (find-agent a (path-join a (.root tree) "nowhere") "" "grammar"))]
+      (assert (= (.origin entry) "bundled"))
+      (assert (= (.home entry) "")))))
+
+(deftest a-path-is-read-as-it-is-and-its-home-is-its-project
+  (let [a (malloc-allocator)
+        tree (make-tree a)
+        in-project (path-join a (.repo tree) ".factory/agents/mine.md")
+        loose-file (path-join a (.home tree) "loose/solo.md")]
+    (write! a loose-file (agent-text a "solo" "a file"))
+    (let [entry (found-entry (find-agent a (.site tree) "" in-project))]
+      (assert (= (.origin entry) "file"))
+      (assert (= (.home entry) (.repo tree))))
+    (let [entry (found-entry (find-agent a (.site tree) "" loose-file))]
+      (assert (= (.home entry) (path-join a (.home tree) "loose"))))
+    ;; A site agent named by its path is at home in the site's directory.
+    (let [entry (found-entry (find-agent a (.site tree) "" (path-join a (.site tree) "agents/shared.md")))]
+      (assert (= (.home entry) (path-join a (.site tree) "agents"))))
+    (match (find-agent a (.site tree) "" (path-join a (.home tree) "loose/missing.md"))
+      (AgentNotFound [message] (assert (contains? message "no agent file at")))
+      (AgentFoundOk [entry] (assert false)))))
+
+(deftest lists-what-names-reach-and-what-each-hides
+  (let [a (malloc-allocator)
+        tree (make-tree a)
+        (mut seen) (sb-new a)]
+    (for listed (iter (list-agents a (.site tree) (.repo tree)))
+      (sb-push-str! (mut seen) (.name (.entry listed)))
+      (sb-push-str! (mut seen) ":")
+      (sb-push-str! (mut seen) (.origin (.entry listed)))
+      (when (> (len (.shadows listed)) 0)
+        (sb-push-str! (mut seen) ">")
+        (sb-push-str! (mut seen) (.shadows listed))
+        0)
+      (sb-push-str! (mut seen) " "))
+    (assert (= (sb-str (load seen)) "mine:project shared:project>site grammar:site>bundled "))))

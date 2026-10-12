@@ -1,0 +1,227 @@
+(module factory.agentlib)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.config" :use [path-join agents-dir])
+(import "factory.library" :use [Bundled path-like? join])
+(import "factory.proc" :use [real-path])
+
+;;; Where standalone agents come from. A name resolves, in order, to:
+;;;
+;;;     PATH                          anything with a `/` or ending in `.md`
+;;;     <project>/.factory/agents/NAME.md
+;;;     ~/.factory/agents/NAME.md     the site's agents, for every project
+;;;     bundled                       compiled into this executable
+;;;
+;;; The project is the nearest directory, from where you are up to the root
+;;; of the git repository you are in, that has `.factory/agents/`. The site's
+;;; own home (`~/.factory`) is never a project, though a search from a
+;;; directory under the home directory passes it.
+;;;
+;;; Every agent has two directories. Its `home` is where the relative
+;;; commands in its file (`run:`, `mcp:`, `gate:`) are found: the project
+;;; for a project's agent, the file's directory for a site agent or a path,
+;;; and none for a bundled agent. Its work directory is where it works: the
+;;; project you are in (see `find-project`), whichever agent it is.
+
+(const BUNDLED-GRAMMAR (include-str "../agents/grammar.md"))
+
+(defn bundled-agents [] (-> (array Bundled 1))
+  [(Bundled :name "grammar" :text BUNDLED-GRAMMAR)])
+
+(defstruct AgentEntry
+  [(name (slice u8))
+   ;;; "file", "project", "site", or "bundled".
+   (origin (slice u8))
+   ;;; The file it was read from; "" when bundled.
+   (path (slice u8))
+   (text (slice u8))
+   ;;; Where its relative commands are found; "" when bundled.
+   (home (slice u8))])
+
+(defsum AgentFound
+  (AgentFoundOk [(entry AgentEntry)])
+  (AgentNotFound [(message (slice u8))]))
+
+;;; The project a directory belongs to: `root` is the nearest directory with
+;;; `.factory/agents/` (then `has-agents`) or, failing that, the root of its
+;;; git repository.
+(defstruct Project [(root (slice u8)) (has-agents bool)])
+
+(defn exists? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (match (atomic/path-kind a path)
+    (Ok [kind] (match kind (atomic/Missing [] false) (_ true)))
+    (Err [failure] false)))
+
+(defn directory? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
+  (match (atomic/dir-exists? a path)
+    (Ok [found] found)
+    (Err [failure] false)))
+
+;;; The directory part of an absolute path ("/" for a top-level entry).
+(defn parent-of [(path (slice u8))] (-> (slice u8))
+  (let [(mut i) (- (len path) 1)]
+    (loop (if (or (< (load i) 0) (= (cast i64 (get path (load i))) 47))
+              (break)
+              (set! i (- (load i) 1))))
+    (cond (<= (load i) 0) "/"
+          :else (subslice [u8] path 0 (load i)))))
+
+;;; Whether `dir/.factory` is the site's own home, which is never a project.
+(defn site-home? [(a (dyn Allocator)) (dir (slice u8)) (home (slice u8))] (-> bool)
+  (match (real-path a (path-join a dir ".factory"))
+    (None [] false)
+    (Some [here] (match (real-path a home)
+                   (Some [site] (= here site))
+                   (None [] false)))))
+
+;;; The project `start` is in, searching upward and stopping at the root of
+;;; its git repository; None outside of any.
+(defn find-project [(a (dyn Allocator)) (start (slice u8)) (home (slice u8))] (-> (Option Project))
+  (match (real-path a start)
+    (None [] (None))
+    (Some [canonical]
+          (let [(mut dir) canonical
+                (mut found) (: (None) (Option Project))]
+            (loop
+              (let [here (load dir)]
+                (cond (and (directory? a (path-join a here ".factory/agents"))
+                           (not (site-home? a here home)))
+                        (do (set! found (Some (Project :root here :has-agents true))) (break))
+                      (exists? a (path-join a here ".git"))
+                        (do (set! found (Some (Project :root here :has-agents false))) (break))
+                      (= here "/") (break)
+                      :else (set! dir (parent-of here)))))
+            (load found)))))
+
+;;; The projects whose agents a search from `start` sees: the project's
+;;; directory when it has `.factory/agents/`, else "".
+(defn project-agents-root [(a (dyn Allocator)) (start (slice u8)) (home (slice u8))] (-> (slice u8))
+  (match (find-project a start home)
+    (Some [project] (if (.has-agents project) (.root project) ""))
+    (None [] "")))
+
+;;; Where an agent works when it is run from `start`: its project, else
+;;; `start` itself.
+(defn work-directory [(a (dyn Allocator)) (start (slice u8)) (home (slice u8))] (-> (slice u8))
+  (match (find-project a start home)
+    (Some [project] (.root project))
+    (None [] (match (real-path a start) (Some [canonical] canonical) (None [] start)))))
+
+(defn agent-file [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))] (-> (slice u8))
+  (path-join a dir (join a [name ".md"])))
+
+(defn project-agents-dir [(a (dyn Allocator)) (root (slice u8))] (-> (slice u8))
+  (path-join a root ".factory/agents"))
+
+;;; The home of an agent read from `path`: the project when the file is in a
+;;; project's `.factory/agents/`, else the file's directory.
+(defn path-home [(a (dyn Allocator)) (path (slice u8)) (home (slice u8))] (-> (slice u8))
+  (let [canonical (match (real-path a path) (Some [p] p) (None [] path))
+        dir (parent-of canonical)
+        marker "/.factory/agents"]
+    (if (and (> (len dir) (len marker))
+             (= (subslice [u8] dir (- (len dir) (len marker)) (len dir)) marker))
+        (let [root (subslice [u8] dir 0 (- (len dir) (len marker)))
+              root-dir (if (= (len root) 0) "/" root)]
+          (if (site-home? a root-dir home) dir root-dir))
+        dir)))
+
+(defn read-entry [(a (dyn Allocator)) (path (slice u8))] (-> (Result (Option (slice u8)) (slice u8)))
+  (match (atomic/read-file-if-exists a path)
+    (Ok [found] (Ok found))
+    (Err [failure] (Err (join a ["cannot read " path])))))
+
+;;; Find the agent `reference` names, seen from `project` (a project root
+;;; with `.factory/agents/`, or "" for none).
+(defn find-agent [(a (dyn Allocator)) (home (slice u8)) (project (slice u8)) (reference (slice u8))] (-> AgentFound)
+  (block :find
+         (when (path-like? reference)
+           (return-from :find
+                          (match (read-entry a reference)
+                            (Err [message] (AgentNotFound message))
+                            (Ok [found]
+                                (match found
+                                  (Some [text] (AgentFoundOk (AgentEntry :name reference :origin "file" :path reference :text text
+                                                                         :home (path-home a reference home))))
+                                  (None [] (AgentNotFound (join a ["no agent file at " reference]))))))))
+         (when (> (len project) 0)
+           (let [path (agent-file a (project-agents-dir a project) reference)]
+             (match (read-entry a path)
+               (Err [message] (return-from :find (AgentNotFound message)))
+               (Ok [found]
+                   (match found
+                     (Some [text] (return-from :find (AgentFoundOk (AgentEntry :name reference :origin "project" :path path
+                                                                               :text text :home project))))
+                     (None [] 0))))))
+         (let [dir (agents-dir a home)
+               path (agent-file a dir reference)]
+           (match (read-entry a path)
+             (Err [message] (return-from :find (AgentNotFound message)))
+             (Ok [found]
+                 (match found
+                   (Some [text] (return-from :find (AgentFoundOk (AgentEntry :name reference :origin "site" :path path
+                                                                             :text text :home dir))))
+                   (None [] 0)))))
+         (for b (iter (bundled-agents))
+           (when (= (.name b) reference)
+             (return-from :find (AgentFoundOk (AgentEntry :name reference :origin "bundled" :path "" :text (.text b) :home "")))
+             0))
+         (AgentNotFound (join a ["no agent named \"" reference "\"; `factory agents` lists them"]))))
+
+;;; An agent `factory agents` lists, and the origin of the one it hides, if
+;;; any ("" when it hides none).
+(defstruct AgentListing [(entry AgentEntry) (shadows (slice u8))])
+
+(defn add-listed! [(out (ptr (ArrayList AgentListing))) (entry AgentEntry)] (-> i64)
+  (let [(mut hidden) false
+        (mut i) 0
+        n (len (load out))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [listed (al-elem [AgentListing] out (load i))]
+                (when (= (.name (.entry listed)) (.name entry))
+                  (when (= (len (.shadows listed)) 0) (set! (.shadows listed) (.origin entry)) 0)
+                  (set! hidden true)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (when (not (load hidden)) (push! out (AgentListing :entry entry :shadows "")) 0)
+    0))
+
+(defn list-dir-agents! [(a (dyn Allocator))
+                        (out (ptr (ArrayList AgentListing)))
+                        (dir (slice u8))
+                        (origin (slice u8))
+                        (home (slice u8))] (-> i64)
+  (match (atomic/list-dir a dir)
+    (Err [failure] 0)
+    (Ok [names]
+        (do (for file (iter names)
+              (when (and (> (len file) 3) (= (subslice [u8] file (- (len file) 3) (len file)) ".md"))
+                (let [path (path-join a dir file)]
+                  (match (read-entry a path)
+                    (Ok [found]
+                        (match found
+                          (Some [text] (add-listed! out (AgentEntry :name (subslice [u8] file 0 (- (len file) 3))
+                                                                    :origin origin :path path :text text :home home)))
+                          (None [] 0)))
+                    (Err [message] 0))
+                  0)
+                0))
+            0))))
+
+;;; Every agent a name can reach from `project`, in the order names resolve:
+;;; the project's, the site's, then bundled ones. An agent that a name
+;;; would never reach is not listed; the one that hides it says so.
+(defn list-agents [(a (dyn Allocator)) (home (slice u8)) (project (slice u8))] (-> (ArrayList AgentListing))
+  (let [(mut out) (al-new [AgentListing] a)
+        site (agents-dir a home)]
+    (when (> (len project) 0)
+      (list-dir-agents! a (mut out) (project-agents-dir a project) "project" project)
+      0)
+    (list-dir-agents! a (mut out) site "site" site)
+    (for b (iter (bundled-agents))
+      (add-listed! (mut out) (AgentEntry :name (.name b) :origin "bundled" :path "" :text (.text b) :home "")))
+    (load out)))
