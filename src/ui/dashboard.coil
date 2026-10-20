@@ -10,6 +10,8 @@
 (import "tui.keys" :use *)
 (import "tui.widgets" :use *)
 (import "tui.app" :use *)
+(import "tui.palette" :use *)
+(import "tui.tree" :use *)
 (import "tui.term" :use [TermError NotATerminal])
 (import "factory.client"
         :use
@@ -19,6 +21,8 @@
 (import "factory.ui.feed" :use *)
 (import "factory.ui.chat" :use *)
 (import "factory.ui.model" :use *)
+(import "factory.ui.launch" :use *)
+(import "factory.ui.inspect" :use *)
 (import "factory.ui.overview" :use [draw-overview!])
 (import "factory.ui.runview" :use [draw-run-view!])
 (import "factory.ui.chatview" :use [draw-chat-view!])
@@ -242,7 +246,9 @@
         (let [chat (field d chat)]
           (when (or (not (= (.run chat) (.run-id d)))
                     (not (= (.agent chat) agent)))
-            (chat-open! chat (.run-id d) agent)))
+            (chat-open! chat (.run-id d) agent)
+            (tree-free! (field d inspection))
+            (set! (.inspection d) (tree-new (.allocator d)))))
         (set! (.chat-from-run d) from-run)
         (set! (.view d) (ViewChat))
         (fetch-run! d)
@@ -349,7 +355,8 @@
 (defn overview-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (match key
     (Char [ch]
-          (cond (= ch #\q) (Quit)
+          (cond (= ch #\n) (do (set! (.launch-open d) true) (Continue))
+                (= ch #\q) (Quit)
                 (= ch #\?) (do (set! (.help d) true) (Continue))
                 (= ch #\c)
                   (let [run (selected-run d)]
@@ -449,15 +456,147 @@
                                     1))
                   (Continue)))
       (Ctrl [l]
-            (if (= l #\t)
-                (do (set! (.details chat) (not (.details chat))) (Continue))
-                (do (input-handle-key! (field chat input) key) (Continue))))
+            (if (= l #\o)
+                (do (set! (.inspection-open d) true) (Continue))
+                (if (= l #\t)
+                    (do (set! (.details chat) (not (.details chat))) (Continue))
+                    (do (input-handle-key! (field chat input) key) (Continue)))))
       (_ (match (input-handle-key! (field chat input) key)
            (InputSubmitted [] (do (send! d) (Continue)))
            (_ (Continue)))))))
 
+;;; Build commands from current state at use time, so actions cannot retain a
+;;; stale run or agent across refreshes. IDs are stable, independent of filtering.
+(defn focused-agent [(d (ptr Dash))] (-> (slice u8))
+  (match (.view d)
+    (ViewChat [] (.agent (.chat d)))
+    (ViewRun [] (selected-agent d))
+    (ViewOverview [] (default-agent (selected-run d)))))
+
+(defn dashboard-commands [(d (ptr Dash)) (a (dyn Allocator))]
+  (-> (ArrayList Command))
+  (let [(mut commands) (ArrayList::new [Command] a)
+        run (focused-run d)
+        id (js run "id")
+        status (js run "status")]
+    (for command (iter [(Command
+                          :id 1
+                          :title "Factory overview"
+                          :detail "Every site and run"
+                          :enabled true)
+                        (Command
+                          :id 2
+                          :title "Open selected run"
+                          :detail id
+                          :enabled (> (len id) 0))
+                        (Command
+                          :id 3
+                          :title "Chat with agent"
+                          :detail id
+                          :enabled (> (len (focused-agent d)) 0))
+                        (Command
+                          :id 4
+                          :title "Pause run"
+                          :detail id
+                          :enabled (= status "running"))
+                        (Command
+                          :id 5
+                          :title "Resume run"
+                          :detail id
+                          :enabled
+                            (or (= status "paused")
+                                (= status "lost")
+                                (= status "failed")))
+                        (Command
+                          :id 6
+                          :title "Stop run…"
+                          :detail id
+                          :enabled
+                            (and (> (len id) 0) (not (finished-status? status))))
+                        (Command
+                          :id 7
+                          :title "Keyboard help"
+                          :detail "Navigation and controls"
+                          :enabled true)
+                        (Command
+                          :id 8
+                          :title "Quit"
+                          :detail "Leave the dashboard"
+                          :enabled true)
+                        (Command
+                          :id 9
+                          :title "New factory run"
+                          :detail "Choose factory, harness, model and site"
+                          :enabled true)
+                        (Command
+                          :id 10
+                          :title "Inspect tool calls"
+                          :detail "Expand arguments, results and delegated work"
+                          :enabled
+                            (match (.view d) (ViewChat [] true) (_ false)))])
+      (push! (mut commands) command))
+    (load commands)))
+
+(defn command-selected! [(d (ptr Dash)) (id i64)] (-> AppFlow)
+  (set! (.commands-open d) false)
+  (cond (= id 1)
+          (do (set! (.view d) (ViewOverview)) (fetch-overview! d) (Continue))
+        (= id 2) (do (open-run! d (js (focused-run d) "id")) (Continue))
+        (= id 3)
+          (let [run (focused-run d)]
+            (open-chat! d (js run "id") (focused-agent d) true)
+            (Continue))
+        (or (= id 4) (= id 5)) (do (pause-or-resume! d) (Continue))
+        (= id 6) (do (ask-stop! d) (Continue))
+        (= id 7) (do (set! (.help d) true) (Continue))
+        (= id 8) (Quit)
+        (= id 9) (do (set! (.launch-open d) true) (Continue))
+        (= id 10) (do (set! (.inspection-open d) true) (Continue))
+        :else (Continue)))
+
+(defn submit-launch! [(d (ptr Dash))] (-> i64)
+  (let [form (field d launch)
+        problem (launch-problem form)]
+    (if (> (len problem) 0)
+        (toast! d problem (ToneWarning))
+        (let [a (io-allocator d)
+              reply
+                (request! d
+                          a
+                          "POST"
+                          "/v1/runs"
+                          (jv-encode a (launch-body a form)))]
+          (if (reply-ok? reply)
+              (let [id (js (reply-body reply) "id")]
+                (if (= (len id) 0)
+                    (toast! d
+                            "The site accepted the run but returned no run id; check the overview before retrying."
+                            (ToneWarning))
+                    (do
+                      (set! (.launch-open d) false)
+                      (open-run! d id))))
+              (complain! d a reply))))))
+
 (defn dashboard-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (cond (match key (Ctrl [l] (= l #\c)) (_ false)) (Quit)
+        (.inspection-open d)
+          (do
+            (match key
+              (Escape [] (set! (.inspection-open d) false))
+              (_ (let [a (io-allocator d)
+                       nodes (inspection-nodes d a (.inspection-width d))]
+                   (tree-key! (field d inspection) a (slice nodes) key))))
+            (Continue))
+        (.launch-open d)
+          (do
+            (match key
+              (Escape [] (set! (.launch-open d) false))
+              (Ctrl [l]
+                    (if (= l #\s)
+                        (submit-launch! d)
+                        (launch-key! (field d launch) key)))
+              (_ (launch-key! (field d launch) key)))
+            (Continue))
         (.confirm-stop d)
           (match key
             (Char [ch]
@@ -479,6 +618,18 @@
                     (when (or (= ch #\?) (= ch #\q)) (set! (.help d) false)))
               (_ 0))
             (Continue))
+        (.commands-open d)
+          (let [a (io-allocator d)
+                commands (dashboard-commands d a)]
+            (match (palette-key! (field d commands) a (slice commands) key)
+              (PaletteClose [] (do (set! (.commands-open d) false) (Continue)))
+              (PaletteSelected [id] (command-selected! d id))
+              (_ (Continue))))
+        (match key (Ctrl [l] (= l #\p)) (_ false))
+          (do
+            (palette-reset! (field d commands))
+            (set! (.commands-open d) true)
+            (Continue))
         :else
           (match (.view d)
             (ViewOverview [] (overview-key! d key))
@@ -498,6 +649,18 @@
     (when (.help self) (draw-help! self (.canvas frame)))
     (when (.confirm-stop self)
       (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
+    (when (.commands-open self)
+      (let [commands (dashboard-commands self (.scratch frame))]
+        (draw-palette! (field self commands)
+                       (.canvas frame)
+                       (.scratch frame)
+                       (canvas-rect (.canvas frame))
+                       (slice commands)
+                       (.theme self))))
+    (when (.launch-open self)
+      (draw-launch! (field self launch) (.canvas frame) (.theme self)))
+    (when (.inspection-open self)
+      (draw-inspection! self (.canvas frame) (.scratch frame)))
     0)
   (app-event [(self (ptr Dash)) (event Event)]
     (-> AppFlow)

@@ -1,0 +1,259 @@
+(module claude.harness-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.os" :as os)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.harness" :use *)
+(import "claude.harness" :use *)
+
+(defstruct Recorder
+  [(said i64) (started i64) (ended i64) (input i64) (output i64)])
+
+(impl AgentObserver Recorder
+  (observe [(self (ptr Recorder)) (event AgentEvent)] (-> i64)
+    (match event
+      (Said [_] (set! (.said self) (+ (.said self) 1)))
+      (ToolStarted [_ _] (set! (.started self) (+ (.started self) 1)))
+      (ToolEnded [_ _ _ _ _] (set! (.ended self) (+ (.ended self) 1)))
+      (UsageReported [input cached output]
+                     (do
+                       (set! (.input self) input)
+                       (set! (.output self) output)))
+      (_ 0))
+    0))
+
+(defstruct ControlScript [(cancel bool)])
+
+(impl AgentControl ControlScript
+  (control-check [(self (ptr ControlScript))] (-> Control)
+    (if (.cancel self) (Cancel) (Proceed)))
+  (control-inbox [(self (ptr ControlScript)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (ArrayList::new [Inbound] a))
+  (control-idle [(self (ptr ControlScript))] (-> i64)
+    0))
+
+(defn fixture [(a (dyn Allocator))
+               (r (ptr Recorder))
+               (control (ptr ControlScript))] (-> ClaudeHarness)
+  (let [mcp (jv-object a)]
+    (jv-put! mcp "mcpServers" (jv-object a))
+    (claude-new a
+                (ClaudeOptions
+                  :program "claude"
+                  :launcher
+                    (slice::new [(slice u8)] (cast (ptr (slice u8)) 0) 0)
+                  :workdir "/tmp"
+                  :model "haiku"
+                  :tools ""
+                  :mcp mcp
+                  :ready-file ""
+                  :stop-tool "mcp__factory__finish"
+                  :stop-tool-as "finish"
+                  :idle-timeout-ms 5000)
+                r
+                control)))
+
+(defn event! [(turn (ptr Turn)) (text (slice u8))] (-> bool)
+  (let [(mut out) (StrBuf::new (.allocator turn))]
+    (for byte (iter text) (push! (mut out) (if (= byte 39) (cast u8 34) byte)))
+    (apply-event! turn (finish! (mut out)))))
+
+(deftest parallel-tools-correlate-and-child-finish-does-not-finish-parent
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut turn) (turn-new a (mut h) (cast (ptr scratch/ScratchArena) 0))]
+    (event! (mut turn)
+            "{'type':'system','subtype':'init','session_id':'session-one'}")
+    (assert (= (.session h) "session-one"))
+    (event! (mut turn)
+            "{'type':'assistant','parent_tool_use_id':'parent','message':{'content':[{'type':'tool_use','id':'child','name':'mcp__factory__finish','input':{'summary':'child done'}},{'type':'tool_use','id':'read','name':'Read','input':{'file_path':'x'}}]}}")
+    (event! (mut turn)
+            "{'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'read','content':'contents'},{'type':'tool_result','tool_use_id':'child','content':[{'type':'text','text':'Recorded.'}]}]}}")
+    (assert-eq (.started r) 2)
+    (assert-eq (.ended r) 2)
+    (assert-eq (len (.open turn)) 0)
+    (match (.finish turn) (None [] (assert true)) (_ (assert false)))
+    (event! (mut turn)
+            "{'type':'assistant','message':{'content':[{'type':'tool_use','id':'root','name':'mcp__factory__finish','input':{'summary':'root done'}}]}}")
+    (set! (.interrupt turn) true)
+    (assert (event! (mut turn)
+                    "{'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'root','content':'Recorded.'}]}}"))
+    (assert (not (.interrupted turn)))
+    (match (.finish turn)
+      (Some [call] (assert (= (.name call) "finish")))
+      (_ (assert false)))
+    (assert (= (.finish-output turn) "Recorded."))
+    (assert (not (event! (mut turn)
+                         "{'type':'assistant','message':{'content':[{'type':'tool_use','id':'late','name':'Read','input':{}}]}}")))
+    (assert-eq (.started r) 3)))
+
+(deftest failed-finish-is-not-success-and-interrupt-waits-for-open-tools
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut turn) (turn-new a (mut h) (cast (ptr scratch/ScratchArena) 0))]
+    (event! (mut turn)
+            "{'type':'assistant','message':{'content':[{'type':'tool_use','id':'f','name':'mcp__factory__finish','input':{}}]}}")
+    (set! (.interrupt turn) true)
+    (assert (not (event! (mut turn)
+                         "{'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'f','is_error':true,'content':'gate failed'}]}}")))
+    (assert (.interrupted turn))
+    (match (.finish turn) (None [] (assert true)) (_ (assert false)))))
+
+(deftest usage-includes-cache-and-result-errors-are-visible
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut turn) (turn-new a (mut h) (cast (ptr scratch/ScratchArena) 0))]
+    (event! (mut turn)
+            "{'type':'result','subtype':'success','usage':{'input_tokens':10,'cache_read_input_tokens':20,'cache_creation_input_tokens':30,'output_tokens':5}}")
+    (assert-eq (.input r) 60)
+    (assert-eq (.output r) 5)
+    (assert (.result-seen turn))
+    (event! (mut turn)
+            "{'type':'result','subtype':'error_max_turns','is_error':true}")
+    (assert (> (len (.error turn)) 0))))
+
+(deftest checkpoint-round-trips-and-does-not-accept-another-harness
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut other) (fixture a (mut r) (mut control))]
+    (harness-add-system! (mut h) "system")
+    (harness-add-user! (mut h) "hello")
+    (push! (mut (.inbound h))
+           (Inbound
+             :from "operator"
+             :text "Use tabs"
+             :ref 17))
+    (set! (.session h) "session-one")
+    (assert (harness-restore! (mut other) (harness-checkpoint (mut h) a)))
+    (assert (= (.session other) "session-one"))
+    (assert-eq (len (.pending other)) 1)
+    (assert-eq (len (.inbound other)) 1)
+    (assert-eq (.ref (get (.inbound other) 0)) 17)
+    (assert (not (harness-restore! (mut other) "{\"harness\":\"codex\"}")))
+    (assert (= (.session other) "session-one"))
+    (assert (not (harness-restore! (mut other)
+                                   "{\"harness\":\"claude\",\"version\":1,\"session\":\"corrupt\"}")))
+    (assert (= (.session other) "session-one"))
+    (let [args (claude-argv a (mut other))]
+      (assert (= (get args (- (len args) 2)) "--resume"))
+      (assert (= (get args (- (len args) 1)) "session-one")))))
+
+(deftest cancellation-before-launch-does-not-start-a-process
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (ControlScript :cancel true)
+        (mut h) (fixture a (mut r) (mut control))]
+    (set! (.program (field (mut h) options)) "/no-such-program")
+    (match (harness-run! (mut h))
+      (Cancelled [] (assert true))
+      (_ (assert false)))))
+
+;;; Opt-in integration test: CLAUDE_LIVE_TEST=1 coil test --filter live.
+;;; Uses the installed CLI and subscription, with no tools or file access.
+(deftest live-cli-replies-and-restores-its-conversation
+  (let [a (malloc-allocator)]
+    (when (match (os/get-env a "CLAUDE_LIVE_TEST")
+            (Ok [value]
+                (match value (Some [s] (= (.bytes s) "1")) (None [] false)))
+            (Err [_] false))
+      (let [(mut r) (zeroed Recorder)
+            (mut control) (zeroed ControlScript)
+            (mut h) (fixture a (mut r) (mut control))]
+        (set! (.idle-timeout-ms (field (mut h) options)) 60000)
+        (harness-add-system! (mut h) "Reply briefly. Do not use any tools.")
+        (harness-add-user! (mut h)
+                           "Remember this exact token: cobalt-731. Reply only with that token.")
+        (match (harness-run! (mut h))
+          (Replied [text]
+                   (do
+                     (println "Claude replied: {s}" text)
+                     (assert (> (len text) 0))))
+          (Failed [error]
+                  (do
+                    (println "Claude failed: {s}" (.message error))
+                    (assert false)))
+          (_ (assert false)))
+        (let [(mut resumed) (fixture a (mut r) (mut control))]
+          (set! (.idle-timeout-ms (field (mut resumed) options)) 60000)
+          (assert (harness-restore! (mut resumed)
+                                    (harness-checkpoint (mut h) a)))
+          (harness-add-user! (mut resumed)
+                             "What exact token did I ask you to remember? Reply only with that token.")
+          (match (harness-run! (mut resumed))
+            (Replied [text]
+                     (assert (match (find text "cobalt-731")
+                               (Some [_] true)
+                               (None [] false))))
+            (Failed [error]
+                    (do
+                      (println "Resume failed: {s}" (.message error))
+                      (assert false)))
+            (_ (assert false)))))
+      0)))
+
+(deftest live-cli-reports-real-tool-results
+  (let [a (malloc-allocator)]
+    (when (match (os/get-env a "CLAUDE_LIVE_TEST")
+            (Ok [value]
+                (match value (Some [s] (= (slice s) "1")) (None [] false)))
+            (Err [_] false))
+      (let [(mut r) (zeroed Recorder)
+            (mut control) (zeroed ControlScript)
+            (mut h) (fixture a (mut r) (mut control))]
+        (set! (.tools (field (mut h) options)) "Read")
+        (set! (.idle-timeout-ms (field (mut h) options)) 60000)
+        (harness-add-user! (mut h)
+                           "Use the Read tool to read /etc/hosts, then reply with one sentence. You must call Read.")
+        (match (harness-run! (mut h))
+          (Replied [_] (assert (> (.started r) 0)))
+          (Failed [error]
+                  (do
+                    (println "Tool run failed: {s}" (.message error))
+                    (assert false)))
+          (_ (assert false)))
+        (assert-eq (.started r) (.ended r)))
+      0)))
+
+(deftest live-cli-delegates-and-retains-child-output
+  (let [a (malloc-allocator)]
+    (when (match (os/get-env a "CLAUDE_LIVE_TEST")
+            (Ok [value]
+                (match value (Some [s] (= (slice s) "1")) (None [] false)))
+            (Err [_] false))
+      (let [(mut r) (zeroed Recorder)
+            (mut control) (zeroed ControlScript)
+            (mut h) (fixture a (mut r) (mut control))]
+        (set! (.tools (field (mut h) options)) "Agent,Read")
+        (set! (.idle-timeout-ms (field (mut h) options)) 60000)
+        (harness-add-user! (mut h)
+                           "Use Agent to spawn exactly one general-purpose subagent. Its entire task is: reply with cobalt-731 without calling tools. Wait for it and report its answer. You must use Agent, and must not read any files.")
+        (match (harness-run! (mut h))
+          (Replied [text]
+                   (assert (match (find text "cobalt-731")
+                             (Some [_] true)
+                             (None [] false))))
+          (Failed [error]
+                  (do
+                    (println "Delegation failed: {s}" (.message error))
+                    (assert false)))
+          (_ (assert false)))
+        (assert (> (.started r) 0))
+        (assert-eq (.started r) (.ended r))
+        (assert (match (find (harness-checkpoint (mut h) a) "subagent")
+                  (Some [_] true)
+                  (None [] false))))
+      0)))

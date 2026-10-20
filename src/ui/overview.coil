@@ -188,6 +188,39 @@
           :width (Fixed 4)
           :align (AlignRight))])
 
+(const COMPACT-RUN-COLUMNS
+       [(Column :title "STATUS" :width (Fixed 11) :align (AlignLeft))
+        (Column :title "RUN" :width (Fixed 16) :align (AlignLeft))
+        (Column :title "STATION" :width (Fixed 12) :align (AlignLeft))
+        (Column :title "ACTIVITY" :width (Fill 1) :align (AlignLeft))
+        (Column :title "TOKENS" :width (Fixed 6) :align (AlignRight))])
+
+(const NARROW-RUN-COLUMNS
+       [(Column :title "STATUS" :width (Fixed 10) :align (AlignLeft))
+        (Column :title "RUN" :width (Fill 1) :align (AlignLeft))
+        (Column :title "ACTIVITY" :width (Fill 2) :align (AlignLeft))])
+
+;;; Keep the useful columns readable as the terminal shrinks. Projection
+;;; preserves the same rows and selection rather than hiding entire runs.
+(defn project-run-cells [(a (dyn Allocator)) (cells (slice TableCell)) (indices (slice i64))]
+  (-> (slice TableCell))
+  (let [(mut out) (ArrayList::new [TableCell] a)]
+    (for row (range 0 (/ (len cells) 8))
+      (for column (iter indices)
+        (push! (mut out) (get cells (+ (* row 8) column)))))
+    (slice out)))
+
+(defn draw-run-table! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))
+                       (r Rect) (runs JVal) (tick i64)] (-> i64)
+  (let [cells (run-cells d a runs tick)]
+    (cond (< (.w r) 70)
+            (draw-table! c r NARROW-RUN-COLUMNS (project-run-cells a cells [0 1 5])
+                         (field d runs-lv) 1 (.theme d) true)
+          (< (.w r) 108)
+            (draw-table! c r COMPACT-RUN-COLUMNS (project-run-cells a cells [0 1 4 5 6])
+                         (field d runs-lv) 1 (.theme d) true)
+          :else (draw-table! c r RUN-COLUMNS cells (field d runs-lv) 2 (.theme d) true))))
+
 (defn draw-runs! [(d (ptr Dash))
                   (c (ptr Canvas))
                   (a (dyn Allocator))
@@ -207,7 +240,7 @@
       (if (= n 0)
           (let [msg
                   (if (.has (field d overview))
-                      "No runs yet. Start one with: factory start <factory> --brief \"…\""
+                      "No runs yet. Press n to start one, or ctrl-p for commands."
                       "Waiting for the hub…")]
             (put-text-ellipsis! c
                                 inner
@@ -215,14 +248,7 @@
                                 (+ (.y inner) 1)
                                 msg
                                 (.subtle theme)))
-          (draw-table! c
-                       inner
-                       RUN-COLUMNS
-                       (run-cells d a runs tick)
-                       (field d runs-lv)
-                       2
-                       theme
-                       true))
+          (draw-run-table! d c a inner runs tick))
       0)))
 
 ;;; One overseer line with its time, for sorting.
@@ -369,7 +395,9 @@
       0)))
 
 (const OVERVIEW-HINTS
-       [(KeyHint :key "↑↓" :label "select")
+       [(KeyHint :key "ctrl-p" :label "commands")
+        (KeyHint :key "n" :label "new run")
+        (KeyHint :key "↑↓" :label "select")
         (KeyHint :key "enter" :label "open")
         (KeyHint :key "c" :label "chat")
         (KeyHint :key "p" :label "pause/resume")

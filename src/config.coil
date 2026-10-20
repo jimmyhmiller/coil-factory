@@ -108,6 +108,8 @@
    ;;; The model `codex` agents use when nothing else names one; "" means
    ;;; there is none.
    (codex-model (slice u8))
+   (claude (slice u8))
+   (claude-model (slice u8))
    ;;; Directories outside the workspace that `codex` agents allowed to write
    ;;; (their workspace sandbox) may also write, comma-separated; `~` is the
    ;;; home directory. "" for none.
@@ -200,6 +202,8 @@
                 (set! (.codex config) (json-str-or object "codex" ""))
                 (set! (.codex-model config)
                       (json-str-or object "codex_model" ""))
+                (set! (.claude config) (json-str-or object "claude" ""))
+                (set! (.claude-model config) (json-str-or object "claude_model" ""))
                 (set! (.codex-writable config)
                       (names-text a (jv-get object "codex_writable")))
                 (set! (.codex-network config)
@@ -249,8 +253,9 @@
                         (SiteConfigBad "site.json: overseer.policy must be observe, nudge, or pause")
                       (not (or (= (.default-harness config) "builtin")
                                (= (.default-harness config) "opencode")
-                               (= (.default-harness config) "codex")))
-                        (SiteConfigBad "site.json: default_harness must be \"builtin\", \"opencode\", or \"codex\"")
+                               (= (.default-harness config) "codex")
+                               (= (.default-harness config) "claude")))
+                        (SiteConfigBad "site.json: default_harness must be builtin, opencode, codex, or claude")
                       (< (.max-runs config) 1)
                         (SiteConfigBad "site.json: max_runs must be at least 1")
                       :else (SiteConfigOk (load config)))))))))

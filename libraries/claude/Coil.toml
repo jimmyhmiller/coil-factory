@@ -1,0 +1,13 @@
+[package]
+name = "claude"
+source-roots = ["src", "tests"]
+
+[dependencies]
+ai = { path = "../ai" }
+agent = { path = "../agent" }
+agent_tools = { path = "../agent-tools" }
+durable = { path = "../durable" }
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]

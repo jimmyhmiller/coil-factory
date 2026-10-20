@@ -184,14 +184,12 @@
 ;;; the ChatGPT apps of the operator's account (some write to it), plugins,
 ;;; the list of the operator's skills (several thousand tokens on every
 ;;; request), browser and computer use, image generation, goals, memories,
-;;; tool suggestions, web search, and the first multi-agent tools, with the
-;;; instructions about them.
+;;; tool suggestions, and web search, with the instructions about them.
 ;;;
-;;; Two things are left on. Code mode, because some models are served only
+;;; Code mode stays on because some models are served only
 ;;; through it (with its host off, Codex refuses every call and never ends the
-;;; turn). And the multi-agent v2 instructions and tools, because the model
-;;; catalog turns them on per model and no setting reaches them (verified
-;;; against codex-cli 0.162.1).
+;;; turn). Delegation defaults off here; coding stations explicitly enable it
+;;; in the caller's settings, with a concurrency limit.
 (const CLOSED-SETTINGS
        ["features.apps=false"
         "features.plugins=false"
@@ -451,6 +449,11 @@
                        "query"
                        (JStr (jv-string-or (jv-get item "query") "")))
               (Some (tool-call id "web_search" input (jv-encode a input))))
+          (= kind "collab_agent_tool_call")
+            (Some (tool-call id
+                            (join a ["agent." (jv-string-or (jv-get item "tool") "unknown")])
+                            (jv-clone a item)
+                            (jv-encode a item)))
           :else (None))))
 
 (defn item-summary [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
@@ -476,6 +479,9 @@
                    (jv-string-or (jv-get item "tool") "")])
           (= kind "web_search")
             (join a ["search " (jv-string-or (jv-get item "query") "")])
+          (= kind "collab_agent_tool_call")
+            (join a ["agent " (jv-string-or (jv-get item "tool") "") " "
+                     (jv-string-or (jv-get item "prompt") "")])
           :else kind)))
 
 (defn item-ok? [(item JVal)] (-> bool)
@@ -496,6 +502,7 @@
                    ": "
                    (file-change-paths a h item)])
           (= kind "mcp_tool_call") (mcp-output a item)
+          (= kind "collab_agent_tool_call") (jv-encode a item)
           :else (jv-string-or (jv-get item "status") ""))))
 
 (defn open-index [(turn (ptr Turn)) (id (slice u8))] (-> i64)

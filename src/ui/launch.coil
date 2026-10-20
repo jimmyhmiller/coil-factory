@@ -1,0 +1,110 @@
+(module factory.ui.launch)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [trim])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [jv-object jv-put!])
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.keys" :use *)
+
+;;; Fields are editors with their own undo-free cursor and paste handling.
+;;; The project path is interpreted on the selected site, just like the API.
+(defstruct Launch [(fields (array TextInput 8)) (focus i64)])
+
+(const LABELS
+       ["Factory"
+        "Brief"
+        "Project on site"
+        "Site"
+        "Harness"
+        "Model"
+        "Reviewers"
+        "Base commit"])
+
+(const PLACEHOLDERS
+       ["feature, fix, haiku, or a factory path"
+        "What should the factory accomplish?"
+        "Repository path, or empty for a new workspace"
+        "Empty uses the local site"
+        "builtin, codex, claude, opencode; empty uses default"
+        "Empty uses factory or site default"
+        "Comma-separated names, none, or empty for default"
+        "Empty uses the project's HEAD"])
+
+(const FIELDS
+       ["factory" "brief" "project" "site" "harness" "model" "reviewers" "base"])
+
+(defn launch-new [(a (dyn Allocator))] (-> Launch)
+  (let [(mut form) (zeroed Launch)]
+    (for i (range 0 8)
+      (set! (index (field (mut form) fields) i) (text-input-new a false)))
+    (load form)))
+
+(defn launch-free! [(form (ptr Launch))] (-> i64)
+  (for i (range 0 8) (text-input-free! (index (field form fields) i)))
+  0)
+
+(defn launch-value [(form (ptr Launch)) (i i64)] (-> (slice u8))
+  (trim (input-text (index (field form fields) i))))
+
+;;; Validate without erasing the user's draft. The server owns factory/model
+;;; validation; the form only checks what it can know locally.
+(defn launch-problem [(form (ptr Launch))] (-> (slice u8))
+  (let [harness (launch-value form 4)]
+    (cond (= (len (launch-value form 0)) 0) "Choose a factory."
+          (= (len (launch-value form 1)) 0) "Describe the work in Brief."
+          (and (> (len harness) 0)
+               (not (= harness "builtin"))
+               (not (= harness "codex"))
+               (not (= harness "opencode"))
+               (not (= harness "claude")))
+            "Harness must be builtin, codex, claude, or opencode."
+          :else "")))
+
+(defn launch-body [(a (dyn Allocator)) (form (ptr Launch))] (-> JVal)
+  (let [body (jv-object a)]
+    (for i (range 0 8)
+      (jv-put! body (get FIELDS i) (JStr (launch-value form i))))
+    body))
+
+;;; Enter moves to the next field; Ctrl-S is the only submission gesture.
+(defn launch-key! [(form (ptr Launch)) (key Key)] (-> i64)
+  (match key
+    (Tab [] (set! (.focus form) (% (+ (.focus form) 1) 8)))
+    (Enter [] (set! (.focus form) (% (+ (.focus form) 1) 8)))
+    (BackTab [] (set! (.focus form) (% (+ (.focus form) 7) 8)))
+    (_ (do (input-handle-key! (index (field form fields) (.focus form)) key) 0)))
+  0)
+
+(defn draw-launch! [(form (ptr Launch)) (c (ptr Canvas)) (theme Theme)] (-> i64)
+  (canvas-hide-cursor! c)
+  (let [r (rect-center (canvas-rect c) 94 23)
+        (mut opts) (panel-opts theme "New factory run" true)]
+    (set! (.footer opts) "tab next · ctrl-s start · esc close (draft kept)")
+    (fill! c r 32 (style-default))
+    (let [inner (rect-inset-xy (draw-box! c r opts) 1 0)
+          ;; On short terminals, scroll whole fields to keep focus visible.
+          visible (if (> (.h inner) 1) (/ (.h inner) 2) 1)
+          start
+            (if (>= (.focus form) visible) (+ (- (.focus form) visible) 1) 0)]
+      (for i (range start 8)
+        (let [y (+ (.y inner) (* (- i start) 2))
+              input-r (rect (+ (.x inner) 19) y (- (.w inner) 19) 1)
+              focused (= i (.focus form))]
+          (when (< y (rect-bottom inner))
+            (put-text-ellipsis! c
+                                (rect (.x inner) y 18 1)
+                                (.x inner)
+                                y
+                                (get LABELS i)
+                                (if focused (.accent theme) (.muted theme)))
+            (draw-input! c
+                         (rect-intersect inner input-r)
+                         (index (field form fields) i)
+                         (.text theme)
+                         (get PLACEHOLDERS i)
+                         (.subtle theme)
+                         focused)
+            0)))
+      0)))

@@ -83,8 +83,8 @@
     (assert (= (station-harness (mut spec) (station-spec (mut spec) 0) "builtin") "opencode"))
     (assert (= (station-harness (mut spec) (station-spec (mut spec) 1) "opencode") "builtin")))
   (let [a (malloc-allocator)
-        p (problems-of a "---\nname: x\nharness: claude\n---\n\n## Station: a\nharness: amp\n\nDo it.\n")]
-    (assert (contains? p "line 3: unknown harness \"claude\"; the harnesses are builtin, opencode, and codex"))
+        p (problems-of a "---\nname: x\nharness: unsupported-harness\n---\n\n## Station: a\nharness: amp\n\nDo it.\n")]
+    (assert (contains? p "line 3: unknown harness \"unsupported-harness\"; the harnesses are builtin, opencode, codex, and claude"))
     (assert (contains? p "line 7: unknown harness \"amp\""))))
 
 (deftest reads-review-for-the-factory-and-each-station

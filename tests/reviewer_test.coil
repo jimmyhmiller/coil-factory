@@ -94,11 +94,11 @@
       (assert (contains? p "at least two verdicts")))
     (let [p
             (problems-of a
-                         "---\nname: x\nverdicts: good, Bad\nok: good\nevery: 5s\ntools: files\nharness: claude\nconfidence: 2\n---\n\nDo it.\n")]
+                         "---\nname: x\nverdicts: good, Bad\nok: good\nevery: 5s\ntools: files\nharness: unsupported-harness\nconfidence: 2\n---\n\nDo it.\n")]
       (assert (contains? p "verdict \"Bad\" must be lowercase"))
       (assert (contains? p "every must be a duration from 30s to 24h"))
       (assert (contains? p "a reviewer's tools are \"read\""))
-      (assert (contains? p "unknown harness \"claude\""))
+      (assert (contains? p "unknown harness \"unsupported-harness\""))
       (assert (contains? p "confidence must be a number from 0 to 1")))
     (let [p (problems-of a "---\nname: x\nverdicts: good, bad\nok: good\n---\n")]
       (assert (contains? p "needs instructions")))))

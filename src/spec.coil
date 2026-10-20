@@ -110,7 +110,7 @@
 ;;; that only answer requests from OpenCode itself); and `codex`, the Codex
 ;;; CLI driven headlessly (which reaches the models of the operator's Codex
 ;;; login).
-(const HARNESSES ["builtin" "opencode" "codex"])
+(const HARNESSES ["builtin" "opencode" "codex" "claude"])
 
 (defn harness-known? [(name (slice u8))] (-> bool)
   (let [(mut found) false]
@@ -125,7 +125,7 @@
         (push-str! (mut out) "unknown harness \"")
         (push-str! (mut out) name)
         (push-str! (mut out)
-                   "\"; the harnesses are builtin, opencode, and codex")
+                   "\"; the harnesses are builtin, opencode, codex, and claude")
         (finish! (mut out)))))
 
 ;;; The harness a station uses: its own, the factory's, then `fallback`.

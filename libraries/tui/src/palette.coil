@@ -1,0 +1,137 @@
+(module tui.palette)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "tui.canvas" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+
+;;; Commands borrow their strings. The caller keeps them alive for the palette.
+;;; Identity is independent of position and remains stable while filtering.
+(defstruct Command
+  [(id i64) (title (slice u8)) (detail (slice u8)) (enabled bool)])
+
+(defstruct Palette [(input TextInput) (list ListView)])
+
+(defsum PaletteResult
+  (PaletteContinue)
+  (PaletteClose)
+  (PaletteSelected [(id i64)]))
+
+(defn palette-new [(a (dyn Allocator))] (-> Palette)
+  (Palette :input (text-input-new a false) :list (list-view-new)))
+
+(defn palette-free! [(p (ptr Palette))] (-> i64)
+  (text-input-free! (field p input)))
+
+(defn palette-reset! [(p (ptr Palette))] (-> i64)
+  (input-clear! (field p input))
+  (set! (.list p) (list-view-new))
+  0)
+
+(defn fold-ascii [(b u8)] (-> u8)
+  (if (and (>= b 65) (<= b 90)) (+ b 32) b))
+
+;;; Case-insensitive subsequence search. UTF-8 bytes outside ASCII match exactly;
+;;; ASCII whitespace separates terms, allowing "pause run" to find "Pause this run".
+(defn command-matches? [(text (slice u8)) (query (slice u8))] (-> bool)
+  (block
+    :search
+      (let [(mut i) 0]
+        (for b (iter query)
+          (when (and (!= b 32) (!= b 9))
+            (loop (if (or (>= (load i) (len text))
+                          (= (fold-ascii (get text (load i))) (fold-ascii b)))
+                      (break)
+                      (set! i (+ (load i) 1))))
+            (when (>= (load i) (len text)) (return-from :search false))
+            (set! i (+ (load i) 1))
+            0))
+        true)))
+
+(defn palette-items [(a (dyn Allocator))
+                     (p (ptr Palette))
+                     (commands (slice Command))]
+  (-> (ArrayList Command))
+  (let [(mut out) (ArrayList::new [Command] a)
+        query (input-text (field p input))]
+    (for command (iter commands)
+      (when (and (.enabled command)
+                 (or (command-matches? (.title command) query)
+                     (command-matches? (.detail command) query)))
+        (push! (mut out) command)
+        0))
+    (load out)))
+
+;;; Scratch allocations belong to the caller's frame or event arena.
+(defn palette-key! [(p (ptr Palette))
+                    (a (dyn Allocator))
+                    (commands (slice Command))
+                    (key Key)] (-> PaletteResult)
+  (let [items (palette-items a p commands)]
+    (list-set-count! (field p list) (len items))
+    (match key
+      (Escape [] (PaletteClose))
+      (Enter []
+             (if (= (len items) 0)
+                 (PaletteContinue)
+                 (PaletteSelected (.id (get items (.selected (.list p)))))))
+      (Up [] (do (list-move! (field p list) -1) (PaletteContinue)))
+      (Down [] (do (list-move! (field p list) 1) (PaletteContinue)))
+      (PageUp [] (do (list-move! (field p list) -8) (PaletteContinue)))
+      (PageDown [] (do (list-move! (field p list) 8) (PaletteContinue)))
+      (_ (do
+           (input-handle-key! (field p input) key)
+           (list-select! (field p list) 0)
+           (PaletteContinue))))))
+
+;;; A responsive modal that reuses the toolkit's editor, table and theme.
+(defn draw-palette! [(p (ptr Palette))
+                     (c (ptr Canvas))
+                     (a (dyn Allocator))
+                     (bounds Rect)
+                     (commands (slice Command))
+                     (theme Theme)] (-> i64)
+  (canvas-hide-cursor! c)
+  (let [r (rect-center bounds 76 16)
+        opts (panel-opts theme "Commands" true)]
+    (fill! c r 32 (style-default))
+    (let [inner (draw-box! c r opts)
+          query-r (rect (.x inner) (.y inner) (.w inner) 1)
+          results-r (rect-drop-top inner 2)
+          items (palette-items a p commands)
+          (mut cells) (ArrayList::new [TableCell] a)]
+      (draw-input! c
+                   query-r
+                   (field p input)
+                   (.text theme)
+                   "Search commands…"
+                   (.muted theme)
+                   true)
+      (for command (iter items)
+        (push! (mut cells) (table-cell (.title command) (.text theme)))
+        (push! (mut cells) (table-cell (.detail command) (.muted theme))))
+      (list-set-count! (field p list) (len items))
+      (if (= (len items) 0)
+          (put-text-ellipsis! c
+                              results-r
+                              (.x results-r)
+                              (.y results-r)
+                              "No matching commands"
+                              (.muted theme))
+          (draw-table! c
+                       results-r
+                       [(Column
+                          :title "ACTION"
+                          :width (Fill 2)
+                          :align (AlignLeft))
+                        (Column
+                          :title "CONTEXT"
+                          :width (Fill 3)
+                          :align (AlignLeft))]
+                       (slice cells)
+                       (field p list)
+                       1
+                       theme
+                       false))
+      0)))

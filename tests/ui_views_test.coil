@@ -4,6 +4,7 @@
 (import "coil.str" :use [StrBuf])
 (import "coil.arraylist" :use *)
 (import "tui.keys" :use *)
+(import "tui.canvas" :use *)
 (import "tui.app" :use [Quit Continue])
 (import "coil.serde.value" :use *)
 (import "agent.json" :use [jv-parse jv-encode jv-put!])
@@ -14,6 +15,8 @@
 (import "factory.ui.chat" :use *)
 (import "factory.ui.model" :use *)
 (import "factory.ui.dashboard" :use *)
+(import "factory.ui.launch" :as launch)
+(import "factory.ui.inspect" :as inspect)
 
 (extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
 
@@ -99,7 +102,7 @@
 │ ◉ 02:34 blocker-73c0  judge: stuck — the gate cannot pass                                                            │
 │ ⚠ 02:34 blocker-73c0/attempt  the gate failed on every attempt  [flailing]                                           │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────── 2 notices ─╯
- ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
+ ctrl-p commands · n new run · ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
 "))))
   0)
 
@@ -394,3 +397,59 @@
     (assert (not (.loaded chat)))
     (assert (.has (field chat transcript))))
   0)
+
+(deftest command-palette-and-launcher-preserve-the-operators-draft
+  (let [a (malloc-allocator) d (dash-for-test a)]
+    (dashboard-key! d (Ctrl #\p))
+    (assert (.commands-open d))
+    (dashboard-key! d (Paste "new factory"))
+    (dashboard-key! d (Enter))
+    (assert (not (.commands-open d)))
+    (assert (.launch-open d))
+    (dashboard-key! d (Paste "feature"))
+    (dashboard-key! d (Tab))
+    (dashboard-key! d (Paste "Build a tested app"))
+    (dashboard-key! d (Escape))
+    (assert (not (.launch-open d)))
+    (dashboard-key! d (Char #\n))
+    (assert (.launch-open d))
+    (assert (= (launch/launch-value (field d launch) 0) "feature"))
+    (assert (= (launch/launch-value (field d launch) 1) "Build a tested app"))
+    (let [image (app-snapshot d 100 30 0 a)]
+      (assert (str-contains? image "New factory run"))
+      (assert (str-contains? image "Build a tested app")))))
+
+(deftest tool-inspector-correlates-out-of-order-results-and-expands-with-keys
+  (let [a (malloc-allocator) d (dash-for-test a) chat (field d chat)]
+    (chat-open! chat "haiku-4695" "write")
+    (set! (.view d) (ViewChat))
+    (chat-set-transcript! chat (doc a "{'transcript':[{'role':'assistant','tool_calls':[{'id':'first','function':{'name':'Read','arguments':'file one'}},{'id':'second','function':{'name':'Agent','arguments':'review'}}]},{'role':'tool','tool_call_id':'second','content':'second result'},{'role':'tool','tool_call_id':'first','content':'first result'}]}") NOW)
+    (assert (= (inspect/result-for (jv-get (.value (field chat transcript)) "transcript") "first") "first result"))
+    (dashboard-key! d (Ctrl #\o))
+    (assert (.inspection-open d))
+    (let [(mut canvas) (canvas-new a 100 30)]
+      (canvas-set-cursor! (mut canvas) 5 22)
+      (inspect/draw-inspection! d (mut canvas) a)
+      (assert (not (.cursor-visible canvas)))
+      (canvas-free! (mut canvas)))
+    (let [screen (app-snapshot d 100 30 0 a)]
+      (assert (str-contains? screen "Tool inspector"))
+      (assert (not (str-contains? screen "first result"))))
+    (dashboard-key! d (Right))
+    (let [screen (app-snapshot d 100 30 0 a)]
+      (assert (str-contains? screen "Arguments: file one"))
+      (assert (str-contains? screen "Result: first result"))
+      (assert (not (str-contains? screen "second result"))))
+    (dashboard-key! d (Escape))
+    (assert (not (.inspection-open d)))))
+
+(deftest compact-overview-keeps-activity-readable
+  (let [a (malloc-allocator) d (dash-for-test a)]
+    (snap-commit! (field d overview) (doc a OVERVIEW) NOW)
+    (sync-selection! d)
+    (let [screen (app-snapshot d 80 24 0 a)]
+      (assert (str-contains? screen "haiku-4695"))
+      (assert (str-contains? screen "ACTIVITY")))
+    (let [screen (app-snapshot d 60 24 0 a)]
+      (assert (str-contains? screen "haiku-4695"))
+      (assert (str-contains? screen "coil test")))))

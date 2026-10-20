@@ -1,0 +1,658 @@
+(module claude.harness)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.time" :as time)
+(import "coil.serde.value" :use *)
+(import "ai.chat" :as chat)
+(import "agent.json" :use *)
+(import "agent.harness" :use *)
+(import "agent.loop" :use *)
+(import "agent.tool" :use *)
+(import "agent_tools.stream" :as stream)
+(import "durable.atomic" :as atomic)
+
+;;; Native Coil adapter for Claude Code's stream-json CLI protocol. The caller
+;;; supplies a tool allowlist and, where needed, an OS sandbox launcher.
+(defstruct ClaudeOptions
+  [(program (slice u8))
+   (launcher (slice (slice u8)))
+   (workdir (slice u8))
+   (model (slice u8))
+   (tools (slice u8))
+   (mcp JVal)
+   (ready-file (slice u8))
+   (stop-tool (slice u8))
+   (stop-tool-as (slice u8))
+   (idle-timeout-ms i64)])
+
+(defstruct ClaudeHarness
+  [(allocator (dyn Allocator))
+   (options ClaudeOptions)
+   (observer (dyn AgentObserver))
+   (control (dyn AgentControl))
+   (session (slice u8))
+   (system (slice u8))
+   (pending (ArrayList (slice u8)))
+   (inbound (ArrayList Inbound))
+   (messages JVal)
+   (turns i64)])
+
+(defn claude-new [(a (dyn Allocator))
+                  (options ClaudeOptions)
+                  (observer (dyn AgentObserver))
+                  (control (dyn AgentControl))] (-> ClaudeHarness)
+  (ClaudeHarness
+    :allocator a
+    :options options
+    :observer observer
+    :control control
+    :session ""
+    :system ""
+    :pending (ArrayList::new [(slice u8)] a)
+    :inbound (ArrayList::new [Inbound] a)
+    :messages (jv-array a)
+    :turns 0))
+
+(defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
+
+(defn now-ms [] (-> i64)
+  (match (time/monotonic-now-ms) (Ok [n] n) (Err [_] 0)))
+
+(defn mirror-text! [(h (ptr ClaudeHarness)) (role (slice u8)) (text (slice u8))]
+  (-> i64)
+  (jv-push! (.messages h)
+            (chat-message (.allocator h) role (copy-bytes (.allocator h) text))))
+
+;;; Settings sources are empty, hooks and skills disabled, and MCP restricted
+;;; to this caller. Claude retains its subscription credentials and CLAUDE.md
+;;; instructions. Safe mode cannot be used: it disables even explicit MCP.
+;;; dontAsk refuses tools outside the allowlist without permission prompts.
+(defn claude-argv [(a (dyn Allocator)) (h (ptr ClaudeHarness))]
+  (-> (ArrayList (slice u8)))
+  (let [opts (.options h)
+        (mut argv) (ArrayList::new [(slice u8)] a)
+        settings (jv-object a)]
+    (jv-put! settings "disableAllHooks" (JBool true))
+    (for word (iter (.launcher opts)) (push! (mut argv) word))
+    (for word (iter [(.program opts)
+                     "--print"
+                     "--verbose"
+                     "--output-format"
+                     "stream-json"
+                     "--include-partial-messages"
+                     "--forward-subagent-text"
+                     "--disable-slash-commands"
+                     "--setting-sources"
+                     ""
+                     "--settings"
+                     (jv-encode a settings)
+                     "--strict-mcp-config"
+                     "--mcp-config"
+                     (jv-encode a (.mcp opts))
+                     "--permission-mode"
+                     "dontAsk"
+                     "--tools"
+                     (.tools opts)
+                     "--allowedTools"
+                     (join a
+                           [(.tools opts)
+                            (if (> (len (.tools opts)) 0) "," "")
+                            "mcp__factory__*"])
+                     "--model"
+                     (.model opts)
+                     "--append-system-prompt"
+                     (.system h)])
+      (push! (mut argv) word))
+    (when (> (len (.session h)) 0)
+      (push! (mut argv) "--resume")
+      (push! (mut argv) (.session h))
+      0)
+    (load argv)))
+
+(defstruct OpenCall [(call ToolCall) (summary (slice u8)) (parent (slice u8))])
+
+(defstruct Turn
+  [(harness (ptr ClaudeHarness))
+   (allocator (dyn Allocator))
+   (arena (ptr scratch/ScratchArena))
+   (open (ArrayList OpenCall))
+   (finish (Option ToolCall))
+   (finish-output (slice u8))
+   (last-text (slice u8))
+   (error (slice u8))
+   (result-seen bool)
+   (usage-seen bool)
+   (interrupt bool)
+   (interrupted bool)
+   (cancelled bool)
+   (idle bool)
+   (last-event-ms i64)
+   (last-inbox-ms i64)])
+
+(defn turn-new [(a (dyn Allocator))
+                (h (ptr ClaudeHarness))
+                (arena (ptr scratch/ScratchArena))] (-> Turn)
+  (Turn
+    :harness h
+    :allocator a
+    :arena arena
+    :open (ArrayList::new [OpenCall] (.allocator h))
+    :finish (None)
+    :finish-output ""
+    :last-text ""
+    :error ""
+    :result-seen false
+    :usage-seen false
+    :interrupt false
+    :interrupted false
+    :cancelled false
+    :idle false
+    :last-event-ms (now-ms)
+    :last-inbox-ms 0))
+
+(defn open-index [(turn (ptr Turn)) (id (slice u8))] (-> i64)
+  (block :find
+    (for i (range 0 (len (.open turn)))
+      (when (= (.id (.call (get (.open turn) i))) id) (return-from :find i)))
+    -1))
+
+(defn content-text [(a (dyn Allocator)) (content JVal)] (-> (slice u8))
+  (match content
+    (JStr [s] s)
+    (_ (let [(mut out) (StrBuf::new a)]
+         (for i (range 0 (jv-count content))
+           (let [part (jv-nth content i)]
+             (when (= (jv-string-or (jv-get part "type") "") "text")
+               (push-str! (mut out) (jv-string-or (jv-get part "text") ""))
+               0)))
+         (finish! (mut out))))))
+
+;;; Parallel tool results are correlated by ID. Only the root agent's successful
+;;; stop tool can finish a station; delegated agents cannot finish their parent.
+(defn assistant! [(turn (ptr Turn)) (event JVal)] (-> bool)
+  (block
+    :event
+      (let [h (.harness turn)
+            a (.allocator h)
+            s (.allocator turn)
+            content (jv-get (jv-get event "message") "content")
+            parent (jv-string-or (jv-get event "parent_tool_use_id") "")]
+        (for i (range 0 (jv-count content))
+          (let [part (jv-nth content i)
+                kind (jv-string-or (jv-get part "type") "")]
+            (cond (= kind "text")
+                    (let [text (jv-string-or (jv-get part "text") "")
+                          shown
+                            (if (> (len parent) 0)
+                                (join s ["[subagent " parent "] " text])
+                                text)]
+                      (observe (.observer h) (Said shown))
+                      (mirror-text! h "assistant" shown)
+                      (when (= (len parent) 0)
+                        (set! (.last-text turn) (copy-bytes a text))
+                        0)
+                      0)
+                  (= kind "thinking")
+                    (do
+                      (observe (.observer h)
+                               (Thought (jv-string-or (jv-get part "thinking")
+                                                      "")))
+                      0)
+                  (= kind "tool_use")
+                    (let [id (jv-string-or (jv-get part "id") "")
+                          name (jv-string-or (jv-get part "name") "")
+                          input (jv-get part "input")]
+                      (when (and (= (len parent) 0)
+                                 (match (.finish turn)
+                                   (Some [_] true)
+                                   (None [] false)))
+                        (return-from :event false))
+                      (when (< (open-index turn id) 0)
+                        (let [call
+                                (tool-call (copy-bytes a id)
+                                           (copy-bytes a name)
+                                           (jv-clone a input)
+                                           (copy-bytes a (jv-encode s input)))
+                              summary
+                                (join a
+                                      [(if (> (len parent) 0)
+                                           (join s ["[subagent " parent "] "])
+                                           "")
+                                       name
+                                       " "
+                                       (jv-encode s input)])]
+                          (push! (mut (.open turn))
+                                 (OpenCall
+                                   :call call
+                                   :summary summary
+                                   :parent (copy-bytes a parent)))
+                          (observe (.observer h) (ToolStarted call summary))
+                          0))
+                      0)
+                  :else 0)))
+        true)))
+
+(defn mirror-tool! [(h (ptr ClaudeHarness))
+                    (call ToolCall)
+                    (output (slice u8))
+                    (parent (slice u8))] (-> i64)
+  (let [a (.allocator h)
+        message (jv-object a)
+        calls (jv-array a)
+        entry (jv-object a)
+        function (jv-object a)
+        result (jv-object a)]
+    (jv-put! function "name" (JStr (.name call)))
+    (jv-put! function "arguments" (JStr (.arguments-json call)))
+    (jv-put! entry "id" (JStr (.id call)))
+    (jv-put! entry "type" (JStr "function"))
+    (jv-put! entry "function" function)
+    (jv-push! calls entry)
+    (jv-put! message "role" (JStr "assistant"))
+    (jv-put! message "content" (JStr ""))
+    (jv-put! message "parent_tool_use_id" (JStr (copy-bytes a parent)))
+    (jv-put! message "tool_calls" calls)
+    (jv-push! (.messages h) message)
+    (jv-put! result "role" (JStr "tool"))
+    (jv-put! result "tool_call_id" (JStr (.id call)))
+    (jv-put! result "content" (JStr (copy-bytes a output)))
+    (jv-push! (.messages h) result)))
+
+(defn tool-results! [(turn (ptr Turn)) (event JVal)] (-> bool)
+  (let [h (.harness turn)
+        a (.allocator h)
+        s (.allocator turn)
+        content (jv-get (jv-get event "message") "content")]
+    (for i (range 0 (jv-count content))
+      (let [part (jv-nth content i)
+            id (jv-string-or (jv-get part "tool_use_id") "")
+            at (open-index turn id)]
+        (when (and (= (jv-string-or (jv-get part "type") "") "tool_result")
+                   (>= at 0))
+          (let [open (get (.open turn) at)
+                call (.call open)
+                ok
+                  (not (match (jv-get part "is_error") (JBool [b] b) (_ false)))
+                output (content-text s (jv-get part "content"))]
+            (observe (.observer h)
+                     (ToolEnded
+                       :call call
+                       :summary (.summary open)
+                       :ok ok
+                       :output output
+                       :elapsed-ms 0))
+            (mirror-tool! h call output (.parent open))
+            (when (and ok
+                       (= (len (.parent open)) 0)
+                       (> (len (.stop-tool (.options h))) 0)
+                       (= (.name call) (.stop-tool (.options h))))
+              (set! (.finish turn)
+                    (Some (tool-call (.id call)
+                                     (.stop-tool-as (.options h))
+                                     (.arguments call)
+                                     (.arguments-json call))))
+              (set! (.finish-output turn) (copy-bytes a output))
+              0)
+            (set! (mut (.open turn))
+                  at
+                  (get (.open turn) (- (len (.open turn)) 1)))
+            (pop! (mut (.open turn)))
+            0)
+          0)))
+    (if (and (.interrupt turn)
+             (= (len (.open turn)) 0)
+             (match (.finish turn) (Some [_] false) (None [] true)))
+        (do (set! (.interrupted turn) true) false)
+        true)))
+
+(defn apply-event! [(turn (ptr Turn)) (line (slice u8))] (-> bool)
+  (let [h (.harness turn)
+        a (.allocator h)
+        s (.allocator turn)]
+    (set! (.last-event-ms turn) (now-ms))
+    (match (jv-parse s line)
+      (None []
+            (do
+              (set! (.error turn)
+                    (copy-bytes a "Claude emitted invalid stream-json."))
+              false))
+      (Some [event]
+            (let [kind (jv-string-or (jv-get event "type") "")
+                  session (jv-string-or (jv-get event "session_id") "")]
+              (when (and (= (len (.session h)) 0) (> (len session) 0))
+                (set! (.session h) (copy-bytes a session))
+                0)
+              (cond (= kind "assistant") (assistant! turn event)
+                    (= kind "user") (tool-results! turn event)
+                    (= kind "stream_event")
+                      (let [delta (jv-get (jv-get event "event") "delta")
+                            text
+                              (jv-string-or (jv-get delta "text")
+                                            (jv-string-or (jv-get delta
+                                                                  "thinking")
+                                                          ""))]
+                        (when (> (len text) 0)
+                          (observe (.observer h)
+                                   (Streaming (if (= (jv-string-or (jv-get delta
+                                                                           "type")
+                                                                   "")
+                                                     "thinking_delta")
+                                                  "reasoning"
+                                                  "text")
+                                              (len text)))
+                          0)
+                        true)
+                    (= kind "result")
+                      (do
+                        (set! (.result-seen turn) true)
+                        (let [usage (jv-get event "usage")]
+                          (when (not (jv-null? usage))
+                            (set! (.usage-seen turn) true)
+                            (observe (.observer h)
+                                     (UsageReported
+                                       :input-tokens
+                                         (+ (jv-int (jv-get usage
+                                                            "input_tokens"))
+                                            (+ (jv-int (jv-get usage
+                                                               "cache_read_input_tokens"))
+                                               (jv-int (jv-get usage
+                                                               "cache_creation_input_tokens"))))
+                                       :cached-input-tokens
+                                         (jv-int (jv-get usage
+                                                         "cache_read_input_tokens"))
+                                       :output-tokens
+                                         (jv-int (jv-get usage "output_tokens"))))
+                            0))
+                        (when (or (match (jv-get event "is_error")
+                                    (JBool [b] b)
+                                    (_ false))
+                                  (not (= (jv-string-or (jv-get event "subtype")
+                                                        "")
+                                          "success")))
+                          (set! (.error turn)
+                                (copy-bytes a (jv-encode s event)))
+                          0)
+                        true)
+                    :else true))))))
+
+(impl stream/LineSink Turn
+  (on-line [(self (ptr Turn)) (line (slice u8))] (-> bool)
+    (let [go (apply-event! self line)]
+      (when (!= (cast i64 (.arena self)) 0) (reset! (.arena self)) 0)
+      go))
+  (on-tick [(self (ptr Turn))] (-> bool)
+    (let [h (.harness self)
+          now (now-ms)]
+      (block :tick
+        (match (control-check (.control h))
+          (Cancel []
+                  (do (set! (.cancelled self) true) (return-from :tick false)))
+          (Pause [] (set! (.interrupt self) true))
+          (Proceed [] 0))
+        (when (>= (- now (.last-inbox-ms self)) 1000)
+          (set! (.last-inbox-ms self) now)
+          (let [(mut arrived) (control-inbox (.control h) (.allocator h))]
+            (for message (iter arrived)
+              (push! (mut (.inbound h)) message)
+              (set! (.interrupt self) true))
+            (free! (mut arrived))
+            0))
+        (when (and (.interrupt self)
+                   (= (len (.open self)) 0)
+                   (match (.finish self) (Some [_] false) (None [] true)))
+          (set! (.interrupted self) true)
+          (return-from :tick false))
+        (when (and (> (.idle-timeout-ms (.options h)) 0)
+                   (>= (- now (.last-event-ms self))
+                       (.idle-timeout-ms (.options h))))
+          (set! (.idle self) true)
+          (return-from :tick false))
+        true))))
+
+(defn failure [(a (dyn Allocator)) (message (slice u8))] (-> AgentStop)
+  (Failed (chat/chat-error "harness" 0 (copy-bytes a message))))
+
+(defn await-proceed! [(h (ptr ClaudeHarness))] (-> bool)
+  (block :await
+    (match (control-check (.control h))
+      (Proceed [] (return-from :await true))
+      (Cancel [] (return-from :await false))
+      (Pause [] 0))
+    (observe (.observer h) (PausedEvent))
+    (loop (control-idle (.control h))
+      (match (control-check (.control h))
+        (Proceed []
+                 (do
+                   (observe (.observer h) (ResumedEvent))
+                   (return-from :await true)))
+        (Cancel [] (return-from :await false))
+        (Pause [] 0)))
+    true))
+
+(defn take-prompt! [(h (ptr ClaudeHarness))] (-> (slice u8))
+  (let [a (.allocator h)
+        (mut prompt) (StrBuf::new a)
+        (mut arrived) (control-inbox (.control h) a)]
+    (for message (iter arrived) (push! (mut (.inbound h)) message))
+    (free! (mut arrived))
+    (for text (iter (.pending h))
+      (push-str! (mut prompt) text)
+      (push-str! (mut prompt) "\n\n")
+      (mirror-text! h "user" text))
+    (for message (iter (.inbound h))
+      (let [text (join a ["[" (.from message) "] " (.text message)])]
+        (push-str! (mut prompt) text)
+        (push-str! (mut prompt) "\n\n")
+        (mirror-text! h "user" text)
+        (observe (.observer h) (MessageDelivered message))))
+    (clear! (mut (.pending h)))
+    (clear! (mut (.inbound h)))
+    (when (= (len prompt) 0)
+      (push-str! (mut prompt) "Continue where you left off.")
+      0)
+    (finish! (mut prompt))))
+
+(defn run-claude! [(h (ptr ClaudeHarness))] (-> AgentStop)
+  (let [a (.allocator h)
+        opts (.options h)]
+    (block :run
+      (loop (when (not (await-proceed! h)) (return-from :run (Cancelled)))
+        (let [prompt (take-prompt! h)]
+          (when (> (len (.ready-file opts)) 0)
+            (atomic/unlink-path a (.ready-file opts))
+            0)
+          (set! (.turns h) (+ (.turns h) 1))
+          (observe (.observer h) (TurnStarted (.turns h)))
+          (let [(mut argv) (claude-argv a h)
+                all (slice argv)
+                arena
+                  (box! a scratch/ScratchArena (zeroed scratch/ScratchArena))
+                _ (scratch/ScratchArena::init arena a)
+                turn (box! a Turn (turn-new (allocator arena) h arena))
+                ended
+                  (stream/stream-lines a
+                                       (stream/StreamSpec
+                                         :program (get all 0)
+                                         :args (subslice all 1 (len all))
+                                         :cwd (.workdir opts)
+                                         :input prompt
+                                         :timeout-ms 0
+                                         :max-line-bytes 67108864
+                                         :stderr-bytes 8192)
+                                       turn)]
+            (free! (mut argv))
+            (close! arena)
+            (free! (mut (.open turn)))
+            (when (not (.usage-seen turn))
+              (observe (.observer h)
+                       (UsageUnknown "Claude did not report final usage for this invocation."))
+              0)
+            (match ended
+              (Err [message] (return-from :run (failure a message)))
+              (Ok [end]
+                  (cond (.cancelled turn) (return-from :run (Cancelled))
+                        (> (len (.error turn)) 0)
+                          (return-from :run (failure a (.error turn)))
+                        (.interrupted turn) 0
+                        (.idle turn)
+                          (return-from
+                            :run
+                              (failure a
+                                       "Claude stopped after its idle timeout."))
+                        (and (.stopped end)
+                             (match (.finish turn)
+                               (Some [_] true)
+                               (None [] false)))
+                          (match (.finish turn)
+                            (Some [call]
+                                  (return-from
+                                    :run (Finished call (.finish-output turn))))
+                            (None []
+                                  (return-from
+                                    :run (failure a "Finish result vanished."))))
+                        (or (!= (.exit-code end) 0) (> (.dropped-lines end) 0))
+                          (return-from
+                            :run
+                              (failure a
+                                       (join a
+                                             ["Claude process failed or lost an oversized event: "
+                                              (.errors end)])))
+                        (or (not (.result-seen turn)) (= (len (.session h)) 0))
+                          (return-from
+                            :run
+                              (failure a
+                                       "Claude exited without a complete result and session id."))
+                        :else
+                          (do
+                            (when (> (len (.ready-file opts)) 0)
+                              (match (atomic/file-exists? a (.ready-file opts))
+                                (Ok [found]
+                                    (when (not found)
+                                      (return-from
+                                        :run
+                                          (failure a
+                                                   "Claude's factory MCP server never initialized."))))
+                                (Err [_]
+                                     (return-from
+                                       :run
+                                         (failure a
+                                                  "Cannot verify Claude's factory MCP server.")))))
+                            (match (.finish turn)
+                              (Some [call]
+                                    (return-from
+                                      :run (Finished call (.finish-output turn))))
+                              (None []
+                                    (return-from
+                                      :run (Replied (.last-text turn))))))))))))
+      (Cancelled))))
+
+(defn checkpoint-json [(a (dyn Allocator)) (h (ptr ClaudeHarness))]
+  (-> (slice u8))
+  (let [root (jv-object a)
+        pending (jv-array a)
+        inbound (jv-array a)]
+    (for text (iter (.pending h)) (jv-push! pending (JStr text)))
+    (for message (iter (.inbound h))
+      (let [entry (jv-object a)]
+        (jv-put! entry "from" (JStr (.from message)))
+        (jv-put! entry "text" (JStr (.text message)))
+        (jv-put! entry "ref" (JInt (.ref message)))
+        (jv-push! inbound entry)))
+    (jv-put! root "version" (JInt 1))
+    (jv-put! root "harness" (JStr "claude"))
+    (jv-put! root "session" (JStr (.session h)))
+    (jv-put! root "system" (JStr (.system h)))
+    (jv-put! root "messages" (.messages h))
+    (jv-put! root "pending" pending)
+    (jv-put! root "inbound" inbound)
+    (jv-put! root "turns" (JInt (.turns h)))
+    (jv-encode a root)))
+
+(defn checkpoint-valid? [(root JVal)] (-> bool)
+  (block :valid
+    (when (not (and (= (jv-string-or (jv-get root "harness") "") "claude")
+                    (= (jv-int (jv-get root "version")) 1)
+                    (match (jv-get root "session") (JStr [_] true) (_ false))
+                    (match (jv-get root "system") (JStr [_] true) (_ false))
+                    (match (jv-get root "messages") (JArr [_] true) (_ false))
+                    (match (jv-get root "pending") (JArr [_] true) (_ false))
+                    (match (jv-get root "inbound") (JArr [_] true) (_ false))
+                    (match (jv-get root "turns") (JInt [n] (>= n 0)) (_ false))))
+      (return-from :valid false))
+    (for i (range 0 (jv-count (jv-get root "pending")))
+      (when (not (match (jv-nth (jv-get root "pending") i)
+                   (JStr [_] true)
+                   (_ false)))
+        (return-from :valid false)))
+    (for i (range 0 (jv-count (jv-get root "inbound")))
+      (let [message (jv-nth (jv-get root "inbound") i)]
+        (when (not (and (match (jv-get message "from")
+                          (JStr [_] true)
+                          (_ false))
+                        (match (jv-get message "text")
+                          (JStr [_] true)
+                          (_ false))
+                        (match (jv-get message "ref") (JInt [_] true) (_ false))))
+          (return-from :valid false))))
+    true))
+
+(defn restore! [(h (ptr ClaudeHarness)) (text (slice u8))] (-> bool)
+  (let [a (.allocator h)]
+    (match (jv-parse a text)
+      (None [] false)
+      (Some [root]
+            (if (not (checkpoint-valid? root))
+                false
+                (do
+                  (set! (.session h)
+                        (copy-bytes a (jv-string-or (jv-get root "session") "")))
+                  (set! (.system h)
+                        (copy-bytes a (jv-string-or (jv-get root "system") "")))
+                  (set! (.messages h) (jv-clone a (jv-get root "messages")))
+                  (set! (.turns h) (jv-int (jv-get root "turns")))
+                  (clear! (mut (.pending h)))
+                  (clear! (mut (.inbound h)))
+                  (for i (range 0 (jv-count (jv-get root "inbound")))
+                    (let [message (jv-nth (jv-get root "inbound") i)]
+                      (push! (mut (.inbound h))
+                             (Inbound
+                               :from
+                                 (copy-bytes a
+                                             (jv-string-or (jv-get message
+                                                                   "from")
+                                                           ""))
+                               :text
+                                 (copy-bytes a
+                                             (jv-string-or (jv-get message
+                                                                   "text")
+                                                           ""))
+                               :ref (jv-int (jv-get message "ref"))))))
+                  (for i (range 0 (jv-count (jv-get root "pending")))
+                    (push! (mut (.pending h))
+                           (copy-bytes a
+                                       (jv-string-or (jv-nth (jv-get root
+                                                                     "pending")
+                                                             i)
+                                                     ""))))
+                  true))))))
+
+(impl Harness ClaudeHarness
+  (harness-add-system! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> i64)
+    (set! (.system self) (copy-bytes (.allocator self) text))
+    (mirror-text! self "system" text))
+  (harness-add-user! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> i64)
+    (push! (mut (.pending self)) (copy-bytes (.allocator self) text))
+    0)
+  (harness-run! [(self (ptr ClaudeHarness))] (-> AgentStop)
+    (run-claude! self))
+  (harness-checkpoint [(self (ptr ClaudeHarness)) (a (dyn Allocator))]
+    (-> (slice u8))
+    (checkpoint-json a self))
+  (harness-restore! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> bool)
+    (restore! self text)))

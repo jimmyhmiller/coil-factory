@@ -1,0 +1,68 @@
+(module tui.tree-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.keys" :use *)
+(import "tui.tree" :use *)
+
+(defn nodes [] (-> (array TreeNode 5))
+  [(TreeNode
+     :id "root"
+     :depth 0
+     :label "root"
+     :style (style-default))
+   (TreeNode
+     :id "child"
+     :depth 1
+     :label "child"
+     :style (style-default))
+   (TreeNode
+     :id "leaf"
+     :depth 2
+     :label "leaf"
+     :style (style-default))
+   (TreeNode
+     :id "sibling"
+     :depth 1
+     :label "sibling"
+     :style (style-default))
+   (TreeNode
+     :id "other"
+     :depth 0
+     :label "other"
+     :style (style-default))])
+
+(deftest nested-navigation-preserves-expansion-and-hides-descendants
+  (let [a (malloc-allocator)
+        (mut tree) (tree-new a)
+        all (nodes)]
+    (assert-eq (len (tree-visible a (mut tree) all)) 2)
+    (tree-key! (mut tree) a all (Right))
+    (assert-eq (len (tree-visible a (mut tree) all)) 4)
+    (tree-key! (mut tree) a all (Right))
+    (assert-eq (.selected (.list tree)) 1)
+    (tree-key! (mut tree) a all (Right))
+    (assert-eq (len (tree-visible a (mut tree) all)) 5)
+    (tree-key! (mut tree) a all (Right))
+    (assert-eq (.selected (.list tree)) 2)
+    (tree-key! (mut tree) a all (Left))
+    (assert-eq (.selected (.list tree)) 1)
+    (tree-key! (mut tree) a all (Left))
+    (assert-eq (len (tree-visible a (mut tree) all)) 4)
+    (tree-key! (mut tree) a all (Left))
+    (assert-eq (.selected (.list tree)) 0)
+    (tree-key! (mut tree) a all (Left))
+    (assert-eq (len (tree-visible a (mut tree) all)) 2)
+    (for size (iter [0 1 4 20])
+      (let [(mut c) (canvas-new a size size)]
+        (draw-tree! (mut tree)
+                    (mut c)
+                    a
+                    (canvas-rect (mut c))
+                    all
+                    (theme-default)
+                    true)
+        (canvas-free! (mut c))))
+    (tree-free! (mut tree))))

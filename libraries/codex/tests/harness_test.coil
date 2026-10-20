@@ -2,6 +2,7 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :as fs)
+(import "coil.scratch" :as scratch)
 (import "coil.primitive" :as primitive)
 (import "coil.process" :as process)
 (import "coil.subprocess" :as subprocess)
@@ -634,3 +635,17 @@ pwd > \"$dir/pwd.$n\"
       (Failed [error]
               (assert (contains? (.message error) "never started in Codex")))
       (_ (assert false)))))
+
+(deftest delegated-work-is-recorded-with-its-child-thread-state
+  (let [a (malloc-allocator)
+        f (fixture a "delegation-events" [] (script a))
+        h (.harness f)
+        r (.recorder f)
+        (mut turn) (turn-new a h (cast (ptr scratch/ScratchArena) 0))]
+    (assert (apply-event! (mut turn)
+      "{\"type\":\"item.started\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"in_progress\",\"sender_thread_id\":\"root\",\"receiver_thread_ids\":[\"child\"]}}"))
+    (assert (saw? r "tool agent spawn_agent Review the parser"))
+    (assert (apply-event! (mut turn)
+      "{\"type\":\"item.completed\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"completed\",\"receiver_thread_ids\":[\"child\"],\"agents_states\":{\"child\":{\"status\":\"completed\",\"message\":\"No defects\"}}}}"))
+    (assert-eq (len (.open turn)) 0)
+    (assert (contains? (harness-checkpoint h a) "No defects"))))

@@ -1,0 +1,66 @@
+(module tui.palette-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "tui.palette" :use *)
+(import "tui.widgets" :use *)
+(import "tui.keys" :use *)
+(import "tui.canvas" :use *)
+
+(const COMMANDS
+       [(Command
+          :id 17
+          :title "Pause this run"
+          :detail "build-123"
+          :enabled true)
+        (Command
+          :id 22
+          :title "Resume run"
+          :detail "build-456"
+          :enabled false)
+        (Command
+          :id 99
+          :title "Chat with agent"
+          :detail "writer"
+          :enabled true)])
+
+(deftest search-is-case-insensitive-and-handles-empty-and-unicode
+  (assert (command-matches? "Pause this run" "PAUSE RUN"))
+  (assert (command-matches? "factory" ""))
+  (assert (command-matches? "中文 agent" "中文"))
+  (assert (not (command-matches? "Pause" "res")))
+  (assert (not (command-matches? "" "x"))))
+
+(deftest filtering-keeps-identity-and-excludes-disabled-actions
+  (let [a (malloc-allocator)
+        (mut p) (palette-new a)]
+    (assert-eq (len (palette-items a (mut p) COMMANDS)) 2)
+    (palette-key! (mut p) a COMMANDS (Down))
+    (match (palette-key! (mut p) a COMMANDS (Enter))
+      (PaletteSelected [id] (assert-eq id 99))
+      (_ (assert false)))
+    (input-set-text! (field (mut p) input) "build")
+    (match (palette-key! (mut p) a COMMANDS (Enter))
+      (PaletteSelected [id] (assert-eq id 17))
+      (_ (assert false)))
+    (input-set-text! (field (mut p) input) "missing")
+    (match (palette-key! (mut p) a COMMANDS (Enter))
+      (PaletteContinue [] (assert true))
+      (_ (assert false)))
+    (palette-reset! (mut p))
+    (assert-eq (len (input-text (field (mut p) input))) 0)
+    (palette-free! (mut p))))
+
+(deftest palette-renders-and-clips-at-small-terminal-sizes
+  (let [a (malloc-allocator)
+        (mut p) (palette-new a)]
+    (for size (iter [0 1 4 20 80])
+      (let [(mut c) (canvas-new a size size)]
+        (draw-palette! (mut p)
+                       (mut c)
+                       a
+                       (canvas-rect (mut c))
+                       COMMANDS
+                       (theme-default))
+        (canvas-free! (mut c))))
+    (palette-free! (mut p))))

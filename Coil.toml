@@ -18,6 +18,7 @@ tui = { path = "libraries/tui" }
 mcp = { path = "libraries/mcp" }
 opencode = { path = "libraries/opencode" }
 codex = { path = "libraries/codex" }
+claude = { path = "libraries/claude" }
 
 [test]
 roots = ["tests"]

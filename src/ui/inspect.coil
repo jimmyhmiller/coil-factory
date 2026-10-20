@@ -1,0 +1,125 @@
+(module factory.ui.inspect)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.str" :use [keyops-borrowed])
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.tree" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.fmt" :use *)
+
+;;; An expandable view of the authoritative checkpoint. Each tool call owns
+;;; its arguments and its matching result, including calls returned out of order.
+(defn result-for [(messages JVal) (id (slice u8))] (-> (slice u8))
+  (block :find
+    (for i (range 0 (jv-len messages))
+      (let [message (jv-nth messages i)]
+        (when (and (= (js message "role") "tool")
+                   (= (js message "tool_call_id") id))
+          (return-from :find (js message "content")))))
+    "Waiting for a checkpointed result…"))
+
+(defn inspect-lines! [(a (dyn Allocator))
+                      (nodes (mut (ArrayList TreeNode)))
+                      (id (slice u8))
+                      (text (slice u8))
+                      (width i64)
+                      (style Style)] (-> i64)
+  (let [lines (wrap-text a text width)]
+    (for i (range 0 (len lines))
+      (push! (mut nodes)
+             (TreeNode
+               :id (concat a [id "/" (int-text a i)])
+               :depth 1
+               :label (get lines i)
+               :style style)))
+    0))
+
+(defn inspection-nodes [(d (ptr Dash)) (a (dyn Allocator)) (width i64)]
+  (-> (ArrayList TreeNode))
+  (let [messages
+          (jv-get (.value (field (field d chat) transcript)) "transcript")
+        (mut nodes) (ArrayList::new [TreeNode] a)
+        (mut results) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed))
+        theme (.theme d)]
+    (for i (range 0 (jv-len messages))
+      (let [message (jv-nth messages i)]
+        (when (= (js message "role") "tool")
+          (set! (mut results)
+                (js message "tool_call_id")
+                (js message "content"))
+          0)))
+    (for i (range 0 (jv-len messages))
+      (let [message (jv-nth messages i)
+            calls (jv-get message "tool_calls")]
+        (for j (range 0 (jv-len calls))
+          (let [call (jv-nth calls j)
+                function (jv-get call "function")
+                id (js call "id")
+                name (js function "name")
+                parent (js message "parent_tool_use_id")]
+            (push! (mut nodes)
+                   (TreeNode
+                     :id id
+                     :depth 0
+                     :label
+                       (concat a
+                               [(if (> (len parent) 0)
+                                    (concat a ["[subagent " parent "] "])
+                                    "")
+                                name
+                                "  ·  "
+                                id])
+                     :style (.accent theme)))
+            (inspect-lines! a
+                            (mut nodes)
+                            (concat a [id "/arguments"])
+                            (concat a ["Arguments: " (js function "arguments")])
+                            width
+                            (.muted theme))
+            (inspect-lines! a
+                            (mut nodes)
+                            (concat a [id "/result"])
+                            (concat a
+                                    ["Result: "
+                                     (match (get results id)
+                                       (Some [text] text)
+                                       (None []
+                                             "Waiting for a checkpointed result…"))])
+                            width
+                            (.text theme))))))
+    (load nodes)))
+
+(defn inspect-bounds [(c (ptr Canvas))] (-> Rect)
+  (rect-inset-xy (canvas-rect c) 2 1))
+
+(defn draw-inspection! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))]
+  (-> i64)
+  (canvas-hide-cursor! c)
+  (let [r (inspect-bounds c)
+        (mut opts)
+          (panel-opts (.theme d) "Tool inspector · latest checkpoint" true)]
+    (set! (.footer opts)
+          "↑↓ select · → expand · ← collapse · esc close")
+    (fill! c r 32 (style-default))
+    (let [inner (draw-box! c r opts)]
+      (set! (.inspection-width d) (- (.w inner) 5))
+      (let [nodes (inspection-nodes d a (.inspection-width d))]
+        (if (= (len nodes) 0)
+            (put-text-ellipsis! c
+                                inner
+                                (.x inner)
+                                (.y inner)
+                                "No checkpointed tool calls yet. Live calls appear in chat."
+                                (.muted (.theme d)))
+            (draw-tree! (field d inspection)
+                        c
+                        a
+                        inner
+                        (slice nodes)
+                        (.theme d)
+                        true))
+        0))))

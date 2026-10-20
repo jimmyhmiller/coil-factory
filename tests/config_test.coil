@@ -47,7 +47,7 @@
                              (assert (= (len (codex-settings a
                                                              (mut config)
                                                              "workspace-write"))
-                                        0))))
+                                        2))))
              (SiteConfigBad [message] (assert false)))
            (match (load-site-config a (home-with a "{\"codex_network\":true}"))
              (SiteConfigOk [loaded]
@@ -57,13 +57,13 @@
                                      (codex-settings a
                                                      (mut config)
                                                      "workspace-write")]
-                               (assert (= (len settings) 1))
-                               (assert (= (get settings 0)
+                               (assert (= (len settings) 3))
+                               (assert (= (get settings 0) "features.multi_agent=true"))
+                               (assert (= (get settings 2)
                                           "sandbox_workspace_write.network_access=true")))
-                             (assert (= (len (codex-settings a
-                                                             (mut config)
-                                                             "read-only"))
-                                        0))))
+                             (let [readonly (codex-settings a (mut config) "read-only")]
+                               (assert-eq (len readonly) 2)
+                               (assert (= (get readonly 0) "features.multi_agent=false")))))
              (SiteConfigBad [message] (assert false)))
            (match (load-site-config a (home-with a "{\"codex_network\":false}"))
              (SiteConfigOk [config] (assert (not (.codex-network config))))
@@ -77,3 +77,12 @@
              (SiteConfigBad [message]
                             (assert (contains? message
                                                "codex_network must be a boolean"))))))
+
+(deftest claude-can-be-the-site-default-with-its-own-model-and-program
+  (let [a (malloc-allocator)]
+    (match (load-site-config a (home-with a "{\"default_harness\":\"claude\",\"claude_model\":\"haiku\",\"claude\":\"/opt/claude\"}"))
+      (SiteConfigOk [config]
+        (do (assert (= (.default-harness config) "claude"))
+            (assert (= (.claude-model config) "haiku"))
+            (assert (= (.claude config) "/opt/claude"))))
+      (SiteConfigBad [message] (do (println "{s}" message) (assert false))))))

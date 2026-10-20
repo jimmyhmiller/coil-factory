@@ -81,7 +81,7 @@
   (let [a (malloc-allocator)]
     (assert (contains? (problems-of a (with-tool a "colour: red\n" "")) "line 3: unknown front-matter key \"colour\""))
     (assert (contains? (problems-of a (with-tool a "tools: files, net\n" "")) "unknown tool group \"net\""))
-    (assert (contains? (problems-of a (with-tool a "harness: claude\n" "")) "unknown harness \"claude\""))
+    (assert (contains? (problems-of a (with-tool a "harness: unsupported-harness\n" "")) "unknown harness \"unsupported-harness\""))
     (assert (contains? (problems-of a "---\nname: Bad Name\n---\n\nHi.\n") "must be lowercase letters, digits, and dashes"))
     (assert (contains? (problems-of a "---\nname: empty\n---\n") "an agent needs instructions"))
     (assert (contains? (problems-of a "Just text.\n") "an agent starts with front matter"))

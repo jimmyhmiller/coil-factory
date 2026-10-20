@@ -14,6 +14,7 @@
 (import "agent_tools.workspace" :as ws)
 (import "opencode.harness" :as opencode)
 (import "codex.harness" :as codex)
+(import "claude.harness" :as claude)
 (import "factory.config" :use *)
 (import "factory.finish" :use *)
 (import "factory.models" :use *)
@@ -124,18 +125,21 @@
   (cond (> (len model) 0) model
         (= harness "opencode") (.opencode-model config)
         (= harness "codex") (.codex-model config)
+        (= harness "claude") (.claude-model config)
         :else (.default-model config)))
 
 ;;; The site.json key that holds a harness's default model, quoted.
 (defn model-setting [(harness (slice u8))] (-> (slice u8))
   (cond (= harness "opencode") "\"opencode_model\""
         (= harness "codex") "\"codex_model\""
+        (= harness "claude") "\"claude_model\""
         :else "\"default_model\""))
 
 ;;; Where a model can be chosen, for a message about one that is missing.
 (defn model-choices [(harness (slice u8))] (-> (slice u8))
   (cond (= harness "opencode") "--model, `model:` in the factory or station, or \"opencode_model\" in site.json"
         (= harness "codex") "--model, `model:` in the factory or station, or \"codex_model\" in site.json"
+        (= harness "claude") "--model, `model:` in the factory or station, or \"claude_model\" in site.json"
         :else "--model, `model:` in the factory or station, or \"default_model\" in site.json"))
 
 (defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
@@ -157,7 +161,8 @@
         (= (.harness request) "builtin") (builtin-agent a config request observer control)
         (= (.harness request) "opencode") (opencode-agent a config request observer control)
         (= (.harness request) "codex") (codex-agent a config request observer control)
-        :else (AgentUnavailable (cat a ["unknown harness \"" (.harness request) "\"; the harnesses are builtin, opencode, and codex"]))))
+        (= (.harness request) "claude") (claude-agent a config request observer control)
+        :else (AgentUnavailable (cat a ["unknown harness \"" (.harness request) "\"; the harnesses are builtin, opencode, codex, and claude"]))))
 
 ;; ---------------------------------------------------------------------------
 ;; builtin
@@ -429,6 +434,8 @@
 (defn codex-settings [(a (dyn Allocator)) (config (ptr SiteConfig)) (sandbox (slice u8))] (-> (slice (slice u8)))
   (let [(mut out) (ArrayList::new [(slice u8)] a)
         (mut roots) (ArrayList::new [(slice u8)] a)]
+    (push! (mut out) (if (= sandbox "workspace-write") "features.multi_agent=true" "features.multi_agent=false"))
+    (push! (mut out) "agents.max_threads=3")
     (when (= sandbox "workspace-write")
       (when (.codex-network config)
         (push! (mut out) "sandbox_workspace_write.network_access=true")
@@ -488,3 +495,98 @@
                                          :tool-prefix ""
                                          :workspace-note "Your shell starts in that directory. Keep every change inside it: Codex's sandbox refuses writes outside it."
                                          :tools-note (codex-tools-note sandbox))))))))
+(defn claude-tools [(a (dyn Allocator)) (tools (slice u8))] (-> (slice u8))
+  (let [files (has-group? a tools "files")
+        shell (has-group? a tools "shell")
+        look (or files (has-group? a tools "read"))
+        (mut out) (StrBuf::new a)]
+    (when look (push-str! (mut out) "Read,Glob,Grep") 0)
+    (when files (push-str! (mut out) ",Edit,Write") 0)
+    (when shell
+      (when look (push-str! (mut out) ",") 0)
+      (push-str! (mut out) "Bash")
+      0)
+    (when (and files shell) (push-str! (mut out) ",Agent") 0)
+    (finish! (mut out))))
+
+(defn claude-agent [(a (dyn Allocator))
+                    (config (ptr SiteConfig))
+                    (request AgentRequest)
+                    (observer (dyn AgentObserver))
+                    (control (dyn AgentControl))] (-> AgentSetup)
+  (block
+    :setup
+      (let [program
+              (match (if (> (len (.claude config)) 0)
+                         (real-path a (.claude config))
+                         (search-path a "claude"))
+                (Some [path] path)
+                (None []
+                      (return-from
+                        :setup
+                          (AgentUnavailable "Install Claude Code on this site, or set claude in site.json to its executable path."))))
+            root (path-join a (.run-dir request) "claude")
+            problem (ensure-dirs! a [root])]
+        (when (> (len problem) 0)
+          (return-from :setup (AgentUnavailable problem)))
+        (let [launcher
+                (match (opencode-launcher a
+                                          config
+                                          (.workspace request)
+                                          [root
+                                           (path-join a
+                                                      (env-or a "HOME" "/")
+                                                      ".claude")])
+                  (Ok [argv] argv)
+                  (Err [message]
+                       (return-from :setup (AgentUnavailable message))))
+              ready (path-join a root (cat a [(.station request) ".ready"]))
+              command (tool-server a request ready)
+              stop (stop-name request)
+              mcp (jv-object a)
+              servers (jv-object a)
+              server (jv-object a)
+              args (jv-array a)]
+          (when (> (len command) 0)
+            (jv-put! server "command" (JStr (get command 0)))
+            (for i (range 1 (len command))
+              (jv-push! args (JStr (get command i))))
+            (jv-put! server "args" args)
+            (jv-put! servers "factory" server)
+            0)
+          (jv-put! mcp "mcpServers" servers)
+          (let [model (effective-model config "claude" (.model request))
+                harness
+                  (box! a
+                        claude/ClaudeHarness
+                        (claude/claude-new a
+                                           (claude/ClaudeOptions
+                                             :program program
+                                             :launcher launcher
+                                             :workdir (.workspace request)
+                                             :model model
+                                             :tools
+                                               (claude-tools a (.tools request))
+                                             :mcp mcp
+                                             :ready-file
+                                               (if (> (len command) 0) ready "")
+                                             :stop-tool
+                                               (if (> (len stop) 0)
+                                                   (cat a
+                                                        ["mcp__factory__" stop])
+                                                   "")
+                                             :stop-tool-as stop
+                                             :idle-timeout-ms 1800000)
+                                           observer
+                                           control))]
+            (AgentReady (StationAgent
+                          :harness harness
+                          :label (cat a [model " via claude"])
+                          :finish-tool
+                            (if (> (len stop) 0)
+                                (cat a ["mcp__factory__" stop])
+                                "finish")
+                          :tool-prefix "mcp__factory__"
+                          :workspace-note
+                            "Your tools start in this workspace. Keep changes inside it."
+                          :tools-note (claude-tools a (.tools request)))))))))

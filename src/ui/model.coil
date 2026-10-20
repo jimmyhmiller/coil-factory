@@ -8,11 +8,14 @@
 (import "tui.canvas" :use *)
 (import "tui.width" :use [text-width])
 (import "tui.widgets" :use *)
+(import "tui.palette" :use *)
+(import "tui.tree" :use *)
 (import "factory.client" :use [Hub])
 (import "factory.ui.fmt" :use *)
 (import "factory.ui.store" :use *)
 (import "factory.ui.feed" :use *)
 (import "factory.ui.chat" :use *)
+(import "factory.ui.launch" :use *)
 
 ;;; The dashboard's whole state. Views draw from it; the event handler fetches
 ;;; into it. Nothing here touches the network.
@@ -44,6 +47,13 @@
    (chat Chat)
    ;; overlays and status
    (help bool)
+   (commands-open bool)
+   (commands Palette)
+   (launch-open bool)
+   (launch Launch)
+   (inspection-open bool)
+   (inspection TreeView)
+   (inspection-width i64)
    (confirm-stop bool)
    (confirm-run (slice u8))
    (toast (slice u8))
@@ -75,6 +85,13 @@
   (set! (.feed-focus d) false)
   (chat-init! (field d chat) a)
   (set! (.help d) false)
+  (set! (.commands-open d) false)
+  (set! (.commands d) (palette-new a))
+  (set! (.launch-open d) false)
+  (set! (.launch d) (launch-new a))
+  (set! (.inspection-open d) false)
+  (set! (.inspection d) (tree-new a))
+  (set! (.inspection-width d) 80)
   (set! (.confirm-stop d) false)
   (set! (.confirm-run d) "")
   (set! (.toast d) "")
@@ -314,6 +331,7 @@
                           (r Rect)
                           (title (slice u8))
                           (tone Tone)] (-> Rect)
+  (canvas-hide-cursor! c)
   (fill! c r 32 (style-default))
   (draw-box! c
              r
@@ -328,7 +346,9 @@
 (defstruct HelpRow [(key (slice u8)) (what (slice u8))])
 
 (const HELP-ROWS
-       [(HelpRow :key "↑ ↓  pgup pgdn" :what "move, scroll")
+       [(HelpRow :key "ctrl-p" :what "search commands from any view")
+        (HelpRow :key "n" :what "new factory run (overview)")
+        (HelpRow :key "↑ ↓  pgup pgdn" :what "move, scroll")
         (HelpRow :key "enter" :what "open the run / the agent's chat")
         (HelpRow :key "c" :what "chat with the run's current agent")
         (HelpRow :key "p" :what "pause or resume the run")
@@ -341,6 +361,9 @@
         (HelpRow
           :key "ctrl-t"
           :what "show tool output and full reasoning (chat)")
+        (HelpRow
+          :key "ctrl-o"
+          :what "expand checkpointed tool arguments and results (chat)")
         (HelpRow :key "esc" :what "back")
         (HelpRow :key "q  ctrl-c" :what "quit")])
 

@@ -282,7 +282,7 @@
                               (args/flag "harness"
                                          0
                                          "NAME"
-                                         "Run every station's agent in this harness: builtin or opencode")
+                                         "Run every station's agent in this harness: builtin, codex, claude, or opencode")
                               (args/flag "reviewers"
                                          0
                                          "NAMES"

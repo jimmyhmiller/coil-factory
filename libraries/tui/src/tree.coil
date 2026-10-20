@@ -1,0 +1,150 @@
+(module tui.tree)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.keys" :use *)
+
+;;; A preorder tree. Depth starts at zero; a child is one level below its
+;;; parent. IDs must be unique and stable across refreshes. Labels are borrowed.
+(defstruct TreeNode
+  [(id (slice u8)) (depth i64) (label (slice u8)) (style Style)])
+
+;;; Only IDs of open branches are retained, copied into the tree's allocator.
+(defstruct TreeView
+  [(allocator (dyn Allocator))
+   (expanded (ArrayList (slice u8)))
+   (list ListView)])
+
+(defn tree-new [(a (dyn Allocator))] (-> TreeView)
+  (TreeView
+    :allocator a
+    :expanded (ArrayList::new [(slice u8)] a)
+    :list (list-view-new)))
+
+(defn tree-free! [(tree (ptr TreeView))] (-> i64)
+  (for id (iter (.expanded tree)) (free [u8] (.allocator tree) id))
+  (free! (mut (.expanded tree)))
+  0)
+
+(defn tree-expanded? [(tree (ptr TreeView)) (id (slice u8))] (-> bool)
+  (block :find
+    (for value (iter (.expanded tree))
+      (when (= value id) (return-from :find true)))
+    false))
+
+(defn tree-toggle! [(tree (ptr TreeView)) (id (slice u8))] (-> i64)
+  (block :toggle
+    (for i (range 0 (len (.expanded tree)))
+      (when (= (get (.expanded tree) i) id)
+        (free [u8] (.allocator tree) (get (.expanded tree) i))
+        (set! (mut (.expanded tree))
+              i
+              (get (.expanded tree) (- (len (.expanded tree)) 1)))
+        (pop! (mut (.expanded tree)))
+        (return-from :toggle 0)))
+    (let [(mut owned) (ArrayList::new [u8] (.allocator tree))]
+      (for byte (iter id) (push! (mut owned) byte))
+      (push! (mut (.expanded tree)) (into-slice (mut owned))))
+    0))
+
+(defn tree-branch? [(nodes (slice TreeNode)) (i i64)] (-> bool)
+  (and (< (+ i 1) (len nodes))
+       (> (.depth (get nodes (+ i 1))) (.depth (get nodes i)))))
+
+(defn tree-visible [(a (dyn Allocator))
+                    (tree (ptr TreeView))
+                    (nodes (slice TreeNode))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] a)
+        (mut hidden-depth) -1]
+    (for i (range 0 (len nodes))
+      (let [node (get nodes i)]
+        (when (and (>= (load hidden-depth) 0)
+                   (<= (.depth node) (load hidden-depth)))
+          (set! hidden-depth -1)
+          0)
+        (when (< (load hidden-depth) 0)
+          (push! (mut out) i)
+          (when (and (tree-branch? nodes i)
+                     (not (tree-expanded? tree (.id node))))
+            (set! hidden-depth (.depth node))
+            0)
+          0)))
+    (load out)))
+
+;;; Right opens a branch or enters its first child; left closes it or selects
+;;; its parent. Enter toggles. Other navigation follows the standard list keys.
+(defn tree-key! [(tree (ptr TreeView))
+                 (a (dyn Allocator))
+                 (nodes (slice TreeNode))
+                 (key Key)] (-> bool)
+  (let [visible (tree-visible a tree nodes)
+        lv (field tree list)]
+    (list-set-count! lv (len visible))
+    (if (= (len visible) 0)
+        false
+        (let [i (get visible (.selected (load lv)))
+              node (get nodes i)
+              branch (tree-branch? nodes i)
+              expanded (tree-expanded? tree (.id node))]
+          (match key
+            (Right []
+                   (do
+                     (if (and branch (not expanded))
+                         (tree-toggle! tree (.id node))
+                         (when (and branch expanded) (list-move! lv 1) 0))
+                     true))
+            (Left []
+                  (do
+                    (if (and branch expanded)
+                        (tree-toggle! tree (.id node))
+                        (let [(mut row) (- (.selected (load lv)) 1)]
+                          (loop (if (< (load row) 0)
+                                    (break)
+                                    (if (< (.depth (get nodes
+                                                        (get visible (load row))))
+                                           (.depth node))
+                                        (do
+                                          (list-select! lv (load row))
+                                          (break))
+                                        (set! row (- (load row) 1)))))))
+                    true))
+            (Enter [] (do (when branch (tree-toggle! tree (.id node)) 0) true))
+            (_ (list-handle-key! lv key 10)))))))
+
+(defn draw-tree! [(tree (ptr TreeView))
+                  (c (ptr Canvas))
+                  (a (dyn Allocator))
+                  (r Rect)
+                  (nodes (slice TreeNode))
+                  (theme Theme)
+                  (focused bool)] (-> i64)
+  (let [visible (tree-visible a tree nodes)
+        lv (field tree list)]
+    (list-set-count! lv (len visible))
+    (list-scroll-into-view! lv (.h r))
+    (for row (range 0 (.h r))
+      (let [at (+ (.offset (load lv)) row)]
+        (when (< at (len visible))
+          (let [i (get visible at)
+                node (get nodes i)
+                selected (= at (.selected (load lv)))
+                style
+                  (if (and selected focused)
+                      (reverse (.style node))
+                      (.style node))
+                x (+ (.x r) (* 2 (.depth node)))
+                y (+ (.y r) row)]
+            (when selected (fill! c (rect (.x r) y (.w r) 1) 32 style))
+            (put-text! c
+                       r
+                       x
+                       y
+                       (if (tree-branch? nodes i)
+                           (if (tree-expanded? tree (.id node)) "▾ " "▸ ")
+                           "  ")
+                       style)
+            (put-text-ellipsis! c r (+ x 2) y (.label node) style))
+          0)))
+    (len visible)))
