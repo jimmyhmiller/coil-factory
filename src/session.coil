@@ -19,6 +19,7 @@
 (import "factory.harnesses" :use *)
 (import "factory.proc" :use *)
 (import "factory.journal" :use [append-record! AppendedAt AppendFailed])
+(import "factory.sidebar" :as sidebar)
 
 ;;; Personal coding conversations are independent of factory runs. They work
 ;;; directly in the chosen directory, persist under sessions/, and need no hub.
@@ -426,7 +427,7 @@
                               (set! (.error w)
                                     "The saved conversation checkpoint is invalid; it was preserved."))
                             (harness-add-system! h
-                                                 "You are the user's coding assistant. Work directly in the chosen project directory, follow its instructions, and collaborate in an ongoing conversation. This is a personal session, not a factory station: there is no finish tool, gate, or automatic commit. Use subagents when the user asks or project instructions call for them."))
+                                                 "You are the user's coding assistant. Work directly in the chosen project directory, follow its instructions, and collaborate in an ongoing conversation. This is a personal session, not a factory station: there is no finish tool, gate, or automatic commit. Use the sidebar tools to keep the latest benchmark results, todos and important working context visible beside the conversation. Create named sections and update items by stable id; the tools save automatically. Use subagents when the user asks or project instructions call for them."))
                         (save! w)
                         (when (not (.failed w))
                           (match (harness-run! h)
@@ -543,6 +544,9 @@
           (jv-put! meta "error" (jv-get saved "error"))
           (jv-put! meta "checkpoint" (jv-get saved "checkpoint"))
           (jv-put! meta "inbox_cursor" (jv-get saved "inbox_cursor"))
+          (jv-put! meta
+                   "sidebar"
+                   (sidebar/view a (path a home id "") "assistant"))
           0)
         meta)))
 

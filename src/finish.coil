@@ -7,9 +7,9 @@
 (import "mcp.server" :as mcp)
 
 ;;; The `finish` tool that ends a station, whichever harness runs its agent.
-;;; The builtin harness registers it with the agent loop. An outside harness
-;;; (OpenCode) reaches it over MCP: `factory _mcp-finish [--gate]` serves it on
-;;; stdio, and the harness reports the call when it sees the agent make it.
+;;; The builtin harness registers it with the agent loop. Outside harnesses
+;;; reach it alongside context tools through `factory _mcp-harness`. The legacy
+;;; `factory _mcp-finish [--gate]` entry still serves finish alone on stdio.
 
 (defstruct FinishTool [(gate (slice u8))])
 

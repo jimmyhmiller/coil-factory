@@ -1,0 +1,99 @@
+;;; Run after `coil build`: coil test tests/live/sidebar_live.coil
+;;; Exercises the real executable and MCP transport, without a model account.
+(module factory.sidebar-live)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+(import "mcp.client" :use *)
+(import "factory.proc" :use [real-path])
+(import "factory.session-test" :use [fresh-home])
+(import "factory.sidebar-test" :use [json ok])
+(import "factory.sidebar" :as sidebar)
+
+(defn connect [(a (dyn Allocator)) (root (slice u8)) (station bool)]
+  (-> (ptr McpClient))
+  (let [program
+          (match (real-path a "./build/release/factory")
+            (Some [p] p)
+            (_ (do (assert false) "")))
+        (mut args) (ArrayList::new [(slice u8)] a)]
+    (for arg (iter [program "_mcp-harness" root "assistant"])
+      (push! (mut args) arg))
+    (when station (push! (mut args) "--finish") 0)
+    (match (mcp-connect a
+                        (slice args)
+                        root
+                        "factory"
+                        10000
+                        (box! a NeverCancelled (NeverCancelled :unused 0)))
+      (Ok [client] client)
+      (Err [why]
+           (do (println "{s}" why) (assert false) (cast (ptr McpClient) 0))))))
+
+(defn invoke [(a (dyn Allocator))
+              (client (ptr McpClient))
+              (name (slice u8))
+              (args (slice u8))] (-> McpCallResult)
+  (match (mcp-call-tool! client
+                         a
+                         name
+                         (json a args)
+                         10000
+                         (box! a NeverCancelled (NeverCancelled :unused 0)))
+    (Ok [result] result)
+    (Err [why] (do (println "{s}" why) (assert false) (zeroed McpCallResult)))))
+
+(deftest real-mcp-server-exposes-sidebar-tools-without-a-finish-tool-for-personal-sessions
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-mcp")
+        client (connect a home false)]
+    (match (mcp-list-tools! client
+                            a
+                            10000
+                            (box! a NeverCancelled (NeverCancelled :unused 0)))
+      (Ok [tools] (assert-eq (len tools) 3))
+      (_ (assert false)))
+    (assert (not (.is-error (invoke a
+                                    client
+                                    "sidebar_section"
+                                    "{\"section\":\"benchmark\",\"title\":\"Latest benchmark\"}"))))
+    (assert (not (.is-error (invoke a
+                                    client
+                                    "sidebar_item"
+                                    "{\"section\":\"benchmark\",\"id\":\"latest\",\"text\":\"31 ms\",\"status\":\"done\"}"))))
+    (assert (.is-error (invoke a
+                               client
+                               "sidebar_item"
+                               "{\"section\":\"benchmark\",\"id\":\"latest\",\"status\":\"invalid\"}")))
+    (mcp-close! client)
+    (let [reopened (connect a home false)
+          result (invoke a reopened "sidebar_read" "{}")
+          doc (json a (.text result))]
+      (assert (not (.is-error result)))
+      (assert-eq (jv-int (jv-get doc "revision")) 2)
+      (assert (= (sidebar/text (jv-nth (jv-get (jv-nth (jv-get doc "sections")
+                                                       0)
+                                               "items")
+                                       0)
+                               "text")
+                 "31 ms"))
+      (mcp-close! reopened))))
+
+(deftest factory-mcp-retains-finish-alongside-the-sidebar
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-mcp-station")
+        client (connect a home true)]
+    (match (mcp-list-tools! client
+                            a
+                            10000
+                            (box! a NeverCancelled (NeverCancelled :unused 0)))
+      (Ok [tools] (assert-eq (len tools) 4))
+      (_ (assert false)))
+    (assert (not (.is-error (invoke a
+                                    client
+                                    "finish"
+                                    "{\"outcome\":\"done\",\"summary\":\"Verified\"}"))))
+    (mcp-close! client)))

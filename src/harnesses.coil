@@ -20,6 +20,7 @@
 (import "factory.models" :use *)
 (import "factory.proc" :use *)
 (import "factory.toolkit" :use *)
+(import "factory.sidebar" :as sidebar)
 
 ;;; A station's agent in the harness the station asks for (see `HARNESSES` in
 ;;; factory.spec). The worker drives the result only through `Harness`.
@@ -95,17 +96,54 @@
 (defn no-agent-server [] (-> (slice (slice u8)))
   (slice::new (primitive/cast (ptr (slice u8)) 0) 0))
 
-;;; The MCP server an outside harness starts for an agent: the finish tool
-;;; for a station, the agent's own tools for a standalone agent, else none.
-(defn tool-server [(a (dyn Allocator)) (request AgentRequest) (ready-file (slice u8))] (-> (ArrayList (slice u8)))
+(defn context-note [(a (dyn Allocator))
+                    (request AgentRequest)
+                    (tools (slice u8))] (-> (slice u8))
+  (if (= (len (.run-dir request)) 0)
+      tools
+      (cat a
+           [tools
+            ". Persistent context: use sidebar_read, sidebar_section and sidebar_item (with the harness's MCP prefix when present) to keep the latest results, todos and important working context visible beside the conversation. Use stable section/item ids and update them in place. The tools save automatically; this board is separate from the transcript."])))
+
+;;; Persistent harnesses expose the context board and, for stations, finish.
+;;; A standalone agent's custom server also receives its context scope.
+;;; Requests without persistent state keep the legacy finish-only server.
+(defn tool-server [(a (dyn Allocator))
+                   (request AgentRequest)
+                   (ready-file (slice u8))] (-> (ArrayList (slice u8)))
   (let [(mut command) (ArrayList::new [(slice u8)] a)]
-    (cond (.finish request)
-            (do (push! (mut command) (self-executable a))
-                (push! (mut command) "_mcp-finish")
-                (when (> (len (.gate request)) 0) (push! (mut command) "--gate") 0)
+    (cond (and (> (len (.run-dir request)) 0)
+               (= (len (.agent-server request)) 0))
+            (do
+              (push! (mut command) (self-executable a))
+              (push! (mut command) "_mcp-harness")
+              (push! (mut command) (.run-dir request))
+              (push! (mut command) (.station request))
+              (when (.finish request) (push! (mut command) "--finish") 0)
+              (when (> (len (.gate request)) 0)
+                (push! (mut command) "--gate")
                 0)
+              0)
+          (.finish request)
+            (do
+              (push! (mut command) (self-executable a))
+              (push! (mut command) "_mcp-finish")
+              (when (> (len (.gate request)) 0)
+                (push! (mut command) "--gate")
+                0)
+              0)
           (> (len (.agent-server request)) 0)
-            (do (for word (iter (.agent-server request)) (push! (mut command) word)) 0)
+            (do
+              (for word (iter (.agent-server request))
+                (push! (mut command) word))
+              (when (> (len (.run-dir request)) 0)
+                (for word (iter ["--sidebar-root"
+                                 (.run-dir request)
+                                 "--sidebar-agent"
+                                 (.station request)])
+                  (push! (mut command) word))
+                0)
+              0)
           :else 0)
     (when (> (len command) 0)
       (push! (mut command) "--ready")
@@ -121,7 +159,9 @@
 ;;; The model a request resolves to in its harness: the one it names, else the
 ;;; site's default for that harness. "" when neither exists: the factory has no
 ;;; model of its own to fall back on.
-(defn effective-model [(config (ptr SiteConfig)) (harness (slice u8)) (model (slice u8))] (-> (slice u8))
+(defn effective-model [(config (ptr SiteConfig))
+                       (harness (slice u8))
+                       (model (slice u8))] (-> (slice u8))
   (cond (> (len model) 0) model
         (= harness "opencode") (.opencode-model config)
         (= harness "codex") (.codex-model config)
@@ -137,10 +177,14 @@
 
 ;;; Where a model can be chosen, for a message about one that is missing.
 (defn model-choices [(harness (slice u8))] (-> (slice u8))
-  (cond (= harness "opencode") "--model, `model:` in the factory or station, or \"opencode_model\" in site.json"
-        (= harness "codex") "--model, `model:` in the factory or station, or \"codex_model\" in site.json"
-        (= harness "claude") "--model, `model:` in the factory or station, or \"claude_model\" in site.json"
-        :else "--model, `model:` in the factory or station, or \"default_model\" in site.json"))
+  (cond (= harness "opencode")
+          "--model, `model:` in the factory or station, or \"opencode_model\" in site.json"
+        (= harness "codex")
+          "--model, `model:` in the factory or station, or \"codex_model\" in site.json"
+        (= harness "claude")
+          "--model, `model:` in the factory or station, or \"claude_model\" in site.json"
+        :else
+          "--model, `model:` in the factory or station, or \"default_model\" in site.json"))
 
 (defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
   (let [(mut out) (StrBuf::new a)]
@@ -153,16 +197,35 @@
                      (observer (dyn AgentObserver))
                      (control (dyn AgentControl))] (-> AgentSetup)
   (cond (= (len (effective-model config (.harness request) (.model request))) 0)
-          (AgentUnavailable (cat a ["no model is chosen for " (.station request) " (" (.harness request) " harness); choose one with "
-                                    (model-choices (.harness request))]))
-        (and (> (len (.extra-tools request)) 0) (= (len (.agent-server request)) 0) (not (= (.harness request) "builtin")))
-          (AgentUnavailable (cat a ["the " (.harness request) " harness cannot offer " (.station request)
-                                    "'s own tools yet; only the builtin harness can (choose it with --harness builtin or `harness: builtin`)"]))
-        (= (.harness request) "builtin") (builtin-agent a config request observer control)
-        (= (.harness request) "opencode") (opencode-agent a config request observer control)
-        (= (.harness request) "codex") (codex-agent a config request observer control)
-        (= (.harness request) "claude") (claude-agent a config request observer control)
-        :else (AgentUnavailable (cat a ["unknown harness \"" (.harness request) "\"; the harnesses are builtin, opencode, codex, and claude"]))))
+          (AgentUnavailable (cat a
+                                 ["no model is chosen for "
+                                  (.station request)
+                                  " ("
+                                  (.harness request)
+                                  " harness); choose one with "
+                                  (model-choices (.harness request))]))
+        (and (> (len (.extra-tools request)) 0)
+             (= (len (.agent-server request)) 0)
+             (not (= (.harness request) "builtin")))
+          (AgentUnavailable (cat a
+                                 ["the "
+                                  (.harness request)
+                                  " harness cannot offer "
+                                  (.station request)
+                                  "'s own tools yet; only the builtin harness can (choose it with --harness builtin or `harness: builtin`)"]))
+        (= (.harness request) "builtin")
+          (builtin-agent a config request observer control)
+        (= (.harness request) "opencode")
+          (opencode-agent a config request observer control)
+        (= (.harness request) "codex")
+          (codex-agent a config request observer control)
+        (= (.harness request) "claude")
+          (claude-agent a config request observer control)
+        :else
+          (AgentUnavailable (cat a
+                                 ["unknown harness \""
+                                  (.harness request)
+                                  "\"; the harnesses are builtin, opencode, codex, and claude"]))))
 
 ;; ---------------------------------------------------------------------------
 ;; builtin
@@ -172,47 +235,88 @@
                      (request AgentRequest)
                      (observer (dyn AgentObserver))
                      (control (dyn AgentControl))] (-> AgentSetup)
-  (match (resolve-model a config (effective-model config "builtin" (.model request)))
+  (match (resolve-model a
+                        config
+                        (effective-model config "builtin" (.model request)))
     (ModelBad [message] (AgentUnavailable message))
     (ModelOk [found]
              (let [resolved found
                    registry (box! a ToolRegistry (registry-new a))
                    finish (box! a FinishTool (FinishTool :gate (.gate request)))]
-               (match (add-tool-groups! a registry (.workspace request) (.tools request) (.isolation config))
+               (match (add-tool-groups! a
+                                        registry
+                                        (.workspace request)
+                                        (.tools request)
+                                        (.isolation config))
                  (Some [problem] (AgentUnavailable problem))
                  (None []
                        (block :tools
-                              (when (.finish request) (registry-add! registry finish) 0)
-                              (for tool (iter (.extra-tools request))
-                                (when (not (registry-add! registry tool))
-                                  (return-from :tools
-                                                 (AgentUnavailable (cat a ["two of " (.station request) "'s tools are named \""
-                                                                           (.name (tool-spec tool)) "\"; rename the agent's own tool"])))
-                                  0))
-                              (let [stop (if (.finish request) "finish" (.stop-tool request))
-                                    agent (box! a Agent (agent-new a (.provider resolved)
-                                                                   (agent-config (.model resolved) stop)
-                                                                   registry observer control))]
-                                (AgentReady (StationAgent :harness agent
-                                                          :label (.label resolved)
-                                                          :finish-tool (if (.finish request) "finish" (.stop-tool request))
-                                                          :tool-prefix ""
-                                                          :workspace-note "Every path you give a tool is relative to that directory, and shell commands already start in it."
-                                                          :tools-note (.tools request)))))))))))
+                         (when (.finish request)
+                           (registry-add! registry finish)
+                           0)
+                         (sidebar/register! a
+                                            registry
+                                            (.run-dir request)
+                                            (.station request))
+                         (for tool (iter (.extra-tools request))
+                           (when (not (registry-add! registry tool))
+                             (return-from
+                               :tools
+                                 (AgentUnavailable (cat a
+                                                        ["two of "
+                                                         (.station request)
+                                                         "'s tools are named \""
+                                                         (.name (tool-spec tool))
+                                                         "\"; rename the agent's own tool"])))
+                             0))
+                         (let [stop
+                                 (if (.finish request)
+                                     "finish"
+                                     (.stop-tool request))
+                               agent
+                                 (box! a
+                                       Agent
+                                       (agent-new a
+                                                  (.provider resolved)
+                                                  (agent-config (.model resolved)
+                                                                stop)
+                                                  registry
+                                                  observer
+                                                  control))]
+                           (AgentReady (StationAgent
+                                         :harness agent
+                                         :label (.label resolved)
+                                         :finish-tool
+                                           (if (.finish request)
+                                               "finish"
+                                               (.stop-tool request))
+                                         :tool-prefix ""
+                                         :workspace-note
+                                           "Every path you give a tool is relative to that directory, and shell commands already start in it."
+                                         :tools-note
+                                           (context-note a
+                                                         request
+                                                         (.tools request))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; opencode
 
 ;;; The OpenCode executable: site.json `opencode`, else `opencode` on PATH,
 ;;; else OpenCode's own install location, ~/.opencode/bin/opencode.
-(defn find-opencode [(a (dyn Allocator)) (config (ptr SiteConfig))] (-> (Option (slice u8)))
+(defn find-opencode [(a (dyn Allocator)) (config (ptr SiteConfig))]
+  (-> (Option (slice u8)))
   (if (> (len (.opencode config)) 0)
       (real-path a (.opencode config))
       (match (search-path a "opencode")
         (Some [path] (Some path))
-        (None [] (real-path a (path-join a (env-or a "HOME" "/") ".opencode/bin/opencode"))))))
+        (None []
+              (real-path a
+                         (path-join a
+                                    (env-or a "HOME" "/")
+                                    ".opencode/bin/opencode"))))))
 
-(defn has-group? [(a (dyn Allocator)) (tools (slice u8)) (group (slice u8))] (-> bool)
+(defn has-group? [(a (dyn Allocator)) (tools (slice u8)) (group (slice u8))]
+  (-> bool)
   (let [(mut found) false]
     (for name (iter (split-groups a tools))
       (when (= name group) (set! found true) 0))
@@ -238,15 +342,24 @@
 
 ;;; The OpenCode tools a station may not call that permissions cannot remove
 ;;; (see `opencode-permission`), with the reason the agent is shown.
-(defn opencode-refusals [(a (dyn Allocator)) (tools (slice u8))] (-> (ArrayList (slice u8)))
+(defn opencode-refusals [(a (dyn Allocator)) (tools (slice u8))]
+  (-> (ArrayList (slice u8)))
   (let [(mut out) (ArrayList::new [(slice u8)] a)]
     (when (not (has-group? a tools "shell"))
       (push! (mut out) "bash")
-      (push! (mut out) (cat a ["This station has no shell (its tools are: " tools "), so the factory refused bash."]))
+      (push! (mut out)
+             (cat a
+                  ["This station has no shell (its tools are: "
+                   tools
+                   "), so the factory refused bash."]))
       0)
     (when (not (or (has-group? a tools "files") (has-group? a tools "read")))
       (push! (mut out) "read")
-      (push! (mut out) (cat a ["This station has no file tools (its tools are: " tools "), so the factory refused read."]))
+      (push! (mut out)
+             (cat a
+                  ["This station has no file tools (its tools are: "
+                   tools
+                   "), so the factory refused read."]))
       0)
     (load out)))
 
@@ -256,39 +369,51 @@
 
 ;;; An OpenCode plugin that refuses calls to the tools in `refusals`
 ;;; (tool, reason, tool, reason, ...), keeping them offered to the model.
-(defn opencode-guard [(a (dyn Allocator)) (station (slice u8)) (refusals (slice (slice u8)))] (-> (slice u8))
+(defn opencode-guard [(a (dyn Allocator))
+                      (station (slice u8))
+                      (refusals (slice (slice u8)))] (-> (slice u8))
   (let [(mut out) (StrBuf::new a)
         (mut i) 0]
     (push-str! (mut out) "// Generated by the factory for the station ")
     (push-str! (mut out) station)
-    (push-str! (mut out) ". OpenCode Zen's free models only answer requests that offer\n// OpenCode's bash and read tools, so a tool this station may not use stays offered\n// and its calls are refused here.\nconst refused = {\n")
+    (push-str! (mut out)
+               ". OpenCode Zen's free models only answer requests that offer\n// OpenCode's bash and read tools, so a tool this station may not use stays offered\n// and its calls are refused here.\nconst refused = {\n")
     (loop (if (>= (+ (load i) 1) (len refusals))
               (break)
-              (do (push-str! (mut out) "  ")
-                  (push-str! (mut out) (json-string a (get refusals (load i))))
-                  (push-str! (mut out) ": ")
-                  (push-str! (mut out) (json-string a (get refusals (+ (load i) 1))))
-                  (push-str! (mut out) ",\n")
-                  (set! i (+ (load i) 2)))))
-    (push-str! (mut out) "};\nexport const FactoryGuard = async () => ({\n  \"tool.execute.before\": async (input) => {\n    const why = refused[input.tool];\n    if (why) throw new Error(why);\n  },\n});\n")
+              (do
+                (push-str! (mut out) "  ")
+                (push-str! (mut out) (json-string a (get refusals (load i))))
+                (push-str! (mut out) ": ")
+                (push-str! (mut out)
+                           (json-string a (get refusals (+ (load i) 1))))
+                (push-str! (mut out) ",\n")
+                (set! i (+ (load i) 2)))))
+    (push-str! (mut out)
+               "};\nexport const FactoryGuard = async () => ({\n  \"tool.execute.before\": async (input) => {\n    const why = refused[input.tool];\n    if (why) throw new Error(why);\n  },\n});\n")
     (finish! (mut out))))
 
-(defn opencode-tools-note [(a (dyn Allocator)) (tools (slice u8))] (-> (slice u8))
+(defn opencode-tools-note [(a (dyn Allocator)) (tools (slice u8))]
+  (-> (slice u8))
   (let [files (has-group? a tools "files")
         shell (has-group? a tools "shell")]
-    (cond (and files shell) "OpenCode's file tools (read, edit, write, grep, glob, list) and bash"
-          files "OpenCode's file tools (read, edit, write, grep, glob, list); no shell"
-          (has-group? a tools "read") "OpenCode's read, grep, glob, and list; nothing that changes files"
+    (cond (and files shell)
+            "OpenCode's file tools (read, edit, write, grep, glob, list) and bash"
+          files
+            "OpenCode's file tools (read, edit, write, grep, glob, list); no shell"
+          (has-group? a tools "read")
+            "OpenCode's read, grep, glob, and list; nothing that changes files"
           shell "OpenCode's bash; no file tools"
           :else "none")))
 
-(defn ensure-dirs! [(a (dyn Allocator)) (dirs (slice (slice u8)))] (-> (slice u8))
+(defn ensure-dirs! [(a (dyn Allocator)) (dirs (slice (slice u8)))]
+  (-> (slice u8))
   (let [(mut problem) ""]
     (for dir (iter dirs)
       (when (= (len (load problem)) 0)
         (match (atomic/ensure-dir! a dir 448)
           (Ok [made] 0)
-          (Err [failure] (do (set! problem (cat a ["could not create " dir])) 0)))
+          (Err [failure]
+               (do (set! problem (cat a ["could not create " dir])) 0)))
         0))
     (load problem)))
 
@@ -298,7 +423,8 @@
 (defn opencode-launcher [(a (dyn Allocator))
                          (config (ptr SiteConfig))
                          (workspace (slice u8))
-                         (writable (slice (slice u8)))] (-> (Result (slice (slice u8)) (slice u8)))
+                         (writable (slice (slice u8)))]
+  (-> (Result (slice (slice u8)) (slice u8)))
   (if (= (.isolation config) "none")
       (Ok (slice::new (primitive/cast (ptr (slice u8)) 0) 0))
       (match (ws/workspace-open a workspace)
@@ -308,18 +434,27 @@
               (Err [message] (Err message))
               (Ok [base]
                   (let [(mut paths) (ArrayList::new [(slice u8)] a)]
-                    (for path (iter (.extra-writable base)) (push! (mut paths) path))
+                    (for path (iter (.extra-writable base))
+                      (push! (mut paths) path))
                     (for path (iter writable)
                       ;; The macOS sandbox compares canonical paths.
                       (match (real-path a path)
                         (Some [canonical] (push! (mut paths) canonical))
                         (None [] (push! (mut paths) path))))
-                    (let [options (sandbox/sandbox-options-with-paths true (slice paths))
+                    (let [options
+                            (sandbox/sandbox-options-with-paths true
+                                                                (slice paths))
                           policy (sandbox/sandbox-detect a options)]
                       (match policy
-                        (sandbox/NoSandbox [] (Err "this site's isolation is \"sandbox\" but this machine has neither sandbox-exec nor bwrap"))
-                        (_ (let [(mut argv) (sandbox/sandbox-program-argv a policy (ws/workspace-root opened)
-                                                                          (slice::new (primitive/cast (ptr (slice u8)) 0) 0))]
+                        (sandbox/NoSandbox []
+                                           (Err "this site's isolation is \"sandbox\" but this machine has neither sandbox-exec nor bwrap"))
+                        (_ (let [(mut argv)
+                                   (sandbox/sandbox-program-argv a
+                                                                 policy
+                                                                 (ws/workspace-root opened)
+                                                                 (slice::new (primitive/cast (ptr (slice u8))
+                                                                                             0)
+                                                                             0))]
                              (Ok (slice argv)))))))))))))
 
 (defn opencode-agent [(a (dyn Allocator))
@@ -327,80 +462,161 @@
                       (request AgentRequest)
                       (observer (dyn AgentObserver))
                       (control (dyn AgentControl))] (-> AgentSetup)
-  (block :setup
-         (let [program (match (find-opencode a config)
-                         (Some [path] path)
-                         (None [] (return-from :setup
-                                                 (AgentUnavailable "the opencode harness needs OpenCode on this site: install it (https://opencode.ai) or set \"opencode\" in site.json to its path"))))
-               root (path-join a (.run-dir request) "opencode")
-               state-dir (path-join a root (if (> (len (.state-key request)) 0) (cat a ["state-" (.state-key request)]) "state"))
-               ;; Shared by every run on the site: OpenCode installs its plugin
-               ;; package (about 60 MB) into the config home and keeps the
-               ;; models.dev catalog in the cache.
-               site-root (path-join a (.home config) "opencode")
-               config-home (path-join a site-root "config")
-               cache-dir (path-join a site-root "cache")
-               problem (ensure-dirs! a [root state-dir site-root config-home cache-dir])]
-           (when (> (len problem) 0) (return-from :setup (AgentUnavailable problem)))
-           (let [launcher (match (opencode-launcher a config (.workspace request) [root site-root])
-                            (Ok [argv] argv)
-                            (Err [message] (return-from :setup (AgentUnavailable message))))
-                 model (effective-model config "opencode" (.model request))
-                 ready-file (path-join a root (cat a [(.station request) ".ready"]))
-                 finish-server (jv-object a)
-                 command (jv-array a)
-                 mcp (jv-object a)
-                 plugins (jv-array a)
-                 refusals (opencode-refusals a (.tools request))
-                 server (tool-server a request ready-file)
-                 stop (stop-name request)]
-             (when (> (len refusals) 0)
-               (let [guard-path (path-join a root (cat a [(.station request) "-guard.js"]))]
-                 (match (atomic/write-file-atomic! a guard-path (opencode-guard a (.station request) (slice refusals)) 420)
-                   (Ok [_] (jv-push! plugins (JStr (cat a ["file://" guard-path]))))
-                   (Err [_] (return-from :setup (AgentUnavailable (cat a ["could not write " guard-path])))))
-                 0))
-             (when (> (len server) 0)
-               (for word (iter server) (jv-push! command (JStr word)))
-               (jv-put! finish-server "type" (JStr "local"))
-               (jv-put! finish-server "command" command)
-               (jv-put! finish-server "enabled" (JBool true))
-               (jv-put! mcp "factory" finish-server)
-               0)
-             (let [harness (box! a opencode/OpenCodeHarness
-                                 (opencode/opencode-new
-                                   a
-                                   (opencode/OpenCodeOptions :program program
-                                                             :launcher launcher
-                                                             :workdir (.workspace request)
-                                                             :state-dir state-dir
-                                                             :config-home config-home
-                                                             :cache-dir cache-dir
-                                                             :config-path (path-join a root (cat a [(.station request) ".json"]))
-                                                             :model model
-                                                             :agent-name (cat a ["factory-" (.station request)])
-                                                             :permission (opencode-permission a (.tools request))
-                                                             :mcp mcp
-                                                             :plugins plugins
-                                                             ;; Without a tool server there is nothing to
-                                                             ;; wait for or stop on.
-                                                             :ready-file (if (> (len server) 0) ready-file "")
-                                                             :stop-tool (if (> (len stop) 0) (cat a ["factory_" stop]) "")
-                                                             :stop-tool-as stop
-                                                             :idle-timeout-ms 1800000)
-                                   observer control))]
-               (AgentReady (StationAgent :harness harness
-                                         :label (cat a [model " via opencode"])
-                                         :finish-tool (cat a ["factory_" (if (> (len stop) 0) stop "finish")])
-                                         :tool-prefix "factory_"
-                                         :workspace-note "Your tools work in that directory, and shell commands already start in it. Keep every path inside it: file tools refuse paths outside it."
-                                         :tools-note (opencode-tools-note a (.tools request)))))))))
+  (block
+    :setup
+      (let [program
+              (match (find-opencode a config)
+                (Some [path] path)
+                (None []
+                      (return-from
+                        :setup
+                          (AgentUnavailable "the opencode harness needs OpenCode on this site: install it (https://opencode.ai) or set \"opencode\" in site.json to its path"))))
+            root (path-join a (.run-dir request) "opencode")
+            state-dir
+              (path-join a
+                         root
+                         (if (> (len (.state-key request)) 0)
+                             (cat a ["state-" (.state-key request)])
+                             "state"))
+            ;; Shared by every run on the site: OpenCode installs its plugin
+            ;; package (about 60 MB) into the config home and keeps the
+            ;; models.dev catalog in the cache.
+            site-root (path-join a (.home config) "opencode")
+            config-home (path-join a site-root "config")
+            cache-dir (path-join a site-root "cache")
+            problem
+              (ensure-dirs! a
+                            [root
+                             state-dir
+                             site-root
+                             config-home
+                             cache-dir
+                             (path-join a (.run-dir request) "sidebar")])]
+        (when (> (len problem) 0)
+          (return-from :setup (AgentUnavailable problem)))
+        (let [launcher
+                (match (opencode-launcher a
+                                          config
+                                          (.workspace request)
+                                          [root
+                                           site-root
+                                           (path-join a
+                                                      (.run-dir request)
+                                                      "sidebar")])
+                  (Ok [argv] argv)
+                  (Err [message]
+                       (return-from :setup (AgentUnavailable message))))
+              model (effective-model config "opencode" (.model request))
+              ready-file
+                (path-join a root (cat a [(.station request) ".ready"]))
+              finish-server (jv-object a)
+              command (jv-array a)
+              mcp (jv-object a)
+              plugins (jv-array a)
+              refusals (opencode-refusals a (.tools request))
+              server (tool-server a request ready-file)
+              stop (stop-name request)]
+          (when (> (len refusals) 0)
+            (let [guard-path
+                    (path-join a root (cat a [(.station request) "-guard.js"]))]
+              (match (atomic/write-file-atomic! a
+                                                guard-path
+                                                (opencode-guard a
+                                                                (.station request)
+                                                                (slice refusals))
+                                                420)
+                (Ok [_]
+                    (jv-push! plugins (JStr (cat a ["file://" guard-path]))))
+                (Err [_]
+                     (return-from
+                       :setup
+                         (AgentUnavailable (cat a
+                                                ["could not write " guard-path])))))
+              0))
+          (when (> (len server) 0)
+            (for word (iter server) (jv-push! command (JStr word)))
+            (jv-put! finish-server "type" (JStr "local"))
+            (jv-put! finish-server "command" command)
+            (jv-put! finish-server "enabled" (JBool true))
+            (jv-put! mcp "factory" finish-server)
+            0)
+          (let [harness
+                  (box! a
+                        opencode/OpenCodeHarness
+                        (opencode/opencode-new a
+                                               (opencode/OpenCodeOptions :program
+                                                                         program
+                                                                         :launcher
+                                                                         launcher
+                                                                         :workdir
+                                                                         (.workspace request)
+                                                                         :state-dir
+                                                                         state-dir
+                                                                         :config-home
+                                                                         config-home
+                                                                         :cache-dir
+                                                                         cache-dir
+                                                                         :config-path
+                                                                         (path-join a
+                                                                                    root
+                                                                                    (cat a
+                                                                                         [(.station request)
+                                                                                          ".json"]))
+                                                                         :model
+                                                                         model
+                                                                         :agent-name
+                                                                         (cat a
+                                                                              ["factory-"
+                                                                               (.station request)])
+                                                                         :permission
+                                                                         (opencode-permission a
+                                                                                              (.tools request))
+                                                                         :mcp
+                                                                         mcp
+                                                                         :plugins
+                                                                         plugins
+                                                                         ;; Without a tool server there is nothing to
+                                                                         ;; wait for or stop on.
+                                                                         :ready-file
+                                                                         (if (> (len server)
+                                                                                0)
+                                                                             ready-file
+                                                                             "")
+                                                                         :stop-tool
+                                                                         (if (> (len stop)
+                                                                                0)
+                                                                             (cat a
+                                                                                  ["factory_"
+                                                                                   stop])
+                                                                             "")
+                                                                         :stop-tool-as
+                                                                         stop
+                                                                         :idle-timeout-ms
+                                                                         1800000)
+                                               observer
+                                               control))]
+            (AgentReady (StationAgent
+                          :harness harness
+                          :label (cat a [model " via opencode"])
+                          :finish-tool
+                            (cat a
+                                 ["factory_"
+                                  (if (> (len stop) 0) stop "finish")])
+                          :tool-prefix "factory_"
+                          :workspace-note
+                            "Your tools work in that directory, and shell commands already start in it. Keep every path inside it: file tools refuse paths outside it."
+                          :tools-note
+                            (context-note a
+                                          request
+                                          (opencode-tools-note a
+                                                               (.tools request))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; codex
 
 ;;; The Codex executable: site.json `codex`, else `codex` on PATH.
-(defn find-codex [(a (dyn Allocator)) (config (ptr SiteConfig))] (-> (Option (slice u8)))
+(defn find-codex [(a (dyn Allocator)) (config (ptr SiteConfig))]
+  (-> (Option (slice u8)))
   (if (> (len (.codex config)) 0)
       (real-path a (.codex config))
       (search-path a "codex")))
@@ -415,13 +631,17 @@
 ;;; patch tool and cannot take either away, so only two shapes fit: both
 ;;; groups (the workspace is writable), or none of them (read-only; `read`
 ;;; looks without changing anything). Anything else is refused, not widened.
-(defn codex-sandbox [(a (dyn Allocator)) (tools (slice u8))] (-> (Result (slice u8) (slice u8)))
+(defn codex-sandbox [(a (dyn Allocator)) (tools (slice u8))]
+  (-> (Result (slice u8) (slice u8)))
   (let [files (has-group? a tools "files")
         shell (has-group? a tools "shell")]
     (cond (and files shell) (Ok "workspace-write")
           (and (not files) (not shell)) (Ok "read-only")
-          :else (Err (cat a ["the codex harness cannot give an agent only part of files and shell (its tools are: " tools
-                             "): Codex always has both, so give it both, or neither (read-only), or use another harness"])))))
+          :else
+            (Err (cat a
+                      ["the codex harness cannot give an agent only part of files and shell (its tools are: "
+                       tools
+                       "): Codex always has both, so give it both, or neither (read-only), or use another harness"])))))
 
 (defn codex-tools-note [(sandbox (slice u8))] (-> (slice u8))
   (if (= sandbox "workspace-write")
@@ -431,10 +651,15 @@
 ;;; Extra Codex settings for a sandbox: the site's `codex_writable`
 ;;; directories become writable roots of the workspace sandbox. A read-only
 ;;; agent gets none.
-(defn codex-settings [(a (dyn Allocator)) (config (ptr SiteConfig)) (sandbox (slice u8))] (-> (slice (slice u8)))
+(defn codex-settings [(a (dyn Allocator))
+                      (config (ptr SiteConfig))
+                      (sandbox (slice u8))] (-> (slice (slice u8)))
   (let [(mut out) (ArrayList::new [(slice u8)] a)
         (mut roots) (ArrayList::new [(slice u8)] a)]
-    (push! (mut out) (if (= sandbox "workspace-write") "features.multi_agent=true" "features.multi_agent=false"))
+    (push! (mut out)
+           (if (= sandbox "workspace-write")
+               "features.multi_agent=true"
+               "features.multi_agent=false"))
     (push! (mut out) "agents.max_threads=3")
     (when (= sandbox "workspace-write")
       (when (.codex-network config)
@@ -443,12 +668,20 @@
       (for raw (iter (split a (.codex-writable config) ","))
         (let [path (trim raw)]
           (when (> (len path) 0)
-            (push! (mut roots) (if (or (= path "~") (starts-with path "~/"))
-                                   (path-join a (env-or a "HOME" "/") (subslice path (if (= path "~") 1 2) (len path)))
-                                   path))
+            (push! (mut roots)
+                   (if (or (= path "~") (starts-with path "~/"))
+                       (path-join a
+                                  (env-or a "HOME" "/")
+                                  (subslice path
+                                            (if (= path "~") 1 2)
+                                            (len path)))
+                       path))
             0)))
       (when (> (len roots) 0)
-        (push! (mut out) (cat a ["sandbox_workspace_write.writable_roots=" (codex/toml-array a (slice roots))]))
+        (push! (mut out)
+               (cat a
+                    ["sandbox_workspace_write.writable_roots="
+                     (codex/toml-array a (slice roots))]))
         0)
       0)
     (slice out)))
@@ -458,43 +691,61 @@
                    (request AgentRequest)
                    (observer (dyn AgentObserver))
                    (control (dyn AgentControl))] (-> AgentSetup)
-  (block :setup
-         (let [program (match (find-codex a config)
-                         (Some [path] path)
-                         (None [] (return-from :setup
-                                                 (AgentUnavailable "the codex harness needs the Codex CLI on this site: install it, or set \"codex\" in site.json to its path"))))
-               sandbox (match (codex-sandbox a (.tools request))
-                         (Ok [mode] mode)
-                         (Err [message] (return-from :setup (AgentUnavailable message))))
-               root (path-join a (.run-dir request) "codex")
-               problem (ensure-dirs! a [root])]
-           (when (> (len problem) 0) (return-from :setup (AgentUnavailable problem)))
-           (let [model (effective-model config "codex" (.model request))
-                 ready-file (path-join a root (cat a [(.station request) ".ready"]))
-                 (mut command) (tool-server a request ready-file)
-                 stop (stop-name request)]
-             (let [harness (box! a codex/CodexHarness
-                                 (codex/codex-new
-                                   a
-                                   (codex/CodexOptions :program program
-                                                       :workdir (.workspace request)
-                                                       :home (codex-home a)
-                                                       :model model
-                                                       :sandbox sandbox
-                                                       :stop-server "factory"
-                                                       :stop-command (slice command)
-                                                       :stop-tool stop
-                                                       :stop-tool-as stop
-                                                       :ready-file (if (> (len command) 0) ready-file "")
-                                                       :settings (codex-settings a config sandbox)
-                                                       :idle-timeout-ms 1800000)
-                                   observer control))]
-               (AgentReady (StationAgent :harness harness
-                                         :label (cat a [model " via codex"])
-                                         :finish-tool (if (> (len stop) 0) stop "finish")
-                                         :tool-prefix ""
-                                         :workspace-note "Your shell starts in that directory. Keep every change inside it: Codex's sandbox refuses writes outside it."
-                                         :tools-note (codex-tools-note sandbox))))))))
+  (block
+    :setup
+      (let [program
+              (match (find-codex a config)
+                (Some [path] path)
+                (None []
+                      (return-from
+                        :setup
+                          (AgentUnavailable "the codex harness needs the Codex CLI on this site: install it, or set \"codex\" in site.json to its path"))))
+            sandbox
+              (match (codex-sandbox a (.tools request))
+                (Ok [mode] mode)
+                (Err [message] (return-from :setup (AgentUnavailable message))))
+            root (path-join a (.run-dir request) "codex")
+            problem (ensure-dirs! a [root])]
+        (when (> (len problem) 0)
+          (return-from :setup (AgentUnavailable problem)))
+        (let [model (effective-model config "codex" (.model request))
+              ready-file
+                (path-join a root (cat a [(.station request) ".ready"]))
+              (mut command) (tool-server a request ready-file)
+              stop (stop-name request)]
+          (let [harness
+                  (box! a
+                        codex/CodexHarness
+                        (codex/codex-new a
+                                         (codex/CodexOptions
+                                           :program program
+                                           :workdir (.workspace request)
+                                           :home (codex-home a)
+                                           :model model
+                                           :sandbox sandbox
+                                           :stop-server "factory"
+                                           :stop-command (slice command)
+                                           :stop-tool stop
+                                           :stop-tool-as stop
+                                           :ready-file
+                                             (if (> (len command) 0)
+                                                 ready-file
+                                                 "")
+                                           :settings
+                                             (codex-settings a config sandbox)
+                                           :idle-timeout-ms 1800000)
+                                         observer
+                                         control))]
+            (AgentReady (StationAgent
+                          :harness harness
+                          :label (cat a [model " via codex"])
+                          :finish-tool (if (> (len stop) 0) stop "finish")
+                          :tool-prefix ""
+                          :workspace-note
+                            "Your shell starts in that directory. Keep every change inside it: Codex's sandbox refuses writes outside it."
+                          :tools-note
+                            (context-note a request (codex-tools-note sandbox)))))))))
+
 (defn claude-tools [(a (dyn Allocator)) (tools (slice u8))] (-> (slice u8))
   (let [files (has-group? a tools "files")
         shell (has-group? a tools "shell")
@@ -526,7 +777,8 @@
                         :setup
                           (AgentUnavailable "Install Claude Code on this site, or set claude in site.json to its executable path."))))
             root (path-join a (.run-dir request) "claude")
-            problem (ensure-dirs! a [root])]
+            problem
+              (ensure-dirs! a [root (path-join a (.run-dir request) "sidebar")])]
         (when (> (len problem) 0)
           (return-from :setup (AgentUnavailable problem)))
         (let [launcher
@@ -534,6 +786,9 @@
                                           config
                                           (.workspace request)
                                           [root
+                                           (path-join a
+                                                      (.run-dir request)
+                                                      "sidebar")
                                            (path-join a
                                                       (env-or a "HOME" "/")
                                                       ".claude")])
@@ -589,4 +844,7 @@
                           :tool-prefix "mcp__factory__"
                           :workspace-note
                             "Your tools start in this workspace. Keep changes inside it."
-                          :tools-note (claude-tools a (.tools request)))))))))
+                          :tools-note
+                            (context-note a
+                                          request
+                                          (claude-tools a (.tools request))))))))))

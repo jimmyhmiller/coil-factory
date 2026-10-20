@@ -10,6 +10,7 @@
 (import "factory.ui.store" :use *)
 (import "factory.ui.chat" :use *)
 (import "factory.ui.model" :use *)
+(import "factory.ui.sidebar" :as context)
 
 ;;; Talking to one agent: its conversation, what it is doing right now, and an
 ;;; input whose meaning depends on the run (steer, unblock, or converse).
@@ -123,12 +124,22 @@
     (split-vertical full [(Fixed 1) (Fixed banner) (Fill 1) (Fixed 1)] 0 parts)
     (draw-chat-header! d c a (index parts 0))
     (when (hub-down? d) (draw-hub-banner! d c a (index parts 1)))
-    (let [box (index parts 2)
+    (let [body (index parts 2)
+          width (context/panel-width d (.w body))
+          box (rect-drop-right body width)
           agent (chat-agent-state d)
           (mut opts)
             (panel-opts theme
                         (concat a [(.agent chat) " · conversation"])
-                        true)]
+                        (not (.sidebar-focus (.workbench d))))]
+      (when (> width 0)
+        (context/draw! d
+                       c
+                       a
+                       (rect (- (rect-right body) width)
+                             (.y body)
+                             width
+                             (.h body))))
       (set! (.footer opts)
             (concat a
                     [(int-text a (ji agent "turns"))

@@ -10,6 +10,7 @@
 (import "factory.ui.fmt" :use *)
 (import "factory.ui.chat" :use *)
 (import "factory.ui.workbench" :as workbench)
+(import "factory.ui.sidebar" :as context)
 
 ;;; Bearer tokens stay editable without ever placing their contents on screen.
 (defn draw-token! [(c (ptr Canvas))
@@ -121,16 +122,23 @@
         model (if existing (js current "model") (workbench/value w 2))
         chat (field d personal)
         full (canvas-rect c)
-        sidebar (if (>= (.w full) 70) (if (>= (.w full) 110) 30 23) 0)
+        context-width (context/panel-width d (.w full))
+        sidebar (if (>= (.w full) 120) 23 0)
         body (rect-drop-top (rect-drop-bottom full 1) 2)
         left (rect (.x body) (.y body) sidebar (.h body))
-        right (rect-drop-left body sidebar)
+        right (rect-drop-right (rect-drop-left body sidebar) context-width)
+        context-r
+          (rect (- (rect-right body) context-width)
+                (.y body)
+                context-width
+                (.h body))
         inner
           (rect-inset-xy (draw-box! c
                                     right
                                     (panel-opts theme
                                                 "Conversation"
-                                                (not (.history-focus w))))
+                                                (not (or (.history-focus w)
+                                                         (.sidebar-focus w)))))
                          1
                          0)
         input-height
@@ -171,6 +179,7 @@
                             (workbench/value w 0))
                         (.subtle theme))
     (when (> sidebar 0) (draw-sidebar! d c a left))
+    (when (> context-width 0) (context/draw! d c a context-r))
     (if (= (len lines) 0)
         (do
           (put-text-ellipsis! c
@@ -329,3 +338,40 @@
                     theme
                     (= (.connection-focus w) 3)))
       0)))
+
+;;; History stays usable when context replaces workspace navigation on a
+;;; smaller terminal. The same selection model serves both presentations.
+(defn draw-history! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))]
+  (-> i64)
+  (let [w (field d workbench)
+        theme (.theme d)
+        r (rect-center (canvas-rect c) 76 16)
+        sessions (.value (field w sessions))
+        (mut labels) (ArrayList::new [(slice u8)] a)]
+    (canvas-hide-cursor! c)
+    (fill! c r 32 (style-default))
+    (let [inner
+            (rect-inset-xy (draw-box! c
+                                      r
+                                      (panel-opts theme "Conversations" true))
+                           1
+                           0)]
+      (for i (range 0 (jv-len sessions))
+        (let [item (jv-nth sessions i)]
+          (push! (mut labels)
+                 (concat a
+                         [(js item "title")
+                          "  ·  "
+                          (js item "harness")
+                          "  ·  "
+                          (js item "status")]))))
+      (list-set-count! (field w history) (len labels))
+      (if (= (len labels) 0)
+          (put-text-ellipsis! c
+                              inner
+                              (.x inner)
+                              (.y inner)
+                              "No saved conversations yet."
+                              (.muted theme))
+          (draw-list! c inner (field w history) (slice labels) theme true)))
+    0))

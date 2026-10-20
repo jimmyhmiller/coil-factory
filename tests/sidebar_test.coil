@@ -1,0 +1,194 @@
+(module factory.sidebar-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+(import "coil.thread" :as thread)
+(import "coil.scratch" :as scratch)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+(import "factory.sidebar" :as sidebar)
+(import "factory.session-test" :use [fresh-home])
+(import "durable.atomic" :as disk)
+
+(defn json [(a (dyn Allocator)) (s (slice u8))] (-> JVal)
+  (match (jv-parse a s) (Some [v] v) (_ (do (assert false) (JNull)))))
+
+(defn ok [(r (Result JVal (slice u8)))] (-> JVal)
+  (match r
+    (Ok [v] v)
+    (Err [why] (do (println "{s}" why) (assert false) (JNull)))))
+
+(defn section! [(a (dyn Allocator)) (home (slice u8))] (-> JVal)
+  (ok (sidebar/update! a
+                       home
+                       "assistant"
+                       2
+                       (json a
+                             "{\"section\":\"benchmark\",\"title\":\"Latest benchmark\"}"))))
+
+(deftest sections-and-items-persist-update-in-place-and-remain-isolated
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-store")]
+    (section! a home)
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         3
+                         (json a
+                               "{\"section\":\"benchmark\",\"id\":\"latest\",\"text\":\"42 ms\",\"status\":\"done\"}")))
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         3
+                         (json a
+                               "{\"section\":\"benchmark\",\"id\":\"latest\",\"text\":\"31 ms\",\"status\":\"done\"}")))
+    (let [v (ok (sidebar/read-board a home "assistant"))
+          items (jv-get (jv-nth (jv-get v "sections") 0) "items")]
+      (assert-eq (jv-int (jv-get v "revision")) 3)
+      (assert-eq (jv-count items) 1)
+      (assert (= (sidebar/text (jv-nth items 0) "text") "31 ms")))
+    (assert-eq (jv-count (jv-get (ok (sidebar/read-board a home "other"))
+                                 "sections"))
+               0)
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         2
+                         (json a
+                               "{\"section\":\"tasks\",\"title\":\"Todo\",\"items\":[{\"id\":\"repeat\",\"text\":\"Repeat benchmark\",\"status\":\"todo\"}]}")))
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         3
+                         (json a
+                               "{\"section\":\"benchmark\",\"id\":\"latest\",\"remove\":true}")))
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         2
+                         (json a "{\"section\":\"benchmark\",\"remove\":true}")))
+    (let [v (ok (sidebar/read-board a home "assistant"))
+          sections (jv-get v "sections")]
+      (assert-eq (jv-count sections) 1)
+      (assert (= (sidebar/text (jv-nth sections 0) "id") "tasks")))))
+
+(deftest invalid-and-stale-writes-preserve-the-saved-board
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-invalid")]
+    (section! a home)
+    (for args (iter ["{\"section\":\"benchmark\",\"title\":\"Wrong\",\"expected_revision\":0}"
+                     "{\"section\":\"../escape\",\"title\":\"Bad\"}"
+                     "{\"section\":\"benchmark\",\"items\":[{\"id\":\"x\",\"text\":\"a\"},{\"id\":\"x\",\"text\":\"b\"}]}"
+                     "{\"section\":\"benchmark\",\"items\":[{\"id\":\"x\",\"text\":\"a\",\"status\":123}]}"
+                     "{\"section\":\"benchmark\",\"remove\":\"yes\"}"])
+      (assert (match (sidebar/update! a home "assistant" 2 (json a args))
+                (Err [_] true)
+                (_ false))))
+    (let [v (ok (sidebar/read-board a home "assistant"))]
+      (assert-eq (jv-int (jv-get v "revision")) 1)
+      (assert (= (sidebar/text (jv-nth (jv-get v "sections") 0) "title")
+                 "Latest benchmark")))
+    (assert (match (sidebar/update! a home "../agent" 2 (json a "{}"))
+              (Err [_] true)
+              (_ false)))
+    (match (disk/write-file-atomic! a
+                                    (sidebar/file a home "assistant" ".json")
+                                    "broken"
+                                    384)
+      (Ok [_] 0)
+      (_ (assert false)))
+    (assert (match (sidebar/update! a
+                                    home
+                                    "assistant"
+                                    2
+                                    (json a
+                                          "{\"section\":\"other\",\"title\":\"Other\"}"))
+              (Err [_] true)
+              (_ false)))
+    (match (disk/read-file-if-exists a
+                                     (sidebar/file a home "assistant" ".json"))
+      (Ok [found]
+          (match found (Some [s] (assert (= s "broken"))) (_ (assert false))))
+      (_ (assert false)))))
+
+(defstruct Writer [(home (slice u8)) (number i64)])
+
+(defn write-items [(arg (ptr i8))] (-> (ptr i8))
+  (let [writer (cast (ptr Writer) arg)
+        (mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/ScratchArena::init (mut arena) (malloc-allocator))
+    (let [a (allocator (mut arena))]
+      (for n (range 0 16)
+        (let [args (jv-object a)
+              (mut id) (StrBuf::new a)]
+          (push-i64! (mut id) (.number writer))
+          (push-str! (mut id) "-")
+          (push-i64! (mut id) n)
+          (jv-put! args "section" (JStr "benchmark"))
+          (jv-put! args "id" (JStr (finish! (mut id))))
+          (jv-put! args "text" (JStr "saved"))
+          (ok (sidebar/update! a (.home writer) "assistant" 3 args)))))
+    (close! (mut arena))
+    (cast (ptr i8) 0)))
+
+(deftest concurrent-item-updates-do-not-lose-siblings
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-concurrent")
+        threads
+          (box! a (array thread/Thread 4) (zeroed (array thread/Thread 4)))]
+    (section! a home)
+    (for i (range 0 4)
+      (let [writer (box! a Writer (Writer :home home :number i))]
+        (assert-eq (thread/Thread::spawn (index threads i)
+                                         (fnptr-of write-items)
+                                         (cast (ptr i8) writer))
+                   (cast i32 0))))
+    (for i (range 0 4) (join (index threads i)))
+    (let [v (ok (sidebar/read-board a home "assistant"))]
+      (assert-eq (jv-int (jv-get v "revision")) 65)
+      (assert-eq (jv-count (jv-get (jv-nth (jv-get v "sections") 0) "items"))
+                 64))))
+
+(deftest native-tools-support-status-only-updates-and-are-discoverable
+  (let [a (malloc-allocator)
+        home (fresh-home a "sidebar-native")
+        (mut registry) (registry-new a)
+        context (box! a NeverCancelled (NeverCancelled :unused 0))]
+    (sidebar/register! a (mut registry) home "assistant")
+    (assert-eq (registry-count (mut registry)) 3)
+    (section! a home)
+    (ok (sidebar/update! a
+                         home
+                         "assistant"
+                         3
+                         (json a
+                               "{\"section\":\"benchmark\",\"id\":\"latest\",\"text\":\"31 ms\",\"status\":\"todo\"}")))
+    (match (registry-find (mut registry) "sidebar_item")
+      (Some [tool]
+            (let [args
+                    (json a
+                          "{\"section\":\"benchmark\",\"id\":\"latest\",\"status\":\"done\"}")]
+              (match (tool-run tool
+                               a
+                               (tool-call "status"
+                                          "sidebar_item"
+                                          args
+                                          (jv-encode a args))
+                               context)
+                (ToolOk [text]
+                        (let [ack (json a text)
+                              doc (ok (sidebar/read-board a home "assistant"))
+                              item
+                                (jv-nth (jv-get (jv-nth (jv-get doc "sections")
+                                                        0)
+                                                "items")
+                                        0)]
+                          (assert-eq (jv-int (jv-get ack "revision")) 3)
+                          (assert (jv-null? (jv-get ack "sections")))
+                          (assert (= (sidebar/text item "text") "31 ms"))
+                          (assert (= (sidebar/text item "status") "done"))))
+                (_ (assert false)))))
+      (_ (assert false)))
+    (registry-free! (mut registry))))

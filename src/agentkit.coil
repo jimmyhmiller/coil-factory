@@ -1,4 +1,5 @@
 (module factory.agentkit)
+(import "factory.sidebar" :as sidebar)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.serde.value" :use *)
@@ -764,7 +765,9 @@
    (workdir (slice u8))
    (home (slice u8))
    (isolation (slice u8))
-   (ready (slice u8))])
+   (ready (slice u8))
+   (sidebar-root (slice u8))
+   (sidebar-agent (slice u8))])
 
 (defn server-args [(args (slice (slice u8)))] (-> ServerArgs)
   (let [(mut out)
@@ -776,7 +779,9 @@
             :workdir ""
             :home ""
             :isolation "none"
-            :ready "")
+            :ready ""
+            :sidebar-root ""
+            :sidebar-agent "")
         (mut i) 0]
     (loop (if (>= (+ (load i) 1) (len args))
               (break)
@@ -790,6 +795,9 @@
                       (= flag "--home") (set! (.home out) value)
                       (= flag "--isolation") (set! (.isolation out) value)
                       (= flag "--ready") (set! (.ready out) value)
+                      (= flag "--sidebar-root") (set! (.sidebar-root out) value)
+                      (= flag "--sidebar-agent")
+                        (set! (.sidebar-agent out) value)
                       :else 0)
                 (set! i (+ (load i) 2)))))
     (load out)))
@@ -880,6 +888,10 @@
                                                              :allocator a
                                                              :path (.ready args)))
                                                    (mut problem) ""]
+                                               (sidebar/register! a
+                                                                  (mut registry)
+                                                                  (.sidebar-root args)
+                                                                  (.sidebar-agent args))
                                                (for tool (iter (.tools tools))
                                                  (when (not (registry-add! (mut registry)
                                                                            tool))

@@ -34,6 +34,29 @@ can start the local hub automatically. Command search is available in forms too.
 `/inspect` in a conversation opens expandable checkpointed tool calls and
 results, including delegated work.
 
+Conversations have a persistent **Context** sidebar for results, todos and other
+working context. Agents can create named sections with ordered item lists through
+`sidebar_section`, update individual items through `sidebar_item`, and read the
+board through `sidebar_read`. External harnesses receive these tools over MCP;
+the builtin harness receives them directly. Every conversation or factory station
+has its own board. Item ids let an agent replace the latest benchmark result in
+place, or change a todo's status without duplicating its text. Statuses are
+`info`, `todo`, `doing`, and `done`.
+
+Boards save automatically and survive restarts, transcript compaction and model
+turns. `/sidebar` focuses the board for scrolling (or shows it full-width on a
+narrow terminal); `/sidebar-hide` gives the conversation more room. Factory-agent
+boards refresh independently through the authenticated API, including remote
+factories (`GET /v1/runs/{run}/agents/{station}/sidebar`). Storage is
+`sidebar/<agent>.json` under the conversation or run
+directory, protected by a lock and atomic writes. Optional `expected_revision`
+rejects stale updates. Each board supports 32 sections, 128 items per section,
+and up to 1 MiB of context; item text is limited to 2048 bytes.
+
+After building, `coil test tests/live/sidebar_live.coil` exercises real MCP
+discovery, updates, invalid requests, persistence and the station finish tool
+without requiring a model account.
+
 A factory is a Markdown file of stations. Each station is one agent with tools,
 working on its own git branch, and it is not done until it calls `finish` and its
 gate command passes. You start runs on this machine, another machine, or a

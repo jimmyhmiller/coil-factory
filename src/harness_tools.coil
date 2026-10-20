@@ -1,0 +1,42 @@
+(module factory.harness-tools)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "agent.tool" :use *)
+(import "factory.sidebar" :as sidebar)
+(import "factory.finish" :use [FinishTool ReadyFile])
+(import "mcp.server" :as mcp)
+
+;;; Shared MCP surface for personal conversations and factory stations.
+(defn serve [(a (dyn Allocator)) (args (slice (slice u8)))] (-> i64)
+  (block :serve
+    (when (< (len args) 2) (return-from :serve 1))
+    (let [root (get args 0)
+          agent (get args 1)
+          (mut finish) false
+          (mut gate) false
+          (mut ready) ""
+          (mut i) 2
+          (mut registry) (registry-new a)]
+      (when (or (= (len root) 0) (not (sidebar/scope? agent)))
+        (return-from :serve 1))
+      (loop (when (>= (load i) (len args)) (break))
+        (let [flag (get args (load i))]
+          (cond (= flag "--finish") (set! finish true)
+                (= flag "--gate") (set! gate true)
+                (and (= flag "--ready") (< (+ (load i) 1) (len args)))
+                  (do (set! i (+ (load i) 1)) (set! ready (get args (load i))))
+                :else (return-from :serve 1)))
+        (set! i (+ (load i) 1)))
+      (sidebar/register! a (mut registry) root agent)
+      (when (load finish)
+        (registry-add! (mut registry)
+                       (box! a
+                             FinishTool
+                             (FinishTool :gate (if (load gate) "gate" ""))))
+        0)
+      (mcp/serve-stdio a
+                       (mut registry)
+                       (mcp/ServerInfo :name "factory" :version "0.1.0")
+                       (box! a
+                             ReadyFile
+                             (ReadyFile :allocator a :path (load ready)))))))

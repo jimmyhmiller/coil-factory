@@ -26,6 +26,7 @@
    (home (slice u8))
    (address (slice u8))
    (name (slice u8))
+   (endpoint (slice u8))
    (hub Hub)
    (reply Reply)
    (owns-tunnel bool)
@@ -35,7 +36,8 @@
   (let [job (cast (ptr Job) arg)
         a (allocator (field job arena))]
     (block :run
-      (when (and (= (.kind job) 2) (!= (cast i64 (.tunnel job)) 0))
+      (when (and (or (= (.kind job) 2) (= (.kind job) 5))
+                 (!= (cast i64 (.tunnel job)) 0))
         (match (tunnel/tunnel-ensure! (.tunnel job))
           (tunnel/TunnelReady [port]
                               (set! (.base-url (field job hub))
@@ -140,10 +142,11 @@
                 (hub-call a
                           (.hub job)
                           "GET"
-                          (if (= (.kind job) 2) "/v1/overview" "/v1/site")
+                          (.endpoint job)
                           ""
                           3000)))
       (when (and (!= (.kind job) 2)
+                 (!= (.kind job) 5)
                  (reply-ok? (.reply job))
                  (not (= (jv-string-or (jv-get (reply-body (.reply job))
                                                "version")
@@ -161,7 +164,8 @@
                          (hub Hub)
                          (address (slice u8))
                          (name (slice u8))
-                         (borrowed-tunnel (ptr tunnel/Tunnel))] (-> (ptr Job))
+                         (borrowed-tunnel (ptr tunnel/Tunnel))
+                         (endpoint (slice u8))] (-> (ptr Job))
   (let [job (box! a Job (zeroed Job))]
     (scratch/ScratchArena::init (field job arena) (malloc-allocator))
     (set! (.tunnel job) borrowed-tunnel)
@@ -170,6 +174,7 @@
       (set! (.home job) (copy-bytes scratch home))
       (set! (.address job) (copy-bytes scratch address))
       (set! (.name job) (copy-bytes scratch name))
+      (set! (.endpoint job) (copy-bytes scratch endpoint))
       (set! (.hub job)
             (Hub
               :base-url (copy-bytes scratch (.base-url hub))
@@ -189,7 +194,14 @@
              (hub Hub)
              (address (slice u8))
              (name (slice u8))] (-> (ptr Job))
-  (start-with-tunnel a kind home hub address name (cast (ptr tunnel/Tunnel) 0)))
+  (start-with-tunnel a
+                     kind
+                     home
+                     hub
+                     address
+                     name
+                     (cast (ptr tunnel/Tunnel) 0)
+                     (if (= kind 2) "/v1/overview" "/v1/site")))
 
 (defn refresh [(a (dyn Allocator))
                (home (slice u8))
@@ -204,7 +216,25 @@
                      name
                      (if (= (cast i64 owner) 0)
                          (cast (ptr tunnel/Tunnel) 0)
-                         (.tunnel owner))))
+                         (.tunnel owner))
+                     "/v1/overview"))
+
+(defn fetch [(a (dyn Allocator))
+             (home (slice u8))
+             (hub Hub)
+             (name (slice u8))
+             (endpoint (slice u8))
+             (owner (ptr Job))] (-> (ptr Job))
+  (start-with-tunnel a
+                     5
+                     home
+                     hub
+                     (.base-url hub)
+                     name
+                     (if (= (cast i64 owner) 0)
+                         (cast (ptr tunnel/Tunnel) 0)
+                         (.tunnel owner))
+                     endpoint))
 
 (defn ready? [(job (ptr Job))] (-> bool)
   (and (!= (cast i64 job) 0) (= (atomic/read (field job done)) 1)))

@@ -10,6 +10,7 @@
 (import "factory.proc" :use *)
 (import "factory.worker" :as worker)
 (import "factory.session" :as session)
+(import "factory.harness-tools" :as harness-tools)
 (import "factory.finish" :use [finish-mcp-main])
 (import "factory.daemon" :as daemon)
 (import "factory.cli.ctx" :use *)
@@ -214,6 +215,10 @@
                                 :else 0)
                           (set! i (+ (load i) 1)))))
               (finish-mcp-main a (load gate) (load ready)))
+          (and (>= argc 2) (= (arg argv 1) "_mcp-harness"))
+            (let [(mut rest) (ArrayList::new [(slice u8)] a)]
+              (for i (range 2 (cast i64 argc)) (push! (mut rest) (arg argv i)))
+              (harness-tools/serve a (slice rest)))
           (and (>= argc 2) (= (arg argv 1) "_mcp-agent"))
             (let [(mut rest) (ArrayList::new [(slice u8)] a)]
               (for i (range 2 (cast i64 argc)) (push! (mut rest) (arg argv i)))

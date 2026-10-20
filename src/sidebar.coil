@@ -1,0 +1,336 @@
+(module factory.sidebar)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+(import "durable.atomic" :as disk)
+(import "durable.lock" :as lock)
+(import "factory.events" :use [wall-ms])
+
+;;; Each conversation/station owns a board. Sections and items have stable ids;
+;;; updates lock and atomically replace the document, independently of transcripts.
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut s) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut s) part))
+    (finish! (mut s))))
+
+(defn text [(v JVal) (key (slice u8))] (-> (slice u8))
+  (jv-string-or (jv-get v key) ""))
+
+(defn jv-bool [(v JVal)] (-> bool)
+  (match v (JBool [b] b) (_ false)))
+
+(defn identifier? [(id (slice u8)) (limit i64)] (-> bool)
+  (block :key
+    (when (or (= (len id) 0) (> (len id) limit) (= id ".") (= id ".."))
+      (return-from :key false))
+    (for b (iter id)
+      (when (not (or (and (>= b 65) (<= b 90))
+                     (and (>= b 97) (<= b 122))
+                     (and (>= b 48) (<= b 57))
+                     (= b 45)
+                     (= b 95)
+                     (= b 46)))
+        (return-from :key false)))
+    true))
+
+(defn key? [(id (slice u8))] (-> bool)
+  (identifier? id 64))
+
+(defn scope? [(id (slice u8))] (-> bool)
+  (identifier? id 128))
+
+(defn file [(a (dyn Allocator))
+            (root (slice u8))
+            (agent (slice u8))
+            (suffix (slice u8))] (-> (slice u8))
+  (cat a [root "/sidebar/" agent suffix]))
+
+(defn empty-board [(a (dyn Allocator))] (-> JVal)
+  (let [v (jv-object a)]
+    (jv-put! v "version" (JInt 1))
+    (jv-put! v "revision" (JInt 0))
+    (jv-put! v "updated" (JInt 0))
+    (jv-put! v "sections" (jv-array a))
+    v))
+
+(defn item-valid? [(v JVal)] (-> bool)
+  (let [status (text v "status")
+        body (text v "text")]
+    (and (key? (text v "id"))
+         (> (len (trim body)) 0)
+         (<= (len body) 2048)
+         (match (jv-get v "status") (JNull [] true) (JStr [_] true) (_ false))
+         (or (= status "")
+             (= status "info")
+             (= status "todo")
+             (= status "doing")
+             (= status "done")))))
+
+(defn items-valid? [(items JVal)] (-> bool)
+  (block :items
+    (when (not (match items (JArr [_] true) (_ false)))
+      (return-from :items false))
+    (when (> (jv-count items) 128) (return-from :items false))
+    (for i (range 0 (jv-count items))
+      (let [item (jv-nth items i)]
+        (when (not (item-valid? item)) (return-from :items false))
+        (for j (range 0 i)
+          (when (= (text item "id") (text (jv-nth items j) "id"))
+            (return-from :items false)))))
+    true))
+
+(defn board-valid? [(v JVal)] (-> bool)
+  (block
+    :board
+      (let [sections (jv-get v "sections")
+            revision (jv-get v "revision")]
+        (when (or (!= (jv-int (jv-get v "version")) 1)
+                  (not (match revision
+                         (JInt [n] (and (>= n 0) (< n 9000000000000000)))
+                         (_ false)))
+                  (not (match sections (JArr [_] true) (_ false)))
+                  (> (jv-count sections) 32))
+          (return-from :board false))
+        (for i (range 0 (jv-count sections))
+          (let [s (jv-nth sections i)]
+            (when (or (not (key? (text s "id")))
+                      (= (len (trim (text s "title"))) 0)
+                      (> (len (text s "title")) 120)
+                      (not (items-valid? (jv-get s "items"))))
+              (return-from :board false))
+            (for j (range 0 i)
+              (when (= (text s "id") (text (jv-nth sections j) "id"))
+                (return-from :board false)))))
+        true)))
+
+(defn read-board [(a (dyn Allocator)) (root (slice u8)) (agent (slice u8))]
+  (-> (Result JVal (slice u8)))
+  (if (or (= (len root) 0) (not (scope? agent)))
+      (Err "Invalid sidebar scope.")
+      (match (disk/read-file-if-exists a (file a root agent ".json"))
+        (Ok [found]
+            (match found
+              (None [] (Ok (empty-board a)))
+              (Some [data]
+                    (match (jv-parse a data)
+                      (Some [v]
+                            (if (and (<= (len data) 1048576) (board-valid? v))
+                                (Ok v)
+                                (Err "The saved sidebar is invalid; it was preserved.")))
+                      (_ (Err "The saved sidebar is not valid JSON; it was preserved."))))))
+        (_ (Err "Cannot read the saved sidebar.")))))
+
+(defn view [(a (dyn Allocator)) (root (slice u8)) (agent (slice u8))] (-> JVal)
+  (match (read-board a root agent)
+    (Ok [v] v)
+    (Err [why] (let [v (empty-board a)] (jv-put! v "error" (JStr why)) v))))
+
+;;; kind 2 replaces a section's list; kind 3 updates one item without touching
+;;; its siblings. Optional expected_revision makes stale full-list writes fail.
+(defn change [(a (dyn Allocator)) (board JVal) (kind i64) (args JVal)]
+  (-> (Result JVal (slice u8)))
+  (block
+    :change
+      (let [id (text args "section")
+            remove (jv-get args "remove")
+            expected (jv-get args "expected_revision")
+            sections (jv-get board "sections")
+            out (jv-array a)
+            (mut found) false]
+        (when (not (key? id))
+          (return-from
+            :change
+              (Err "section must be a stable id (1–64 letters, digits, dots, dashes or underscores).")))
+        (when (not (match remove (JNull [] true) (JBool [_] true) (_ false)))
+          (return-from :change (Err "remove must be a boolean.")))
+        (when (not (match expected
+                     (JNull [] true)
+                     (JInt [n] (= n (jv-int (jv-get board "revision"))))
+                     (_ false)))
+          (return-from
+            :change
+              (Err "Sidebar revision changed. Read it again before replacing a section.")))
+        (when (and (= kind 3) (not (key? (text args "id"))))
+          (return-from :change (Err "An item needs a stable id.")))
+        (for s (range 0 (jv-count sections))
+          (let [old (jv-nth sections s)]
+            (if (not (= (text old "id") id))
+                (jv-push! out old)
+                (do
+                  (set! found true)
+                  (if (= kind 2)
+                      (when (not (jv-bool remove))
+                        (let [section (jv-clone a old)]
+                          (when (not (jv-null? (jv-get args "title")))
+                            (jv-put! section "title" (jv-get args "title"))
+                            0)
+                          (when (not (jv-null? (jv-get args "items")))
+                            (jv-put! section "items" (jv-get args "items"))
+                            0)
+                          (jv-push! out section))
+                        0)
+                      (let [items (jv-array a)
+                            (mut item-found) false]
+                        (for i (range 0 (jv-count (jv-get old "items")))
+                          (let [item (jv-nth (jv-get old "items") i)]
+                            (if (= (text item "id") (text args "id"))
+                                (do
+                                  (set! item-found true)
+                                  (when (not (jv-bool remove))
+                                    (jv-push! items (merge-item a item args))
+                                    0))
+                                (jv-push! items item))))
+                        (when (and (not (load item-found))
+                                   (not (jv-bool remove)))
+                          (jv-push! items (new-item a args))
+                          0)
+                        (let [section (jv-clone a old)]
+                          (jv-put! section "items" items)
+                          (jv-push! out section))))
+                  0))))
+        (when (not (load found))
+          (when (= kind 3)
+            (return-from
+              :change (Err "Create this section with sidebar_section first.")))
+          (when (not (jv-bool remove))
+            (let [section (jv-object a)]
+              (jv-put! section "id" (JStr id))
+              (jv-put! section "title" (jv-get args "title"))
+              (jv-put! section
+                       "items"
+                       (if (jv-null? (jv-get args "items"))
+                           (jv-array a)
+                           (jv-get args "items")))
+              (jv-push! out section))
+            0)
+          0)
+        (jv-put! board "sections" out)
+        (jv-put! board
+                 "revision"
+                 (JInt (+ (jv-int (jv-get board "revision")) 1)))
+        (jv-put! board "updated" (JInt (wall-ms)))
+        (if (and (board-valid? board) (<= (len (jv-encode a board)) 1048576))
+            (Ok board)
+            (Err "Use at most 32 sections, 128 items per section, 120-byte titles and 2048-byte item text. Ids must be unique; status is info, todo, doing or done. The whole sidebar is limited to 1 MiB.")))))
+
+(defn new-item [(a (dyn Allocator)) (args JVal)] (-> JVal)
+  (merge-item a (jv-object a) args))
+
+(defn merge-item [(a (dyn Allocator)) (old JVal) (args JVal)] (-> JVal)
+  (let [item (jv-clone a old)]
+    (for key (iter ["id" "text" "status"])
+      (when (not (jv-null? (jv-get args key)))
+        (jv-put! item key (jv-get args key))
+        0))
+    item))
+
+(defn update! [(a (dyn Allocator))
+               (root (slice u8))
+               (agent (slice u8))
+               (kind i64)
+               (args JVal)] (-> (Result JVal (slice u8)))
+  (block :update
+    (when (or (= (len root) 0) (not (scope? agent)))
+      (return-from :update (Err "Invalid sidebar scope.")))
+    (match (disk/ensure-dir! a (cat a [root "/sidebar"]) 448)
+      (Ok [_] 0)
+      (_ (return-from :update (Err "Cannot create sidebar storage."))))
+    (let [(mut gate)
+            (match (lock/lock-open! a (file a root agent ".lock"))
+              (Ok [g] g)
+              (_ (return-from :update (Err "Cannot open sidebar lock."))))]
+      (match (lock/lock-wait! (mut gate))
+        (Ok [_] 0)
+        (_ (do
+             (lock/lock-close! (mut gate))
+             (return-from :update (Err "Cannot lock sidebar.")))))
+      (let [result
+              (match (read-board a root agent)
+                (Err [why] (Err why))
+                (Ok [board]
+                    (match (change a board kind args)
+                      (Err [why] (Err why))
+                      (Ok [v]
+                          (match (disk/write-file-atomic! a
+                                                          (file a
+                                                                root
+                                                                agent
+                                                                ".json")
+                                                          (jv-encode a v)
+                                                          384)
+                            (Ok [_] (Ok v))
+                            (_ (Err "Could not save the sidebar.")))))))]
+        (lock/lock-close! (mut gate))
+        result))))
+
+(defstruct SidebarTool [(root (slice u8)) (agent (slice u8)) (kind i64)])
+
+(impl Tool SidebarTool
+  (tool-spec [(self (ptr SidebarTool))] (-> ToolSpec)
+    (ToolSpec
+      :name
+        (get ["sidebar_read" "sidebar_section" "sidebar_item"]
+             (- (.kind self) 1))
+      :description
+        (get ["Read the persistent context sidebar and its revision. Use sections for benchmark results, todos, decisions and other context the user should keep seeing beside the conversation."
+              "Create/update a sidebar section by stable section id. Supply title for a new section; items replaces its ordered list. Omit items to preserve it. remove deletes the section. Prefer sidebar_item for individual changes. expected_revision rejects stale writes."
+              "Upsert an item by stable section and item id without disturbing other items. Omitted text/status preserve existing values; a new item needs text. text is plain text; status is info, todo, doing or done. remove deletes it. Create its section first. Keep important latest results here; do not append every log line."]
+             (- (.kind self) 1))
+      :parameters
+        (get ["{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}"
+              "{\"type\":\"object\",\"properties\":{\"section\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"items\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"info\",\"todo\",\"doing\",\"done\"]}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}},\"remove\":{\"type\":\"boolean\"},\"expected_revision\":{\"type\":\"integer\"}},\"required\":[\"section\"],\"additionalProperties\":false}"
+              "{\"type\":\"object\",\"properties\":{\"section\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"info\",\"todo\",\"doing\",\"done\"]},\"remove\":{\"type\":\"boolean\"},\"expected_revision\":{\"type\":\"integer\"}},\"required\":[\"section\",\"id\"],\"additionalProperties\":false}"]
+             (- (.kind self) 1))
+      :self-checked false))
+  (tool-summary [(self (ptr SidebarTool)) (a (dyn Allocator)) (call ToolCall)]
+    (-> (slice u8))
+    (cat a ["sidebar " (call-string call "section")]))
+  (tool-run [(self (ptr SidebarTool))
+             (a (dyn Allocator))
+             (call ToolCall)
+             (context (dyn ToolContext))] (-> ToolOutcome)
+    (match (if (= (.kind self) 1)
+               (read-board a (.root self) (.agent self))
+               (update! a
+                        (.root self)
+                        (.agent self)
+                        (.kind self)
+                        (.arguments call)))
+      (Ok [v]
+          (ToolOk (jv-encode a
+                             (if (= (.kind self) 1)
+                                 v
+                                 (let [ack (jv-object a)]
+                                   (jv-put! ack "saved" (JBool true))
+                                   (jv-put! ack
+                                            "revision"
+                                            (jv-get v "revision"))
+                                   (jv-put! ack
+                                            "section"
+                                            (jv-get (.arguments call) "section"))
+                                   (when (= (.kind self) 3)
+                                     (jv-put! ack
+                                              "id"
+                                              (jv-get (.arguments call) "id"))
+                                     0)
+                                   ack)))))
+      (Err [why] (ToolFailed why)))))
+
+(defn register! [(a (dyn Allocator))
+                 (registry (ptr ToolRegistry))
+                 (root (slice u8))
+                 (agent (slice u8))] (-> i64)
+  (when (> (len root) 0)
+    (for kind (range 1 4)
+      (registry-add! registry
+                     (box! a
+                           SidebarTool
+                           (SidebarTool
+                             :root root
+                             :agent agent
+                             :kind kind)))
+      0))
+  0)

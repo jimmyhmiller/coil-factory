@@ -321,7 +321,7 @@
 (defn hub-down? [(d (ptr Dash))] (-> bool)
   (> (len (.hub-error d)) 0))
 
-;;; The bottom line: key hints, or a toast while one is showing.
+;;; The bottom line stays quiet unless a transient status toast is showing.
 (defn draw-footer! [(d (ptr Dash))
                     (c (ptr Canvas))
                     (r Rect)] (-> i64)

@@ -1,0 +1,79 @@
+(module factory.ui.sidebar)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.fmt" :use *)
+(import "factory.ui.chat" :use [Line line draw-lines!])
+
+;;; On narrow screens the board becomes a focused full-width pane. Wide
+;;; screens keep it beside the conversation, independent of chat scrolling.
+(defn panel-width [(d (ptr Dash)) (width i64)] (-> i64)
+  (let [w (field d workbench)]
+    (cond (not (.sidebar-visible w)) 0
+          (< width 70) (if (.sidebar-focus w) width 0)
+          (>= width 110) 30
+          :else 24)))
+
+(defn board [(d (ptr Dash))] (-> JVal)
+  (match (.view d)
+    (ViewPersonal []
+                  (jv-get (.value (field (field d workbench) current))
+                          "sidebar"))
+    (_ (.value (field (field d workbench) sidebar)))))
+
+(defn draw! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)]
+  (-> i64)
+  (let [w (field d workbench)
+        theme (.theme d)
+        inner
+          (rect-inset-xy (draw-box! c
+                                    r
+                                    (panel-opts theme
+                                                "Context"
+                                                (.sidebar-focus w)))
+                         1
+                         0)
+        doc (board d)
+        sections (jv-get doc "sections")
+        (mut lines) (ArrayList::new [Line] a)]
+    (when (> (len (js doc "error")) 0)
+      (for row (iter (wrap-text a (js doc "error") (.w inner)))
+        (push! (mut lines) (line "" (ToneMuted) row (ToneError)))))
+    (when (= (jv-len sections) 0)
+      (for row (iter (wrap-text a
+                                "Your assistant can pin results, todos and other context here."
+                                (.w inner)))
+        (push! (mut lines) (line "" (ToneMuted) row (ToneMuted)))))
+    (for i (range 0 (jv-len sections))
+      (let [section (jv-nth sections i)
+            items (jv-get section "items")]
+        (when (> i 0)
+          (push! (mut lines) (line "" (ToneMuted) "" (ToneMuted)))
+          0)
+        (for row (iter (wrap-text a (js section "title") (.w inner)))
+          (push! (mut lines) (line "" (ToneAccent) row (ToneAccent))))
+        (for j (range 0 (jv-len items))
+          (let [item (jv-nth items j)
+                status (js item "status")
+                glyph
+                  (cond (= status "done") "✓ "
+                        (= status "todo") "☐ "
+                        (= status "doing") "◐ "
+                        :else "· ")
+                tone
+                  (cond (= status "done") (ToneSuccess)
+                        (= status "doing") (ToneAccent)
+                        :else (TonePlain))
+                rows (wrap-text a (js item "text") (- (.w inner) 2))]
+            (for n (range 0 (len rows))
+              (push! (mut lines)
+                     (line (if (= n 0) glyph "  ") tone (get rows n) tone)))))))
+    (when (= (.total (.sidebar-sv w)) 0)
+      (set! (.stick-bottom (.sidebar-sv w)) false)
+      0)
+    (draw-lines! c inner (field w sidebar-sv) (slice lines) theme)
+    0))

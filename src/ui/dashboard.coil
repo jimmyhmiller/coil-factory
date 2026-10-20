@@ -215,6 +215,7 @@
 (defn poll! [(d (ptr Dash))] (-> i64)
   (poll-network! d)
   (poll-personal! d)
+  (poll-sidebar! d)
   (let [now (.now d)]
     (match (.view d)
       (ViewPersonal [] (refresh-factory-background! d))
@@ -262,6 +263,9 @@
           (when (or (not (= (.run chat) (.run-id d)))
                     (not (= (.agent chat) agent)))
             (chat-open! chat (.run-id d) agent)
+            (snap-reset! (field (field d workbench) sidebar))
+            (set! (.sidebar-polled (.workbench d)) 0)
+            (set! (.sidebar-sv (.workbench d)) (scroll-view-new))
             (tree-free! (field d inspection))
             (set! (.inspection d) (tree-new (.allocator d)))))
         (set! (.chat-from-run d) from-run)
@@ -492,7 +496,7 @@
     (ViewOverview [] (default-agent (selected-run d)))))
 
 (defn command-name [(id i64)] (-> (slice u8))
-  (if (and (> id 0) (<= id 22))
+  (if (and (> id 0) (<= id 24))
       (get ["factory"
             "open"
             "agent"
@@ -514,12 +518,14 @@
             "remote"
             "start"
             "confirm"
-            "dismiss"]
+            "dismiss"
+            "sidebar"
+            "sidebar-hide"]
            (- id 1))
       ""))
 
 (defn command-shortcut [(id i64)] (-> (slice u8))
-  (if (and (> id 0) (<= id 22))
+  (if (and (> id 0) (<= id 24))
       (get ["Ctrl-F"
             "Enter"
             "c"
@@ -541,9 +547,18 @@
             "Ctrl-R in connections"
             "Ctrl-S"
             "y"
-            "Esc"]
+            "Esc"
+            "Ctrl-Y"
+            ""]
            (- id 1))
       ""))
+
+(defn command-label [(a (dyn Allocator)) (id i64)] (-> (slice u8))
+  (let [shortcut (command-shortcut id)]
+    (concat a
+            ["/"
+             (command-name id)
+             (if (= (len shortcut) 0) "" (concat a [" · " shortcut]))])))
 
 (defn dashboard-commands [(d (ptr Dash)) (a (dyn Allocator))]
   (-> (ArrayList Command))
@@ -674,7 +689,21 @@
                           :id 22
                           :title "Keep running"
                           :detail "Dismiss stop confirmation"
-                          :enabled (.confirm-stop d))])
+                          :enabled (.confirm-stop d))
+                        (Command
+                          :id 23
+                          :title "Focus saved context"
+                          :detail "Sections, results and lists"
+                          :enabled
+                            (match (.view d)
+                              (ViewPersonal [] true)
+                              (ViewChat [] true)
+                              (_ false)))
+                        (Command
+                          :id 24
+                          :title "Hide context sidebar"
+                          :detail "Give the conversation more room"
+                          :enabled (.sidebar-visible (.workbench d)))])
       (push! (mut commands)
              (Command
                :id (.id command)
@@ -701,17 +730,18 @@
             (= id 13)
             (= id 14)
             (= id 16)
-            (= id 19))
+            (= id 19)
+            (= id 23))
     (set! (.settings-open (.workbench d)) false)
     (set! (.connections-open (.workbench d)) false)
     (set! (.inspection-open d) false)
     (set! (.launch-open d) false)
     (set! (.help d) false)
     (set! (.confirm-stop d) false)
+    (set! (.sidebar-focus (.workbench d)) false)
     0)
   (toast! d
-          (concat (.allocator d)
-                  ["/" (command-name id) " · " (command-shortcut id)])
+          (command-label (.allocator d) id)
           (ToneMuted))
   (cond (= id 1)
           (do
@@ -771,6 +801,12 @@
               0)
             (Continue))
         (= id 22) (do (set! (.confirm-stop d) false) (Continue))
+        (= id 23) (do (focus-sidebar! d) (Continue))
+        (= id 24)
+          (do
+            (set! (.sidebar-visible (.workbench d)) false)
+            (set! (.sidebar-focus (.workbench d)) false)
+            (Continue))
         :else (Continue)))
 
 (defn submit-launch! [(d (ptr Dash))] (-> i64)
@@ -812,6 +848,7 @@
                 (.launch-open d)
                 (.help d)))
        (or (.confirm-stop d)
+           (.sidebar-focus (.workbench d))
            (match (.view d)
              (ViewPersonal []
                            (= (len (input-text (field (field d personal) input)))
@@ -846,6 +883,12 @@
             (_ (Continue)))
         (.settings-open (.workbench d)) (settings-key! d key)
         (.connections-open (.workbench d)) (connections-key! d key)
+        (and (match key (Ctrl [ch] (= ch #\y)) (_ false))
+             (match (.view d)
+               (ViewPersonal [] true)
+               (ViewChat [] true)
+               (_ false)))
+          (do (focus-sidebar! d) (Continue))
         (.inspection-open d)
           (do
             (match key
@@ -911,6 +954,12 @@
                              (.home (.workbench d))
                              (.session-id (.workbench d)))
             (Continue))
+        (and (.sidebar-focus (.workbench d))
+             (match (.view d)
+               (ViewPersonal [] true)
+               (ViewChat [] true)
+               (_ false)))
+          (sidebar-key! d key)
         :else
           (match (.view d)
             (ViewPersonal [] (personal-key! d key))
@@ -936,11 +985,7 @@
                             bottom
                             1
                             (.y bottom)
-                            (concat a
-                                    ["/"
-                                     (command-name (.id selected))
-                                     " · "
-                                     (command-shortcut (.id selected))])
+                            (command-label a (.id selected))
                             (.muted (.theme d)))))
     0))
 
@@ -953,6 +998,11 @@
       (ViewOverview [] (draw-overview! self frame))
       (ViewRun [] (draw-run-view! self frame))
       (ViewChat [] (draw-chat-view! self frame)))
+    (when (.sidebar-focus (.workbench self))
+      (canvas-hide-cursor! (.canvas frame)))
+    (when (and (.history-focus (.workbench self))
+               (match (.view self) (ViewPersonal [] true) (_ false)))
+      (personal/draw-history! self (.canvas frame) (.scratch frame)))
     (when (.help self) (draw-help! self (.canvas frame)))
     (when (.confirm-stop self)
       (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
@@ -1027,6 +1077,8 @@
     (set! (.needs-transcript chat) false)
     (set! (.status w) "new")
     (set! (.history-focus w) false)
+    (set! (.sidebar-focus w) false)
+    (set! (.sidebar-sv w) (scroll-view-new))
     (set! (.view d) (ViewPersonal))
     0))
 
@@ -1035,6 +1087,8 @@
     (tree-free! (field d inspection))
     (set! (.inspection d) (tree-new (.allocator d)))
     (own! d (field w session-id) id)
+    (set! (.sidebar-focus w) false)
+    (set! (.sidebar-sv w) (scroll-view-new))
     (chat-open! (field d personal) id "assistant")
     (set! (.exact (.personal d)) true)
     (set! (.needs-transcript (.personal d)) false)
@@ -1197,53 +1251,65 @@
     (when (network/ready? job)
       (set! (.job w) (cast (ptr network/Job) 0))
       (set! (.starting w) false)
-      (if (= (.kind job) 2)
-          (do
-            (set! (.polled-overview-t d) (.now d))
-            (if (reply-ok? (.reply job))
-                (let [a (snap-spare (field d overview))]
-                  (snap-commit! (field d overview)
-                                (jv-clone a (reply-body (.reply job)))
-                                (.now d))
-                  (sync-selection! d)
-                  (own! d (field (field d hub) base-url) (.base-url (.hub job)))
-                  (set! (.connected w) true)
-                  (own! d (field d hub-error) ""))
-                (do
-                  (set! (.connected w) false)
-                  (own! d
-                        (field d hub-error)
-                        "Factory is disconnected. Use /connect to choose a connection.")))
-            (network/close! (.allocator d) job))
-          (if (reply-ok? (.reply job))
+      (if (= (.kind job) 5)
+          (do (apply-sidebar! d job) (network/close! (.allocator d) job))
+          (if (= (.kind job) 2)
               (do
-                (network/close! (.allocator d) (.active-connection w))
-                (set! (.active-connection w) job)
-                (own! d (field (field d hub) base-url) (.base-url (.hub job)))
-                (own! d (field (field d hub) token) (.token (.hub job)))
-                (own! d (field w connection-name) (.name job))
-                (set! (.connected w) true)
-                (set! (.connections-open w) false)
-                (own! d (field d hub-error) "")
-                (snap-reset! (field d overview))
-                (snap-reset! (field d run))
-                (set! (.polled-overview-t d) 0)
-                (when (not (match (.view d) (ViewPersonal [] true) (_ false)))
-                  (set! (.view d) (ViewOverview))
-                  0)
-                (if (save-profile! d job)
-                    (toast! d "Factory connected." (ToneSuccess))
+                (set! (.polled-overview-t d) (.now d))
+                (if (reply-ok? (.reply job))
+                    (let [a (snap-spare (field d overview))]
+                      (snap-commit! (field d overview)
+                                    (jv-clone a (reply-body (.reply job)))
+                                    (.now d))
+                      (sync-selection! d)
+                      (own! d
+                            (field (field d hub) base-url)
+                            (.base-url (.hub job)))
+                      (set! (.connected w) true)
+                      (own! d (field d hub-error) ""))
+                    (do
+                      (set! (.connected w) false)
+                      (own! d
+                            (field d hub-error)
+                            "Factory is disconnected. Use /connect to choose a connection.")))
+                (network/close! (.allocator d) job))
+              (if (reply-ok? (.reply job))
+                  (do
+                    (network/close! (.allocator d) (.active-connection w))
+                    (set! (.active-connection w) job)
+                    (own! d
+                          (field (field d hub) base-url)
+                          (.base-url (.hub job)))
+                    (own! d (field (field d hub) token) (.token (.hub job)))
+                    (own! d (field w connection-name) (.name job))
+                    (set! (.connected w) true)
+                    (set! (.connections-open w) false)
+                    (own! d (field d hub-error) "")
+                    (snap-reset! (field d overview))
+                    (snap-reset! (field d run))
+                    (snap-reset! (field w sidebar))
+                    (set! (.sidebar-polled w) 0)
+                    (set! (.polled-overview-t d) 0)
+                    (when (not (match (.view d)
+                                 (ViewPersonal [] true)
+                                 (_ false)))
+                      (set! (.view d) (ViewOverview))
+                      0)
+                    (if (save-profile! d job)
+                        (toast! d "Factory connected." (ToneSuccess))
+                        (toast! d
+                                "Factory connected, but the connection profile could not be saved."
+                                (ToneWarning)))
+                    (when (.auto-submit w)
+                      (set! (.auto-submit w) false)
+                      (submit-launch! d))
+                    0)
+                  (do
                     (toast! d
-                            "Factory connected, but the connection profile could not be saved."
-                            (ToneWarning)))
-                (when (.auto-submit w)
-                  (set! (.auto-submit w) false)
-                  (submit-launch! d))
-                0)
-              (do
-                (toast! d (reply-error (.allocator d) (.reply job)) (ToneError))
-                (set! (.auto-submit w) false)
-                (network/close! (.allocator d) job)))))
+                            (reply-error (.allocator d) (.reply job))
+                            (ToneError))
+                    (set! (.auto-submit w) false)
+                    (network/close! (.allocator d) job))))))
     0))
 
 (defn refresh-factory-background! [(d (ptr Dash))] (-> i64)
@@ -1313,3 +1379,73 @@
                                   key)
                0))))
     (Continue)))
+
+(defn focus-sidebar! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)]
+    (set! (.sidebar-visible w) true)
+    (set! (.sidebar-focus w) (not (.sidebar-focus w)))
+    (set! (.sidebar-polled w) 0)
+    0))
+
+(defn sidebar-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)]
+    (match key
+      (Escape [] (set! (.sidebar-focus w) false))
+      (Up [] (scroll-up! (field w sidebar-sv) 1))
+      (Down [] (scroll-down! (field w sidebar-sv) 1))
+      (PageUp [] (scroll-up! (field w sidebar-sv) 10))
+      (PageDown [] (scroll-down! (field w sidebar-sv) 10))
+      (Home [] (scroll-to-top! (field w sidebar-sv)))
+      (End [] (scroll-to-bottom! (field w sidebar-sv)))
+      (_ 0))
+    (Continue)))
+
+(defn sidebar-scope [(d (ptr Dash)) (a (dyn Allocator))] (-> (slice u8))
+  (concat a [(.run (.chat d)) "/" (.agent (.chat d))]))
+
+(defn poll-sidebar! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)]
+    (when (and (> (len (.home w)) 0)
+               (.sidebar-visible w)
+               (match (.view d) (ViewChat [] true) (_ false))
+               (= (cast i64 (.job w)) 0)
+               (>= (- (.now d) (.sidebar-polled w)) 1000))
+      (let [a (io-allocator d)]
+        (set! (.sidebar-polled w) (.now d))
+        (set! (.job w)
+              (network/fetch (.allocator d)
+                             (.home w)
+                             (.hub d)
+                             (sidebar-scope d a)
+                             (run-path a
+                                       (.run (.chat d))
+                                       (concat a
+                                               ["/agents/"
+                                                (.agent (.chat d))
+                                                "/sidebar"]))
+                             (.active-connection w)))))
+    0))
+
+(defn apply-sidebar! [(d (ptr Dash)) (job (ptr network/Job))] (-> i64)
+  (let [w (field d workbench)
+        a (io-allocator d)]
+    ;; Ignore a result for an agent the user has already left.
+    (when (and (match (.view d) (ViewChat [] true) (_ false))
+               (= (.name job) (sidebar-scope d a)))
+      (let [sa (snap-spare (field w sidebar))
+            doc
+              (if (reply-ok? (.reply job))
+                  (jv-clone sa (reply-body (.reply job)))
+                  (let [old (.value (field w sidebar))]
+                    (if (jv-null? old) (jv-object sa) (jv-clone sa old))))]
+        (when (not (reply-ok? (.reply job)))
+          (jv-put! doc
+                   "error"
+                   (JStr (copy-bytes sa
+                                     "Context is unavailable; showing the last saved board.")))
+          0)
+        (snap-commit! (field w sidebar) doc (.now d))
+        (when (reply-ok? (.reply job))
+          (own! d (field (field d hub) base-url) (.base-url (.hub job)))
+          0)))
+    0))

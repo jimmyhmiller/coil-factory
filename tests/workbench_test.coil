@@ -12,11 +12,14 @@
 (import "coil.serde.value" :use *)
 (import "factory.ui.model" :use *)
 (import "factory.ui.dashboard" :use *)
+(import "factory.ui.chat" :use [chat-open!])
 (import "factory.ui.workbench" :as workbench)
 (import "factory.ui.network" :as network)
 (import "factory.ui-views-test" :use [str-contains?])
 (import "agent.loop" :use [sleep-ms])
 (import "factory.session-test" :use [fresh-home])
+(import "factory.sidebar" :as context)
+(import "factory.sidebar-test" :use [json ok])
 
 (defn standalone [(a (dyn Allocator)) (tag (slice u8))] (-> (ptr Dash))
   (let [d (box! a Dash (zeroed Dash))]
@@ -194,3 +197,94 @@
     (dashboard-key! d (Enter))
     (assert (not (.confirm-stop d)))
     (assert (not (.commands-open d)))))
+
+(deftest context-sidebar-updates-live-persists-and-never-leaks-across-conversations
+  (let [a (malloc-allocator)
+        d (standalone a "context-board")
+        w (field d workbench)
+        id
+          (match (session/create! a
+                                  (.home w)
+                                  "claude"
+                                  "haiku"
+                                  (.home w)
+                                  "Benchmark session")
+            (Ok [id] id)
+            (_ (do (assert false) "")))
+        root (session/path a (.home w) id "")]
+    (ok (context/update! a
+                         root
+                         "assistant"
+                         2
+                         (json a
+                               "{\"section\":\"results\",\"title\":\"Benchmark\",\"items\":[{\"id\":\"latest\",\"text\":\"42 ms\"}]}")))
+    (set! (.now d) 1000)
+    (open-personal! d id)
+    (dashboard-key! d (Paste "my draft"))
+    (let [screen (app-snapshot d 120 30 0 a)]
+      (assert (str-contains? screen "Context"))
+      (assert (str-contains? screen "Benchmark"))
+      (assert (str-contains? screen "42 ms")))
+    (ok (context/update! a
+                         root
+                         "assistant"
+                         3
+                         (json a
+                               "{\"section\":\"results\",\"id\":\"latest\",\"text\":\"31 ms\",\"status\":\"done\"}")))
+    (set! (.now d) 1400)
+    (poll-personal! d)
+    (assert (str-contains? (app-snapshot d 120 30 0 a) "31 ms"))
+    (assert (= (input-text (field (field d personal) input)) "my draft"))
+    (new-personal! d)
+    (assert (not (str-contains? (app-snapshot d 120 30 0 a) "31 ms")))
+    (set! (.now d) 1800)
+    (open-personal! d id)
+    (assert (str-contains? (app-snapshot d 120 30 0 a) "31 ms"))
+    (dashboard-key! d (Paste "/history"))
+    (dashboard-key! d (Enter))
+    (assert (str-contains? (app-snapshot d 80 24 0 a) "Benchmark session"))
+    (dashboard-key! d (Escape))
+    (dashboard-key! d (Paste "/sidebar"))
+    (dashboard-key! d (Enter))
+    (assert (.sidebar-focus w))
+    (for size (iter [0 1 4 20 40]) (app-snapshot d size size 0 a))
+    (assert (str-contains? (app-snapshot d 40 20 0 a) "31 ms"))
+    (dashboard-key! d (Escape))
+    (assert (not (.sidebar-focus w)))
+    (dashboard-key! d (Paste "/sidebar-hide"))
+    (dashboard-key! d (Enter))
+    (assert (not (.sidebar-visible w)))))
+
+(deftest remote-sidebar-results-ignore-old-agents-and-preserve-last-board-on-failure
+  (let [a (malloc-allocator)
+        d (standalone a "context-remote")
+        w (field d workbench)
+        job (box! a network/Job (zeroed network/Job))
+        doc
+          (json a
+                "{\"version\":1,\"revision\":2,\"sections\":[{\"id\":\"bench\",\"title\":\"Latest\",\"items\":[{\"id\":\"result\",\"text\":\"31 ms\"}]}]}")]
+    (chat-open! (field d chat) "run-123" "assistant")
+    (set! (.view d) (ViewChat))
+    (set! (.name job) "run-123/assistant")
+    (set! (.hub job) (.hub d))
+    (set! (.reply job)
+          (client/ReplyOk
+            :status 200
+            :body doc
+            :text ""))
+    (apply-sidebar! d job)
+    (assert-eq (jv-int (jv-get (.value (.sidebar w)) "revision")) 2)
+    (set! (.name job) "other-run/assistant")
+    (set! (.reply job)
+          (client/ReplyOk
+            :status 200
+            :body (jv-object a)
+            :text ""))
+    (apply-sidebar! d job)
+    (assert-eq (jv-int (jv-get (.value (.sidebar w)) "revision")) 2)
+    (set! (.name job) "run-123/assistant")
+    (set! (.reply job) (client/ReplyFailed "offline"))
+    (apply-sidebar! d job)
+    (assert-eq (jv-int (jv-get (.value (.sidebar w)) "revision")) 2)
+    (assert (str-contains? (app-snapshot d 110 30 0 a) "31 ms"))
+    (assert (> (len (context/text (.value (.sidebar w)) "error")) 0))))
