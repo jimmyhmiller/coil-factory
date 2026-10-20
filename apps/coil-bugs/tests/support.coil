@@ -34,4 +34,4 @@
       (println "sh failed: {s}\n{s}{s}" script (.output result) (.error result))
       (assert false)
       0)
-    (str-trim (.output result))))
+    (trim (.output result))))

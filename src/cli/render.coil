@@ -1,7 +1,6 @@
 (module factory.cli.render)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -14,14 +13,14 @@
 ;;; vocabulary shared by `ps`, `show`, `watch`, and `ask`.
 
 (defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) n)
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) n)
+    (finish! (mut out))))
 
 (defn str-field [(value JVal) (key (slice u8))] (-> (slice u8))
   (jv-string-or (jv-get value key) ""))
@@ -32,17 +31,34 @@
 (defn bool-field [(value JVal) (key (slice u8))] (-> bool)
   (match (jv-get value key) (JBool [b] b) (_ false)))
 
-(defn amber [] (-> style/Color) (style/rgb 229 181 103))
-(defn violet [] (-> style/Color) (style/rgb 180 142 255))
-(defn soft-blue [] (-> style/Color) (style/rgb 122 162 247))
-(defn soft-green [] (-> style/Color) (style/rgb 158 206 106))
-(defn soft-red [] (-> style/Color) (style/rgb 247 118 142))
-(defn slate [] (-> style/Color) (style/rgb 120 124 153))
+(defn amber [] (-> style/Color)
+  (style/rgb 229 181 103))
 
-(defn paint-fg [(a (dyn Allocator)) (term style/Term) (color style/Color) (text (slice u8))] (-> (slice u8))
+(defn violet [] (-> style/Color)
+  (style/rgb 180 142 255))
+
+(defn soft-blue [] (-> style/Color)
+  (style/rgb 122 162 247))
+
+(defn soft-green [] (-> style/Color)
+  (style/rgb 158 206 106))
+
+(defn soft-red [] (-> style/Color)
+  (style/rgb 247 118 142))
+
+(defn slate [] (-> style/Color)
+  (style/rgb 120 124 153))
+
+(defn paint-fg [(a (dyn Allocator))
+                (term style/Term)
+                (color style/Color)
+                (text (slice u8))] (-> (slice u8))
   (style/paint a term (style/fg color) text))
 
-(defn paint-bold [(a (dyn Allocator)) (term style/Term) (color style/Color) (text (slice u8))] (-> (slice u8))
+(defn paint-bold [(a (dyn Allocator))
+                  (term style/Term)
+                  (color style/Color)
+                  (text (slice u8))] (-> (slice u8))
   (style/paint a term (style/bold (style/fg color)) text))
 
 (defn status-color [(status (slice u8))] (-> style/Color)
@@ -71,11 +87,13 @@
         (= status "queued") (pick term "○" "o")
         :else (pick term "○" "o")))
 
-(defn status-glyph [(a (dyn Allocator)) (term style/Term) (status (slice u8))] (-> (slice u8))
+(defn status-glyph [(a (dyn Allocator)) (term style/Term) (status (slice u8))]
+  (-> (slice u8))
   (paint-fg a term (status-color status) (status-glyph-text term status)))
 
 ;;; "blocked" and "approval" read as a call to action.
-(defn status-word [(a (dyn Allocator)) (term style/Term) (status (slice u8))] (-> (slice u8))
+(defn status-word [(a (dyn Allocator)) (term style/Term) (status (slice u8))]
+  (-> (slice u8))
   (cond (= status "blocked") (paint-bold a term (amber) "needs you")
         (= status "approval") (paint-bold a term (amber) "needs your approval")
         :else (paint-fg a term (status-color status) status)))
@@ -87,7 +105,9 @@
   (if (<= then 0) "—" (style/relative-time a (- (now-wall-ms) then))))
 
 (defn tokens [(a (dyn Allocator)) (run JVal)] (-> (slice u8))
-  (style/human-count a (+ (int-field run "input_tokens") (int-field run "output_tokens"))))
+  (style/human-count a
+                     (+ (int-field run "input_tokens")
+                        (int-field run "output_tokens"))))
 
 ;;; "build 2/3", or "—" before any station started.
 (defn station-progress [(a (dyn Allocator)) (run JVal)] (-> (slice u8))
@@ -98,8 +118,11 @@
         (mut i) 0]
     (loop (if (>= (load i) n)
               (break)
-              (do (when (= (str-field (jv-nth stations (load i)) "name") current) (set! index (+ (load i) 1)) 0)
-                  (set! i (+ (load i) 1)))))
+              (do
+                (when (= (str-field (jv-nth stations (load i)) "name") current)
+                  (set! index (+ (load i) 1))
+                  0)
+                (set! i (+ (load i) 1)))))
     (if (= (len current) 0)
         "—"
         (join a [current " " (int-text a (load index)) "/" (int-text a n)]))))
@@ -114,21 +137,30 @@
     (loop (if (>= (load i) (jv-count agents))
               (break)
               (let [agent (jv-nth agents (load i))]
-                (when (= (str-field agent "name") current) (set! activity (str-field agent "activity")) 0)
+                (when (= (str-field agent "name") current)
+                  (set! activity (str-field agent "activity"))
+                  0)
                 (set! i (+ (load i) 1)))))
-    (cond (and (> (len (str-field run "reason")) 0) (not (= status "running"))) (str-field run "reason")
+    (cond (and (> (len (str-field run "reason")) 0) (not (= status "running")))
+            (str-field run "reason")
           (= status "queued") "waiting for capacity"
           (> (len (load activity)) 0) (load activity)
           :else "")))
 
-(defn truncate [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+(defn truncate [(a (dyn Allocator)) (text (slice u8)) (width i64)]
+  (-> (slice u8))
   (if (<= (style/display-width text) width)
       text
       (preview a text (if (> width 1) (- width 1) 1))))
 
 (defn clock [(a (dyn Allocator)) (t i64)] (-> (slice u8))
   (let [local (local-hms t)]
-    (join a [(two a (/ local 3600)) ":" (two a (% (/ local 60) 60)) ":" (two a (% local 60))])))
+    (join a
+          [(two a (/ local 3600))
+           ":"
+           (two a (% (/ local 60) 60))
+           ":"
+           (two a (% local 60))])))
 
 (defn two [(a (dyn Allocator)) (n i64)] (-> (slice u8))
   (if (< n 10) (join a ["0" (int-text a n)]) (int-text a n)))
@@ -137,131 +169,493 @@
 
 ;;; Seconds since local midnight for a wall-clock millisecond time.
 (defn local-hms [(t i64)] (-> i64)
-  (let [seconds (primitive/alloc-stack i64)
-        tm (primitive/alloc-stack (array u8 64))]
-    (store! seconds (/ t 1000))
-    (localtime_r seconds (cast (ptr u8) tm))
-    (let [fields (cast (ptr i32) tm)]
-      (+ (* 3600 (cast i64 (load (primitive/index fields 2))))
-         (+ (* 60 (cast i64 (load (primitive/index fields 1))))
-            (cast i64 (load (primitive/index fields 0))))))))
+  (let [(mut seconds) (: (/ t 1000) i64)
+        (mut tm) (zeroed (array u8 64))]
+    (localtime_r (mut seconds) (cast (ptr u8) (mut tm)))
+    (let [fields (cast (ptr i32) (mut tm))]
+      (+ (* 3600 (cast i64 (load (index fields 2))))
+         (+ (* 60 (cast i64 (load (index fields 1))))
+            (cast i64 (load (index fields 0))))))))
 
 ;;; One journal record as one readable line, or "" for records not worth a
 ;;; line of their own.
-(defn event-line [(a (dyn Allocator)) (term style/Term) (record JVal) (verbose bool)] (-> (slice u8))
+(defn event-line [(a (dyn Allocator))
+                  (term style/Term)
+                  (record JVal)
+                  (verbose bool)] (-> (slice u8))
   (let [kind (str-field record "kind")
         agent (str-field record "agent")
-        who (paint-fg a term (soft-blue) (style/pad-right a (if (> (len agent) 0) agent "run") 10))
+        who
+          (paint-fg a
+                    term
+                    (soft-blue)
+                    (style/pad-right a (if (> (len agent) 0) agent "run") 10))
         when (style/muted a term (clock a (int-field record "t")))]
-    (cond
-      (= kind "run.created") (join a [when "  " who "  " (style/strong a term "created") " " (str-field record "factory")
-                                      (style/muted a term (join a [" on " (str-field record "site")]))])
-      (= kind "run.started") (join a [when "  " who "  " (style/strong a term "started")
-                                      (style/muted a term (join a [" from " (preview a (str-field record "base") 10)]))])
-      (= kind "run.finished")
-        (let [status (str-field record "status")]
-          (join a [when "  " who "  " (status-glyph a term status) " " (status-word a term status)
-                   (if (> (len (str-field record "reason")) 0)
-                       (style/muted a term (join a ["  " (first-line a (str-field record "reason") 160)]))
-                       "")]))
-      (= kind "run.lost") (join a [when "  " who "  " (paint-fg a term (soft-red) "lost") " "
-                                   (style/muted a term (str-field record "reason"))])
-      (= kind "run.requeued") (join a [when "  " who "  " (style/muted a term "requeued")])
-      (= kind "station.started")
-        (join a [when "  " who "  " (paint-bold a term (violet) "▶ station") " " agent
-                 (if (bool-field record "resumed") (style/muted a term " (resumed)") "")])
-      (= kind "station.finished")
-        (let [outcome (str-field record "outcome")]
-          (join a [when "  " who "  " (status-glyph a term outcome) " " (paint-fg a term (status-color outcome) outcome)
-                   "  " (first-line a (str-field record "summary") 140)]))
-      (= kind "gate.started") (join a [when "  " who "  " (paint-fg a term (violet) "⛩ gate") " "
-                                       (style/accent a term (str-field record "command"))])
-      (= kind "gate.finished")
-        (if (bool-field record "ok")
-            (join a [when "  " who "  " (style/ok a term "⛩ gate passed")])
-            (join a [when "  " who "  " (style/err a term (join a ["⛩ gate failed (exit " (int-text a (int-field record "exit")) ")"]))
-                     (if verbose (join a ["\n" (style/muted a term (str-field record "output"))]) "")]))
-      (= kind "agent.turn") (if verbose (join a [when "  " who "  " (style/muted a term (join a ["⟳ turn " (int-text a (int-field record "turn"))]))]) "")
-      (= kind "agent.text") (join a [when "  " who "  " (pick term "💬 " "> ") (first-line a (str-field record "text") 200)])
-      (= kind "agent.thought") (if verbose (join a [when "  " who "  " (style/muted a term (join a [(pick term "💭 " "~ ") (first-line a (str-field record "text") 200)]))]) "")
-      (= kind "agent.retry") (join a [when "  " who "  " (style/warn a term (join a ["model retry " (int-text a (int-field record "attempt")) ": "]))
-                                      (first-line a (str-field record "message") 120)])
-      (= kind "agent.usage") ""
-      (= kind "agent.usage-unknown") (join a [when "  " who "  " (style/warn a term "token usage unknown, totals are low: ")
-                                              (first-line a (str-field record "reason") 160)])
-      (= kind "agent.paused") (join a [when "  " who "  " (style/warn a term "‖ paused")])
-      (= kind "agent.resumed") (join a [when "  " who "  " (style/ok a term "▶ resumed")])
-      (= kind "tool.started") (if (= (str-field record "tool") "finish") ""
-                                  (join a [when "  " who "  " (style/accent a term (str-field record "summary"))]))
-      (= kind "tool.finished")
-        (if (bool-field record "ok")
-            (if verbose (join a [when "  " who "  " (style/muted a term (join a ["  ↳ ok " (int-text a (int-field record "ms")) "ms  " (first-line a (str-field record "output") 120)]))]) "")
-            (join a [when "  " who "  " (style/err a term "  ↳ failed ") (first-line a (str-field record "output") 150)]))
-      (= kind "message.sent") (join a [when "  " who "  " (paint-bold a term (amber) (join a ["✉ " (str-field record "from") " → " agent ": "]))
-                                       (first-line a (str-field record "text") 200)])
-      (= kind "message.received") (join a [when "  " who "  " (style/muted a term "✉ read the message")])
-      (= kind "conversation.started") (join a [when "  " who "  " (style/muted a term "in conversation")])
-      (= kind "conversation.finished") (join a [when "  " who "  " (pick term "💬 " "> ") (first-line a (str-field record "reply") 200)])
-      (= kind "control") (join a [when "  " who "  " (style/warn a term (join a [(str-field record "action") " requested"]))
-                                  (let [by (str-field record "by")] (if (> (len by) 0) (style/muted a term (join a [" by " by])) ""))])
-      (= kind "finding")
-        (let [severity (str-field record "severity")
-              reviewer (str-field record "reviewer")]
-          (join a [when "  " (paint-fg a term (amber) (style/pad-right a (if (> (len reviewer) 0) reviewer "overseer") 10)) "  "
-                   (if (= severity "alert") (style/err a term "✗ ") (style/warn a term "⚠ "))
-                   (paint-bold a term (if (= severity "alert") (soft-red) (amber)) (str-field record "code")) "  "
-                   (first-line a (str-field record "message") 200)]))
-      (= kind "oversight")
-        (let [verdict (str-field record "verdict")
-              level (str-field record "level")]
-          (if (or verbose (not (= level "ok")))
-              (join a [when "  " (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
-                       (cond (= level "ok") (style/ok a term (join a ["✓ " verdict]))
-                             (= level "alert") (style/err a term (join a ["✗ " verdict]))
-                             :else (style/warn a term (join a ["◉ " verdict]))) "  "
-                       (style/muted a term (first-line a (str-field record "reason") 160))])
-              ""))
-      (= kind "approval.summarizing")
-        (join a [when "  " who "  " (paint-fg a term (violet) "✍ summarizing for Jimmy")
-                 (style/muted a term (join a [" (" (str-field record "approval_kind") ", round " (int-text a (int-field record "round")) ")"]))])
-      (= kind "approval.requested")
-        (join a [when "  " who "  " (paint-bold a term (amber) "◆ waiting for your approval  ")
-                 (style/accent a term (str-field record "url"))
-                 "\n" (style/muted a term (join a ["            " (first-line a (str-field record "title") 140)]))])
-      (= kind "approval.decided")
-        (cond (= (str-field record "approval_kind") "question")
-                (join a [when "  " who "  " (paint-bold a term (amber) "◆ Jimmy answered; sent to the agent")])
-              (bool-field record "approved_all")
-                (join a [when "  " who "  " (style/ok a term "✓ Jimmy approved")])
-              :else
-                (join a [when "  " who "  " (paint-bold a term (amber) "◆ Jimmy sent it back to the agent")]))
-      (= kind "approval.withdrawn")
-        (join a [when "  " who "  " (style/warn a term "approval withdrawn") "  " (first-line a (str-field record "reason") 160)])
-      (= kind "approval.unreachable")
-        (join a [when "  " who "  " (style/err a term "approvals unreachable (still waiting)") "  " (first-line a (str-field record "message") 160)])
-      (= kind "review.started")
-        (join a [when "  " who "  " (paint-fg a term (violet) "⚖ review") " "
-                 (style/accent a term (str-field record "reviewers"))
-                 (style/muted a term (join a [" (round " (int-text a (int-field record "round")) ")"]))])
-      (= kind "review.verdict")
-        (let [level (str-field record "level")
-              failure (str-field record "failure")]
-          (join a [when "  " who "  "
-                   (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
-                   (cond (> (len failure) 0) (style/err a term "✗ no verdict")
-                         (= level "ok") (style/ok a term (join a ["✓ " (str-field record "verdict")]))
-                         :else (style/err a term (join a ["✗ " (str-field record "verdict")])))
-                   "  " (first-line a (if (> (len failure) 0) failure (str-field record "reason")) 200)]))
-      (= kind "review.round")
-        (if (bool-field record "approved")
-            (join a [when "  " who "  " (style/ok a term "⚖ approved")])
-            (join a [when "  " who "  " (style/err a term "⚖ sent back to the agent")]))
-      (= kind "oversight.failed")
-        (join a [when "  " (paint-fg a term (amber) (style/pad-right a (str-field record "reviewer") 10)) "  "
-                 (style/err a term "✗ reviewer failed") "  "
-                 (first-line a (str-field record "message") 200)])
-      :else (if verbose (join a [when "  " who "  " (style/muted a term kind)]) ""))))
+    (cond (= kind "run.created")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/strong a term "created")
+                   " "
+                   (str-field record "factory")
+                   (style/muted a
+                                term
+                                (join a [" on " (str-field record "site")]))])
+          (= kind "run.started")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/strong a term "started")
+                   (style/muted a
+                                term
+                                (join a
+                                      [" from "
+                                       (preview a (str-field record "base") 10)]))])
+          (= kind "run.finished")
+            (let [status (str-field record "status")]
+              (join a
+                    [when
+                     "  "
+                     who
+                     "  "
+                     (status-glyph a term status)
+                     " "
+                     (status-word a term status)
+                     (if (> (len (str-field record "reason")) 0)
+                         (style/muted a
+                                      term
+                                      (join a
+                                            ["  "
+                                             (first-line a
+                                                         (str-field record
+                                                                    "reason")
+                                                         160)]))
+                         "")]))
+          (= kind "run.lost")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-fg a term (soft-red) "lost")
+                   " "
+                   (style/muted a term (str-field record "reason"))])
+          (= kind "run.requeued")
+            (join a [when "  " who "  " (style/muted a term "requeued")])
+          (= kind "station.started")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-bold a term (violet) "▶ station")
+                   " "
+                   agent
+                   (if (bool-field record "resumed")
+                       (style/muted a term " (resumed)")
+                       "")])
+          (= kind "station.finished")
+            (let [outcome (str-field record "outcome")]
+              (join a
+                    [when
+                     "  "
+                     who
+                     "  "
+                     (status-glyph a term outcome)
+                     " "
+                     (paint-fg a term (status-color outcome) outcome)
+                     "  "
+                     (first-line a (str-field record "summary") 140)]))
+          (= kind "gate.started")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-fg a term (violet) "⛩ gate")
+                   " "
+                   (style/accent a term (str-field record "command"))])
+          (= kind "gate.finished")
+            (if (bool-field record "ok")
+                (join a
+                      [when "  " who "  " (style/ok a term "⛩ gate passed")])
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/err a
+                                  term
+                                  (join a
+                                        ["⛩ gate failed (exit "
+                                         (int-text a (int-field record "exit"))
+                                         ")"]))
+                       (if verbose
+                           (join a
+                                 ["\n"
+                                  (style/muted a
+                                               term
+                                               (str-field record "output"))])
+                           "")]))
+          (= kind "agent.turn")
+            (if verbose
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/muted a
+                                    term
+                                    (join a
+                                          ["⟳ turn "
+                                           (int-text a
+                                                     (int-field record "turn"))]))])
+                "")
+          (= kind "agent.text")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (pick term "💬 " "> ")
+                   (first-line a (str-field record "text") 200)])
+          (= kind "agent.thought")
+            (if verbose
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/muted a
+                                    term
+                                    (join a
+                                          [(pick term "💭 " "~ ")
+                                           (first-line a
+                                                       (str-field record "text")
+                                                       200)]))])
+                "")
+          (= kind "agent.retry")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/warn a
+                               term
+                               (join a
+                                     ["model retry "
+                                      (int-text a (int-field record "attempt"))
+                                      ": "]))
+                   (first-line a (str-field record "message") 120)])
+          (= kind "agent.usage") ""
+          (= kind "agent.streaming") ""
+          (= kind "agent.usage-unknown")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/warn a term "token usage unknown, totals are low: ")
+                   (first-line a (str-field record "reason") 160)])
+          (= kind "agent.paused")
+            (join a [when "  " who "  " (style/warn a term "‖ paused")])
+          (= kind "agent.resumed")
+            (join a [when "  " who "  " (style/ok a term "▶ resumed")])
+          (= kind "tool.started")
+            (if (= (str-field record "tool") "finish")
+                ""
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/accent a term (str-field record "summary"))]))
+          (= kind "tool.finished")
+            (if (bool-field record "ok")
+                (if verbose
+                    (join a
+                          [when
+                           "  "
+                           who
+                           "  "
+                           (style/muted a
+                                        term
+                                        (join a
+                                              ["  ↳ ok "
+                                               (int-text a
+                                                         (int-field record "ms"))
+                                               "ms  "
+                                               (first-line a
+                                                           (str-field record
+                                                                      "output")
+                                                           120)]))])
+                    "")
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/err a term "  ↳ failed ")
+                       (first-line a (str-field record "output") 150)]))
+          (= kind "message.sent")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-bold a
+                               term
+                               (amber)
+                               (join a
+                                     ["✉ "
+                                      (str-field record "from")
+                                      " → "
+                                      agent
+                                      ": "]))
+                   (first-line a (str-field record "text") 200)])
+          (= kind "message.received")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/muted a term "✉ read the message")])
+          (= kind "conversation.started")
+            (join a [when "  " who "  " (style/muted a term "in conversation")])
+          (= kind "conversation.finished")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (pick term "💬 " "> ")
+                   (first-line a (str-field record "reply") 200)])
+          (= kind "control")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/warn a
+                               term
+                               (join a
+                                     [(str-field record "action") " requested"]))
+                   (let [by (str-field record "by")]
+                     (if (> (len by) 0)
+                         (style/muted a term (join a [" by " by]))
+                         ""))])
+          (= kind "finding")
+            (let [severity (str-field record "severity")
+                  reviewer (str-field record "reviewer")]
+              (join a
+                    [when
+                     "  "
+                     (paint-fg a
+                               term
+                               (amber)
+                               (style/pad-right a
+                                                (if (> (len reviewer) 0)
+                                                    reviewer
+                                                    "overseer")
+                                                10))
+                     "  "
+                     (if (= severity "alert")
+                         (style/err a term "✗ ")
+                         (style/warn a term "⚠ "))
+                     (paint-bold a
+                                 term
+                                 (if (= severity "alert") (soft-red) (amber))
+                                 (str-field record "code"))
+                     "  "
+                     (first-line a (str-field record "message") 200)]))
+          (= kind "oversight")
+            (let [verdict (str-field record "verdict")
+                  level (str-field record "level")]
+              (if (or verbose (not (= level "ok")))
+                  (join a
+                        [when
+                         "  "
+                         (paint-fg a
+                                   term
+                                   (amber)
+                                   (style/pad-right a
+                                                    (str-field record
+                                                               "reviewer")
+                                                    10))
+                         "  "
+                         (cond (= level "ok")
+                                 (style/ok a term (join a ["✓ " verdict]))
+                               (= level "alert")
+                                 (style/err a term (join a ["✗ " verdict]))
+                               :else
+                                 (style/warn a term (join a ["◉ " verdict])))
+                         "  "
+                         (style/muted a
+                                      term
+                                      (first-line a
+                                                  (str-field record "reason")
+                                                  160))])
+                  ""))
+          (= kind "approval.summarizing")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-fg a term (violet) "✍ summarizing for Jimmy")
+                   (style/muted a
+                                term
+                                (join a
+                                      [" ("
+                                       (str-field record "approval_kind")
+                                       ", round "
+                                       (int-text a (int-field record "round"))
+                                       ")"]))])
+          (= kind "approval.requested")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-bold a term (amber) "◆ waiting for your approval  ")
+                   (style/accent a term (str-field record "url"))
+                   "\n"
+                   (style/muted a
+                                term
+                                (join a
+                                      ["            "
+                                       (first-line a
+                                                   (str-field record "title")
+                                                   140)]))])
+          (= kind "approval.decided")
+            (cond (= (str-field record "approval_kind") "question")
+                    (join a
+                          [when
+                           "  "
+                           who
+                           "  "
+                           (paint-bold a
+                                       term
+                                       (amber)
+                                       "◆ Jimmy answered; sent to the agent")])
+                  (bool-field record "approved_all")
+                    (join a
+                          [when
+                           "  "
+                           who
+                           "  "
+                           (style/ok a term "✓ Jimmy approved")])
+                  :else
+                    (join a
+                          [when
+                           "  "
+                           who
+                           "  "
+                           (paint-bold a
+                                       term
+                                       (amber)
+                                       "◆ Jimmy sent it back to the agent")]))
+          (= kind "approval.withdrawn")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/warn a term "approval withdrawn")
+                   "  "
+                   (first-line a (str-field record "reason") 160)])
+          (= kind "approval.unreachable")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (style/err a term "approvals unreachable (still waiting)")
+                   "  "
+                   (first-line a (str-field record "message") 160)])
+          (= kind "review.started")
+            (join a
+                  [when
+                   "  "
+                   who
+                   "  "
+                   (paint-fg a term (violet) "⚖ review")
+                   " "
+                   (style/accent a term (str-field record "reviewers"))
+                   (style/muted a
+                                term
+                                (join a
+                                      [" (round "
+                                       (int-text a (int-field record "round"))
+                                       ")"]))])
+          (= kind "review.verdict")
+            (let [level (str-field record "level")
+                  failure (str-field record "failure")]
+              (join a
+                    [when
+                     "  "
+                     who
+                     "  "
+                     (paint-fg a
+                               term
+                               (amber)
+                               (style/pad-right a
+                                                (str-field record "reviewer")
+                                                10))
+                     "  "
+                     (cond (> (len failure) 0)
+                             (style/err a term "✗ no verdict")
+                           (= level "ok")
+                             (style/ok a
+                                       term
+                                       (join a
+                                             ["✓ "
+                                              (str-field record "verdict")]))
+                           :else
+                             (style/err a
+                                        term
+                                        (join a
+                                              ["✗ "
+                                               (str-field record "verdict")])))
+                     "  "
+                     (first-line a
+                                 (if (> (len failure) 0)
+                                     failure
+                                     (str-field record "reason"))
+                                 200)]))
+          (= kind "review.round")
+            (if (bool-field record "approved")
+                (join a [when "  " who "  " (style/ok a term "⚖ approved")])
+                (join a
+                      [when
+                       "  "
+                       who
+                       "  "
+                       (style/err a term "⚖ sent back to the agent")]))
+          (= kind "oversight.failed")
+            (join a
+                  [when
+                   "  "
+                   (paint-fg a
+                             term
+                             (amber)
+                             (style/pad-right a
+                                              (str-field record "reviewer")
+                                              10))
+                   "  "
+                   (style/err a term "✗ reviewer failed")
+                   "  "
+                   (first-line a (str-field record "message") 200)])
+          :else
+            (if verbose
+                (join a [when "  " who "  " (style/muted a term kind)])
+                ""))))
 
 ;;; `fancy` on a Unicode terminal, `plain` otherwise.
-(defn pick [(term style/Term) (fancy (slice u8)) (plain (slice u8))] (-> (slice u8))
+(defn pick [(term style/Term) (fancy (slice u8)) (plain (slice u8))]
+  (-> (slice u8))
   (if (.unicode term) fancy plain))

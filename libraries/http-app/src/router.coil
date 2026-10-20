@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.http.server" :as http)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "http_app.native" :as native)
@@ -50,7 +49,7 @@
 ;;; client disconnected, the server is stopping, or the response never started.
 (deftrait ResponseStream [Self]
   (stream-next [(self (ptr Self)) (allocator (dyn Allocator)) (idle-ms i64)]
-               (-> StreamStep))
+    (-> StreamStep))
   (stream-release [(self (ptr Self)) (reason StreamEndReason)] (-> i64)))
 
 (defstruct Response
@@ -61,17 +60,17 @@
    (stream (Option (dyn ResponseStream)))])
 
 (defn no-headers [] (-> (slice ResponseHeader))
-  (slice-new [ResponseHeader] (cast (ptr ResponseHeader) 0) 0))
+  (slice::new [ResponseHeader] (cast (ptr ResponseHeader) 0) 0))
 
 ;;; A buffered response with no extra headers.
-(defn response [(status i64) (content-type (slice u8)) (body (slice u8))] (-> Response)
-  (let [(mut result) (primitive/zeroed Response)]
-    (set! (.status result) status)
-    (set! (.content-type result) content-type)
-    (set! (.body result) body)
-    (set! (.headers result) (no-headers))
-    (set! (.stream result) (None))
-    (load result)))
+(defn response [(status i64) (content-type (slice u8)) (body (slice u8))]
+  (-> Response)
+  (Response
+    :status status
+    :content-type content-type
+    :body body
+    :headers (no-headers)
+    :stream (None)))
 
 ;;; A buffered response with extra headers. The header slice is borrowed.
 (defn response-with-headers [(status i64)
@@ -107,11 +106,11 @@
                            (value (slice u8))] (-> Response)
   (let [old (.headers reply)
         n (len old)
-        (mut grown) (al-new [ResponseHeader] a)
-        (mut header) (primitive/zeroed ResponseHeader)
+        (mut grown) (ArrayList::new [ResponseHeader] a)
+        (mut header) (zeroed ResponseHeader)
         (mut i) 0
         (mut result) (load reply)]
-    (al-reserve! [ResponseHeader] (mut grown) (+ n 1))
+    (reserve! (mut grown) (+ n 1))
     (loop (if (>= (load i) n)
               (break)
               (do
@@ -120,7 +119,7 @@
     (set! (.name header) name)
     (set! (.value header) value)
     (push! [ResponseHeader] (mut grown) (load header))
-    (set! (.headers result) (al-slice [ResponseHeader] grown))
+    (set! (.headers result) (slice grown))
     (load result)))
 
 (defn contains-byte? [(value (slice u8)) (wanted i64)] (-> bool)
@@ -240,7 +239,7 @@
   (handle [(self (ptr Self))
            (allocator (dyn Allocator))
            (request RequestContext)]
-          (-> Response)))
+    (-> Response)))
 
 ;;; Produces the responses the router and server generate themselves (404, 405,
 ;;; 400, 408, 413, 431, 500, 503, 505). `code` is a stable snake_case identifier
@@ -251,7 +250,7 @@
                    (status i64)
                    (code (slice u8))
                    (message (slice u8))]
-                  (-> Response)))
+    (-> Response)))
 
 (defstruct Route
   [(method (slice u8))
@@ -264,14 +263,13 @@
    (errors (Option (dyn ErrorResponder)))])
 
 (defn router-new [(allocator (dyn Allocator))] (-> Router)
-  (let [(mut result) (primitive/zeroed Router)]
-    (set! (.routes result) (al-new [Route] allocator))
-    (set! (.allocator result) allocator)
-    (set! (.errors result) (None))
-    (load result)))
+  (Router
+    :routes (ArrayList::new [Route] allocator)
+    :allocator allocator
+    :errors (None)))
 
 (defn router-free! [(router (ptr Router))] (-> i64)
-  (al-free! [Route] (mut (.routes router))))
+  (free! (mut (.routes router))))
 
 ;;; Use `responder` for every router- and server-generated error response. The
 ;;; concrete responder must outlive the router.
@@ -296,7 +294,7 @@
   (and (> (len method) 0)
        (> (len pattern) 0)
        (= (cast i64 (get pattern 0)) 47)
-       (not (match (str-find pattern "?")
+       (not (match (find pattern "?")
               (Some [at] true)
               (None [] false)))))
 
@@ -321,7 +319,7 @@
                     (set! i (+ (load i) 1)))))
         (if (load duplicate)
             false
-            (let [(mut route) (primitive/zeroed Route)]
+            (let [(mut route) (zeroed Route)]
               (set! (.method route) method)
               (set! (.pattern route) pattern)
               (set! (.handler route) handler)
@@ -329,12 +327,12 @@
               true)))))
 
 (defn path-of [(target (slice u8))] (-> (slice u8))
-  (match (str-find target "?")
+  (match (find target "?")
     (Some [at] (subslice [u8] target 0 at))
     (None [] target)))
 
 (defn query-of [(target (slice u8))] (-> (slice u8))
-  (match (str-find target "?")
+  (match (find target "?")
     (Some [at] (subslice [u8] target (+ at 1) (len target)))
     (None [] "")))
 
@@ -375,7 +373,7 @@
                 (if (> (len name) 0)
                     (if (= (len vs) 0)
                         (set! matches false)
-                        (let [(mut param) (primitive/zeroed PathParam)]
+                        (let [(mut param) (zeroed PathParam)]
                           (set! (.name param) name)
                           (set! (.value param) vs)
                           (push! [PathParam] (mut params) (load param))
@@ -404,7 +402,8 @@
 
 ;;; Case-insensitive request header lookup that distinguishes an absent header
 ;;; from an empty one. The first occurrence wins.
-(defn header-opt [(ctx RequestContext) (name (slice u8))] (-> (Option (slice u8)))
+(defn header-opt [(ctx RequestContext) (name (slice u8))]
+  (-> (Option (slice u8)))
   (let [request (.request ctx)
         n (http/header-count request)
         (mut i) 0
@@ -440,7 +439,7 @@
   (if (not (or (contains-byte? encoded 37)
                (and plus-as-space (contains-byte? encoded 43))))
       (Some encoded)
-      (let [(mut out) (sb-new a)
+      (let [(mut out) (StrBuf::new a)
             (mut at) 0
             (mut valid) true
             n (len encoded)]
@@ -461,21 +460,21 @@
                                   (if (or (< hi 0) (< lo 0))
                                       (set! valid false)
                                       (do
-                                        (sb-push-byte! (mut out)
-                                                       (cast u8
-                                                             (+ (* hi 16) lo)))
+                                        (push! (mut out)
+                                               (cast u8
+                                                     (+ (* hi 16) lo)))
                                         (set! at (+ (load at) 3))))))
                           (and plus-as-space (= b 43))
                             (do
-                              (sb-push-byte! (mut out) (cast u8 32))
+                              (push! (mut out) (cast u8 32))
                               (set! at (+ (load at) 1)))
                           :else
                             (do
-                              (sb-push-byte! (mut out) (cast u8 b))
+                              (push! (mut out) (cast u8 b))
                               (set! at (+ (load at) 1)))))))
         (if (load valid)
-            (Some (sb-finish! (mut out)))
-            (do (sb-free! (mut out)) (None))))))
+            (Some (finish! (mut out)))
+            (do (free! (mut out)) (None))))))
 
 ;;; Result of looking up one query parameter.
 (defsum QueryLookup
@@ -497,12 +496,12 @@
     (loop (if (> (load start) n)
               (break)
               (let [end
-                      (match (str-find-from query "&" (load start))
+                      (match (find-from query "&" (load start))
                         (Some [at] at)
                         (None [] n))
                     pair (subslice [u8] query (load start) end)
                     eq
-                      (match (str-find pair "=")
+                      (match (find pair "=")
                         (Some [at] at)
                         (None [] -1))
                     raw-key (if (< eq 0) pair (subslice [u8] pair 0 eq))
@@ -530,7 +529,7 @@
           (if (and (> (len value) 7)
                    (ascii-ci-eq (subslice [u8] value 0 6) "bearer")
                    (= (cast i64 (get value 6)) 32))
-              (let [token (str-trim (subslice [u8] value 7 (len value)))]
+              (let [token (trim (subslice [u8] value 7 (len value)))]
                 (if (> (len token) 0) (Some token) (None)))
               (None)))))
 
@@ -554,12 +553,11 @@
 (defn context-for [(request http/Request)
                    (params (slice PathParam))
                    (target (slice u8))] (-> RequestContext)
-  (let [(mut ctx) (primitive/zeroed RequestContext)]
-    (set! (.request ctx) request)
-    (set! (.params ctx) params)
-    (set! (.path ctx) (path-of target))
-    (set! (.query ctx) (query-of target))
-    (load ctx)))
+  (RequestContext
+    :request request
+    :params params
+    :path (path-of target)
+    :query (query-of target)))
 
 ;;; Route `request`, allocating parameters and handler output from `allocator`.
 ;;; No matching pattern yields 404. A pattern that matches under a different
@@ -571,13 +569,13 @@
         path (path-of target)
         (mut i) 0
         count (len (.routes router))
-        (mut allowed) (al-new [(slice u8)] allocator)
-        (mut result) (primitive/zeroed Response)
+        (mut allowed) (ArrayList::new [(slice u8)] allocator)
+        (mut result) (zeroed Response)
         (mut found) false]
     (loop (if (or (>= (load i) count) (load found))
               (break)
               (let [route (get (.routes router) (load i))
-                    (mut params) (al-new [PathParam] allocator)]
+                    (mut params) (ArrayList::new [PathParam] allocator)]
                 (when (match-path allocator (.pattern route) path (mut params))
                   (if (= (http/method request) (.method route))
                       (do
@@ -585,27 +583,27 @@
                               (handle (.handler route)
                                       allocator
                                       (context-for request
-                                                   (al-slice [PathParam] params)
+                                                   (slice params)
                                                    target)))
                         (set! found true))
                       (push! [(slice u8)] (mut allowed) (.method route)))
                   0)
-                (al-free! [PathParam] (mut params))
+                (free! (mut params))
                 (set! i (+ (load i) 1)))))
-    (let [methods (al-slice [(slice u8)] allowed)]
+    (let [methods (slice allowed)]
       (cond (load found) (load result)
             (= (len methods) 0)
               (router-error router allocator 404 "not_found" "not found")
             :else
-              (let [(mut joined) (sb-new allocator)
+              (let [(mut joined) (StrBuf::new allocator)
                     (mut m) 0]
                 (loop (if (>= (load m) (len methods))
                           (break)
                           (do
                             (when (> (load m) 0)
-                              (sb-push-str! (mut joined) ", ")
+                              (push-str! (mut joined) ", ")
                               0)
-                            (sb-push-str! (mut joined) (get methods (load m)))
+                            (push-str! (mut joined) (get methods (load m)))
                             (set! m (+ (load m) 1)))))
                 (response-add-header allocator
                                      (router-error router
@@ -614,7 +612,7 @@
                                                    "method_not_allowed"
                                                    "method not allowed")
                                      "Allow"
-                                     (sb-finish! (mut joined))))))))
+                                     (finish! (mut joined))))))))
 
 ;;; `dispatch-with` using the router's own allocator.
 (defn dispatch [(router (ptr Router)) (request http/Request)] (-> Response)
@@ -669,41 +667,41 @@
                             (framing BodyFraming)] (-> (slice u8))
   (if (not (response-valid? reply))
       ""
-      (let [(mut out) (sb-new a)
+      (let [(mut out) (StrBuf::new a)
             headers (.headers reply)
             (mut i) 0]
-        (sb-push-str! (mut out) "HTTP/1.1 ")
-        (sb-push-i64! (mut out) (.status reply))
-        (sb-push-str! (mut out) " ")
-        (sb-push-str! (mut out) (reason-phrase (.status reply)))
-        (sb-push-str! (mut out) "\r\n")
+        (push-str! (mut out) "HTTP/1.1 ")
+        (push-i64! (mut out) (.status reply))
+        (push-str! (mut out) " ")
+        (push-str! (mut out) (reason-phrase (.status reply)))
+        (push-str! (mut out) "\r\n")
         (when (> (len (.content-type reply)) 0)
-          (sb-push-str! (mut out) "Content-Type: ")
-          (sb-push-str! (mut out) (.content-type reply))
-          (sb-push-str! (mut out) "\r\n")
+          (push-str! (mut out) "Content-Type: ")
+          (push-str! (mut out) (.content-type reply))
+          (push-str! (mut out) "\r\n")
           0)
         (loop (if (>= (load i) (len headers))
                   (break)
                   (let [item (get headers (load i))]
-                    (sb-push-str! (mut out) (.name item))
-                    (sb-push-str! (mut out) ": ")
-                    (sb-push-str! (mut out) (.value item))
-                    (sb-push-str! (mut out) "\r\n")
+                    (push-str! (mut out) (.name item))
+                    (push-str! (mut out) ": ")
+                    (push-str! (mut out) (.value item))
+                    (push-str! (mut out) "\r\n")
                     (set! i (+ (load i) 1)))))
-        (sb-push-str! (mut out) "Connection: close\r\n")
+        (push-str! (mut out) "Connection: close\r\n")
         (match framing
           (FramingLength [length]
                          (when (not (bodiless-status? (.status reply)))
-                           (sb-push-str! (mut out) "Content-Length: ")
-                           (sb-push-i64! (mut out) length)
-                           (sb-push-str! (mut out) "\r\n")
+                           (push-str! (mut out) "Content-Length: ")
+                           (push-i64! (mut out) length)
+                           (push-str! (mut out) "\r\n")
                            0))
           (FramingChunked []
-                          (sb-push-str! (mut out)
-                                        "Transfer-Encoding: chunked\r\n"))
+                          (push-str! (mut out)
+                                     "Transfer-Encoding: chunked\r\n"))
           (FramingClose [] 0))
-        (sb-push-str! (mut out) "\r\n")
-        (sb-finish! (mut out)))))
+        (push-str! (mut out) "\r\n")
+        (finish! (mut out)))))
 
 ;;; Encode a buffered HTTP/1.1 response for a connection the caller will close.
 ;;; Returns "" for an invalid response (see `response-problem`), including header
@@ -718,7 +716,7 @@
                                     (FramingLength (len (.body reply))))]
         (if (= (len head) 0)
             ""
-            (let [(mut out) (sb-new a)]
-              (sb-push-str! (mut out) head)
-              (sb-push-str! (mut out) (.body reply))
-              (sb-finish! (mut out)))))))
+            (let [(mut out) (StrBuf::new a)]
+              (push-str! (mut out) head)
+              (push-str! (mut out) (.body reply))
+              (finish! (mut out)))))))

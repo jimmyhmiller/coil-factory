@@ -18,7 +18,9 @@ Models are named `provider/model` and read their keys from the environment (or
 `~/.factory/secrets.env`): `deepseek/` (`DEEPSEEK_API_KEY`), `openrouter/`,
 `openai/`, `vercel/` (Vercel AI Gateway, `VERCEL_AI_GATEWAY_KEY`), and `zen/`
 (OpenCode Zen, `OPENCODE_KEY`). Free models work like any other, e.g.
-`--model vercel/poolside/laguna-s-2.1-free`.
+`--model vercel/poolside/laguna-s-2.1-free`. `chatgpt/` models
+(`chatgpt/gpt-6-luna`) use a ChatGPT subscription through the login Codex keeps
+(`codex login`), without running Codex.
 
 There is no built-in model. Every station needs one, from `--model`, `model:` in
 the factory or station, or the site's default in `~/.factory/site.json`

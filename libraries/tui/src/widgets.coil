@@ -325,7 +325,7 @@
 ;;; list itself is allocated from `a`. A `width` below 1 yields no lines, since
 ;;; nothing can be shown.
 (defn wrap-text [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (ArrayList (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)]
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
     (when (>= width 1)
       (let [(mut start) 0
             (mut i) 0
@@ -519,14 +519,14 @@
                 (break)
                 (do
                   (set! (index constraints (load i))
-                        (.width (index (slice-data columns) (load i))))
+                        (.width (index (data columns) (load i))))
                   (set! i (+ (load i) 1)))))
       (let [body-h (if (> (.h r) 1) (- (.h r) 1) 0)
             overflow (> nrows body-h)
             inner (rect-drop-left (rect-drop-right r 1) 2)
-            cols (slice-new [Rect] (index rects 0) ncols)]
+            cols (slice::new [Rect] (index rects 0) ncols)]
         (split-horizontal inner
-                          (slice-new [Constraint] (index constraints 0) ncols)
+                          (slice::new [Constraint] (index constraints 0) ncols)
                           gap
                           cols)
         (list-set-count! lv nrows)
@@ -535,7 +535,7 @@
         (let [(mut k) 0]
           (loop (if (>= (load k) ncols)
                     (break)
-                    (let [col (index (slice-data columns) (load k))
+                    (let [col (index (data columns) (load k))
                           cr (get cols (load k))]
                       (draw-aligned! c
                                      (rect (.x cr) (.y r) (.w cr) 1)
@@ -561,9 +561,9 @@
                                               focused))
                       (loop (if (>= (load k) ncols)
                                 (break)
-                                (let [col (index (slice-data columns) (load k))
+                                (let [col (index (data columns) (load k))
                                       cell
-                                        (index (slice-data cells)
+                                        (index (data cells)
                                                (+ (* ri ncols) (load k)))
                                       cr (get cols (load k))
                                       base (.style cell)
@@ -672,7 +672,7 @@
                          :style style))
                 (set! i (+ (load i) 1)))))
     (let [n (len wrapped)]
-      (al-free! (mut wrapped))
+      (free! (mut wrapped))
       n)))
 
 ;;; Draw the visible window of `lines` into `r` and record the geometry in `sv`.
@@ -691,7 +691,7 @@
     (loop (if (or (>= (load row) (.h r))
                   (>= (+ (.offset sv) (load row)) (len lines)))
               (break)
-              (let [line (index (slice-data lines) (+ (.offset sv) (load row)))
+              (let [line (index (data lines) (+ (.offset sv) (load row)))
                     y (+ (.y r) (load row))
                     gw
                       (put-text! c
@@ -722,12 +722,12 @@
 (defn text-input-new [(a (dyn Allocator)) (multiline bool)] (-> TextInput)
   (TextInput
     :allocator a
-    :text (al-new [u8] a)
+    :text (ArrayList::new [u8] a)
     :cursor 0
     :multiline multiline
-    :history (al-new [(slice u8)] a)
+    :history (ArrayList::new [(slice u8)] a)
     :history-pos -1
-    :draft (al-new [u8] a)
+    :draft (ArrayList::new [u8] a)
     :scroll 0))
 
 (defn text-input-free! [(input (ptr TextInput))] (-> i64)
@@ -737,27 +737,27 @@
               (let [entry (get (.history input) (load i))]
                 (free [u8] (.allocator input) entry)
                 (set! i (+ (load i) 1))))))
-  (al-free! (mut (.history input)))
-  (al-free! (mut (.text input)))
-  (al-free! (mut (.draft input)))
+  (free! (mut (.history input)))
+  (free! (mut (.text input)))
+  (free! (mut (.draft input)))
   0)
 
 ;;; The current contents (borrowed; invalidated by the next edit).
 (defn input-text [(input (ptr TextInput))] (-> (slice u8))
-  (al-slice (.text input)))
+  (slice (.text input)))
 
 (defn input-empty? [(input (ptr TextInput))] (-> bool)
   (= (len (.text input)) 0))
 
 ;;; Replace the contents and put the cursor at the end.
 (defn input-set-text! [(input (ptr TextInput)) (text (slice u8))] (-> i64)
-  (al-clear! (mut (.text input)))
-  (al-extend! (mut (.text input)) (slice-data text) (len text))
+  (clear! (mut (.text input)))
+  (extend! (mut (.text input)) (data text) (len text))
   (set! (.cursor input) (len text))
   0)
 
 (defn input-clear! [(input (ptr TextInput))] (-> i64)
-  (al-clear! (mut (.text input)))
+  (clear! (mut (.text input)))
   (set! (.cursor input) 0)
   (set! (.scroll input) 0)
   (set! (.history-pos input) -1)
@@ -769,7 +769,7 @@
 (defn input--next-boundary [(input (ptr TextInput)) (pos i64)] (-> i64)
   (let [(mut it)
           (ClusterIter
-            :text (al-slice (.text input))
+            :text (slice (.text input))
             :offset pos
             :valid-end 0)]
     (match (cluster-next! (mut it))
@@ -777,7 +777,7 @@
       (Some [(Cluster :end end)] end))))
 
 (defn input--prev-boundary [(input (ptr TextInput)) (pos i64)] (-> i64)
-  (let [(mut it) (clusters (al-slice (.text input)))
+  (let [(mut it) (clusters (slice (.text input)))
         (mut prev) 0]
     (loop (match (cluster-next! (mut it))
             (None [] (break))
@@ -809,7 +809,7 @@
   (let [k (len bytes)
         at (.cursor input)
         old (len (.text input))]
-    (al-reserve! (mut (.text input)) (+ old k))
+    (reserve! (mut (.text input)) (+ old k))
     (set! (.len (.text input)) (+ old k))
     (let [data (.data (.text input))
           (mut i) (- old 1)]
@@ -836,14 +836,14 @@
       false
       (let [buf (primitive/alloc-stack (array u8 4))
             n (utf8-encode-into (index buf 0) rune)]
-        (input--insert-bytes! input (slice-new [u8] (index buf 0) n))
+        (input--insert-bytes! input (slice::new [u8] (index buf 0) n))
         true)))
 
 ;;; Insert pasted text at the cursor. CR LF and CR become newlines (spaces in a
 ;;; single-line input), tabs become four spaces, other controls are dropped,
 ;;; and malformed UTF-8 becomes U+FFFD.
 (defn input-insert-text! [(input (ptr TextInput)) (text (slice u8))] (-> i64)
-  (let [(mut clean) (al-new [u8] (.allocator input))
+  (let [(mut clean) (ArrayList::new [u8] (.allocator input))
         (mut i) 0
         n (len text)]
     (loop (if (>= (load i) n)
@@ -868,8 +868,8 @@
                       (rune-control? r) 0
                       :else (utf8-encode! (mut clean) r))
                 (set! i (+ (load i) (.len d))))))
-    (input--insert-bytes! input (al-slice clean))
-    (al-free! (mut clean))
+    (input--insert-bytes! input (slice clean))
+    (free! (mut clean))
     0))
 
 (defn input-backspace! [(input (ptr TextInput))] (-> bool)
@@ -986,9 +986,9 @@
         (do (input--delete-range! input (.cursor input) end) true))))
 
 (defn input--copy [(a (dyn Allocator)) (bytes (slice u8))] (-> (slice u8))
-  (let [(mut copy) (al-new [u8] a)]
-    (al-extend! (mut copy) (slice-data bytes) (len bytes))
-    (al-into-slice (mut copy))))
+  (let [(mut copy) (ArrayList::new [u8] a)]
+    (extend! (mut copy) (data bytes) (len bytes))
+    (into-slice (mut copy))))
 
 ;;; Record `text` as the newest history entry (skipping empty text and repeats
 ;;; of the newest entry). The entry is copied.
@@ -1008,10 +1008,10 @@
         false
         (do
           (when (< pos 0)
-            (al-clear! (mut (.draft input)))
-            (al-extend! (mut (.draft input))
-                        (.data (.text input))
-                        (len (.text input))))
+            (clear! (mut (.draft input)))
+            (extend! (mut (.draft input))
+                     (.data (.text input))
+                     (len (.text input))))
           (set! (.history-pos input) (if (< pos 0) (- n 1) (- pos 1)))
           (input-set-text! input (get (.history input) (.history-pos input)))
           true))))
@@ -1029,13 +1029,13 @@
           :else
             (do
               (set! (.history-pos input) -1)
-              (input-set-text! input (al-slice (.draft input)))
+              (input-set-text! input (slice (.draft input)))
               true))))
 
 ;;; Take the text for sending: push it to history, clear the input, and return
 ;;; a copy allocated from `a`.
 (defn input-submit! [(input (ptr TextInput)) (a (dyn Allocator))] (-> (slice u8))
-  (let [text (input--copy a (al-slice (.text input)))]
+  (let [text (input--copy a (slice (.text input)))]
     (input-history-push! input text)
     (input-clear! input)
     text))
@@ -1054,7 +1054,7 @@
 
 ;;; Move to the same display column on the previous/next text line.
 (defn input--vertical! [(input (ptr TextInput)) (down bool)] (-> i64)
-  (let [text (al-slice (.text input))
+  (let [text (slice (.text input))
         start (input--line-start input (.cursor input))
         column (text-width (subslice text start (.cursor input)))
         target-start
@@ -1069,7 +1069,7 @@
 (defn input--snap-column [(input (ptr TextInput)) (start i64) (column i64)] (-> i64)
   (let [(mut it)
           (ClusterIter
-            :text (al-slice (.text input))
+            :text (slice (.text input))
             :offset start
             :valid-end 0)
         (mut pos) start
@@ -1176,7 +1176,7 @@
 ;;; Number of rows `draw-input!` needs to show all of `input` in a rect `width`
 ;;; columns wide (at least 1): use it to size a growing chat input box.
 (defn input-visual-rows [(input (ptr TextInput)) (width i64)] (-> i64)
-  (let [text (al-slice (.text input))
+  (let [text (slice (.text input))
         w (if (< width 2) 2 width)
         (mut start) 0
         (mut rows) 0]
@@ -1206,7 +1206,7 @@
                    (focused bool)] (-> i64)
   (if (rect-empty? r)
       0
-      (let [text (al-slice (.text input))
+      (let [text (slice (.text input))
             width (if (> (.w r) 1) (- (.w r) 1) 1)
             cursor (.cursor input)]
         (when (= (len text) 0)

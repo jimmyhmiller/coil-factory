@@ -50,7 +50,7 @@
         (Said [text] (println "  said: {s}" text))
         (ToolStarted [call summary] (println "  tool {s}" summary))
         (ToolEnded [call summary ok output ms] (println "  -> {s}" output))
-        (UsageReported [i o] (println "  tokens {} in / {} out" i o))
+        (UsageReported [i c o] (println "  tokens {} in ({} cached) / {} out" i c o))
         (ModelRetrying [attempt error delay] (println "  retry {}" attempt))
         (_ (println "  event")))
       0)))

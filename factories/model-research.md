@@ -3,7 +3,7 @@ name: model-research
 description: Find out what a newly offered free model really is, with sources, so the paper factory can rank it.
 input: A repository holding MODEL.json, the model's catalogue entry, and check_research.py.
 harness: codex
-model: gpt-5.5
+model: gpt-6.1-sol
 tools: files, shell
 attempts: 2
 reviewers: none

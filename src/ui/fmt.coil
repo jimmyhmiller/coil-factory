@@ -4,13 +4,7 @@
 (import "coil.slice" :use *)
 (import "coil.str"
         :use
-        [StrBuf
-         sb-new
-         sb-push-str!
-         sb-push-byte!
-         sb-push-i64!
-         sb-finish!
-         str-trim])
+        [StrBuf trim])
 (import "coil.serde.value" :use *)
 (import "agent.json" :use [jv-parse])
 (import "tui.canvas" :use *)
@@ -47,7 +41,7 @@
                               (= (cast i64 (get text (load end))) 10))
                           (break)
                           (set! end (+ (load end) 1))))
-                (let [line (str-trim (subslice text (load start) (load end)))]
+                (let [line (trim (subslice text (load start) (load end)))]
                   (if (> (len line) 0)
                       (do (set! result line) (break))
                       (set! start (+ (load end) 1)))))))
@@ -67,23 +61,23 @@
     (load n)))
 
 (defn concat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         (mut i) 0]
     (loop (if (>= (load i) (len parts))
               (break)
               (do
-                (sb-push-str! (mut out) (get parts (load i)))
+                (push-str! (mut out) (get parts (load i)))
                 (set! i (+ (load i) 1)))))
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) n)
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) n)
+    (finish! (mut out))))
 
 (defn fmt--two! [(out (mut StrBuf)) (n i64)] (-> i64)
-  (when (< n 10) (sb-push-byte! (mut out) (cast u8 48)))
-  (sb-push-i64! (mut out) n)
+  (when (< n 10) (push! (mut out) (cast u8 48)))
+  (push-i64! (mut out) n)
   0)
 
 ;; ---------------------------------------------------------------------------
@@ -94,19 +88,18 @@
 
 ;;; Local wall-clock time of `t-ms` as "HH:MM" or, with `seconds`, "HH:MM:SS".
 (defn fmt-clock [(a (dyn Allocator)) (t-ms i64) (seconds bool)] (-> (slice u8))
-  (let [secs (primitive/alloc-stack i64)
+  (let [(mut secs) (: (/ t-ms 1000) i64)
         tm (primitive/alloc-stack Tm)
-        (mut out) (sb-new a)]
-    (set! secs (/ t-ms 1000))
+        (mut out) (StrBuf::new a)]
     (set! tm (zeroed Tm))
-    (localtime_r secs tm)
+    (localtime_r (mut secs) tm)
     (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 2))))
-    (sb-push-byte! (mut out) (cast u8 #\:))
+    (push! (mut out) (cast u8 #\:))
     (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 1))))
     (when seconds
-      (sb-push-byte! (mut out) (cast u8 #\:))
+      (push! (mut out) (cast u8 #\:))
       (fmt--two! (mut out) (cast i64 (load (index (field tm fields) 0)))))
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; A compact age: "now", "42s", "7m", "3h", "2d".
 (defn fmt-age [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
@@ -120,34 +113,34 @@
 ;;; A duration: "45s", "12m04s", "3h07m".
 (defn fmt-duration [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
   (let [s (/ (if (< ms 0) 0 ms) 1000)
-        (mut out) (sb-new a)]
-    (cond (< s 60) (do (sb-push-i64! (mut out) s) (sb-push-str! (mut out) "s"))
+        (mut out) (StrBuf::new a)]
+    (cond (< s 60) (do (push-i64! (mut out) s) (push-str! (mut out) "s"))
           (< s 3600)
             (do
-              (sb-push-i64! (mut out) (/ s 60))
-              (sb-push-str! (mut out) "m")
+              (push-i64! (mut out) (/ s 60))
+              (push-str! (mut out) "m")
               (fmt--two! (mut out) (% s 60))
-              (sb-push-str! (mut out) "s"))
+              (push-str! (mut out) "s"))
           :else
             (do
-              (sb-push-i64! (mut out) (/ s 3600))
-              (sb-push-str! (mut out) "h")
+              (push-i64! (mut out) (/ s 3600))
+              (push-str! (mut out) "h")
               (fmt--two! (mut out) (/ (% s 3600) 60))
-              (sb-push-str! (mut out) "m")))
-    (sb-finish! (mut out))))
+              (push-str! (mut out) "m")))
+    (finish! (mut out))))
 
 ;;; Token counts: "812", "12.3k", "4.1M".
 (defn fmt-tokens [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         unit (cond (< n 1000) 1 (< n 1000000) 1000 :else 1000000)]
-    (sb-push-i64! (mut out) (/ n unit))
+    (push-i64! (mut out) (/ n unit))
     (when (> unit 1)
       (let [tenths (/ (% n unit) (/ unit 10))]
         (when (< (/ n unit) 100)
-          (sb-push-str! (mut out) ".")
-          (sb-push-i64! (mut out) tenths))
-        (sb-push-str! (mut out) (if (= unit 1000) "k" "M"))))
-    (sb-finish! (mut out))))
+          (push-str! (mut out) ".")
+          (push-i64! (mut out) tenths))
+        (push-str! (mut out) (if (= unit 1000) "k" "M"))))
+    (finish! (mut out))))
 
 ;; ---------------------------------------------------------------------------
 ;; Status vocabulary
@@ -272,9 +265,17 @@
 ;;; and OpenCode's (bash, read, edit, write, apply_patch, list, glob, grep).
 (defn tool-glyph [(tool (slice u8))] (-> (slice u8))
   (cond (or (= tool "shell") (= tool "bash")) "$"
-        (or (= tool "edit_file") (= tool "write_file")
-            (= tool "edit") (= tool "write") (= tool "apply_patch")) "✎"
-        (or (= tool "read_file") (= tool "list_dir") (= tool "read") (= tool "list")) "▤"
+        (or (= tool "edit_file")
+            (= tool "write_file")
+            (= tool "edit")
+            (= tool "write")
+            (= tool "apply_patch"))
+          "✎"
+        (or (= tool "read_file")
+            (= tool "list_dir")
+            (= tool "read")
+            (= tool "list"))
+          "▤"
         (or (= tool "search") (= tool "grep") (= tool "glob")) "⌕"
         (= tool "finish") "⚑"
         :else "⚙"))
@@ -290,7 +291,8 @@
             (js args "path")
           (or (= tool "edit") (= tool "write") (= tool "read"))
             (js args "filePath")
-          (or (= tool "grep") (= tool "glob")) (concat a ["\"" (js args "pattern") "\""])
+          (or (= tool "grep") (= tool "glob"))
+            (concat a ["\"" (js args "pattern") "\""])
           (= tool "list_dir")
             (let [p (js args "path")] (if (= (len p) 0) "." p))
           (= tool "search") (concat a ["\"" (js args "pattern") "\""])

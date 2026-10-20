@@ -1,5 +1,4 @@
 (module agent_tools.bundle)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -10,6 +9,7 @@
 (import "agent_tools.sys" :as sys)
 (import "agent_tools.text" :use *)
 (import "agent_tools.workspace" :use *)
+
 (export StandardTools standard-tools standard-tools-free!)
 
 ;;; The tools for one workspace and the registry that lists them. The tools
@@ -37,28 +37,42 @@
         (mut found) false]
     (loop (if (or (load found) (>= (load i) (len groups)))
               (break)
-              (do (when (= (get groups (load i)) name)
-                    (set! found true)
-                    0)
-                  (set! i (+ (load i) 1)))))
+              (do
+                (when (= (get groups (load i)) name)
+                  (set! found true)
+                  0)
+                (set! i (+ (load i) 1)))))
     (load found)))
 
 ;;; Err for an unknown or repeated group name. Names match exactly.
-(defn check-groups [(a (dyn Allocator)) (groups (slice (slice u8)))] (-> (Result i64 (slice u8)))
+(defn check-groups [(a (dyn Allocator)) (groups (slice (slice u8)))]
+  (-> (Result i64 (slice u8)))
   (let [(mut i) 0
         (mut outcome) (: (Ok 0) (Result i64 (slice u8)))]
     (loop (if (>= (load i) (len groups))
               (break)
               (let [name (get groups (load i))]
                 (cond (not (known-group? name))
-                        (do (set! outcome (Err (join3 a "unknown tool group " (quoted a name) "; the groups are \"files\", \"read\", and \"shell\"")))
-                            (break))
+                        (do
+                          (set! outcome
+                                (Err (join3 a
+                                            "unknown tool group "
+                                            (quoted a name)
+                                            "; the groups are \"files\", \"read\", and \"shell\"")))
+                          (break))
                       (and (= name "read") (selected? groups "files"))
-                        (do (set! outcome (Err "tool groups \"files\" and \"read\" overlap; \"files\" already includes reading"))
-                            (break))
+                        (do
+                          (set! outcome
+                                (Err "tool groups \"files\" and \"read\" overlap; \"files\" already includes reading"))
+                          (break))
                       (selected? (subslice groups 0 (load i)) name)
-                        (do (set! outcome (Err (join3 a "tool group " (quoted a name) " is listed more than once")))
-                            (break))
+                        (do
+                          (set! outcome
+                                (Err (join3 a
+                                            "tool group "
+                                            (quoted a name)
+                                            " is listed more than once")))
+                          (break))
                       :else (set! i (+ (load i) 1))))))
     (load outcome)))
 
@@ -68,7 +82,9 @@
       ;; Every tool here has a distinct name, so this is a programming error.
       (sys/fatal "standard-tools registered two tools with the same name")))
 
-(defn add-files! [(tools (mut StandardTools)) (workspace Workspace) (backend SearchBackend)] (-> i64)
+(defn add-files! [(tools (mut StandardTools))
+                  (workspace Workspace)
+                  (backend SearchBackend)] (-> i64)
   (let [a (.allocator tools)
         read (box! a ReadFileTool (read-file-tool workspace))
         write (box! a WriteFileTool (write-file-tool workspace))
@@ -86,7 +102,9 @@
     (add! (mut tools) list)
     (add! (mut tools) search)))
 
-(defn add-read! [(tools (mut StandardTools)) (workspace Workspace) (backend SearchBackend)] (-> i64)
+(defn add-read! [(tools (mut StandardTools))
+                 (workspace Workspace)
+                 (backend SearchBackend)] (-> i64)
   (let [a (.allocator tools)
         read (box! a ReadFileTool (read-file-tool workspace))
         list (box! a ListDirTool (list-dir-tool workspace))
@@ -98,7 +116,9 @@
     (add! (mut tools) list)
     (add! (mut tools) search)))
 
-(defn add-shell! [(tools (mut StandardTools)) (workspace Workspace) (policy SandboxPolicy)] (-> i64)
+(defn add-shell! [(tools (mut StandardTools))
+                  (workspace Workspace)
+                  (policy SandboxPolicy)] (-> i64)
   (let [shell (box! (.allocator tools) ShellTool (shell-tool workspace policy))]
     (set! (.shell tools) (Some shell))
     (add! (mut tools) shell)))
@@ -109,35 +129,43 @@
 (defn standard-tools [(a (dyn Allocator))
                       (workspace Workspace)
                       (policy SandboxPolicy)
-                      (groups (slice (slice u8)))] (-> (Result StandardTools (slice u8)))
+                      (groups (slice (slice u8)))]
+  (-> (Result StandardTools (slice u8)))
   (match (check-groups a groups)
     (Err [message] (Err message))
     (Ok [_]
-        (let [(mut tools) (StandardTools :allocator a
-                                         :registry (registry-new a)
-                                         :read-file (None)
-                                         :write-file (None)
-                                         :edit-file (None)
-                                         :list-dir (None)
-                                         :search (None)
-                                         :shell (None))
-              files (: (cond (selected? groups "files")
-                               (match (search-backend-detect a)
-                                 (Err [message] (Err message))
-                                 (Ok [backend] (Ok (add-files! (mut tools) workspace backend))))
-                             (selected? groups "read")
-                               (match (search-backend-detect a)
-                                 (Err [message] (Err message))
-                                 (Ok [backend] (Ok (add-read! (mut tools) workspace backend))))
-                             :else (Ok 0))
-                       (Result i64 (slice u8)))]
+        (let [(mut tools)
+                (StandardTools
+                  :allocator a
+                  :registry (registry-new a)
+                  :read-file (None)
+                  :write-file (None)
+                  :edit-file (None)
+                  :list-dir (None)
+                  :search (None)
+                  :shell (None))
+              files
+                (: (cond (selected? groups "files")
+                           (match (search-backend-detect a)
+                             (Err [message] (Err message))
+                             (Ok [backend]
+                                 (Ok (add-files! (mut tools) workspace backend))))
+                         (selected? groups "read")
+                           (match (search-backend-detect a)
+                             (Err [message] (Err message))
+                             (Ok [backend]
+                                 (Ok (add-read! (mut tools) workspace backend))))
+                         :else (Ok 0))
+                   (Result i64 (slice u8)))]
           (match files
-            (Err [message] (do (standard-tools-free! (mut tools)) (Err message)))
+            (Err [message]
+                 (do (standard-tools-free! (mut tools)) (Err message)))
             (Ok [_]
-                (do (when (selected? groups "shell")
-                      (add-shell! (mut tools) workspace policy)
-                      0)
-                    (Ok (load tools)))))))))
+                (do
+                  (when (selected? groups "shell")
+                    (add-shell! (mut tools) workspace policy)
+                    0)
+                  (Ok (load tools)))))))))
 
 ;;; Free the registry and every tool `standard-tools` allocated.
 (defn standard-tools-free! [(tools (mut StandardTools))] (-> i64)

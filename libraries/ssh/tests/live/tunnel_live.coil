@@ -7,7 +7,6 @@
 (import "coil.slice" :use *)
 (import "coil.socket" :as socket)
 (import "coil.str" :use *)
-(import "coil.subprocess" :as subprocess)
 (import "ssh.target" :use *)
 (import "ssh.tunnel" :use *)
 
@@ -25,7 +24,7 @@
     (TunnelFailed [message] message)))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle)
+  (match (find hay needle)
     (Some [_] true)
     (None [] false)))
 
@@ -33,20 +32,20 @@
 (defn read-first-line [(a (dyn Allocator)) (port i64)] (-> (slice u8))
   (let [connection (primitive/alloc-stack socket/TcpConnection)
         chunk (primitive/alloc-stack (array u8 256))
-        (mut line) (sb-new a)]
+        (mut line) (StrBuf::new a)]
     (try (let [opened
-                 (try-or! (socket/tcp-connect a connection "127.0.0.1" port)
+                 (try-or! (socket/TcpConnection::connect a connection "127.0.0.1" port)
                           (assert false))]
            (do
-             (loop (match (socket/tcp-read opened (cast (ptr i8) chunk) 256)
+             (loop (match (read opened (cast (ptr i8) chunk) 256)
                      (Ok [n]
                          (if (<= n 0)
                              (break)
                              (do
-                               (sb-push-str! (mut line)
-                                             (slice-new (cast (ptr u8) chunk) n))
-                               (when (>= (match (str-find (sb-str (load line))
-                                                          "\n")
+                               (push-str! (mut line)
+                                          (slice::new (cast (ptr u8) chunk) n))
+                               (when (>= (match (find (str (load line))
+                                                      "\n")
                                            (Some [at] at)
                                            (None [] -1))
                                          0)
@@ -54,9 +53,9 @@
                                  0)
                                0)))
                      (Err [_] (break))))
-             (socket/tcp-connection-close! opened)
+             (close! opened)
              0)))
-    (sb-finish! (mut line))))
+    (finish! (mut line))))
 
 (deftest forwards-to-the-remote-sshd
          (let [a (malloc-allocator)
@@ -78,8 +77,8 @@
                (mut tunnel) (tunnel-new a (tunnel-spec (live-host) 22))
                first (ready-port (tunnel-ensure! (mut tunnel)))]
            (assert (> first 0))
-           (subprocess/child-kill (field tunnel child))
-           (subprocess/child-wait (field tunnel child))
+           (kill (field tunnel child))
+           (wait (field tunnel child))
            (assert (not (tunnel-alive? (mut tunnel))))
            (let [second (ready-port (tunnel-ensure! (mut tunnel)))]
              (assert (> second 0))

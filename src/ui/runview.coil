@@ -1,5 +1,4 @@
 (module factory.ui.runview)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -121,17 +120,53 @@
                                 (bold (.warning theme)))
           (= count 0) (put-text! c r x (.y r) "none" (.subtle theme))
           (= standing "failed")
-            (let [x2 (span! c r x (concat a ["✗ " (js worst "name") " failed"]) (tone-style theme (standing-tone standing)))]
-              (put-text-ellipsis! c r (+ x2 2) (.y r) (first-line (js worst "failure")) (.muted theme)))
+            (let [x2
+                    (span! c
+                           r
+                           x
+                           (concat a ["✗ " (js worst "name") " failed"])
+                           (tone-style theme (standing-tone standing)))]
+              (put-text-ellipsis! c
+                                  r
+                                  (+ x2 2)
+                                  (.y r)
+                                  (first-line (js worst "failure"))
+                                  (.muted theme)))
           (> (len standing) 0)
-            (let [x2 (span! c r x
-                            (concat a ["◉ " (js worst "name") ": " (js worst "verdict")])
-                            (tone-style theme (standing-tone standing)))
-                  x3 (if (> count 1)
-                         (span! c r (+ x2 1) (concat a ["(+" (int-text a (- count 1)) ")"]) (.subtle theme))
-                         x2)]
-              (put-text-ellipsis! c r (+ x3 2) (.y r) (first-line (js worst "reason")) (.muted theme)))
-          :else (put-text! c r x (.y r) (concat a [(js worst "name") (if (> count 1) " and others" "") ": no verdict yet"]) (.subtle theme)))))
+            (let [x2
+                    (span! c
+                           r
+                           x
+                           (concat a
+                                   ["◉ "
+                                    (js worst "name")
+                                    ": "
+                                    (js worst "verdict")])
+                           (tone-style theme (standing-tone standing)))
+                  x3
+                    (if (> count 1)
+                        (span! c
+                               r
+                               (+ x2 1)
+                               (concat a ["(+" (int-text a (- count 1)) ")"])
+                               (.subtle theme))
+                        x2)]
+              (put-text-ellipsis! c
+                                  r
+                                  (+ x3 2)
+                                  (.y r)
+                                  (first-line (js worst "reason"))
+                                  (.muted theme)))
+          :else
+            (put-text! c
+                       r
+                       x
+                       (.y r)
+                       (concat a
+                               [(js worst "name")
+                                (if (> count 1) " and others" "")
+                                ": no verdict yet"])
+                       (.subtle theme)))))
 
 (defn draw-pipeline! [(d (ptr Dash))
                       (c (ptr Canvas))
@@ -258,7 +293,7 @@
                      (+ (.y inner) 1)
                      "No agent has started yet."
                      (.subtle theme))
-          (let [(mut cells) (al-new [TableCell] a)
+          (let [(mut cells) (ArrayList::new [TableCell] a)
                 (mut i) 0]
             (loop (if (>= (load i) (jv-len agents))
                       (break)
@@ -310,7 +345,7 @@
             (draw-table! c
                          inner
                          AGENT-COLUMNS
-                         (al-slice cells)
+                         (slice cells)
                          (field d agents-lv)
                          2
                          theme
@@ -319,7 +354,8 @@
 
 ;;; The feed: "HH:MM:SS agent  glyph text  result", following the tail unless
 ;;; scrolled up.
-(defn draw-feed! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)] (-> i64)
+(defn draw-feed! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)]
+  (-> i64)
   (let [theme (.theme d)
         feed (field d feed)
         sv (field d feed-sv)

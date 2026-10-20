@@ -1,0 +1,45 @@
+(module factory.worker-observer-test)
+(import "coil.alloc" :use *)
+(import "coil.fs" :as fs)
+(import "coil.process" :as process)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "agent.loop" :use *)
+(import "factory.worker" :use [JournalObserver])
+
+(defn journal-path [(a (dyn Allocator))] (-> (slice u8))
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) "/private/tmp/factory-observer-test-")
+    (push-i64! (mut b) (process/id))
+    (push-str! (mut b) ".jsonl")
+    (finish! (mut b))))
+
+(defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find text needle) (Some [_] true) (None [] false)))
+
+(deftest streaming-is-journaled-at-most-every-ten-seconds
+  (let [a (malloc-allocator)
+        path (journal-path a)
+        _ (fs/write-file a path "")
+        observer (box! a JournalObserver (JournalObserver :allocator a
+                                                          :path path
+                                                          :agent-name "select"
+                                                          :harness (None)
+                                                          :checkpoint ""
+                                                          :streamed-ms 0
+                                                          :streamed-chars 0))]
+    (observe observer (Streaming "reasoning" 100))
+    (observe observer (Streaming "reasoning" 50))
+    (observe observer (Streaming "reasoning" 25))
+    (let [first (match (fs/read-file a path) (Ok [bytes] bytes) (Err [_] ""))]
+      (assert (contains? first "\"kind\":\"agent.streaming\""))
+      (assert (contains? first "\"part\":\"reasoning\""))
+      (assert (contains? first "\"chars\":100"))
+      (assert (not (contains? first "\"chars\":50")))
+      (assert (not (contains? first "\"chars\":75"))))
+    ;; Once the window has passed, the next report carries everything since.
+    (set! (.streamed-ms observer) 0)
+    (observe observer (Streaming "text" 5))
+    (let [second (match (fs/read-file a path) (Ok [bytes] bytes) (Err [_] ""))]
+      (assert (contains? second "\"part\":\"text\""))
+      (assert (contains? second "\"chars\":80")))))

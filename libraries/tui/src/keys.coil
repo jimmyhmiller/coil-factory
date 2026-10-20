@@ -4,7 +4,7 @@
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.os" :use [os-errno])
+(import "coil.os" :use [errno])
 (import "coil.time" :as time)
 (import "tui.fatal" :use [fatal])
 (import "tui.width"
@@ -13,8 +13,6 @@
 (import "tui.term" :use [term-size term-wake-fd term-drain-wake! TermSize])
 
 (extern read :cc c [i32 (ptr i8) isize] (-> isize))
-
-
 
 ;;; One input event. `Char` is a printable Unicode scalar. `Ctrl` carries a
 ;;; lowercase ASCII letter, or one of `@ [ \ ] ^ _` / space for the other C0
@@ -70,7 +68,8 @@
 (defn keys--byte [(bytes (slice u8)) (i i64)] (-> i64)
   (cast i64 (get bytes i)))
 
-(defn keys--starts-with? [(bytes (slice u8)) (at i64) (prefix (slice u8))] (-> bool)
+(defn keys--starts-with? [(bytes (slice u8)) (at i64) (prefix (slice u8))]
+  (-> bool)
   (let [(mut i) 0
         (mut ok) (<= (+ at (len prefix)) (len bytes))]
     (loop (if (or (not (load ok)) (>= (load i) (len prefix)))
@@ -126,10 +125,10 @@
                          (loop (if (>= (load i) have)
                                    (break)
                                    (do
-                                     (when (!= (primitive/iand (keys--byte bytes
-                                                                           (+ at
-                                                                              (load i)))
-                                                               0xC0)
+                                     (when (!= (& (keys--byte bytes
+                                                              (+ at
+                                                                 (load i)))
+                                                  0xC0)
                                                0x80)
                                        (set! ok false))
                                      (set! i (+ (load i) 1)))))
@@ -209,7 +208,7 @@
 ;;; xterm modifier parameter: 1 + (shift 1 | alt 2 | ctrl 4 | meta 8).
 (defn keys--word-modifier? [(modifier i64)] (-> bool)
   (and (> modifier 1)
-       (!= (primitive/iand (- modifier 1) 6) 0)))
+       (!= (& (- modifier 1) 6) 0)))
 
 (defn keys--csi-key [(csi Csi)] (-> Key)
   (let [f (.final csi)
@@ -333,15 +332,15 @@
   (let [size (term-size)]
     (KeyReader
       :fd 0
-      :buffer (al-new [u8] a)
-      :paste (al-new [u8] a)
+      :buffer (ArrayList::new [u8] a)
+      :paste (ArrayList::new [u8] a)
       :width (.width size)
       :height (.height size)
       :escape-timeout-ms 30)))
 
 (defn key-reader-free! [(r (ptr KeyReader))] (-> i64)
-  (al-free! (mut (.buffer r)))
-  (al-free! (mut (.paste r)))
+  (free! (mut (.buffer r)))
+  (free! (mut (.paste r)))
   0)
 
 (defn keys--now-ms [] (-> i64)
@@ -380,14 +379,15 @@
     (let [ready
             (cast i64
                   (selectors/poll-fds (index fds 0)
-                        count
-                        (cast i32 (if (< timeout-ms 0) -1 timeout-ms))))]
+                                      count
+                                      (cast i32
+                                            (if (< timeout-ms 0) -1 timeout-ms))))]
       (cond (> ready 0)
               (if (and (= count 2) (!= (cast i64 (.revents (index fds 1))) 0))
                   (do (term-drain-wake!) 2)
                   1)
             (= ready 0) 0
-            (= (os-errno) 4) 2
+            (= (errno) 4) 2
             :else (fatal "poll on standard input failed")))))
 
 ;;; Read available bytes into the buffer. Returns false at end of input.
@@ -398,9 +398,9 @@
                 (read (cast i32 (.fd r))
                       (cast (ptr i8) (index chunk 0))
                       (cast isize 4096)))]
-    (cond (> got 0) (do (al-extend! (mut (.buffer r)) (index chunk 0) got) true)
+    (cond (> got 0) (do (extend! (mut (.buffer r)) (index chunk 0) got) true)
           (= got 0) false
-          (or (= (os-errno) 4) (= (os-errno) 35) (= (os-errno) 11)) true
+          (or (= (errno) 4) (= (errno) 35) (= (errno) 11)) true
           :else (do (fatal "read from standard input failed") false))))
 
 (defn keys--take! [(r (ptr KeyReader)) (key Key) (used i64)] (-> Key)
@@ -408,10 +408,10 @@
     (Paste [text]
            (do
              ;; Copy out of the input buffer before it is compacted.
-             (al-clear! (mut (.paste r)))
-             (al-extend! (mut (.paste r)) (slice-data text) (len text))
+             (clear! (mut (.paste r)))
+             (extend! (mut (.paste r)) (data text) (len text))
              (keys--consume! r used)
-             (Paste (al-slice (.paste r)))))
+             (Paste (slice (.paste r)))))
     (_ (do (keys--consume! r used) key))))
 
 (defn keys--resized? [(r (ptr KeyReader))] (-> bool)
@@ -435,7 +435,7 @@
               (let [pending (> (len (.buffer r)) 0)
                     decoded
                       (if pending
-                          (decode-key (al-slice (.buffer r)) false)
+                          (decode-key (slice (.buffer r)) false)
                           (Incomplete))]
                 (match decoded
                   (Decoded [key used]
@@ -461,7 +461,7 @@
                                       (= woke 2) 0
                                       ;; Timed out with bytes pending: resolve them as typed.
                                       pending
-                                        (match (decode-key (al-slice (.buffer r))
+                                        (match (decode-key (slice (.buffer r))
                                                            true)
                                           (Decoded [key used]
                                                    (do

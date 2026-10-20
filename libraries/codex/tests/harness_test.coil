@@ -23,32 +23,35 @@
 (defstruct Recorder [(allocator (dyn Allocator)) (seen (ArrayList (slice u8)))])
 
 (defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (impl AgentObserver Recorder
   (observe [(self (ptr Recorder)) (event AgentEvent)] (-> i64)
     (let [a (.allocator self)
-          line (match event
-                 (TurnStarted [turn] "turn")
-                 (MessageDelivered [m] (cat a ["delivered " (.text m)]))
-                 (Thought [text] (cat a ["thought " text]))
-                 (Said [text] (cat a ["said " text]))
-                 (UsageReported [input output]
-                                (let [(mut b) (sb-new a)]
-                                  (sb-push-str! (mut b) "usage ")
-                                  (sb-push-i64! (mut b) input)
-                                  (sb-push-str! (mut b) "/")
-                                  (sb-push-i64! (mut b) output)
-                                  (sb-finish! (mut b))))
-                 (ToolStarted [call summary] (cat a ["tool " summary]))
-                 (ToolEnded [call summary ok output elapsed] (cat a [(if ok "ok " "failed ") output]))
-                 (ModelRetrying [attempt error delay] "retry")
-                 (PausedEvent [] "paused")
-                 (ResumedEvent [] "resumed")
-                 (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
-                 (Compacted [n bytes] "compacted"))]
+          line
+            (match event
+              (TurnStarted [turn] "turn")
+              (MessageDelivered [m] (cat a ["delivered " (.text m)]))
+              (Thought [text] (cat a ["thought " text]))
+              (Said [text] (cat a ["said " text]))
+              (Streaming [part chars] (cat a ["streaming " part]))
+              (UsageReported [input cached output]
+                             (let [(mut b) (StrBuf::new a)]
+                               (push-str! (mut b) "usage ")
+                               (push-i64! (mut b) input)
+                               (push-str! (mut b) "/")
+                               (push-i64! (mut b) output)
+                               (finish! (mut b))))
+              (ToolStarted [call summary] (cat a ["tool " summary]))
+              (ToolEnded [call summary ok output elapsed]
+                         (cat a [(if ok "ok " "failed ") output]))
+              (ModelRetrying [attempt error delay] "retry")
+              (PausedEvent [] "paused")
+              (ResumedEvent [] "resumed")
+              (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
+              (Compacted [n bytes] "compacted"))]
       (push! (mut (.seen self)) line)
       0)))
 
@@ -66,25 +69,42 @@
 
 (impl AgentControl Script
   (control-check [(self (ptr Script))] (-> Control)
-    (if (and (> (.cancel-at-ms self) 0) (>= (sys/monotonic-ms) (.cancel-at-ms self)))
+    (if (and (> (.cancel-at-ms self) 0)
+             (>= (sys/monotonic-ms) (.cancel-at-ms self)))
         (Cancel)
         (Proceed)))
-  (control-inbox [(self (ptr Script)) (a (dyn Allocator))] (-> (ArrayList Inbound))
-    (let [(mut out) (al-new [Inbound] a)]
+  (control-inbox [(self (ptr Script)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (let [(mut out) (ArrayList::new [Inbound] a)]
       (set! (.inbox-calls self) (+ (.inbox-calls self) 1))
       (when (= (.inbox-calls self) (.message-on self))
-        (push! (mut out) (Inbound :from "operator" :text "use tabs" :ref 7))
+        (push! (mut out)
+               (Inbound
+                 :from "operator"
+                 :text "use tabs"
+                 :ref 7))
         0)
       (load out)))
-  (control-idle [(self (ptr Script))] (-> i64) (sys/sleep-ms 50)))
+  (control-idle [(self (ptr Script))] (-> i64)
+    (sys/sleep-ms 50)))
 
-(defn run-status [(a (dyn Allocator)) (program (slice u8)) (args (slice (slice u8)))] (-> i64)
+(defn run-status [(a (dyn Allocator))
+                  (program (slice u8))
+                  (args (slice (slice u8)))] (-> i64)
   (let [child (primitive/alloc-stack subprocess/Child)]
-    (match (subprocess/spawn a child program args (subprocess/null-stdio) (subprocess/inherit-stdio) (subprocess/inherit-stdio))
+    (match (subprocess/Child::spawn a
+                                    child
+                                    program
+                                    args
+                                    (subprocess/null-stdio)
+                                    (subprocess/inherit-stdio)
+                                    (subprocess/inherit-stdio))
       (Err [_] -1)
-      (Ok [_] (match (subprocess/child-wait child)
-                (Ok [status] (match status (subprocess/Exited [code] code) (subprocess/Signaled [signal] (+ 128 signal))))
-                (Err [_] -1))))))
+      (Ok [_]
+          (try (let [status (try-or! (wait child) -1)]
+                 (match status
+                   (subprocess/Exited [code] code)
+                   (subprocess/Signaled [signal] (+ 128 signal)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A fake `codex`: a shell script that records how it was called and replays
@@ -92,12 +112,12 @@
 ;; shapes codex-cli 0.160 prints.
 
 (defn fresh-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
-  (let [(mut b) (sb-new a)]
-    (sb-push-str! (mut b) "/private/tmp/codex-test-")
-    (sb-push-i64! (mut b) (process/id))
-    (sb-push-str! (mut b) "-")
-    (sb-push-str! (mut b) label)
-    (let [dir (sb-finish! (mut b))]
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) "/private/tmp/codex-test-")
+    (push-i64! (mut b) (process/id))
+    (push-str! (mut b) "-")
+    (push-str! (mut b) label)
+    (let [dir (finish! (mut b))]
       (run-status a "/bin/rm" ["-rf" dir])
       (match (sys/make-directory a dir)
         (Ok [_] dir)
@@ -109,14 +129,13 @@
     (Err [_] (do (println "cannot write {}" path) (assert false) 0))))
 
 (defn read [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
-  (match (fs/read-file a path)
-    (Ok [bytes] bytes)
-    (Err [_] "")))
+  (try (let [bytes (try-or! (fs/read-file a path) "")] bytes)))
 
 (defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find text needle) (Some [_] true) (None [] false)))
+  (match (find text needle) (Some [_] true) (None [] false)))
 
-(const FAKE "#!/bin/sh
+(const FAKE
+       "#!/bin/sh
 dir=\"$(dirname \"$0\")\"
 n=$(cat \"$dir/count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$dir/count\"
 printf '%s\\n' \"$@\" > \"$dir/argv.$n\"
@@ -135,28 +154,44 @@ pwd > \"$dir/pwd.$n\"
   (ev a "\"type\":\"turn.started\""))
 
 (defn turn-completed [(a (dyn Allocator))] (-> (slice u8))
-  (ev a "\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":100,\"cache_write_input_tokens\":0,\"output_tokens\":25,\"reasoning_output_tokens\":0}"))
+  (ev a
+      "\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":100,\"cache_write_input_tokens\":0,\"output_tokens\":25,\"reasoning_output_tokens\":0}"))
 
 (defn message-event [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (ev a (cat a ["\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"" text "\"}"])))
+  (ev a
+      (cat a
+           ["\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\""
+            text
+            "\"}"])))
 
 (defn command-events [(a (dyn Allocator))] (-> (slice u8))
-  (cat a [(ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"ls\\\"\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
-          (ev a "\"type\":\"item.completed\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"ls\\\"\",\"aggregated_output\":\"a.txt\",\"exit_code\":0,\"status\":\"completed\"}")]))
+  (cat a
+       [(ev a
+            "\"type\":\"item.started\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"ls\\\"\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+        (ev a
+            "\"type\":\"item.completed\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc \\\"ls\\\"\",\"aggregated_output\":\"a.txt\",\"exit_code\":0,\"status\":\"completed\"}")]))
 
 (defn edit-event [(a (dyn Allocator)) (dir (slice u8))] (-> (slice u8))
-  (ev a (cat a ["\"type\":\"item.completed\",\"item\":{\"id\":\"e1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"" dir "/poem.md\",\"kind\":\"add\"}],\"status\":\"completed\"}"])))
+  (ev a
+      (cat a
+           ["\"type\":\"item.completed\",\"item\":{\"id\":\"e1\",\"type\":\"file_change\",\"changes\":[{\"path\":\""
+            dir
+            "/poem.md\",\"kind\":\"add\"}],\"status\":\"completed\"}"])))
 
 (defn finish-events [(a (dyn Allocator))] (-> (slice u8))
-  (cat a [(ev a "\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"result\":null,\"error\":null,\"status\":\"in_progress\"}")
-          (ev a "\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Recorded.\"}],\"structured_content\":null},\"error\":null,\"status\":\"completed\"}")]))
+  (cat a
+       [(ev a
+            "\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"result\":null,\"error\":null,\"status\":\"in_progress\"}")
+        (ev a
+            "\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Recorded.\"}],\"structured_content\":null},\"error\":null,\"status\":\"completed\"}")]))
 
 ;;; `items` copied to the heap: an array literal lives in its caller's frame,
 ;;; and the harness keeps these past it.
-(defn kept [(a (dyn Allocator)) (items (slice (slice u8)))] (-> (slice (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)]
+(defn kept [(a (dyn Allocator)) (items (slice (slice u8)))]
+  (-> (slice (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
     (for item (iter items) (push! (mut out) item))
-    (al-slice out)))
+    (slice out)))
 
 (defstruct Fixture
   [(dir (slice u8))
@@ -164,55 +199,82 @@ pwd > \"$dir/pwd.$n\"
    (recorder (ptr Recorder))
    (control (ptr Script))])
 
-(defn fixture [(a (dyn Allocator)) (label (slice u8)) (replies (slice (slice u8))) (control (ptr Script))] (-> Fixture)
+(defn fixture [(a (dyn Allocator))
+               (label (slice u8))
+               (replies (slice (slice u8)))
+               (control (ptr Script))] (-> Fixture)
   (let [dir (fresh-dir a label)
         program (cat a [dir "/codex"])
-        recorder (box! a Recorder (Recorder :allocator a :seen (al-new [(slice u8)] a)))
+        recorder
+          (box! a
+                Recorder
+                (Recorder :allocator a :seen (ArrayList::new [(slice u8)] a)))
         (mut i) 0]
     (write! a program FAKE)
     (run-status a "/bin/chmod" ["+x" program])
     (loop (if (>= (load i) (len replies))
               (break)
-              (let [(mut name) (sb-new a)]
-                (sb-push-str! (mut name) dir)
-                (sb-push-str! (mut name) "/reply.")
-                (sb-push-i64! (mut name) (+ (load i) 1))
-                (write! a (sb-finish! (mut name)) (get replies (load i)))
+              (let [(mut name) (StrBuf::new a)]
+                (push-str! (mut name) dir)
+                (push-str! (mut name) "/reply.")
+                (push-i64! (mut name) (+ (load i) 1))
+                (write! a (finish! (mut name)) (get replies (load i)))
                 (set! i (+ (load i) 1)))))
-    (let [harness (box! a CodexHarness
-                        (codex-new a
-                                   (CodexOptions :program program
-                                                 :workdir dir
-                                                 :home (cat a [dir "/home"])
-                                                 :model "gpt-6.1-sol"
-                                                 :sandbox "workspace-write"
-                                                 :stop-server "factory"
-                                                 :stop-command (kept a ["/usr/local/bin/factory" "_mcp-finish" "--gate"])
-                                                 :stop-tool "finish"
-                                                 :stop-tool-as "finish"
-                                                 :ready-file ""
-                                                 :settings (kept a ["sandbox_workspace_write.network_access=false"])
-                                                 :idle-timeout-ms 0)
-                                   recorder control))]
-      (Fixture :dir dir :harness harness :recorder recorder :control control))))
+    (let [harness
+            (box! a
+                  CodexHarness
+                  (codex-new a
+                             (CodexOptions
+                               :program program
+                               :workdir dir
+                               :home (cat a [dir "/home"])
+                               :model "gpt-6.1-sol"
+                               :sandbox "workspace-write"
+                               :stop-server "factory"
+                               :stop-command
+                                 (kept a
+                                       ["/usr/local/bin/factory"
+                                        "_mcp-finish"
+                                        "--gate"])
+                               :stop-tool "finish"
+                               :stop-tool-as "finish"
+                               :ready-file ""
+                               :settings
+                                 (kept a
+                                       ["sandbox_workspace_write.network_access=false"])
+                               :idle-timeout-ms 0)
+                             recorder
+                             control))]
+      (Fixture
+        :dir dir
+        :harness harness
+        :recorder recorder
+        :control control))))
 
 ;;; Codex's session log for thread th-1 in the fixture's Codex home: an
 ;;; earlier turn, then the run's turn with its usage so far, then `after`.
 (defn session-log! [(a (dyn Allocator)) (f Fixture) (after (slice u8))] (-> i64)
   (let [day (cat a [(.dir f) "/home/sessions/2026/10/12"])]
     (run-status a "/bin/mkdir" ["-p" day])
-    (write! a (cat a [day "/rollout-2026-10-12T09-00-00-th-1.jsonl"])
-            (cat a ["{\"type\":\"session_meta\",\"payload\":{\"id\":\"th-1\"}}\n"
-                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t0\"}}\n"
-                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t0\",\"turn_token_usage\":{\"input_tokens\":999,\"output_tokens\":9}}}\n"
-                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n"
-                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":30,\"output_tokens\":4}}}\n"
-                    "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"c1\"}}\n"
-                    "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":40,\"output_tokens\":5}}}\n"
-                    after]))))
+    (write! a
+            (cat a [day "/rollout-2026-10-12T09-00-00-th-1.jsonl"])
+            (cat a
+                 ["{\"type\":\"session_meta\",\"payload\":{\"id\":\"th-1\"}}\n"
+                  "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t0\"}}\n"
+                  "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t0\",\"turn_token_usage\":{\"input_tokens\":999,\"output_tokens\":9}}}\n"
+                  "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n"
+                  "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":30,\"output_tokens\":4}}}\n"
+                  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"c1\"}}\n"
+                  "{\"type\":\"token_usage_record\",\"payload\":{\"turn_id\":\"t1\",\"turn_token_usage\":{\"input_tokens\":40,\"output_tokens\":5}}}\n"
+                  after]))))
 
 (defn script [(a (dyn Allocator))] (-> (ptr Script))
-  (box! a Script (Script :cancel-at-ms 0 :message-on 0 :inbox-calls 0)))
+  (box! a
+        Script
+        (Script
+          :cancel-at-ms 0
+          :message-on 0
+          :inbox-calls 0)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests
@@ -220,16 +282,25 @@ pwd > \"$dir/pwd.$n\"
 (deftest toml-strings-escape-what-toml-requires
   (let [a (malloc-allocator)]
     (assert (= (toml-string a "plain") "\"plain\""))
-    (assert (= (toml-string a "say \"hi\"\\now\n\ttab") "\"say \\\"hi\\\"\\\\now\\n\\ttab\""))
+    (assert (= (toml-string a "say \"hi\"\\now\n\ttab")
+               "\"say \\\"hi\\\"\\\\now\\n\\ttab\""))
     (assert (= (toml-string a "bell\x07;") "\"bell\\u0007\""))))
 
 (deftest finishes-when-the-stop-tool-is-called-and-stops-the-process
   (let [a (malloc-allocator)
         dir-f (fixture a "finish" ["exit 0\n"] (script a))
-        _ (write! a (cat a [(.dir dir-f) "/reply.1"])
-                  (cat a [(thread-started a) (turn-started a) (message-event a "working") (command-events a)
-                          (edit-event a (.dir dir-f)) (finish-events a) (message-event a "all done")
-                          (turn-completed a)]))
+        _
+          (write! a
+                  (cat a [(.dir dir-f) "/reply.1"])
+                  (cat a
+                       [(thread-started a)
+                        (turn-started a)
+                        (message-event a "working")
+                        (command-events a)
+                        (edit-event a (.dir dir-f))
+                        (finish-events a)
+                        (message-event a "all done")
+                        (turn-completed a)]))
         f dir-f
         h (.harness f)
         started (sys/monotonic-ms)]
@@ -237,9 +308,10 @@ pwd > \"$dir/pwd.$n\"
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
       (Finished [call result]
-                (do (assert (= (.name call) "finish"))
-                    (assert (= (call-string call "summary") "did it"))
-                    (assert (= result "Recorded."))))
+                (do
+                  (assert (= (.name call) "finish"))
+                  (assert (= (call-string call "summary") "did it"))
+                  (assert (= result "Recorded."))))
       (_ (assert false)))
     (assert (< (- (sys/monotonic-ms) started) 8000))
     (let [r (.recorder f)
@@ -254,15 +326,21 @@ pwd > \"$dir/pwd.$n\"
       ;; After finish, the closing message and the turn's usage still arrive.
       (assert (saw? r "said all done"))
       (assert (saw? r "usage 150/25"))
-      (assert (contains? argv "exec\n--json\n--ignore-user-config\n--skip-git-repo-check\n-C\n"))
+      (assert (contains? argv
+                         "exec\n--json\n--ignore-user-config\n--skip-git-repo-check\n-C\n"))
       (assert (contains? argv "-m\ngpt-6.1-sol\n"))
       (assert (contains? argv "-c\nsandbox_mode=\"workspace-write\"\n"))
       (assert (contains? argv "-c\napproval_policy=\"never\"\n"))
-      (assert (contains? argv "-c\ndeveloper_instructions=\"You are a \\\"station\\\".\"\n"))
-      (assert (contains? argv "-c\nmcp_servers.factory.command=\"/usr/local/bin/factory\"\n"))
-      (assert (contains? argv "-c\nmcp_servers.factory.args=[\"_mcp-finish\",\"--gate\"]\n"))
-      (assert (contains? argv "-c\nmcp_servers.factory.default_tools_approval_mode=\"approve\"\n"))
-      (assert (contains? argv "-c\nsandbox_workspace_write.network_access=false\n"))
+      (assert (contains? argv
+                         "-c\ndeveloper_instructions=\"You are a \\\"station\\\".\"\n"))
+      (assert (contains? argv
+                         "-c\nmcp_servers.factory.command=\"/usr/local/bin/factory\"\n"))
+      (assert (contains? argv
+                         "-c\nmcp_servers.factory.args=[\"_mcp-finish\",\"--gate\"]\n"))
+      (assert (contains? argv
+                         "-c\nmcp_servers.factory.default_tools_approval_mode=\"approve\"\n"))
+      (assert (contains? argv
+                         "-c\nsandbox_workspace_write.network_access=false\n"))
       ;; Codex's own extras are off: the operator's ChatGPT apps, skills, web search.
       (assert (contains? argv "-c\nfeatures.apps=false\n"))
       (assert (contains? argv "-c\nskills.include_instructions=false\n"))
@@ -273,34 +351,52 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest new-work-after-finish-is-stopped
   (let [a (malloc-allocator)
-        f (fixture a "after-finish"
-                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
-                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"rm -rf x\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
-                            "sleep 20\necho never\n"])]
+        f
+          (fixture a
+                   "after-finish"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (ev a
+                              "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"rm -rf x\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                          "sleep 20\necho never\n"])]
                    (script a))
         h (.harness f)
         started (sys/monotonic-ms)]
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
-    (session-log! a f "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c9\"}}\n")
+    (session-log! a
+                  f
+                  "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c9\"}}\n")
     (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
     (assert (< (- (sys/monotonic-ms) started) 8000))
     (assert (not (saw? (.recorder f) "tool $ rm -rf x")))
-    (assert (saw? (.recorder f) "thought [codex] the agent started new work (command_execution) after the stop tool, so Codex was stopped"))
+    (assert (saw? (.recorder f)
+                  "thought [codex] the agent started new work (command_execution) after the stop tool, so Codex was stopped"))
     ;; Stopped before `turn.completed`: the turn's usage comes from Codex's
     ;; session log, and it is all there (the request that started the new
     ;; work was logged before the work began).
     (assert (saw? (.recorder f) "usage 40/5"))
     (assert (not (saw? (.recorder f) "usage 999/9")))
-    (for line (iter (.seen (.recorder f))) (assert (not (starts-with line "usage unknown"))))))
+    (for line (iter (.seen (.recorder f)))
+      (assert (not (starts-with line "usage unknown"))))))
 
 (deftest after-the-stop-tool-a-closing-message-or-thought-does-not-stop-the-process
   (let [a (malloc-allocator)
-        f (fixture a "quiet-after-finish"
-                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
-                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"r1\",\"type\":\"reasoning\",\"text\":\"\"}")
-                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"m2\",\"type\":\"agent_message\",\"text\":\"\"}")
-                            (message-event a "all done") (turn-completed a)])]
+        f
+          (fixture a
+                   "quiet-after-finish"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (ev a
+                              "\"type\":\"item.started\",\"item\":{\"id\":\"r1\",\"type\":\"reasoning\",\"text\":\"\"}")
+                          (ev a
+                              "\"type\":\"item.started\",\"item\":{\"id\":\"m2\",\"type\":\"agent_message\",\"text\":\"\"}")
+                          (message-event a "all done")
+                          (turn-completed a)])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -311,26 +407,41 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest a-request-cut-off-by-the-stop-makes-the-usage-incomplete
   (let [a (malloc-allocator)
-        f (fixture a "cut-off"
-                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
-                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
-                            "sleep 20\n"])]
+        f
+          (fixture a
+                   "cut-off"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (ev a
+                              "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                          "sleep 20\n"])]
                    (script a))
         h (.harness f)]
     ;; The last thing logged is a tool's output: Codex had asked the model again.
-    (session-log! a f "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c8\"}}\n")
+    (session-log! a
+                  f
+                  "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c8\"}}\n")
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h) (Finished [call result] 0) (_ (assert false)))
     (assert (saw? (.recorder f) "usage 40/5"))
-    (assert (saw? (.recorder f) "usage unknown: Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))))
+    (assert (saw? (.recorder f)
+                  "usage unknown: Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))))
 
 (deftest with-no-session-log-a-stopped-run-s-usage-is-unknown-not-zero
   (let [a (malloc-allocator)
-        f (fixture a "no-log"
-                   [(cat a [(thread-started a) (turn-started a) (finish-events a)
-                            (ev a "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
-                            "sleep 20\n"])]
+        f
+          (fixture a
+                   "no-log"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (ev a
+                              "\"type\":\"item.started\",\"item\":{\"id\":\"c9\",\"type\":\"command_execution\",\"command\":\"ls\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}")
+                          "sleep 20\n"])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -339,8 +450,10 @@ pwd > \"$dir/pwd.$n\"
     (let [(mut said) false]
       (for line (iter (.seen (.recorder f)))
         ;; No count is made up: the only usage line says it is unknown.
-        (assert (or (not (starts-with line "usage ")) (starts-with line "usage unknown")))
-        (when (and (starts-with line "usage unknown: Codex was stopped before it reported the run's token usage, and no session log for thread th-1 is under ")
+        (assert (or (not (starts-with line "usage "))
+                    (starts-with line "usage unknown")))
+        (when (and (starts-with line
+                                "usage unknown: Codex was stopped before it reported the run's token usage, and no session log for thread th-1 is under ")
                    (contains? line "/home/sessions"))
           (set! said true)
           0))
@@ -348,9 +461,19 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest continues-the-thread-and-replies
   (let [a (malloc-allocator)
-        f (fixture a "continue"
-                   [(cat a [(thread-started a) (turn-started a) (finish-events a) (turn-completed a)])
-                    (cat a [(thread-started a) (turn-started a) (message-event a "all good") (turn-completed a)])]
+        f
+          (fixture a
+                   "continue"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (turn-completed a)])
+                    (cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (message-event a "all good")
+                          (turn-completed a)])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -370,8 +493,14 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest a-checkpoint-restores-the-thread
   (let [a (malloc-allocator)
-        f (fixture a "checkpoint"
-                   [(cat a [(thread-started a) (turn-started a) (message-event a "hello") (turn-completed a)])]
+        f
+          (fixture a
+                   "checkpoint"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (message-event a "hello")
+                          (turn-completed a)])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -393,9 +522,22 @@ pwd > \"$dir/pwd.$n\"
   (let [a (malloc-allocator)
         control (script a)
         _ (set! (.message-on control) 2)
-        f (fixture a "steer"
-                   [(cat a [(thread-started a) (turn-started a) "sleep 1\n" (command-events a) "sleep 1\n" (command-events a) "sleep 20\n"])
-                    (cat a [(thread-started a) (turn-started a) (finish-events a) (turn-completed a)])]
+        f
+          (fixture a
+                   "steer"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          "sleep 1\n"
+                          (command-events a)
+                          "sleep 1\n"
+                          (command-events a)
+                          "sleep 20\n"])
+                    (cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (finish-events a)
+                          (turn-completed a)])]
                    control)
         h (.harness f)
         started (sys/monotonic-ms)]
@@ -410,7 +552,11 @@ pwd > \"$dir/pwd.$n\"
 (deftest cancellation-stops-a-running-agent
   (let [a (malloc-allocator)
         control (script a)
-        f (fixture a "cancel" [(cat a [(thread-started a) (turn-started a) "sleep 30\n"])] control)
+        f
+          (fixture a
+                   "cancel"
+                   [(cat a [(thread-started a) (turn-started a) "sleep 30\n"])]
+                   control)
         h (.harness f)
         started (sys/monotonic-ms)]
     (set! (.cancel-at-ms control) (+ started 500))
@@ -421,29 +567,45 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest errors-and-failed-exits-are-failures
   (let [a (malloc-allocator)
-        f (fixture a "error"
-                   [(cat a [(thread-started a) (turn-started a)
-                            (ev a "\"type\":\"turn.failed\",\"error\":{\"message\":\"model not available\"}") "exit 1\n"])
+        f
+          (fixture a
+                   "error"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (ev a
+                              "\"type\":\"turn.failed\",\"error\":{\"message\":\"model not available\"}")
+                          "exit 1\n"])
                     "echo 'Error loading config.toml: unknown variant' >&2\nexit 3\n"]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
-      (Failed [error] (do (assert (= (.kind error) "harness"))
-                          (assert (= (.message error) "model not available"))))
+      (Failed [error]
+              (do
+                (assert (= (.kind error) "harness"))
+                (assert (= (.message error) "model not available"))))
       (_ (assert false)))
     (harness-add-user! h "again")
     (match (harness-run! h)
-      (Failed [error] (assert (= (.message error) "codex exited with status 3: Error loading config.toml: unknown variant")))
+      (Failed [error]
+              (assert (= (.message error)
+                         "codex exited with status 3: Error loading config.toml: unknown variant")))
       (_ (assert false)))))
 
 (deftest a-failed-stop-tool-call-does-not-finish
   (let [a (malloc-allocator)
-        f (fixture a "denied"
-                   [(cat a [(thread-started a) (turn-started a)
-                            (ev a "\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"x\"},\"result\":null,\"error\":{\"message\":\"MCP tool call requires approval\"},\"status\":\"failed\"}")
-                            (message-event a "could not finish") (turn-completed a)])]
+        f
+          (fixture a
+                   "denied"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (ev a
+                              "\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"mcp_tool_call\",\"server\":\"factory\",\"tool\":\"finish\",\"arguments\":{\"outcome\":\"done\",\"summary\":\"x\"},\"result\":null,\"error\":{\"message\":\"MCP tool call requires approval\"},\"status\":\"failed\"}")
+                          (message-event a "could not finish")
+                          (turn-completed a)])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -455,11 +617,20 @@ pwd > \"$dir/pwd.$n\"
 
 (deftest a-stop-tool-that-never-started-is-a-failure
   (let [a (malloc-allocator)
-        f (fixture a "ready" [(cat a [(thread-started a) (turn-started a) (message-event a "done, I think") (turn-completed a)])] (script a))
+        f
+          (fixture a
+                   "ready"
+                   [(cat a
+                         [(thread-started a)
+                          (turn-started a)
+                          (message-event a "done, I think")
+                          (turn-completed a)])]
+                   (script a))
         h (.harness f)]
     (set! (.ready-file (field h options)) (cat a [(.dir f) "/ready"]))
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
-      (Failed [error] (assert (contains? (.message error) "never started in Codex")))
+      (Failed [error]
+              (assert (contains? (.message error) "never started in Codex")))
       (_ (assert false)))))

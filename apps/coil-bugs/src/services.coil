@@ -1,6 +1,5 @@
 (module coilbugs.services)
 (import "coil.alloc" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.arraylist" :use *)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
@@ -40,127 +39,194 @@
   (Unknown [(message (slice u8))]))
 
 (deftrait Native [Self]
-  (native-check [(self (ptr Self)) (a (dyn Allocator))] (-> (Result i64 (slice u8))))
-  (native-create [(self (ptr Self)) (a (dyn Allocator)) (request JVal)] (-> Created))
-  (native-run [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))] (-> (Result RunView (slice u8))))
-  (native-cancel [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))] (-> (Result i64 (slice u8))))
+  (native-check [(self (ptr Self)) (a (dyn Allocator))]
+    (-> (Result i64 (slice u8))))
+  (native-create [(self (ptr Self)) (a (dyn Allocator)) (request JVal)]
+    (-> Created))
+  (native-run [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result RunView (slice u8))))
+  (native-cancel [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result i64 (slice u8))))
   ;;; The run whose brief starts with `tag`, or "": `run.json` is the durable
   ;;; receipt of a creation even when its reply was lost.
-  (native-reconcile [(self (ptr Self)) (a (dyn Allocator)) (tag (slice u8))] (-> (Result (slice u8) (slice u8))))
+  (native-reconcile [(self (ptr Self)) (a (dyn Allocator)) (tag (slice u8))]
+    (-> (Result (slice u8) (slice u8))))
   (native-home [(self (ptr Self))] (-> (slice u8))))
 
-(defn run-dir [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))] (-> (slice u8))
+(defn run-dir [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))]
+  (-> (slice u8))
   (path-join a (path-join a (native-home native) "runs") id))
 
-(defn run-workspace [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))] (-> (slice u8))
+(defn run-workspace [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))]
+  (-> (slice u8))
   (path-join a (run-dir a native id) "workspace"))
 
-(defn run-journal [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))] (-> (slice u8))
+(defn run-journal [(a (dyn Allocator)) (native (dyn Native)) (id (slice u8))]
+  (-> (slice u8))
   (path-join a (run-dir a native id) "events.jsonl"))
 
-(defn text-of [(a (dyn Allocator)) (value JVal) (key (slice u8))] (-> (slice u8))
+(defn text-of [(a (dyn Allocator)) (value JVal) (key (slice u8))]
+  (-> (slice u8))
   (copy-bytes a (jv-string-or (jv-get value key) "")))
 
 (defn run-view [(a (dyn Allocator)) (value JVal)] (-> RunView)
-  (let [(mut stations) (al-new [StationView] a)
+  (let [(mut stations) (ArrayList::new [StationView] a)
         list (jv-get value "stations")
         (mut i) 0]
     (loop (if (>= (load i) (jv-len list))
               (break)
               (let [s (jv-nth list (load i))]
-                (push! (mut stations) (StationView :name (text-of a s "name") :status (text-of a s "status")))
+                (push! (mut stations)
+                       (StationView
+                         :name (text-of a s "name")
+                         :status (text-of a s "status")))
                 (set! i (+ (load i) 1)))))
-    (RunView :id (text-of a value "id") :status (text-of a value "status")
-             :alive (match (jv-get value "alive") (JBool [b] b) (_ false))
-             :current (text-of a value "current") :reason (text-of a value "reason")
-             :stations (load stations))))
+    (RunView
+      :id (text-of a value "id")
+      :status (text-of a value "status")
+      :alive (match (jv-get value "alive") (JBool [b] b) (_ false))
+      :current (text-of a value "current")
+      :reason (text-of a value "reason")
+      :stations (load stations))))
 
 ;;; The site this controller owns, over its loopback API.
 (defstruct NativeSite [(home (slice u8)) (port i64)])
 
 (defn hub [(a (dyn Allocator)) (site (ptr NativeSite))] (-> client/Hub)
-  (client/Hub :base-url (join a ["http://127.0.0.1:" (int-text a (.port site))])
-              :token (client/read-token a (.home site))))
+  (client/Hub
+    :base-url (join a ["http://127.0.0.1:" (int-text a (.port site))])
+    :token (client/read-token a (.home site))))
 
-(defn reply-message [(a (dyn Allocator)) (what (slice u8)) (reply client/Reply)] (-> (slice u8))
+(defn reply-message [(a (dyn Allocator)) (what (slice u8)) (reply client/Reply)]
+  (-> (slice u8))
   (join a [what ": " (client/reply-error a reply)]))
 
 (impl Native NativeSite
-  (native-check [(self (ptr NativeSite)) (a (dyn Allocator))] (-> (Result i64 (slice u8)))
-                (let [reply (client/hub-get a (hub a self) "/v1/site")]
-                  (if (client/reply-ok? reply) (Ok 0) (Err (reply-message a "the native site" reply)))))
-  (native-create [(self (ptr NativeSite)) (a (dyn Allocator)) (request JVal)] (-> Created)
-                 (let [reply (client/hub-post a (hub a self) "/v1/runs" request)]
-                   (match reply
-                     (client/ReplyFailed [message] (Unknown message))
-                     (client/ReplyOk [status body text]
-                                     (cond (and (>= status 200) (< status 300)) (Created (run-view a body))
-                                           (and (>= status 400) (< status 500)) (Refused (reply-message a "POST /v1/runs" reply))
-                                           :else (Unknown (reply-message a "POST /v1/runs" reply)))))))
-  (native-run [(self (ptr NativeSite)) (a (dyn Allocator)) (id (slice u8))] (-> (Result RunView (slice u8)))
-              (let [reply (client/hub-get a (hub a self) (join a ["/v1/runs/" id]))]
-                (if (client/reply-ok? reply)
-                    (Ok (run-view a (client/reply-body reply)))
-                    (Err (reply-message a (join a ["GET /v1/runs/" id]) reply)))))
-  (native-cancel [(self (ptr NativeSite)) (a (dyn Allocator)) (id (slice u8))] (-> (Result i64 (slice u8)))
-                 (let [reply (client/hub-post a (hub a self) (join a ["/v1/runs/" id "/cancel"]) (jv-object a))]
-                   (if (client/reply-ok? reply) (Ok 0) (Err (reply-message a (join a ["cancel " id]) reply)))))
-  (native-reconcile [(self (ptr NativeSite)) (a (dyn Allocator)) (tag (slice u8))] (-> (Result (slice u8) (slice u8)))
-                    (block :find
-                           (let [runs (path-join a (.home self) "runs")
-                                 (mut found) (al-new [(slice u8)] a)]
-                             (match (list-names a runs)
-                               (Err [why] (Err why))
-                               (Ok [names]
-                                   (do (for name (iter names)
-                                         (match (read-text a (path-join a (path-join a runs name) "run.json"))
-                                           (Err [why] (return-from :find (Err why)))
-                                           (Ok [maybe] (match maybe
-                                                         (None [] 0)
-                                                         (Some [text] (match (jv-parse a text)
-                                                                       (None [] 0)
-                                                                       (Some [spec] (do (when (= (first-line (jv-string-or (jv-get spec "brief") "") 100000) tag)
-                                                                                          (push! (mut found) (text-of a spec "id"))
-                                                                                          0)
-                                                                                        0))))))))
-                                       (cond (> (len found) 1) (Err (join a ["more than one native run carries the tag " tag]))
-                                             (= (len found) 1) (Ok (get found 0))
-                                             :else (Ok ""))))))))
-  (native-home [(self (ptr NativeSite))] (-> (slice u8)) (.home self)))
+  (native-check [(self (ptr NativeSite)) (a (dyn Allocator))]
+    (-> (Result i64 (slice u8)))
+    (let [reply (client/hub-get a (hub a self) "/v1/site")]
+      (if (client/reply-ok? reply)
+          (Ok 0)
+          (Err (reply-message a "the native site" reply)))))
+  (native-create [(self (ptr NativeSite)) (a (dyn Allocator)) (request JVal)]
+    (-> Created)
+    (let [reply (client/hub-post a (hub a self) "/v1/runs" request)]
+      (match reply
+        (client/ReplyFailed [message] (Unknown message))
+        (client/ReplyOk [status body text]
+                        (cond (and (>= status 200) (< status 300))
+                                (Created (run-view a body))
+                              (and (>= status 400) (< status 500))
+                                (Refused (reply-message a "POST /v1/runs" reply))
+                              :else
+                                (Unknown (reply-message a "POST /v1/runs" reply)))))))
+  (native-run [(self (ptr NativeSite)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result RunView (slice u8)))
+    (let [reply (client/hub-get a (hub a self) (join a ["/v1/runs/" id]))]
+      (if (client/reply-ok? reply)
+          (Ok (run-view a (client/reply-body reply)))
+          (Err (reply-message a (join a ["GET /v1/runs/" id]) reply)))))
+  (native-cancel [(self (ptr NativeSite)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result i64 (slice u8)))
+    (let [reply
+            (client/hub-post a
+                             (hub a self)
+                             (join a ["/v1/runs/" id "/cancel"])
+                             (jv-object a))]
+      (if (client/reply-ok? reply)
+          (Ok 0)
+          (Err (reply-message a (join a ["cancel " id]) reply)))))
+  (native-reconcile [(self (ptr NativeSite))
+                     (a (dyn Allocator))
+                     (tag (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (block
+      :find
+        (let [runs (path-join a (.home self) "runs")
+              (mut found) (ArrayList::new [(slice u8)] a)]
+          (match (list-names a runs)
+            (Err [why] (Err why))
+            (Ok [names]
+                (do
+                  (for name (iter names)
+                    (match (read-text a
+                                      (path-join a
+                                                 (path-join a runs name)
+                                                 "run.json"))
+                      (Err [why] (return-from :find (Err why)))
+                      (Ok [maybe]
+                          (match maybe
+                            (None [] 0)
+                            (Some [text]
+                                  (match (jv-parse a text)
+                                    (None [] 0)
+                                    (Some [spec]
+                                          (do
+                                            (when (= (first-line (jv-string-or (jv-get spec
+                                                                                       "brief")
+                                                                               "")
+                                                                 100000)
+                                                     tag)
+                                              (push! (mut found)
+                                                     (text-of a spec "id"))
+                                              0)
+                                            0))))))))
+                  (cond (> (len found) 1)
+                          (Err (join a
+                                     ["more than one native run carries the tag "
+                                      tag]))
+                        (= (len found) 1) (Ok (get found 0))
+                        :else (Ok ""))))))))
+  (native-home [(self (ptr NativeSite))] (-> (slice u8))
+    (.home self)))
 
 ;; ---------------------------------------------------------------------------
 ;; The Coil repository
 
-(defn git [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> (Result (slice u8) (slice u8)))
+(defn git [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))]
+  (-> (Result (slice u8) (slice u8)))
   (let [result (capture a "git" args dir 600000)]
     (if (.ok result)
-        (Ok (str-trim (.output result)))
-        (Err (join a ["git " (get args 0) " in " dir " failed: " (str-trim (.error result))])))))
+        (Ok (trim (.output result)))
+        (Err (join a
+                   ["git "
+                    (get args 0)
+                    " in "
+                    dir
+                    " failed: "
+                    (trim (.error result))])))))
 
 ;;; Where main is now.
 (deftrait Remote [Self]
-  (remote-head [(self (ptr Self)) (a (dyn Allocator))] (-> (Result (slice u8) (slice u8)))))
+  (remote-head [(self (ptr Self)) (a (dyn Allocator))]
+    (-> (Result (slice u8) (slice u8)))))
 
 ;;; The controller's clone: the project every bug run works in (each in its own
 ;;; worktree), and where base compilers are built.
-(defstruct Checkout [(dir (slice u8)) (repository (slice u8)) (branch (slice u8))])
+(defstruct Checkout
+  [(dir (slice u8)) (repository (slice u8)) (branch (slice u8))])
 
-(defn ensure-clone [(a (dyn Allocator)) (checkout (ptr Checkout))] (-> (Result i64 (slice u8)))
+(defn ensure-clone [(a (dyn Allocator)) (checkout (ptr Checkout))]
+  (-> (Result i64 (slice u8)))
   (if (dir-exists? a (path-join a (.dir checkout) ".git"))
       (Ok 0)
       (match (ensure-dir a (dir-name (.dir checkout)) 493)
         (Err [why] (Err why))
-        (Ok [_] (match (git a "" ["clone" "-q" (.repository checkout) (.dir checkout)])
-                  (Err [why] (Err why))
-                  (Ok [_] (Ok 0)))))))
+        (Ok [_]
+            (match (git a
+                        ""
+                        ["clone" "-q" (.repository checkout) (.dir checkout)])
+              (Err [why] (Err why))
+              (Ok [_] (Ok 0)))))))
 
 (impl Remote Checkout
-  (remote-head [(self (ptr Checkout)) (a (dyn Allocator))] (-> (Result (slice u8) (slice u8)))
-               (match (ensure-clone a self)
-                 (Err [why] (Err why))
-                 (Ok [_] (match (git a (.dir self) ["fetch" "-q" "origin" (.branch self)])
-                           (Err [why] (Err why))
-                           (Ok [_] (git a (.dir self) ["rev-parse" "FETCH_HEAD"])))))))
+  (remote-head [(self (ptr Checkout)) (a (dyn Allocator))]
+    (-> (Result (slice u8) (slice u8)))
+    (match (ensure-clone a self)
+      (Err [why] (Err why))
+      (Ok [_]
+          (match (git a (.dir self) ["fetch" "-q" "origin" (.branch self)])
+            (Err [why] (Err why))
+            (Ok [_] (git a (.dir self) ["rev-parse" "FETCH_HEAD"])))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Base compilers
@@ -169,51 +235,105 @@
 
 ;;; A compiler built from one commit of main with the committed seeds.
 (deftrait Builder [Self]
-  (build-start [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))] (-> (Result i64 (slice u8))))
-  (build-poll [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))] (-> BuildPoll))
-  (build-compiler [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))] (-> (slice u8))))
+  (build-start [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))]
+    (-> (Result i64 (slice u8))))
+  (build-poll [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))]
+    (-> BuildPoll))
+  (build-compiler [(self (ptr Self)) (a (dyn Allocator)) (commit (slice u8))]
+    (-> (slice u8))))
 
 ;;; Builds in its own systemd unit, so the build outlives the heartbeat that
 ;;; starts it: `coil-bugs build-base --config FILE --commit SHA`.
-(defstruct SystemdBuilder [(program (slice u8)) (config-path (slice u8)) (state-dir (slice u8)) (memory (slice u8))])
+(defstruct SystemdBuilder
+  [(program (slice u8))
+   (config-path (slice u8))
+   (state-dir (slice u8))
+   (memory (slice u8))])
 
 (defn unit-name [(a (dyn Allocator)) (commit (slice u8))] (-> (slice u8))
-  (join a ["coil-bugs-base-" (subslice commit 0 (if (> (len commit) 12) 12 (len commit)))]))
+  (join a
+        ["coil-bugs-base-"
+         (subslice commit 0 (if (> (len commit) 12) 12 (len commit)))]))
 
-(defn build-dir [(a (dyn Allocator)) (state-dir (slice u8)) (commit (slice u8))] (-> (slice u8))
+(defn build-dir [(a (dyn Allocator)) (state-dir (slice u8)) (commit (slice u8))]
+  (-> (slice u8))
   (path-join a (path-join a state-dir "base-builds") commit))
 
-(defn compiler-path [(a (dyn Allocator)) (state-dir (slice u8)) (commit (slice u8))] (-> (slice u8))
-  (path-join a (path-join a (path-join a state-dir "compilers") commit) "bin/coil"))
+(defn compiler-path [(a (dyn Allocator))
+                     (state-dir (slice u8))
+                     (commit (slice u8))] (-> (slice u8))
+  (path-join a
+             (path-join a (path-join a state-dir "compilers") commit)
+             "bin/coil"))
 
 (impl Builder SystemdBuilder
-  (build-start [(self (ptr SystemdBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> (Result i64 (slice u8)))
-               (let [dir (build-dir a (.state-dir self) commit)
-                     result-file (path-join a dir "result.json")]
-                 (match (ensure-dir a dir 493)
-                   (Err [why] (Err why))
-                   (Ok [_]
-                       (do (when (file-exists? a result-file) (atomic/unlink-path a result-file) 0)
-                           (let [ran (capture a "systemd-run" ["--user" "--unit" (unit-name a commit) "--collect" "--quiet"
-                                                               "--property" (join a ["MemoryMax=" (.memory self)])
-                                                               (.program self) "build-base" "--config" (.config-path self) "--commit" commit]
-                                              "" 60000)]
-                             (if (.ok ran) (Ok 0) (Err (join a ["systemd-run failed: " (str-trim (.error ran))])))))))))
-  (build-poll [(self (ptr SystemdBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> BuildPoll)
-              (match (read-text a (path-join a (build-dir a (.state-dir self) commit) "result.json"))
-                (Err [why] (BuildFailed why))
-                (Ok [maybe]
-                    (match maybe
-                      (Some [text] (if (contains? text "\"ok\": true")
-                                       (if (file-exists? a (compiler-path a (.state-dir self) commit))
-                                           (Built)
-                                           (BuildFailed "the build reported success but left no compiler"))
-                                       (BuildFailed (str-trim text))))
-                      (None [] (if (.ok (capture a "systemctl" ["--user" "is-active" "--quiet" (unit-name a commit)] "" 30000))
-                                   (Building)
-                                   (BuildFailed "the build unit stopped without a result")))))))
-  (build-compiler [(self (ptr SystemdBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> (slice u8))
-                  (compiler-path a (.state-dir self) commit)))
+  (build-start [(self (ptr SystemdBuilder))
+                (a (dyn Allocator))
+                (commit (slice u8))] (-> (Result i64 (slice u8)))
+    (let [dir (build-dir a (.state-dir self) commit)
+          result-file (path-join a dir "result.json")]
+      (match (ensure-dir a dir 493)
+        (Err [why] (Err why))
+        (Ok [_]
+            (do
+              (when (file-exists? a result-file)
+                (atomic/unlink-path a result-file)
+                0)
+              (let [ran
+                      (capture a
+                               "systemd-run"
+                               ["--user"
+                                "--unit"
+                                (unit-name a commit)
+                                "--collect"
+                                "--quiet"
+                                "--property"
+                                (join a ["MemoryMax=" (.memory self)])
+                                (.program self)
+                                "build-base"
+                                "--config"
+                                (.config-path self)
+                                "--commit"
+                                commit]
+                               ""
+                               60000)]
+                (if (.ok ran)
+                    (Ok 0)
+                    (Err (join a ["systemd-run failed: " (trim (.error ran))])))))))))
+  (build-poll [(self (ptr SystemdBuilder))
+               (a (dyn Allocator))
+               (commit (slice u8))] (-> BuildPoll)
+    (match (read-text a
+                      (path-join a
+                                 (build-dir a (.state-dir self) commit)
+                                 "result.json"))
+      (Err [why] (BuildFailed why))
+      (Ok [maybe]
+          (match maybe
+            (Some [text]
+                  (if (contains? text "\"ok\": true")
+                      (if (file-exists? a
+                                        (compiler-path a
+                                                       (.state-dir self)
+                                                       commit))
+                          (Built)
+                          (BuildFailed "the build reported success but left no compiler"))
+                      (BuildFailed (trim text))))
+            (None []
+                  (if (.ok (capture a
+                                    "systemctl"
+                                    ["--user"
+                                     "is-active"
+                                     "--quiet"
+                                     (unit-name a commit)]
+                                    ""
+                                    30000))
+                      (Building)
+                      (BuildFailed "the build unit stopped without a result")))))))
+  (build-compiler [(self (ptr SystemdBuilder))
+                   (a (dyn Allocator))
+                   (commit (slice u8))] (-> (slice u8))
+    (compiler-path a (.state-dir self) commit)))
 
 ;; ---------------------------------------------------------------------------
 ;; GitHub
@@ -221,53 +341,151 @@
 ;;; Pull requests, opened by the controller, never by an agent.
 (deftrait Publisher [Self]
   ;;; One commit on `base` with `head`'s tree, less the factory's evidence.
-  (publish-squash [(self (ptr Self)) (a (dyn Allocator)) (head (slice u8)) (base (slice u8)) (message (slice u8))] (-> (Result (slice u8) (slice u8))))
+  (publish-squash [(self (ptr Self))
+                   (a (dyn Allocator))
+                   (head (slice u8))
+                   (base (slice u8))
+                   (message (slice u8))] (-> (Result (slice u8) (slice u8))))
   ;;; Push `commit` as `branch` and open (or find) its pull request; its URL.
-  (publish-open [(self (ptr Self)) (a (dyn Allocator)) (branch (slice u8)) (commit (slice u8)) (title (slice u8)) (body (slice u8))] (-> (Result (slice u8) (slice u8)))))
+  (publish-open [(self (ptr Self))
+                 (a (dyn Allocator))
+                 (branch (slice u8))
+                 (commit (slice u8))
+                 (title (slice u8))
+                 (body (slice u8))] (-> (Result (slice u8) (slice u8)))))
 
-(defstruct GitHub [(checkout (slice u8)) (gh (slice u8)) (repo (slice u8)) (branch (slice u8)) (scratch (slice u8))])
+(defstruct GitHub
+  [(checkout (slice u8))
+   (gh (slice u8))
+   (repo (slice u8))
+   (branch (slice u8))
+   (scratch (slice u8))])
 
-(defn gh [(a (dyn Allocator)) (github (ptr GitHub)) (args (slice (slice u8)))] (-> (Result (slice u8) (slice u8)))
+(defn gh [(a (dyn Allocator)) (github (ptr GitHub)) (args (slice (slice u8)))]
+  (-> (Result (slice u8) (slice u8)))
   (let [result (capture a (.gh github) args (.checkout github) 120000)]
     (if (.ok result)
-        (Ok (str-trim (.output result)))
-        (Err (join a ["gh " (get args 0) " " (get args 1) " failed: " (str-trim (.error result))])))))
+        (Ok (trim (.output result)))
+        (Err (join a
+                   ["gh "
+                    (get args 0)
+                    " "
+                    (get args 1)
+                    " failed: "
+                    (trim (.error result))])))))
 
 (impl Publisher GitHub
-  (publish-squash [(self (ptr GitHub)) (a (dyn Allocator)) (head (slice u8)) (base (slice u8)) (message (slice u8))] (-> (Result (slice u8) (slice u8)))
-                  (let [index (join a ["GIT_INDEX_FILE=" (path-join a (.scratch self) "pr-index")])
-                        dir (.checkout self)]
-                    (match (ensure-dir a (.scratch self) 448)
-                      (Err [why] (Err why))
-                      (Ok [_]
-                          (match (git a dir ["--version"])
-                            (Err [why] (Err why))
-                            (Ok [_]
-                                (let [read (capture a "env" [index "git" "read-tree" head] dir 60000)
-                                      drop (capture a "env" [index "git" "rm" "-r" "-q" "--cached" "--ignore-unmatch" ".coil-bug"] dir 60000)
-                                      tree (capture a "env" [index "git" "write-tree"] dir 60000)]
-                                  (cond (not (.ok read)) (Err (join a ["git read-tree failed: " (.error read)]))
-                                        (not (.ok drop)) (Err (join a ["git rm failed: " (.error drop)]))
-                                        (not (.ok tree)) (Err (join a ["git write-tree failed: " (.error tree)]))
-                                        :else (git a dir ["commit-tree" (str-trim (.output tree)) "-p" base "-m" message])))))))))
-  (publish-open [(self (ptr GitHub)) (a (dyn Allocator)) (branch (slice u8)) (commit (slice u8)) (title (slice u8)) (body (slice u8))] (-> (Result (slice u8) (slice u8)))
-                (match (git a (.checkout self) ["push" "-q" "--force" "origin" (join a [commit ":refs/heads/" branch])])
-                  (Err [why] (Err why))
-                  (Ok [_]
-                      (match (gh a self ["pr" "list" "--repo" (.repo self) "--head" branch "--state" "all" "--json" "url"])
-                        (Err [why] (Err why))
-                        (Ok [listed]
-                            (let [existing (match (jv-parse a listed) (Some [v] (jv-string-or (jv-get (jv-nth v 0) "url") "")) (None [] ""))]
-                              (if (> (len existing) 0)
-                                  (Ok (copy-bytes a existing))
-                                  (let [body-file (path-join a (.scratch self) "pr-body.md")]
-                                    (match (write-text a body-file body 384)
-                                      (Err [why] (Err why))
-                                      (Ok [_] (match (gh a self ["pr" "create" "--repo" (.repo self) "--base" (.branch self) "--head" branch
-                                                                 "--title" title "--body-file" body-file])
-                                                (Err [why] (Err why))
-                                                (Ok [out] (let [lines (str-split a out "\n")]
-                                                            (Ok (str-trim (get lines (- (len lines) 1))))))))))))))))))
+  (publish-squash [(self (ptr GitHub))
+                   (a (dyn Allocator))
+                   (head (slice u8))
+                   (base (slice u8))
+                   (message (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (let [index
+            (join a
+                  ["GIT_INDEX_FILE=" (path-join a (.scratch self) "pr-index")])
+          dir (.checkout self)]
+      (match (ensure-dir a (.scratch self) 448)
+        (Err [why] (Err why))
+        (Ok [_]
+            (match (git a dir ["--version"])
+              (Err [why] (Err why))
+              (Ok [_]
+                  (let [read
+                          (capture a
+                                   "env"
+                                   [index "git" "read-tree" head]
+                                   dir
+                                   60000)
+                        drop
+                          (capture a
+                                   "env"
+                                   [index
+                                    "git"
+                                    "rm"
+                                    "-r"
+                                    "-q"
+                                    "--cached"
+                                    "--ignore-unmatch"
+                                    ".coil-bug"]
+                                   dir
+                                   60000)
+                        tree
+                          (capture a "env" [index "git" "write-tree"] dir 60000)]
+                    (cond (not (.ok read))
+                            (Err (join a
+                                       ["git read-tree failed: " (.error read)]))
+                          (not (.ok drop))
+                            (Err (join a ["git rm failed: " (.error drop)]))
+                          (not (.ok tree))
+                            (Err (join a
+                                       ["git write-tree failed: " (.error tree)]))
+                          :else
+                            (git a
+                                 dir
+                                 ["commit-tree"
+                                  (trim (.output tree))
+                                  "-p"
+                                  base
+                                  "-m"
+                                  message])))))))))
+  (publish-open [(self (ptr GitHub))
+                 (a (dyn Allocator))
+                 (branch (slice u8))
+                 (commit (slice u8))
+                 (title (slice u8))
+                 (body (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (match (git a
+                (.checkout self)
+                ["push"
+                 "-q"
+                 "--force"
+                 "origin"
+                 (join a [commit ":refs/heads/" branch])])
+      (Err [why] (Err why))
+      (Ok [_]
+          (match (gh a
+                     self
+                     ["pr"
+                      "list"
+                      "--repo"
+                      (.repo self)
+                      "--head"
+                      branch
+                      "--state"
+                      "all"
+                      "--json"
+                      "url"])
+            (Err [why] (Err why))
+            (Ok [listed]
+                (let [existing
+                        (match (jv-parse a listed)
+                          (Some [v]
+                                (jv-string-or (jv-get (jv-nth v 0) "url") ""))
+                          (None [] ""))]
+                  (if (> (len existing) 0)
+                      (Ok (copy-bytes a existing))
+                      (let [body-file (path-join a (.scratch self) "pr-body.md")]
+                        (match (write-text a body-file body 384)
+                          (Err [why] (Err why))
+                          (Ok [_]
+                              (match (gh a
+                                         self
+                                         ["pr"
+                                          "create"
+                                          "--repo"
+                                          (.repo self)
+                                          "--base"
+                                          (.branch self)
+                                          "--head"
+                                          branch
+                                          "--title"
+                                          title
+                                          "--body-file"
+                                          body-file])
+                                (Err [why] (Err why))
+                                (Ok [out]
+                                    (let [lines (split a out "\n")]
+                                      (Ok (trim (get lines (- (len lines) 1))))))))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Jimmy's approvals page
@@ -289,27 +507,42 @@
 ;;; Asks Jimmy to confirm that a bug is out of scope. The factory's approvals
 ;;; client (factory.approval) does the asking; tests stand in for it.
 (deftrait Approver [Self]
-  (approver-submit [(self (ptr Self)) (a (dyn Allocator)) (body (slice u8))] (-> (Result Ticket (slice u8))))
-  (approver-fetch [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))] (-> ScopeAnswer)))
+  (approver-submit [(self (ptr Self)) (a (dyn Allocator)) (body (slice u8))]
+    (-> (Result Ticket (slice u8))))
+  (approver-fetch [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8))]
+    (-> ScopeAnswer)))
 
 (defstruct Approvals [(site approval-config/SiteConfig)])
 
-(defn approvals-for [(a (dyn Allocator)) (url (slice u8)) (token-file (slice u8))] (-> Approvals)
-  (let [(mut site) (primitive/zeroed approval-config/SiteConfig)]
+(defn approvals-for [(a (dyn Allocator))
+                     (url (slice u8))
+                     (token-file (slice u8))] (-> Approvals)
+  (let [(mut site) (zeroed approval-config/SiteConfig)]
     (set! (.approvals-url site) url)
     (set! (.approvals-token-file site) token-file)
     (Approvals :site (load site))))
 
 (impl Approver Approvals
-  (approver-submit [(self (ptr Approvals)) (a (dyn Allocator)) (body (slice u8))] (-> (Result Ticket (slice u8)))
-                   (match (approval/approval-submit! a (field self site) body)
-                     (Ok [submitted] (Ok (Ticket :id (.id submitted) :page (.page submitted))))
-                     (Err [why] (Err why))))
-  (approver-fetch [(self (ptr Approvals)) (a (dyn Allocator)) (id (slice u8))] (-> ScopeAnswer)
-                  (match (approval/approval-fetch a (field self site) id)
-                    (approval/Waiting [] (ScopeWaiting))
-                    (approval/Withdrawn [reason] (ScopeWithdrawn))
-                    (approval/Unreachable [message] (ScopeUnreachable message))
-                    (approval/Decided [approved-all message decision]
-                                      (let [comment (copy-bytes a (str-trim (jv-string-or (jv-get (jv-nth (jv-get decision "proposals") 0) "comment") "")))]
-                                        (if approved-all (ScopeConfirmed comment) (ScopeOverruled comment)))))))
+  (approver-submit [(self (ptr Approvals))
+                    (a (dyn Allocator))
+                    (body (slice u8))] (-> (Result Ticket (slice u8)))
+    (match (approval/approval-submit! a (field self site) body)
+      (Ok [submitted] (Ok (Ticket :id (.id submitted) :page (.page submitted))))
+      (Err [why] (Err why))))
+  (approver-fetch [(self (ptr Approvals)) (a (dyn Allocator)) (id (slice u8))]
+    (-> ScopeAnswer)
+    (match (approval/approval-fetch a (field self site) id)
+      (approval/Waiting [] (ScopeWaiting))
+      (approval/Withdrawn [reason] (ScopeWithdrawn))
+      (approval/Unreachable [message] (ScopeUnreachable message))
+      (approval/Decided [approved-all message decision]
+                        (let [comment
+                                (copy-bytes a
+                                            (trim (jv-string-or (jv-get (jv-nth (jv-get decision
+                                                                                        "proposals")
+                                                                                0)
+                                                                        "comment")
+                                                                "")))]
+                          (if approved-all
+                              (ScopeConfirmed comment)
+                              (ScopeOverruled comment)))))))

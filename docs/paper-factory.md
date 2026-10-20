@@ -59,7 +59,7 @@ with the accepted workspace (a clone of it) as `--project`.
 
 Selection and implementation first use the top-ranked free model (see *Free models*
 below). If none qualifies, the run starts on the paid model and says why. Judgment always uses
-an independent Codex `gpt-5.5` conversation. Provider failures, failed native gates,
+an independent Codex `gpt-6.1-sol` conversation. Provider failures, failed native gates,
 blocked work, judge rejection, and bounded lack of progress trigger automatic paid
 Codex repair, with at most **two paid attempts** per day. Codex uses the existing
 account login; this is the paid/subscription fallback, not a new API key or billing
@@ -75,14 +75,18 @@ Defaults in `config.json`:
 
 | Limit | Value |
 | --- | --- |
-| Free agent inactivity | 5 minutes |
+| Free agent inactivity | 15 minutes |
 | Paid agent/judge inactivity | 15 minutes |
 | Native gate inactivity | 30 minutes |
 | Free whole-attempt duration | 90 minutes |
 | Paid whole-attempt duration | 3 hours |
 | Paid attempts | 2 |
 
-Agent/tool/station progress resets inactivity. Polling and token usage alone do not.
+Agent/tool/station progress resets inactivity, including reasoning and text the model
+is still streaming (`agent.streaming`). Polling and token usage alone do not. Free
+models get the same 15 minutes as paid ones because OpenCode Zen delivers a tool call
+whole: while a model writes a large file the connection is silent (a 21 KB `write`
+arrived after 35 s of nothing), so a shorter limit kills models that are working.
 Operator pauses are respected; an external cancellation ends that daily job rather
 than starting a repair. A cancellation that leaves a worker alive blocks further
 daily work, so the controller cannot accumulate overlapping model processes.

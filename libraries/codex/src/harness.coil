@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :as fs)
-(import "coil.primitive" :as primitive)
 (import "coil.scratch" :as scratch)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
@@ -15,8 +14,19 @@
 (import "agent.loop" :use *)
 (import "agent.tool" :use *)
 (import "agent_tools.stream" :as stream)
-(export CodexOptions CodexHarness codex-new codex-argv toml-string toml-array apply-event! Turn turn-new
-        LoggedUsage logged-usage find-session-log)
+
+(export CodexOptions
+        CodexHarness
+        codex-new
+        codex-argv
+        toml-string
+        toml-array
+        apply-event!
+        Turn
+        turn-new
+        LoggedUsage
+        logged-usage
+        find-session-log)
 
 ;;; The Codex CLI (`codex exec`) driven headlessly as a `Harness`. Each run of
 ;;; the harness is one `codex exec --json` process working in the workspace;
@@ -54,8 +64,8 @@
 ;;; rather than counting nothing.
 
 (defstruct CodexOptions
-  [;;; The codex executable.
-   (program (slice u8))
+  ;;; The codex executable.
+  [(program (slice u8))
    (workdir (slice u8))
    ;;; Codex's home (CODEX_HOME), where it keeps each thread's session log;
    ;;; "" when not known, and then a run stopped early has unknown usage.
@@ -101,21 +111,22 @@
                  (options CodexOptions)
                  (observer (dyn AgentObserver))
                  (control (dyn AgentControl))] (-> CodexHarness)
-  (CodexHarness :allocator a
-                :options options
-                :observer observer
-                :control control
-                :session ""
-                :system ""
-                :pending (al-new [(slice u8)] a)
-                :inbound (al-new [Inbound] a)
-                :messages (jv-array a)
-                :turns 0))
+  (CodexHarness
+    :allocator a
+    :options options
+    :observer observer
+    :control control
+    :session ""
+    :system ""
+    :pending (ArrayList::new [(slice u8)] a)
+    :inbound (ArrayList::new [Inbound] a)
+    :messages (jv-array a)
+    :turns 0))
 
 (defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (defn now-ms [] (-> i64)
   (match (time/monotonic-now-ms)
@@ -123,9 +134,9 @@
     (Err [failure] 0)))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut t) (sb-new a)]
-    (sb-push-i64! (mut t) n)
-    (sb-finish! (mut t))))
+  (let [(mut t) (StrBuf::new a)]
+    (push-i64! (mut t) n)
+    (finish! (mut t))))
 
 ;; ---------------------------------------------------------------------------
 ;; The command
@@ -136,34 +147,36 @@
 ;;; `text` as a TOML basic string, quotes included: the form Codex parses a
 ;;; `-c key=value` value in. Bytes of 0x80 and up are UTF-8 and pass through.
 (defn toml-string [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) "\"")
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "\"")
     (for byte (iter text)
       (let [c (cast i64 byte)]
-        (cond (= c 34) (sb-push-str! (mut out) "\\\"")
-              (= c 92) (sb-push-str! (mut out) "\\\\")
-              (= c 10) (sb-push-str! (mut out) "\\n")
-              (= c 9) (sb-push-str! (mut out) "\\t")
-              (= c 13) (sb-push-str! (mut out) "\\r")
+        (cond (= c 34) (push-str! (mut out) "\\\"")
+              (= c 92) (push-str! (mut out) "\\\\")
+              (= c 10) (push-str! (mut out) "\\n")
+              (= c 9) (push-str! (mut out) "\\t")
+              (= c 13) (push-str! (mut out) "\\r")
               (or (< c 32) (= c 127))
-                (do (sb-push-str! (mut out) "\\u00")
-                    (sb-push-byte! (mut out) (hex-digit (/ c 16)))
-                    (sb-push-byte! (mut out) (hex-digit (% c 16)))
-                    0)
-              :else (do (sb-push-byte! (mut out) byte) 0))))
-    (sb-push-str! (mut out) "\"")
-    (sb-finish! (mut out))))
+                (do
+                  (push-str! (mut out) "\\u00")
+                  (push! (mut out) (hex-digit (/ c 16)))
+                  (push! (mut out) (hex-digit (% c 16)))
+                  0)
+              :else (do (push! (mut out) byte) 0))))
+    (push-str! (mut out) "\"")
+    (finish! (mut out))))
 
-(defn toml-array [(a (dyn Allocator)) (items (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+(defn toml-array [(a (dyn Allocator)) (items (slice (slice u8)))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
         (mut first) true]
-    (sb-push-str! (mut out) "[")
+    (push-str! (mut out) "[")
     (for item (iter items)
-      (when (not (load first)) (sb-push-str! (mut out) ",") 0)
-      (sb-push-str! (mut out) (toml-string a item))
+      (when (not (load first)) (push-str! (mut out) ",") 0)
+      (push-str! (mut out) (toml-string a item))
       (set! first false))
-    (sb-push-str! (mut out) "]")
-    (sb-finish! (mut out))))
+    (push-str! (mut out) "]")
+    (finish! (mut out))))
 
 ;;; Codex's own extras, turned off: an agent gets Codex's shell and patch tool
 ;;; and the tools of the MCP server it is given, nothing else.
@@ -179,36 +192,41 @@
 ;;; turn). And the multi-agent v2 instructions and tools, because the model
 ;;; catalog turns them on per model and no setting reaches them (verified
 ;;; against codex-cli 0.162.1).
-(const CLOSED-SETTINGS ["features.apps=false"
-                        "features.plugins=false"
-                        "features.browser_use=false"
-                        "features.computer_use=false"
-                        "features.image_generation=false"
-                        "features.goals=false"
-                        "features.memories=false"
-                        "features.tool_suggest=false"
-                        "features.skill_search=false"
-                        "features.multi_agent=false"
-                        "web_search=\"disabled\""
-                        "skills.include_instructions=false"
-                        "skills.bundled.enabled=false"
-                        "include_apps_instructions=false"
-                        "include_collaboration_mode_instructions=false"])
+(const CLOSED-SETTINGS
+       ["features.apps=false"
+        "features.plugins=false"
+        "features.browser_use=false"
+        "features.computer_use=false"
+        "features.image_generation=false"
+        "features.goals=false"
+        "features.memories=false"
+        "features.tool_suggest=false"
+        "features.skill_search=false"
+        "features.multi_agent=false"
+        "web_search=\"disabled\""
+        "skills.include_instructions=false"
+        "skills.bundled.enabled=false"
+        "include_apps_instructions=false"
+        "include_collaboration_mode_instructions=false"])
 
 (defn has-stop-tool? [(h (ptr CodexHarness))] (-> bool)
   (> (len (.stop-command (field h options))) 0))
 
-(defn setting! [(a (dyn Allocator)) (argv (mut (ArrayList (slice u8)))) (key (slice u8)) (value (slice u8))] (-> i64)
+(defn setting! [(a (dyn Allocator))
+                (argv (mut (ArrayList (slice u8))))
+                (key (slice u8))
+                (value (slice u8))] (-> i64)
   (push! (mut argv) "-c")
   (push! (mut argv) (join a [key "=" value]))
   0)
 
 ;;; The complete argv for one run: a new thread when there is none yet,
 ;;; otherwise the thread continued. The prompt itself goes on stdin.
-(defn codex-argv [(a (dyn Allocator)) (h (ptr CodexHarness))] (-> (ArrayList (slice u8)))
+(defn codex-argv [(a (dyn Allocator)) (h (ptr CodexHarness))]
+  (-> (ArrayList (slice u8)))
   (let [options (field h options)
         resuming (> (len (.session h)) 0)
-        (mut argv) (al-new [(slice u8)] a)]
+        (mut argv) (ArrayList::new [(slice u8)] a)]
     (push! (mut argv) (.program options))
     (push! (mut argv) "exec")
     (when resuming (push! (mut argv) "resume") 0)
@@ -229,9 +247,18 @@
     (when (has-stop-tool? h)
       (let [command (.stop-command options)
             server (join a ["mcp_servers." (.stop-server options)])]
-        (setting! a (mut argv) (join a [server ".command"]) (toml-string a (get command 0)))
-        (setting! a (mut argv) (join a [server ".args"]) (toml-array a (subslice command 1 (len command))))
-        (setting! a (mut argv) (join a [server ".default_tools_approval_mode"]) (toml-string a "approve")))
+        (setting! a
+                  (mut argv)
+                  (join a [server ".command"])
+                  (toml-string a (get command 0)))
+        (setting! a
+                  (mut argv)
+                  (join a [server ".args"])
+                  (toml-array a (subslice command 1 (len command))))
+        (setting! a
+                  (mut argv)
+                  (join a [server ".default_tools_approval_mode"])
+                  (toml-string a "approve")))
       0)
     (for override (iter (.settings options))
       (push! (mut argv) "-c")
@@ -268,21 +295,38 @@
    (last-event-ms i64)
    (last-inbox-ms i64)])
 
-(defn turn-new [(a (dyn Allocator)) (h (ptr CodexHarness)) (arena (ptr scratch/ScratchArena))] (-> Turn)
-  (Turn :harness h :allocator a :arena arena :finish (None) :finish-output "" :last-text "" :error ""
-        :noise "" :interrupt false :interrupted false :cancelled false :idle false
-        :started false :usage-seen false
-        :open (al-new [(slice u8)] (.allocator h))
-        :last-event-ms (now-ms) :last-inbox-ms 0))
+(defn turn-new [(a (dyn Allocator))
+                (h (ptr CodexHarness))
+                (arena (ptr scratch/ScratchArena))] (-> Turn)
+  (Turn
+    :harness h
+    :allocator a
+    :arena arena
+    :finish (None)
+    :finish-output ""
+    :last-text ""
+    :error ""
+    :noise ""
+    :interrupt false
+    :interrupted false
+    :cancelled false
+    :idle false
+    :started false
+    :usage-seen false
+    :open (ArrayList::new [(slice u8)] (.allocator h))
+    :last-event-ms (now-ms)
+    :last-inbox-ms 0))
 
 (defn mirror! [(h (ptr CodexHarness)) (message JVal)] (-> i64)
   (jv-push! (.messages h) message))
 
-(defn mirror-text! [(h (ptr CodexHarness)) (role (slice u8)) (text (slice u8))] (-> i64)
+(defn mirror-text! [(h (ptr CodexHarness)) (role (slice u8)) (text (slice u8))]
+  (-> i64)
   (mirror! h (chat-message (.allocator h) role text)))
 
 ;;; The assistant's tool call and its result, as the built-in loop records them.
-(defn mirror-tool! [(h (ptr CodexHarness)) (call ToolCall) (output (slice u8))] (-> i64)
+(defn mirror-tool! [(h (ptr CodexHarness)) (call ToolCall) (output (slice u8))]
+  (-> i64)
   (let [a (.allocator h)
         assistant (jv-object a)
         calls (jv-array a)
@@ -316,13 +360,14 @@
 ;;; The command a person would have typed: Codex runs every command as
 ;;; `SHELL -lc "COMMAND"`, which is shown as COMMAND.
 (defn shown-command [(command (slice u8))] (-> (slice u8))
-  (match (str-find command " -lc ")
+  (match (find command " -lc ")
     (None [] command)
     (Some [at]
           (let [rest (subslice command (+ at 5) (len command))
                 n (len rest)]
             (if (and (>= n 2)
-                     (or (= (cast i64 (get rest 0)) 34) (= (cast i64 (get rest 0)) 39))
+                     (or (= (cast i64 (get rest 0)) 34)
+                         (= (cast i64 (get rest 0)) 39))
                      (= (cast i64 (get rest (- n 1))) (cast i64 (get rest 0))))
                 (subslice rest 1 (- n 1))
                 rest)))))
@@ -330,28 +375,39 @@
 (defn mcp-output [(a (dyn Allocator)) (item JVal)] (-> (slice u8))
   (let [error (jv-get item "error")
         content (jv-get (jv-get item "result") "content")
-        (mut out) (sb-new a)
+        (mut out) (StrBuf::new a)
         (mut i) 0]
     (if (not (jv-null? error))
         (jv-string-or (jv-get error "message") (jv-encode a error))
-        (do (loop (if (>= (load i) (jv-count content))
-                      (break)
-                      (do (when (> (load i) 0) (sb-push-str! (mut out) "\n") 0)
-                          (sb-push-str! (mut out) (jv-string-or (jv-get (jv-nth content (load i)) "text") ""))
-                          (set! i (+ (load i) 1)))))
-            (sb-finish! (mut out))))))
+        (do
+          (loop (if (>= (load i) (jv-count content))
+                    (break)
+                    (do
+                      (when (> (load i) 0) (push-str! (mut out) "\n") 0)
+                      (push-str! (mut out)
+                                 (jv-string-or (jv-get (jv-nth content (load i))
+                                                       "text")
+                                               ""))
+                      (set! i (+ (load i) 1)))))
+          (finish! (mut out))))))
 
-(defn file-change-paths [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)] (-> (slice u8))
+(defn file-change-paths [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
+  (-> (slice u8))
   (let [changes (jv-get item "changes")
-        (mut out) (sb-new a)
+        (mut out) (StrBuf::new a)
         (mut i) 0]
     (loop (if (>= (load i) (jv-count changes))
               (break)
-              (do (when (> (load i) 0) (sb-push-str! (mut out) ", ") 0)
-                  (sb-push-str! (mut out) (relative-to (jv-string-or (jv-get (jv-nth changes (load i)) "path") "")
-                                                       (.workdir (field h options))))
-                  (set! i (+ (load i) 1)))))
-    (sb-finish! (mut out))))
+              (do
+                (when (> (load i) 0) (push-str! (mut out) ", ") 0)
+                (push-str! (mut out)
+                           (relative-to (jv-string-or (jv-get (jv-nth changes
+                                                                      (load i))
+                                                              "path")
+                                                      "")
+                                        (.workdir (field h options))))
+                (set! i (+ (load i) 1)))))
+    (finish! (mut out))))
 
 (defn stop-call? [(h (ptr CodexHarness)) (item JVal)] (-> bool)
   (let [options (field h options)]
@@ -361,37 +417,65 @@
 
 ;;; A tool-like item (command, file change, MCP call, web search) as a call
 ;;; and the line a person reads; None for items that are not tool calls.
-(defn item-call [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)] (-> (Option ToolCall))
+(defn item-call [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
+  (-> (Option ToolCall))
   (let [kind (jv-string-or (jv-get item "type") "")
         id (jv-string-or (jv-get item "id") "")]
     (cond (= kind "command_execution")
             (let [input (jv-object a)]
-              (jv-put! input "command" (JStr (shown-command (jv-string-or (jv-get item "command") ""))))
+              (jv-put! input
+                       "command"
+                       (JStr (shown-command (jv-string-or (jv-get item
+                                                                  "command")
+                                                          ""))))
               (Some (tool-call id "bash" input (jv-encode a input))))
           (= kind "file_change")
             (let [input (jv-object a)]
               (jv-put! input "changes" (jv-get item "changes"))
               (Some (tool-call id "edit" input (jv-encode a input))))
           (= kind "mcp_tool_call")
-            (let [arguments (let [given (jv-get item "arguments")] (if (jv-null? given) (jv-object a) given))
-                  name (if (stop-call? h item)
-                           (.stop-tool-as (field h options))
-                           (join a [(jv-string-or (jv-get item "server") "") "." (jv-string-or (jv-get item "tool") "")]))]
+            (let [arguments
+                    (let [given (jv-get item "arguments")]
+                      (if (jv-null? given) (jv-object a) given))
+                  name
+                    (if (stop-call? h item)
+                        (.stop-tool-as (field h options))
+                        (join a
+                              [(jv-string-or (jv-get item "server") "")
+                               "."
+                               (jv-string-or (jv-get item "tool") "")]))]
               (Some (tool-call id name arguments (jv-encode a arguments))))
           (= kind "web_search")
             (let [input (jv-object a)]
-              (jv-put! input "query" (JStr (jv-string-or (jv-get item "query") "")))
+              (jv-put! input
+                       "query"
+                       (JStr (jv-string-or (jv-get item "query") "")))
               (Some (tool-call id "web_search" input (jv-encode a input))))
           :else (None))))
 
-(defn item-summary [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)] (-> (slice u8))
+(defn item-summary [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
+  (-> (slice u8))
   (let [kind (jv-string-or (jv-get item "type") "")]
-    (cond (= kind "command_execution") (join a ["$ " (shown-command (jv-string-or (jv-get item "command") ""))])
+    (cond (= kind "command_execution")
+            (join a
+                  ["$ "
+                   (shown-command (jv-string-or (jv-get item "command") ""))])
           (= kind "file_change") (join a ["edit " (file-change-paths a h item)])
           (and (= kind "mcp_tool_call") (stop-call? h item))
-            (join a [(.stop-tool-as (field h options)) ": " (jv-string-or (jv-get (jv-get item "arguments") "outcome") (jv-string-or (jv-get (jv-get item "arguments") "summary") ""))])
-          (= kind "mcp_tool_call") (join a [(jv-string-or (jv-get item "server") "") "." (jv-string-or (jv-get item "tool") "")])
-          (= kind "web_search") (join a ["search " (jv-string-or (jv-get item "query") "")])
+            (join a
+                  [(.stop-tool-as (field h options))
+                   ": "
+                   (jv-string-or (jv-get (jv-get item "arguments") "outcome")
+                                 (jv-string-or (jv-get (jv-get item "arguments")
+                                                       "summary")
+                                               ""))])
+          (= kind "mcp_tool_call")
+            (join a
+                  [(jv-string-or (jv-get item "server") "")
+                   "."
+                   (jv-string-or (jv-get item "tool") "")])
+          (= kind "web_search")
+            (join a ["search " (jv-string-or (jv-get item "query") "")])
           :else kind)))
 
 (defn item-ok? [(item JVal)] (-> bool)
@@ -401,10 +485,16 @@
         (and (= status "completed") (= (jv-int (jv-get item "exit_code")) 0))
         (= status "completed"))))
 
-(defn item-output [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)] (-> (slice u8))
+(defn item-output [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
+  (-> (slice u8))
   (let [kind (jv-string-or (jv-get item "type") "")]
-    (cond (= kind "command_execution") (jv-string-or (jv-get item "aggregated_output") "")
-          (= kind "file_change") (join a [(jv-string-or (jv-get item "status") "") ": " (file-change-paths a h item)])
+    (cond (= kind "command_execution")
+            (jv-string-or (jv-get item "aggregated_output") "")
+          (= kind "file_change")
+            (join a
+                  [(jv-string-or (jv-get item "status") "")
+                   ": "
+                   (file-change-paths a h item)])
           (= kind "mcp_tool_call") (mcp-output a item)
           :else (jv-string-or (jv-get item "status") ""))))
 
@@ -419,8 +509,8 @@
 ;;; Drop the open item at `at` (order does not matter).
 (defn forget-open! [(turn (ptr Turn)) (at i64)] (-> i64)
   (let [last (- (len (.open turn)) 1)]
-    (al-set! (mut (.open turn)) at (get (.open turn) last))
-    (al-pop! (mut (.open turn)))
+    (set! (mut (.open turn)) at (get (.open turn) last))
+    (pop! (mut (.open turn)))
     0))
 
 ;;; Items that are not work: what the agent thinks and says.
@@ -431,10 +521,14 @@
 ;;; tool has been called and this is new work (the agent should not go on
 ;;; working), or an interrupt is due.
 (defn stop-here? [(turn (ptr Turn)) (kind (slice u8))] (-> bool)
-  (cond (and (match (.finish turn) (Some [_] true) (None [] false)) (not (quiet-item? kind)))
+  (cond (and (match (.finish turn) (Some [_] true) (None [] false))
+             (not (quiet-item? kind)))
           (let [h (.harness turn)]
-            (observe (.observer h) (Thought (join (.allocator turn) ["[codex] the agent started new work (" kind
-                                                                      ") after the stop tool, so Codex was stopped"])))
+            (observe (.observer h)
+                     (Thought (join (.allocator turn)
+                                    ["[codex] the agent started new work ("
+                                     kind
+                                     ") after the stop tool, so Codex was stopped"])))
             true)
         (.interrupt turn) (do (set! (.interrupted turn) true) true)
         :else false))
@@ -455,117 +549,184 @@
         scratch (.allocator turn)]
     (set! (.last-event-ms turn) (now-ms))
     (match (jv-parse scratch line)
-      (None [] (do (when (> (len (str-trim line)) 0) (set! (.noise turn) (copy-bytes a line)) 0) true))
+      (None []
+            (do
+              (when (> (len (trim line)) 0)
+                (set! (.noise turn) (copy-bytes a line))
+                0)
+              true))
       (Some [event]
             (let [kind (jv-string-or (jv-get event "type") "")
                   item (jv-get event "item")
                   item-kind (jv-string-or (jv-get item "type") "")]
-              (cond
-                (= kind "thread.started")
-                  (do (when (= (len (.session h)) 0)
-                        (set! (.session h) (copy-bytes a (jv-string-or (jv-get event "thread_id") "")))
-                        0)
-                      true)
-                (= kind "turn.started")
-                  (do (set! (.turns h) (+ (.turns h) 1))
-                      (set! (.started turn) true)
-                      (observe (.observer h) (TurnStarted (.turns h)))
-                      true)
-                (= kind "item.started")
-                  (if (stop-here? turn item-kind)
-                      false
-                      (do (match (item-call scratch h item)
-                            (None [] 0)
-                            (Some [call]
-                                  (do (push! (mut (.open turn)) (copy-bytes a (.id call)))
-                                      (observe (.observer h) (ToolStarted call (item-summary scratch h item)))
+              (cond (= kind "thread.started")
+                      (do
+                        (when (= (len (.session h)) 0)
+                          (set! (.session h)
+                                (copy-bytes a
+                                            (jv-string-or (jv-get event
+                                                                  "thread_id")
+                                                          "")))
+                          0)
+                        true)
+                    (= kind "turn.started")
+                      (do
+                        (set! (.turns h) (+ (.turns h) 1))
+                        (set! (.started turn) true)
+                        (observe (.observer h) (TurnStarted (.turns h)))
+                        true)
+                    (= kind "item.started")
+                      (if (stop-here? turn item-kind)
+                          false
+                          (do
+                            (match (item-call scratch h item)
+                              (None [] 0)
+                              (Some [call]
+                                    (do
+                                      (push! (mut (.open turn))
+                                             (copy-bytes a (.id call)))
+                                      (observe (.observer h)
+                                               (ToolStarted call
+                                                            (item-summary scratch
+                                                                          h
+                                                                          item)))
                                       0)))
-                          true))
-                (= kind "item.completed")
-                  (do (cond
-                        (= item-kind "agent_message")
-                          (let [text (jv-string-or (jv-get item "text") "")]
-                            (when (> (len (str-trim text)) 0)
-                              (observe (.observer h) (Said text))
-                              (mirror-text! h "assistant" text)
-                              (set! (.last-text turn) (copy-bytes a text))
-                              0)
-                            0)
-                        (= item-kind "reasoning")
-                          (let [text (jv-string-or (jv-get item "text") "")]
-                            (when (> (len (str-trim text)) 0) (observe (.observer h) (Thought text)) 0)
-                            0)
-                        (= item-kind "error")
-                          (do (observe (.observer h) (Thought (join scratch ["[codex] " (jv-string-or (jv-get item "message") "")])))
-                              0)
-                        :else
-                          (match (item-call scratch h item)
-                            (None [] 0)
-                            (Some [call]
-                                  (let [summary (item-summary scratch h item)
-                                        ok (item-ok? item)
-                                        output (item-output scratch h item)
-                                        at (open-index turn (.id call))]
-                                    (if (>= at 0)
-                                        (forget-open! turn at)
-                                        (do (observe (.observer h) (ToolStarted call summary)) 0))
-                                    (observe (.observer h) (ToolEnded :call call :summary summary :ok ok :output output :elapsed-ms 0))
-                                    (mirror-tool! h call output)
-                                    (when (and ok (= item-kind "mcp_tool_call") (stop-call? h item))
-                                      (set! (.finish turn)
-                                            (Some (tool-call (copy-bytes a (.id call))
-                                                             (copy-bytes a (.name call))
-                                                             (jv-clone a (.arguments call))
-                                                             (copy-bytes a (.arguments-json call)))))
-                                      (set! (.finish-output turn) (copy-bytes a output))
-                                      0)
-                                    0))))
-                      (not (interrupt-here? turn)))
-                (= kind "turn.completed")
-                  (let [usage (jv-get event "usage")]
-                    (set! (.usage-seen turn) true)
-                    (observe (.observer h) (UsageReported (jv-int (jv-get usage "input_tokens"))
-                                                          (jv-int (jv-get usage "output_tokens"))))
-                    true)
-                (= kind "turn.failed")
-                  (do (set! (.error turn) (copy-bytes a (jv-string-or (jv-get (jv-get event "error") "message")
-                                                                      (jv-encode scratch event))))
-                      true)
-                (= kind "error")
-                  (do (set! (.error turn) (copy-bytes a (jv-string-or (jv-get event "message") (jv-encode scratch event))))
-                      true)
-                :else true))))))
+                            true))
+                    (= kind "item.completed")
+                      (do
+                        (cond (= item-kind "agent_message")
+                                (let [text
+                                        (jv-string-or (jv-get item "text") "")]
+                                  (when (> (len (trim text)) 0)
+                                    (observe (.observer h) (Said text))
+                                    (mirror-text! h "assistant" text)
+                                    (set! (.last-text turn) (copy-bytes a text))
+                                    0)
+                                  0)
+                              (= item-kind "reasoning")
+                                (let [text
+                                        (jv-string-or (jv-get item "text") "")]
+                                  (when (> (len (trim text)) 0)
+                                    (observe (.observer h) (Thought text))
+                                    0)
+                                  0)
+                              (= item-kind "error")
+                                (do
+                                  (observe (.observer h)
+                                           (Thought (join scratch
+                                                          ["[codex] "
+                                                           (jv-string-or (jv-get item
+                                                                                 "message")
+                                                                         "")])))
+                                  0)
+                              :else
+                                (match (item-call scratch h item)
+                                  (None [] 0)
+                                  (Some [call]
+                                        (let [summary
+                                                (item-summary scratch h item)
+                                              ok (item-ok? item)
+                                              output
+                                                (item-output scratch h item)
+                                              at (open-index turn (.id call))]
+                                          (if (>= at 0)
+                                              (forget-open! turn at)
+                                              (do
+                                                (observe (.observer h)
+                                                         (ToolStarted call
+                                                                      summary))
+                                                0))
+                                          (observe (.observer h)
+                                                   (ToolEnded
+                                                     :call call
+                                                     :summary summary
+                                                     :ok ok
+                                                     :output output
+                                                     :elapsed-ms 0))
+                                          (mirror-tool! h call output)
+                                          (when (and ok
+                                                     (= item-kind
+                                                        "mcp_tool_call")
+                                                     (stop-call? h item))
+                                            (set! (.finish turn)
+                                                  (Some (tool-call (copy-bytes a
+                                                                               (.id call))
+                                                                   (copy-bytes a
+                                                                               (.name call))
+                                                                   (jv-clone a
+                                                                             (.arguments call))
+                                                                   (copy-bytes a
+                                                                               (.arguments-json call)))))
+                                            (set! (.finish-output turn)
+                                                  (copy-bytes a output))
+                                            0)
+                                          0))))
+                        (not (interrupt-here? turn)))
+                    (= kind "turn.completed")
+                      (let [usage (jv-get event "usage")]
+                        (set! (.usage-seen turn) true)
+                        (observe (.observer h)
+                                 (UsageReported
+                                   :input-tokens
+                                     (jv-int (jv-get usage "input_tokens"))
+                                   :cached-input-tokens
+                                     (jv-int (jv-get usage
+                                                     "cached_input_tokens"))
+                                   :output-tokens
+                                     (jv-int (jv-get usage "output_tokens"))))
+                        true)
+                    (= kind "turn.failed")
+                      (do
+                        (set! (.error turn)
+                              (copy-bytes a
+                                          (jv-string-or (jv-get (jv-get event
+                                                                        "error")
+                                                                "message")
+                                                        (jv-encode scratch
+                                                                   event))))
+                        true)
+                    (= kind "error")
+                      (do
+                        (set! (.error turn)
+                              (copy-bytes a
+                                          (jv-string-or (jv-get event "message")
+                                                        (jv-encode scratch
+                                                                   event))))
+                        true)
+                    :else true))))))
 
 (impl stream/LineSink Turn
   (on-line [(self (ptr Turn)) (line (slice u8))] (-> bool)
-           (let [go (apply-event! self line)]
-             (when (!= (cast i64 (.arena self)) 0)
-               (scratch/scratch-reset! (.arena self))
-               0)
-             go))
+    (let [go (apply-event! self line)]
+      (when (!= (cast i64 (.arena self)) 0)
+        (reset! (.arena self))
+        0)
+      go))
   (on-tick [(self (ptr Turn))] (-> bool)
-           (let [h (.harness self)
-                 now (now-ms)]
-             (block :tick
-                    (match (control-check (.control h))
-                      (Cancel [] (do (set! (.cancelled self) true) (return-from :tick false)))
-                      (Pause [] (do (set! (.interrupt self) true) 0))
-                      (Proceed [] 0))
-                    ;; Messages are read about once a second; any that arrive
-                    ;; interrupt the run at its next item boundary.
-                    (when (>= (- now (.last-inbox-ms self)) 1000)
-                      (set! (.last-inbox-ms self) now)
-                      (let [(mut arrived) (control-inbox (.control h) (.allocator h))]
-                        (for message (iter arrived)
-                          (push! (mut (.inbound h)) message)
-                          (set! (.interrupt self) true))
-                        (al-free! (mut arrived))
-                        0))
-                    (let [idle-limit (.idle-timeout-ms (field h options))]
-                      (when (and (> idle-limit 0) (>= (- now (.last-event-ms self)) idle-limit))
-                        (set! (.idle self) true)
-                        (return-from :tick false)))
-                    true))))
+    (let [h (.harness self)
+          now (now-ms)]
+      (block :tick
+        (match (control-check (.control h))
+          (Cancel []
+                  (do (set! (.cancelled self) true) (return-from :tick false)))
+          (Pause [] (do (set! (.interrupt self) true) 0))
+          (Proceed [] 0))
+        ;; Messages are read about once a second; any that arrive
+        ;; interrupt the run at its next item boundary.
+        (when (>= (- now (.last-inbox-ms self)) 1000)
+          (set! (.last-inbox-ms self) now)
+          (let [(mut arrived) (control-inbox (.control h) (.allocator h))]
+            (for message (iter arrived)
+              (push! (mut (.inbound h)) message)
+              (set! (.interrupt self) true))
+            (free! (mut arrived))
+            0))
+        (let [idle-limit (.idle-timeout-ms (field h options))]
+          (when (and (> idle-limit 0)
+                     (>= (- now (.last-event-ms self)) idle-limit))
+            (set! (.idle self) true)
+            (return-from :tick false)))
+        true))))
 
 ;; ---------------------------------------------------------------------------
 ;; Token usage from Codex's session log
@@ -576,35 +737,47 @@
 
 ;;; The names in `dir`; none when it cannot be read.
 (defn names-in [(a (dyn Allocator)) (dir (slice u8))] (-> (slice (slice u8)))
-  (match (fs/dir-list a dir)
-    (Ok [names] (let [(mut found) names] (al-slice found)))
-    (Err [_] (let [(mut none) (al-new [(slice u8)] a)] (al-slice none)))))
+  (try (let [(mut found)
+               (try-or! (fs/Directory::list a dir)
+                        (let [(mut none) (ArrayList::new [(slice u8)] a)]
+                          (slice none)))]
+         (slice found))))
 
 ;;; Codex's session log for `thread`: `HOME/sessions/YYYY/MM/DD/rollout-…-THREAD.jsonl`.
-(defn find-session-log [(a (dyn Allocator)) (home (slice u8)) (thread (slice u8))] (-> (Option (slice u8)))
+(defn find-session-log [(a (dyn Allocator))
+                        (home (slice u8))
+                        (thread (slice u8))] (-> (Option (slice u8)))
   (let [sessions (join a [home "/sessions"])
         wanted (join a ["-" thread ".jsonl"])]
     (block :found
-           (for year (iter (names-in a sessions))
-             (let [y (join a [sessions "/" year])]
-               (for month (iter (names-in a y))
-                 (let [m (join a [y "/" month])]
-                   (for day (iter (names-in a m))
-                     (let [d (join a [m "/" day])]
-                       (for name (iter (names-in a d))
-                         (when (and (starts-with name "rollout-") (suffix? name wanted))
-                           (return-from :found (Some (join a [d "/" name])))))))))))
-           (None))))
+      (for year (iter (names-in a sessions))
+        (let [y (join a [sessions "/" year])]
+          (for month (iter (names-in a y))
+            (let [m (join a [y "/" month])]
+              (for day (iter (names-in a m))
+                (let [d (join a [m "/" day])]
+                  (for name (iter (names-in a d))
+                    (when (and (starts-with name "rollout-")
+                               (suffix? name wanted))
+                      (return-from :found (Some (join a [d "/" name])))))))))))
+      (None))))
 
 ;;; What a session log says the last turn in it used. `in-flight` is set when
 ;;; a tool's output was the last thing logged: Codex had sent the model
 ;;; another request, whose usage was never logged.
-(defstruct LoggedUsage [(found bool) (input i64) (output i64) (in-flight bool)])
+(defstruct LoggedUsage
+  [(found bool) (input i64) (cached i64) (output i64) (in-flight bool)])
 
 (defn logged-usage [(a (dyn Allocator)) (log (slice u8))] (-> LoggedUsage)
-  (let [(mut out) (LoggedUsage :found false :input 0 :output 0 :in-flight false)
+  (let [(mut out)
+          (LoggedUsage
+            :found false
+            :input 0
+            :cached 0
+            :output 0
+            :in-flight false)
         (mut turn) ""]
-    (for line (iter (str-split a log "\n"))
+    (for line (iter (split a log "\n"))
       (match (jv-parse a line)
         (None [] 0)
         (Some [record]
@@ -612,54 +785,108 @@
                     payload (jv-get record "payload")
                     payload-kind (jv-string-or (jv-get payload "type") "")]
                 (cond (and (= kind "event_msg") (= payload-kind "task_started"))
-                        (do (set! turn (jv-string-or (jv-get payload "turn_id") ""))
-                            (set! out (LoggedUsage :found false :input 0 :output 0 :in-flight false))
-                            0)
-                      (and (= kind "token_usage_record") (= (jv-string-or (jv-get payload "turn_id") "") (load turn)))
-                        (let [usage (jv-get payload "turn_token_usage")]
-                          (set! out (LoggedUsage :found true
-                                                 :input (jv-int (jv-get usage "input_tokens"))
-                                                 :output (jv-int (jv-get usage "output_tokens"))
-                                                 :in-flight false))
+                        (do
+                          (set! turn
+                                (jv-string-or (jv-get payload "turn_id") ""))
+                          (set! out
+                                (LoggedUsage
+                                  :found false
+                                  :input 0
+                                  :cached 0
+                                  :output 0
+                                  :in-flight false))
                           0)
-                      (and (= kind "response_item") (suffix? payload-kind "_output"))
+                      (and (= kind "token_usage_record")
+                           (= (jv-string-or (jv-get payload "turn_id") "")
+                              (load turn)))
+                        (let [usage (jv-get payload "turn_token_usage")]
+                          (set! out
+                                (LoggedUsage
+                                  :found true
+                                  :input (jv-int (jv-get usage "input_tokens"))
+                                  :cached
+                                    (jv-int (jv-get usage "cached_input_tokens"))
+                                  :output
+                                    (jv-int (jv-get usage "output_tokens"))
+                                  :in-flight false))
+                          0)
+                      (and (= kind "response_item")
+                           (suffix? payload-kind "_output"))
                         (do (set! (.in-flight out) true) 0)
                       :else 0)))))
     (load out)))
 
 ;;; Report the usage of a run that ended before Codex reported it.
 (defn recover-usage! [(h (ptr CodexHarness))] (-> i64)
-  (let [arena (box! (.allocator h) scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))
-        _ (scratch/scratch-init arena (.allocator h))
-        a (scratch/scratch-allocator arena)
+  (let [arena
+          (box! (.allocator h)
+                scratch/ScratchArena
+                (zeroed scratch/ScratchArena))
+        _ (scratch/ScratchArena::init arena (.allocator h))
+        a (allocator arena)
         home (.home (field h options))
         stopped "Codex was stopped before it reported the run's token usage"]
     (cond (= (len home) 0)
-            (observe (.observer h) (UsageUnknown (join a [stopped ", and no Codex home was given to read its session log from"])))
+            (observe (.observer h)
+                     (UsageUnknown (join a
+                                         [stopped
+                                          ", and no Codex home was given to read its session log from"])))
           (= (len (.session h)) 0)
-            (observe (.observer h) (UsageUnknown (join a [stopped ", and it started no thread"])))
+            (observe (.observer h)
+                     (UsageUnknown (join a
+                                         [stopped ", and it started no thread"])))
           :else
             (match (find-session-log a home (.session h))
-              (None [] (observe (.observer h) (UsageUnknown (join a [stopped ", and no session log for thread " (.session h)
-                                                                     " is under " home "/sessions"]))))
+              (None []
+                    (observe (.observer h)
+                             (UsageUnknown (join a
+                                                 [stopped
+                                                  ", and no session log for thread "
+                                                  (.session h)
+                                                  " is under "
+                                                  home
+                                                  "/sessions"]))))
               (Some [path]
-                    (match (atomic/read-file-if-exists a path)
-                      (Ok [read]
-                          (match read
-                            (Some [text]
-                                  (let [logged (logged-usage a text)]
-                                    (if (not (.found logged))
-                                        (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path
-                                                                                      " records none for the run's turn"])))
-                                        (do (observe (.observer h) (UsageReported (.input logged) (.output logged)))
-                                            (when (.in-flight logged)
-                                              (observe (.observer h)
-                                                       (UsageUnknown "Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))
-                                              0)
-                                            0))))
-                            (None [] (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path " is gone"]))))))
-                      (Err [_] (observe (.observer h) (UsageUnknown (join a [stopped ", and its session log " path " cannot be read"]))))))))
-    (scratch/scratch-close! arena)
+                    (try (let [read
+                                 (try-or! (atomic/read-file-if-exists a path)
+                                          (observe (.observer h)
+                                                   (UsageUnknown (join a
+                                                                       [stopped
+                                                                        ", and its session log "
+                                                                        path
+                                                                        " cannot be read"]))))]
+                           (match read
+                             (Some [text]
+                                   (let [logged (logged-usage a text)]
+                                     (if (not (.found logged))
+                                         (observe (.observer h)
+                                                  (UsageUnknown (join a
+                                                                      [stopped
+                                                                       ", and its session log "
+                                                                       path
+                                                                       " records none for the run's turn"])))
+                                         (do
+                                           (observe (.observer h)
+                                                    (UsageReported
+                                                      :input-tokens
+                                                        (.input logged)
+                                                      :cached-input-tokens
+                                                        (.cached logged)
+                                                      :output-tokens
+                                                        (.output logged)))
+                                           (when (.in-flight logged)
+                                             (observe (.observer h)
+                                                      (UsageUnknown "Codex was stopped while a model request was under way; that request's tokens were never logged, so they are not counted"))
+                                             0)
+                                           0))))
+                             (None []
+                                   (observe (.observer h)
+                                            (UsageUnknown (join a
+                                                                [stopped
+                                                                 ", and its session log "
+                                                                 path
+                                                                 " is gone"]))))))))))
+    (close! arena)
     0))
 
 ;; ---------------------------------------------------------------------------
@@ -668,44 +895,45 @@
 ;;; Wait out a pause. False when cancelled.
 (defn await-proceed! [(h (ptr CodexHarness))] (-> bool)
   (block :await
-         (match (control-check (.control h))
-           (Proceed [] (return-from :await true))
-           (Cancel [] (return-from :await false))
-           (Pause [] 0))
-         (observe (.observer h) (PausedEvent))
-         (loop
-           (control-idle (.control h))
-           (match (control-check (.control h))
-             (Proceed [] (do (observe (.observer h) (ResumedEvent))
-                             (return-from :await true)))
-             (Cancel [] (return-from :await false))
-             (Pause [] 0)))
-         true))
+    (match (control-check (.control h))
+      (Proceed [] (return-from :await true))
+      (Cancel [] (return-from :await false))
+      (Pause [] 0))
+    (observe (.observer h) (PausedEvent))
+    (loop (control-idle (.control h))
+      (match (control-check (.control h))
+        (Proceed []
+                 (do
+                   (observe (.observer h) (ResumedEvent))
+                   (return-from :await true)))
+        (Cancel [] (return-from :await false))
+        (Pause [] 0)))
+    true))
 
 ;;; Everything waiting to be said, as one prompt; messages from people are
 ;;; acknowledged as delivered. Empty when there is nothing.
 (defn take-prompt! [(h (ptr CodexHarness))] (-> (slice u8))
   (let [a (.allocator h)
         (mut arrived) (control-inbox (.control h) a)
-        (mut out) (sb-new a)
+        (mut out) (StrBuf::new a)
         (mut first) true]
     (for message (iter arrived) (push! (mut (.inbound h)) message))
-    (al-free! (mut arrived))
+    (free! (mut arrived))
     (for text (iter (.pending h))
-      (when (not (load first)) (sb-push-str! (mut out) "\n\n") 0)
-      (sb-push-str! (mut out) text)
+      (when (not (load first)) (push-str! (mut out) "\n\n") 0)
+      (push-str! (mut out) text)
       (mirror-text! h "user" text)
       (set! first false))
     (for message (iter (.inbound h))
       (let [text (join a ["[" (.from message) "] " (.text message)])]
-        (when (not (load first)) (sb-push-str! (mut out) "\n\n") 0)
-        (sb-push-str! (mut out) text)
+        (when (not (load first)) (push-str! (mut out) "\n\n") 0)
+        (push-str! (mut out) text)
         (mirror-text! h "user" text)
         (observe (.observer h) (MessageDelivered message))
         (set! first false)))
-    (al-clear! (mut (.pending h)))
-    (al-clear! (mut (.inbound h)))
-    (sb-finish! (mut out))))
+    (clear! (mut (.pending h)))
+    (clear! (mut (.inbound h)))
+    (finish! (mut out))))
 
 (defn harness-failure [(a (dyn Allocator)) (message (slice u8))] (-> AgentStop)
   (Failed (chat/chat-error "harness" 0 (copy-bytes a message))))
@@ -713,74 +941,118 @@
 ;;; The last line of `text` that has anything in it.
 (defn last-line [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
   (let [(mut result) ""]
-    (for line (iter (str-split a text "\n"))
-      (when (> (len (str-trim line)) 0) (set! result (str-trim line)) 0))
+    (for line (iter (split a text "\n"))
+      (when (> (len (trim line)) 0) (set! result (trim line)) 0))
     (load result)))
 
 (defn run-codex! [(h (ptr CodexHarness))] (-> AgentStop)
   (let [a (.allocator h)
         options (field h options)]
     (block :run
-           (loop
-             (when (not (await-proceed! h))
-               (return-from :run (Cancelled)))
-             (let [taken (take-prompt! h)
-                   prompt (if (> (len taken) 0)
-                              taken
-                              (let [note "[factory] You were paused and have been resumed. Continue where you left off."]
-                                (mirror-text! h "user" note)
-                                note))]
-               (when (> (len (.ready-file options)) 0)
-                 (atomic/unlink-path a (.ready-file options))
-                 0)
-               (let [(mut argv) (codex-argv a h)
-                     all (al-slice argv)
-                     arena (box! a scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))
-                     _ (scratch/scratch-init arena a)
-                     turn (box! a Turn (turn-new (scratch/scratch-allocator arena) h arena))
-                     ended (stream/stream-lines a
-                                                (stream/StreamSpec :program (get all 0)
-                                                                   :args (subslice all 1 (len all))
-                                                                   :cwd (.workdir options)
-                                                                   :input prompt
-                                                                   :timeout-ms 0
-                                                                   :max-line-bytes 67108864
-                                                                   :stderr-bytes 8192)
-                                                turn)]
-                 (al-free! (mut argv))
-                 (scratch/scratch-close! arena)
-                 (when (and (.started turn) (not (.usage-seen turn)))
-                   (recover-usage! h)
-                   0)
-                 (match ended
-                   (Err [message] (return-from :run (harness-failure a message)))
-                   (Ok [end]
-                       (cond (.cancelled turn) (return-from :run (Cancelled))
-                             (match (.finish turn) (Some [_] true) (None [] false))
-                               (match (.finish turn)
-                                 (Some [call] (return-from :run (Finished call (.finish-output turn))))
-                                 (None [] (return-from :run (harness-failure a "unreachable: finish vanished"))))
-                             (.interrupted turn) 0
-                             (.idle turn)
-                               (return-from :run (harness-failure a (join a ["Codex reported nothing for "
-                                                                             (int-text a (/ (.idle-timeout-ms options) 60000))
-                                                                             " minutes and was stopped"])))
-                             (> (len (.error turn)) 0) (return-from :run (harness-failure a (.error turn)))
-                             (!= (.exit-code end) 0)
-                               (return-from :run
-                                              (harness-failure a (join a ["codex exited with status " (int-text a (.exit-code end)) ": "
-                                                                          (let [why (last-line a (.errors end))]
-                                                                            (if (> (len why) 0) why (.noise turn)))])))
-                             (= (len (.session h)) 0)
-                               (return-from :run (harness-failure a (join a ["codex started no thread: " (last-line a (.errors end))])))
-                             (and (> (len (.ready-file options)) 0)
-                                  (match (atomic/file-exists? a (.ready-file options)) (Ok [found] (not found)) (Err [_] true)))
-                               (return-from :run (harness-failure a (join a ["the stop tool `" (.stop-server options) "." (.stop-tool options)
-                                                                             "` never started in Codex (its MCP server did not initialize), so the agent could not call it"])))
-                             :else (return-from :run (Replied (.last-text turn)))))))))
-           (Cancelled))))
+      (loop (when (not (await-proceed! h))
+              (return-from :run (Cancelled)))
+        (let [taken (take-prompt! h)
+              prompt
+                (if (> (len taken) 0)
+                    taken
+                    (let [note
+                            "[factory] You were paused and have been resumed. Continue where you left off."]
+                      (mirror-text! h "user" note)
+                      note))]
+          (when (> (len (.ready-file options)) 0)
+            (atomic/unlink-path a (.ready-file options))
+            0)
+          (let [(mut argv) (codex-argv a h)
+                all (slice argv)
+                arena
+                  (box! a scratch/ScratchArena (zeroed scratch/ScratchArena))
+                _ (scratch/ScratchArena::init arena a)
+                turn (box! a Turn (turn-new (allocator arena) h arena))
+                ended
+                  (stream/stream-lines a
+                                       (stream/StreamSpec
+                                         :program (get all 0)
+                                         :args (subslice all 1 (len all))
+                                         :cwd (.workdir options)
+                                         :input prompt
+                                         :timeout-ms 0
+                                         :max-line-bytes 67108864
+                                         :stderr-bytes 8192)
+                                       turn)]
+            (free! (mut argv))
+            (close! arena)
+            (when (and (.started turn) (not (.usage-seen turn)))
+              (recover-usage! h)
+              0)
+            (match ended
+              (Err [message] (return-from :run (harness-failure a message)))
+              (Ok [end]
+                  (cond (.cancelled turn) (return-from :run (Cancelled))
+                        (match (.finish turn) (Some [_] true) (None [] false))
+                          (match (.finish turn)
+                            (Some [call]
+                                  (return-from
+                                    :run (Finished call (.finish-output turn))))
+                            (None []
+                                  (return-from
+                                    :run
+                                      (harness-failure a
+                                                       "unreachable: finish vanished"))))
+                        (.interrupted turn) 0
+                        (.idle turn)
+                          (return-from
+                            :run
+                              (harness-failure a
+                                               (join a
+                                                     ["Codex reported nothing for "
+                                                      (int-text a
+                                                                (/ (.idle-timeout-ms options)
+                                                                   60000))
+                                                      " minutes and was stopped"])))
+                        (> (len (.error turn)) 0)
+                          (return-from :run (harness-failure a (.error turn)))
+                        (!= (.exit-code end) 0)
+                          (return-from
+                            :run
+                              (harness-failure a
+                                               (join a
+                                                     ["codex exited with status "
+                                                      (int-text a
+                                                                (.exit-code end))
+                                                      ": "
+                                                      (let [why
+                                                              (last-line a
+                                                                         (.errors end))]
+                                                        (if (> (len why) 0)
+                                                            why
+                                                            (.noise turn)))])))
+                        (= (len (.session h)) 0)
+                          (return-from
+                            :run
+                              (harness-failure a
+                                               (join a
+                                                     ["codex started no thread: "
+                                                      (last-line a
+                                                                 (.errors end))])))
+                        (and (> (len (.ready-file options)) 0)
+                             (match (atomic/file-exists? a
+                                                         (.ready-file options))
+                               (Ok [found] (not found))
+                               (Err [_] true)))
+                          (return-from
+                            :run
+                              (harness-failure a
+                                               (join a
+                                                     ["the stop tool `"
+                                                      (.stop-server options)
+                                                      "."
+                                                      (.stop-tool options)
+                                                      "` never started in Codex (its MCP server did not initialize), so the agent could not call it"])))
+                        :else (return-from :run (Replied (.last-text turn)))))))))
+      (Cancelled))))
 
-(defn checkpoint-json [(a (dyn Allocator)) (h (ptr CodexHarness))] (-> (slice u8))
+(defn checkpoint-json [(a (dyn Allocator)) (h (ptr CodexHarness))]
+  (-> (slice u8))
   (let [root (jv-object a)
         pending (jv-array a)]
     (for text (iter (.pending h)) (jv-push! pending (JStr text)))
@@ -802,26 +1074,39 @@
                 (let [messages (jv-get root "messages")
                       pending (jv-get root "pending")
                       (mut i) 0]
-                  (set! (.session h) (copy-bytes a (jv-string-or (jv-get root "session") "")))
-                  (set! (.system h) (copy-bytes a (jv-string-or (jv-get root "system") "")))
+                  (set! (.session h)
+                        (copy-bytes a (jv-string-or (jv-get root "session") "")))
+                  (set! (.system h)
+                        (copy-bytes a (jv-string-or (jv-get root "system") "")))
                   (set! (.turns h) (jv-int (jv-get root "turns")))
-                  (set! (.messages h) (if (jv-null? messages) (jv-array a) (jv-clone a messages)))
-                  (al-clear! (mut (.pending h)))
+                  (set! (.messages h)
+                        (if (jv-null? messages)
+                            (jv-array a)
+                            (jv-clone a messages)))
+                  (clear! (mut (.pending h)))
                   (loop (if (>= (load i) (jv-count pending))
                             (break)
-                            (do (push! (mut (.pending h)) (copy-bytes a (jv-string-or (jv-nth pending (load i)) "")))
-                                (set! i (+ (load i) 1)))))
+                            (do
+                              (push! (mut (.pending h))
+                                     (copy-bytes a
+                                                 (jv-string-or (jv-nth pending
+                                                                       (load i))
+                                                               "")))
+                              (set! i (+ (load i) 1)))))
                   true))))))
 
 (impl Harness CodexHarness
   (harness-add-system! [(self (ptr CodexHarness)) (text (slice u8))] (-> i64)
-                       (do (set! (.system self) (copy-bytes (.allocator self) text))
-                           (mirror-text! self "system" text)))
+    (do
+      (set! (.system self) (copy-bytes (.allocator self) text))
+      (mirror-text! self "system" text)))
   (harness-add-user! [(self (ptr CodexHarness)) (text (slice u8))] (-> i64)
-                     (do (push! (mut (.pending self)) (copy-bytes (.allocator self) text)) 0))
+    (do (push! (mut (.pending self)) (copy-bytes (.allocator self) text)) 0))
   (harness-run! [(self (ptr CodexHarness))] (-> AgentStop)
-                (run-codex! self))
-  (harness-checkpoint [(self (ptr CodexHarness)) (a (dyn Allocator))] (-> (slice u8))
-                      (checkpoint-json a self))
-  (harness-restore! [(self (ptr CodexHarness)) (checkpoint (slice u8))] (-> bool)
-                    (restore! self checkpoint)))
+    (run-codex! self))
+  (harness-checkpoint [(self (ptr CodexHarness)) (a (dyn Allocator))]
+    (-> (slice u8))
+    (checkpoint-json a self))
+  (harness-restore! [(self (ptr CodexHarness)) (checkpoint (slice u8))]
+    (-> bool)
+    (restore! self checkpoint)))

@@ -82,7 +82,7 @@ it. No old judgment is copied. A separate independent judge must review again.
 
 ## Station: judge
 harness: codex
-model: gpt-5.5
+model: gpt-6.1-sol
 attempts: 1
 gate: mkdir -p .cache/xdg-config .cache/xdg-cache && XDG_CONFIG_HOME="$PWD/.cache/xdg-config" XDG_CACHE_HOME="$PWD/.cache/xdg-cache" sh scripts/verify.sh && python3 -c 'import json; v=json.load(open("JUDGMENT.json")); assert v["verdict"] == "approved" and v["checks_run"] and v["evidence"]'
 

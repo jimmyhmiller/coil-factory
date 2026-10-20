@@ -1,7 +1,6 @@
 (module agent.tool)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -43,30 +42,29 @@
   ;;; One short line a person reads in a dashboard, such as "$ coil test" or
   ;;; "edit src/game.coil". Allocate it in `a`.
   (tool-summary [(self (ptr Self)) (a (dyn Allocator)) (call ToolCall)]
-                (-> (slice u8)))
+    (-> (slice u8)))
   (tool-run [(self (ptr Self))
              (a (dyn Allocator))
              (call ToolCall)
              (context (dyn ToolContext))]
-            (-> ToolOutcome)))
+    (-> ToolOutcome)))
 
 ;;; A context for tools that are run outside an agent, such as in tests.
 (defstruct NeverCancelled [(unused u8)])
 
 (impl ToolContext NeverCancelled
-  (tool-cancelled? [(self (ptr NeverCancelled))] (-> bool) false))
+  (tool-cancelled? [(self (ptr NeverCancelled))] (-> bool)
+    false))
 
 ;;; An ordered set of tools. The registry borrows each tool; the caller keeps
 ;;; the concrete tool alive as long as the registry.
 (defstruct ToolRegistry [(tools (ArrayList (dyn Tool)))])
 
 (defn registry-new [(a (dyn Allocator))] (-> ToolRegistry)
-  (let [(mut result) (primitive/zeroed ToolRegistry)]
-    (set! (.tools result) (al-new [(dyn Tool)] a))
-    (load result)))
+  (ToolRegistry :tools (ArrayList::new [(dyn Tool)] a)))
 
 (defn registry-free! [(registry (ptr ToolRegistry))] (-> i64)
-  (al-free! [(dyn Tool)] (mut (.tools registry))))
+  (free! (mut (.tools registry))))
 
 (defn registry-count [(registry (ptr ToolRegistry))] (-> i64)
   (len (.tools registry)))
@@ -75,7 +73,8 @@
   (get (.tools registry) index))
 
 ;;; Find a tool by name.
-(defn registry-find [(registry (ptr ToolRegistry)) (name (slice u8))] (-> (Option (dyn Tool)))
+(defn registry-find [(registry (ptr ToolRegistry)) (name (slice u8))]
+  (-> (Option (dyn Tool)))
   (let [(mut i) 0
         count (len (.tools registry))
         (mut found) (: (None) (Option (dyn Tool)))]
@@ -119,10 +118,12 @@
     (_ default)))
 
 ;;; Build a ToolCall directly, which is how tools are tested without a model.
-(defn tool-call [(id (slice u8)) (name (slice u8)) (arguments JVal) (arguments-json (slice u8))] (-> ToolCall)
-  (let [(mut call) (primitive/zeroed ToolCall)]
-    (set! (.id call) id)
-    (set! (.name call) name)
-    (set! (.arguments call) arguments)
-    (set! (.arguments-json call) arguments-json)
-    (load call)))
+(defn tool-call [(id (slice u8))
+                 (name (slice u8))
+                 (arguments JVal)
+                 (arguments-json (slice u8))] (-> ToolCall)
+  (ToolCall
+    :id id
+    :name name
+    :arguments arguments
+    :arguments-json arguments-json))

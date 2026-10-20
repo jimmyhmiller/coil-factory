@@ -33,7 +33,10 @@ LOG = logging.getLogger("paper-factory")
 TERMINAL = {"succeeded", "failed", "cancelled", "blocked", "lost"}
 REQUEST_HEX = set("0123456789abcdef")
 STAGES = {"select": "choosing a paper", "build": "implementing and writing", "judge": "independent review"}
-PROGRESS_KINDS = {"agent.text", "agent.thought", "tool.started", "tool.finished",
+# agent.streaming: the model is producing reasoning or text that has not
+# finished yet. A tool call's arguments stream as nothing at all (the gateway
+# delivers the call whole), which is why free_idle_seconds allows minutes.
+PROGRESS_KINDS = {"agent.turn", "agent.streaming", "agent.text", "agent.thought", "tool.started", "tool.finished",
                   "station.started", "station.finished", "gate.started", "gate.finished"}
 
 
@@ -172,6 +175,35 @@ def metadata(workspace, job):
     return paper
 
 
+def seed_project(root, job):
+    """The repository every run of `job` starts from: SELECTION.json, committed.
+
+    The selection carries the whole paper history, which grows daily. The
+    controller owns it, so it writes the file rather than asking a model to
+    transcribe it; metadata() then checks the run left it unchanged.
+    """
+    target = Path(root) / "projects" / job["id"]
+    if target.exists():
+        shown = subprocess.run(["git", "show", "HEAD:SELECTION.json"], cwd=target,
+                               capture_output=True, text=True, check=True)
+        if json.loads(shown.stdout) != job["selection"]:
+            raise ValueError(f"seed repository {target} does not hold the persisted selection")
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".seed-", dir=target.parent))
+    try:
+        atomic_json(temporary / "SELECTION.json", job["selection"])
+        git = ["git", "-c", "user.name=paper-factory", "-c", "user.email=paper-factory@localhost"]
+        for command in (["init", "-q", "-b", "main"], ["add", "SELECTION.json"],
+                        ["commit", "-q", "-m", f'paper-factory: selection for {job["id"]}']):
+            subprocess.run(git + command, cwd=temporary, capture_output=True, check=True)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return target
+
+
 class APIError(RuntimeError):
     def __init__(self, status, message):
         super().__init__(message)
@@ -297,7 +329,7 @@ class Controller:
         job.update(status="running", started=self.timestamp,
                    selection={"date": job["date"], "roll": roll, "mode": "archive" if roll == 0 else "inspired",
                               "archive_url": self.config["archive_url"], "prior_papers": self.history(),
-                              "instructions": "Persist this selection as SELECTION.json; never reroll or repeat a prior paper. Deliver a novice-friendly interactive tutorial and tested implementation."})
+                              "instructions": "SELECTION.json in the workspace is this selection, written by the controller; never edit it, reroll or repeat a prior paper. Deliver a novice-friendly interactive tutorial and tested implementation."})
         self.note(job, f'Persisted roll {roll}: {job["selection"]["mode"]}')
         self.new_attempt(job, "free")
         self.submit(job, job["attempts"][-1])
@@ -393,7 +425,9 @@ class Controller:
                  "recovery_snapshot": str(recovery) if recovery else None,
                  "previous_findings": job["events"][-6:], "project_pad": "coil-factory-papers"}
         text = render_recipe(Path(self.config["recipe"]).read_text(), tier, self.config, model)
-        attempt["request"] = {"factory_text": text, "brief": tag + "\n" + json.dumps(brief, indent=2), "reviewers": "none"}
+        project = seed_project(self.root, job)
+        attempt["request"] = {"factory_text": text, "brief": tag + "\n" + json.dumps(brief, indent=2),
+                              "project": str(project), "reviewers": "none"}
         job["attempts"].append(attempt)
         self.note(job, f'Prepared {tier} attempt {number} on {attempt["model"]}')
 

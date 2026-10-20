@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.io" :as io)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "cli.style" :as style)
@@ -50,27 +49,40 @@
   (if (> (len project) 0) project "."))
 
 (defn read-stdin [(a (dyn Allocator))] (-> (Option (slice u8)))
-  (let [(mut out) (sb-new a)
-        buffer (primitive/alloc-stack (array u8 16384))
+  (let [(mut out) (StrBuf::new a)
+        (mut buffer) (zeroed (array u8 16384))
         (mut failed) false]
-    (loop
-      (match (io/read-some (io/stdin) (cast (ptr i8) buffer) 16384)
-        (Err [e] (do (set! failed true) (break)))
-        (Ok [n] (if (= n 0)
+    (loop (match (io/read-some (io/stdin) (cast (ptr i8) (mut buffer)) 16384)
+            (Err [e] (do (set! failed true) (break)))
+            (Ok [n]
+                (if (= n 0)
                     (break)
-                    (do (sb-push-str! (mut out) (slice-new (cast (ptr u8) buffer) n)) 0)))))
-    (if (load failed) (None) (Some (sb-finish! (mut out))))))
+                    (do
+                      (push-str! (mut out)
+                                 (slice::new (cast (ptr u8) (mut buffer)) n))
+                      0)))))
+    (if (load failed) (None) (Some (finish! (mut out))))))
 
 ;;; The input for `agent run`: --input, --input-file, the words after the
 ;;; agent's name, or else stdin.
-(defn gather-input [(a (dyn Allocator)) (text (slice u8)) (file (slice u8)) (words (slice u8))] (-> (Result (slice u8) (slice u8)))
+(defn gather-input [(a (dyn Allocator))
+                    (text (slice u8))
+                    (file (slice u8))
+                    (words (slice u8))] (-> (Result (slice u8) (slice u8)))
   (cond (> (len text) 0) (Ok text)
-        (> (len file) 0) (match (read-text a file) (Some [t] (Ok t)) (None [] (Err (join a ["cannot read " file]))))
+        (> (len file) 0)
+          (match (read-text a file)
+            (Some [t] (Ok t))
+            (None [] (Err (join a ["cannot read " file]))))
         (> (len words) 0) (Ok words)
-        :else (do (when (style/tty? (cast i32 0))
-                    (write-err "reading the input from the terminal; end it with ctrl-d\n")
-                    0)
-                  (match (read-stdin a) (Some [t] (Ok t)) (None [] (Err "cannot read the input from stdin"))))))
+        :else
+          (do
+            (when (style/tty? (cast i32 0))
+              (write-err "reading the input from the terminal; end it with ctrl-d\n")
+              0)
+            (match (read-stdin a)
+              (Some [t] (Ok t))
+              (None [] (Err "cannot read the input from stdin"))))))
 
 ;;; The agent a reference names, parsed, or the exit code after reporting why
 ;;; not.
@@ -78,7 +90,8 @@
   (LoadedOk [(entry AgentEntry) (spec AgentSpec)])
   (LoadedBad [(code i64)]))
 
-(defn load-agent [(ctx (ptr Ctx)) (reference (slice u8)) (project (slice u8))] (-> Loaded)
+(defn load-agent [(ctx (ptr Ctx)) (reference (slice u8)) (project (slice u8))]
+  (-> Loaded)
   (let [a (.allocator ctx)
         term (.err ctx)
         root (project-agents-root a (start-dir project) (.home ctx))]
@@ -88,33 +101,70 @@
                     (match (parse-agent a (.text found))
                       (AgentSpecOk [spec] (LoadedOk found spec))
                       (AgentSpecBad [problems]
-                                    (do (write-err (join a [(style/err a term "✗ ") (style/strong a term reference) " has problems\n"]))
-                                        (for problem (iter problems)
-                                          (write-err (join a ["  " (style/muted a term (join a ["line " (int-text a (.line problem))])) "  " (.message problem) "\n"])))
-                                        (LoadedBad 1))))))))
+                                    (do
+                                      (write-err (join a
+                                                       [(style/err a
+                                                                   term
+                                                                   "✗ ")
+                                                        (style/strong a
+                                                                      term
+                                                                      reference)
+                                                        " has problems\n"]))
+                                      (for problem (iter problems)
+                                        (write-err (join a
+                                                         ["  "
+                                                          (style/muted a
+                                                                       term
+                                                                       (join a
+                                                                             ["line "
+                                                                              (int-text a
+                                                                                        (.line problem))]))
+                                                          "  "
+                                                          (.message problem)
+                                                          "\n"])))
+                                      (LoadedBad 1))))))))
 
 (defn where-text [(a (dyn Allocator)) (entry (ptr AgentEntry))] (-> (slice u8))
-  (if (> (len (.path entry)) 0) (join a [(.origin entry) " · " (.path entry)]) (.origin entry)))
+  (if (> (len (.path entry)) 0)
+      (join a [(.origin entry) " · " (.path entry)])
+      (.origin entry)))
 
 ;;; What a person should know before running it.
-(defn cautions [(a (dyn Allocator)) (spec (ptr AgentSpec)) (default-harness (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)
+(defn cautions [(a (dyn Allocator))
+                (spec (ptr AgentSpec))
+                (default-harness (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
         harness (if (> (len (.harness spec)) 0) (.harness spec) default-harness)]
     (when (and (= harness "codex") (= (len (.tools spec)) 0))
-      (push! (mut out) "in the codex harness the agent also has Codex's shell, read-only: Codex cannot take it away")
+      (push! (mut out)
+             "in the codex harness the agent also has Codex's shell, read-only: Codex cannot take it away")
       0)
     (load out)))
 
 ;;; The harness and model a run here would use, and where each comes from.
-(defn runs-on [(a (dyn Allocator)) (config (ptr SiteConfig)) (spec (ptr AgentSpec))] (-> (slice u8))
-  (let [harness (if (> (len (.harness spec)) 0) (.harness spec) (.default-harness config))
+(defn runs-on [(a (dyn Allocator))
+               (config (ptr SiteConfig))
+               (spec (ptr AgentSpec))] (-> (slice u8))
+  (let [harness
+          (if (> (len (.harness spec)) 0)
+              (.harness spec)
+              (.default-harness config))
         model (effective-model config harness (.model spec))]
-    (join a [harness (if (> (len (.harness spec)) 0) "" " (site default)") " · "
-             (cond (> (len (.model spec)) 0) model
-                   (> (len model) 0) (join a [model " (site default)"])
-                   :else (join a ["no model: pass --model, or set " (model-setting harness) " in ~/.factory/site.json"]))])))
+    (join a
+          [harness
+           (if (> (len (.harness spec)) 0) "" " (site default)")
+           " · "
+           (cond (> (len (.model spec)) 0) model
+                 (> (len model) 0) (join a [model " (site default)"])
+                 :else
+                   (join a
+                         ["no model: pass --model, or set "
+                          (model-setting harness)
+                          " in ~/.factory/site.json"]))])))
 
-(defn cmd-agent-check [(ctx (ptr Ctx)) (reference (slice u8)) (project (slice u8))] (-> i64)
+(defn cmd-agent-check [(ctx (ptr Ctx))
+                       (reference (slice u8))
+                       (project (slice u8))] (-> i64)
   (let [a (.allocator ctx)
         term (.out ctx)]
     (match (load-agent ctx reference project)
@@ -122,31 +172,82 @@
       (LoadedOk [found parsed]
                 (let [(mut entry) found
                       (mut spec) parsed
-                      (mut table) (style/table-new a ["TOOL" "KIND" "CHECKS" "WHAT"])]
-                  (say (join a [(style/ok a term "✓ ") (style/strong a term (.name spec))
-                                (style/muted a term (join a ["  " (where-text a (mut entry))]))]))
-                  (when (> (len (.description spec)) 0) (say (join a ["  " (.description spec)])) 0)
-                  (when (> (len (.input spec)) 0) (say (style/muted a term (join a ["  input: " (.input spec)]))) 0)
-                  (say (style/muted a term (join a ["  runs on: " (runs-on a (field ctx config) (mut spec))
-                                                    (if (> (len (.tools spec)) 0) (join a [" · " (.tools spec)]) "")])))
+                      (mut table)
+                        (style/table-new a ["TOOL" "KIND" "CHECKS" "WHAT"])]
+                  (say (join a
+                             [(style/ok a term "✓ ")
+                              (style/strong a term (.name spec))
+                              (style/muted a
+                                           term
+                                           (join a
+                                                 ["  "
+                                                  (where-text a (mut entry))]))]))
+                  (when (> (len (.description spec)) 0)
+                    (say (join a ["  " (.description spec)]))
+                    0)
+                  (when (> (len (.input spec)) 0)
+                    (say (style/muted a
+                                      term
+                                      (join a ["  input: " (.input spec)])))
+                    0)
+                  (say (style/muted a
+                                    term
+                                    (join a
+                                          ["  runs on: "
+                                           (runs-on a
+                                                    (field ctx config)
+                                                    (mut spec))
+                                           (if (> (len (.tools spec)) 0)
+                                               (join a [" · " (.tools spec)])
+                                               "")])))
                   (say "")
                   (for tool (iter (.agent-tools spec))
-                    (let [(mut checks) (sb-new a)]
+                    (let [(mut checks) (StrBuf::new a)]
                       (for field-name (iter (.verbatim tool))
-                        (when (> (len (sb-str (load checks))) 0) (sb-push-str! (mut checks) ", ") 0)
-                        (sb-push-str! (mut checks) "verbatim ")
-                        (sb-push-str! (mut checks) field-name))
-                      (style/table-row! (mut table) [(style/strong a term (.name tool))
-                                                     (if (= (.kind tool) "collect") (.kind tool) (join a [(.kind tool) ": " (.command tool)]))
-                                                     (sb-finish! (mut checks))
-                                                     (truncate a (.description tool) 60)])))
+                        (when (> (len (str (load checks))) 0)
+                          (push-str! (mut checks) ", ")
+                          0)
+                        (push-str! (mut checks) "verbatim ")
+                        (push-str! (mut checks) field-name))
+                      (style/table-row! (mut table)
+                                        [(style/strong a term (.name tool))
+                                         (if (= (.kind tool) "collect")
+                                             (.kind tool)
+                                             (join a
+                                                   [(.kind tool)
+                                                    ": "
+                                                    (.command tool)]))
+                                         (finish! (mut checks))
+                                         (truncate a (.description tool) 60)])))
                   (when (has-collect? (mut spec))
-                    (style/table-row! (mut table) [(style/strong a term "retract") "takes a report back" "" "every agent with collect tools has it"])
+                    (style/table-row! (mut table)
+                                      [(style/strong a term "retract")
+                                       "takes a report back"
+                                       ""
+                                       "every agent with collect tools has it"])
                     0)
-                  (style/table-row! (mut table) [(style/strong a term DONE-TOOL) "ends it" "" "every agent has it"])
+                  (style/table-row! (mut table)
+                                    [(style/strong a term DONE-TOOL)
+                                     "ends it"
+                                     ""
+                                     "every agent has it"])
                   (print "{s}" (style/table-render a term (load table)))
-                  (when (> (len (.gate spec)) 0) (say (join a ["gate: " (.gate spec) (style/muted a term (join a ["  (attempts: " (int-text a (agent-attempts (mut spec))) ")"]))])) 0)
-                  (for caution (iter (cautions a (mut spec) (.default-harness (field ctx config))))
+                  (when (> (len (.gate spec)) 0)
+                    (say (join a
+                               ["gate: "
+                                (.gate spec)
+                                (style/muted a
+                                             term
+                                             (join a
+                                                   ["  (attempts: "
+                                                    (int-text a
+                                                              (agent-attempts (mut spec)))
+                                                    ")"]))]))
+                    0)
+                  (for caution (iter (cautions a
+                                               (mut spec)
+                                               (.default-harness (field ctx
+                                                                        config))))
                     (say (join a [(style/warn a term "! ") caution])))
                   0)))))
 
@@ -157,24 +258,40 @@
         (mut table) (style/table-new a ["AGENT" "TOOLS" "WHERE" "WHAT"])]
     (for listed (iter (list-agents a (.home ctx) root))
       (let [entry (.entry listed)
-            where (if (> (len (.shadows listed)) 0)
-                      (join a [(.origin entry) " (hides " (.shadows listed) ")"])
-                      (.origin entry))]
+            where
+              (if (> (len (.shadows listed)) 0)
+                  (join a [(.origin entry) " (hides " (.shadows listed) ")"])
+                  (.origin entry))]
         (match (parse-agent a (.text entry))
           (AgentSpecOk [parsed]
                        (let [(mut spec) parsed
-                             (mut names) (sb-new a)]
+                             (mut names) (StrBuf::new a)]
                          (for tool (iter (.agent-tools spec))
-                           (when (> (len (sb-str (load names))) 0) (sb-push-str! (mut names) ", ") 0)
-                           (sb-push-str! (mut names) (.name tool)))
-                         (style/table-row! (mut table) [(style/strong a term (.name entry)) (sb-finish! (mut names))
-                                                        (style/muted a term where) (truncate a (.description spec) 60)])))
+                           (when (> (len (str (load names))) 0)
+                             (push-str! (mut names) ", ")
+                             0)
+                           (push-str! (mut names) (.name tool)))
+                         (style/table-row! (mut table)
+                                           [(style/strong a term (.name entry))
+                                            (finish! (mut names))
+                                            (style/muted a term where)
+                                            (truncate a (.description spec) 60)])))
           (AgentSpecBad [problems]
-                        (style/table-row! (mut table) [(style/strong a term (.name entry)) (style/err a term "invalid")
-                                                       (style/muted a term where) "factory agent check shows why"])))))
+                        (style/table-row! (mut table)
+                                          [(style/strong a term (.name entry))
+                                           (style/err a term "invalid")
+                                           (style/muted a term where)
+                                           "factory agent check shows why"])))))
     (print "{s}" (style/table-render a term (load table)))
-    (say (style/muted a term (join a ["\nthis project's: " (if (> (len root) 0) (project-agents-dir a root) "(none here; make .factory/agents/ in your repository)")
-                                      "\nthe site's:     " (agents-dir a (.home ctx))])))
+    (say (style/muted a
+                      term
+                      (join a
+                            ["\nthis project's: "
+                             (if (> (len root) 0)
+                                 (project-agents-dir a root)
+                                 "(none here; make .factory/agents/ in your repository)")
+                             "\nthe site's:     "
+                             (agents-dir a (.home ctx))])))
     0))
 
 ;;; Shows on stderr what the agent does, for `agent run --verbose`.
@@ -182,20 +299,57 @@
 
 (impl AgentObserver StderrObserver
   (observe [(self (ptr StderrObserver)) (event AgentEvent)] (-> i64)
-           (let [a (.allocator self)
-                 term (.term self)]
-             (match event
-               (ToolEnded [call summary ok output ms]
-                          (write-err (join a [(if ok (style/ok a term "✓ ") (style/err a term "✗ ")) summary
-                                              (if ok "" (join a ["\n  " (style/muted a term (truncate a output 300))])) "\n"])))
-               (Said [text] (write-err (join a [(style/muted a term (truncate a (str-trim text) 300)) "\n"])))
-               (ModelRetrying [attempt error delay]
-                              (write-err (join a [(style/warn a term "… ") "the model failed; trying again\n"])))
-               (UsageUnknown [reason]
-                             (write-err (join a [(style/warn a term "token usage incomplete: ") reason "\n"])))
-               (_ 0)))))
+    (let [a (.allocator self)
+          term (.term self)]
+      (match event
+        (ToolEnded [call summary ok output ms]
+                   (write-err (join a
+                                    [(if ok
+                                         (style/ok a term "✓ ")
+                                         (style/err a term "✗ "))
+                                     summary
+                                     (if ok
+                                         ""
+                                         (join a
+                                               ["\n  "
+                                                (style/muted a
+                                                             term
+                                                             (truncate a
+                                                                       output
+                                                                       300))]))
+                                     "\n"])))
+        (Said [text]
+              (write-err (join a
+                               [(style/muted a
+                                             term
+                                             (truncate a (trim text) 300))
+                                "\n"])))
+        (ModelRetrying [attempt error delay]
+                       (write-err (join a
+                                        [(style/warn a term "… ")
+                                         "the model failed; trying again\n"])))
+        (UsageReported [input cached output]
+                       (write-err (style/muted a
+                                               term
+                                               (join a
+                                                     ["  tokens: "
+                                                      (int-text a input)
+                                                      " in ("
+                                                      (int-text a cached)
+                                                      " cached), "
+                                                      (int-text a output)
+                                                      " out\n"]))))
+        (UsageUnknown [reason]
+                      (write-err (join a
+                                       [(style/warn a
+                                                    term
+                                                    "token usage incomplete: ")
+                                        reason
+                                        "\n"])))
+        (_ 0)))))
 
-(defn as-observer [(observer (dyn AgentObserver))] (-> (dyn AgentObserver)) observer)
+(defn as-observer [(observer (dyn AgentObserver))] (-> (dyn AgentObserver))
+  observer)
 
 (defn cmd-agent-run [(ctx (ptr Ctx)) (options AgentRunOptions)] (-> i64)
   (let [a (.allocator ctx)]
@@ -203,63 +357,124 @@
       (LoadedBad [code] code)
       (LoadedOk [found parsed]
                 (let [(mut spec) parsed
-                      workdir (work-directory a (start-dir (.project options)) (.home ctx))
-                      observer (if (.verbose options)
-                                   (as-observer (box! a StderrObserver (StderrObserver :allocator a :term (.err ctx))))
-                                   (as-observer (box! a Unobserved (Unobserved :unused 0))))
+                      workdir
+                        (work-directory a
+                                        (start-dir (.project options))
+                                        (.home ctx))
+                      observer
+                        (if (.verbose options)
+                            (as-observer (box! a
+                                               StderrObserver
+                                               (StderrObserver
+                                                 :allocator a
+                                                 :term (.err ctx))))
+                            (as-observer (box! a
+                                               Unobserved
+                                               (Unobserved :unused 0))))
                       control (box! a Unattended (Unattended :unused 0))
-                      (mut result) (run-agent! a (field ctx config) (mut spec)
-                                               (AgentCall :input (.input options) :model (.model options)
-                                                          :harness (.harness options) :workdir workdir
-                                                          :home (.home found) :state-dir (.state-dir options) :server-program "")
-                                               observer control)]
-                  (say (jv-encode a (agent-result-json a (.name spec) (mut result))))
+                      (mut result)
+                        (run-agent! a
+                                    (field ctx config)
+                                    (mut spec)
+                                    (AgentCall
+                                      :input (.input options)
+                                      :model (.model options)
+                                      :harness (.harness options)
+                                      :workdir workdir
+                                      :home (.home found)
+                                      :state-dir (.state-dir options)
+                                      :server-program "")
+                                    observer
+                                    control)]
+                  (say (jv-encode a
+                                  (agent-result-json a
+                                                     (.name spec)
+                                                     (mut result))))
                   (if (.ok result)
                       0
                       (fail-with ctx (.failure result))))))))
 
 (defn agent-template [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
-  (join a ["---\nname: " name "\ndescription: What this agent does, in one line.\ninput: What it is given.\ntools: none\n---\n\n"
-           "What the agent should do with its input. Report each finding with\n`report_finding`, then call `done`.\n\n"
-           "## Tool: report_finding\nverbatim: quote\n\nReport one finding.\n\n"
-           "```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n"
-           "    \"quote\": {\"type\": \"string\", \"description\": \"The exact words from the input this is about.\"},\n"
-           "    \"finding\": {\"type\": \"string\", \"description\": \"What you found.\"}\n  },\n"
-           "  \"required\": [\"quote\", \"finding\"],\n  \"additionalProperties\": false\n}\n```\n"]))
+  (join a
+        ["---\nname: "
+         name
+         "\ndescription: What this agent does, in one line.\ninput: What it is given.\ntools: none\n---\n\n"
+         "What the agent should do with its input. Report each finding with\n`report_finding`, then call `done`.\n\n"
+         "## Tool: report_finding\nverbatim: quote\n\nReport one finding.\n\n"
+         "```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n"
+         "    \"quote\": {\"type\": \"string\", \"description\": \"The exact words from the input this is about.\"},\n"
+         "    \"finding\": {\"type\": \"string\", \"description\": \"What you found.\"}\n  },\n"
+         "  \"required\": [\"quote\", \"finding\"],\n  \"additionalProperties\": false\n}\n```\n"]))
 
 ;;; `factory agent new NAME`: write a starting agent to the project's
 ;;; `.factory/agents/` (or the site's, or `out`), then check it.
-(defn cmd-agent-new [(ctx (ptr Ctx)) (name (slice u8)) (project (slice u8)) (site bool) (out (slice u8))] (-> i64)
-  (block :new
-         (let [a (.allocator ctx)
-               term (.out ctx)]
-           (when (not (kebab-name? name))
-             (return-from :new (fail-with ctx (join a ["the name \"" name "\" must be lowercase letters, digits, and dashes"])))
-             0)
-           (let [dir (cond (> (len out) 0) ""
-                           site (agents-dir a (.home ctx))
-                           :else (match (find-project a (start-dir project) (.home ctx))
-                                   (Some [found] (project-agents-dir a (.root found)))
-                                   (None [] (return-from :new
-                                                         (do (fail-with ctx "this is not inside a git repository, so there is no project to put the agent in")
-                                                             (hint ctx "  run it inside your project, or use --site for an agent every project can use")
-                                                             1)))))
-                 path (if (> (len out) 0) out (agent-file a dir name))]
-             (match (atomic/read-file-if-exists a path)
-               (Ok [found] (match found
-                             (Some [text] (return-from :new (fail-with ctx (join a [path " already exists"]))))
-                             (None [] 0)))
-               (Err [e] (return-from :new (fail-with ctx (join a ["cannot read " path])))))
-             (when (> (len dir) 0)
-               (match (atomic/ensure-dir! a dir 493)
-                 (Ok [_] 0)
-                 (Err [e] (return-from :new (fail-with ctx (join a ["could not create " dir])))))
-               0)
-             (match (atomic/write-file-atomic! a path (agent-template a name) 420)
-               (Ok [_] 0)
-               (Err [e] (return-from :new (fail-with ctx (join a ["could not write " path])))))
-             (say (join a ["wrote " (style/strong a term path) "\n"]))
-             (let [checked (cmd-agent-check ctx path project)]
-               (say (style/muted a term (join a ["\nedit it, then: factory agent check " name "   factory agent run " name " \"…\""])))
-               (say (style/muted a term "the whole format (run: and mcp: tools, gate:, what a run returns): factory agent guide"))
-               checked)))))
+(defn cmd-agent-new [(ctx (ptr Ctx))
+                     (name (slice u8))
+                     (project (slice u8))
+                     (site bool)
+                     (out (slice u8))] (-> i64)
+  (block
+    :new
+      (let [a (.allocator ctx)
+            term (.out ctx)]
+        (when (not (kebab-name? name))
+          (return-from
+            :new
+              (fail-with ctx
+                         (join a
+                               ["the name \""
+                                name
+                                "\" must be lowercase letters, digits, and dashes"])))
+          0)
+        (let [dir
+                (cond (> (len out) 0) ""
+                      site (agents-dir a (.home ctx))
+                      :else
+                        (match (find-project a (start-dir project) (.home ctx))
+                          (Some [found] (project-agents-dir a (.root found)))
+                          (None []
+                                (return-from
+                                  :new
+                                    (do
+                                      (fail-with ctx
+                                                 "this is not inside a git repository, so there is no project to put the agent in")
+                                      (hint ctx
+                                            "  run it inside your project, or use --site for an agent every project can use")
+                                      1)))))
+              path (if (> (len out) 0) out (agent-file a dir name))]
+          (match (atomic/read-file-if-exists a path)
+            (Ok [found]
+                (match found
+                  (Some [text]
+                        (return-from
+                          :new (fail-with ctx (join a [path " already exists"]))))
+                  (None [] 0)))
+            (Err [e]
+                 (return-from
+                   :new (fail-with ctx (join a ["cannot read " path])))))
+          (when (> (len dir) 0)
+            (match (atomic/ensure-dir! a dir 493)
+              (Ok [_] 0)
+              (Err [e]
+                   (return-from
+                     :new (fail-with ctx (join a ["could not create " dir])))))
+            0)
+          (match (atomic/write-file-atomic! a path (agent-template a name) 420)
+            (Ok [_] 0)
+            (Err [e]
+                 (return-from
+                   :new (fail-with ctx (join a ["could not write " path])))))
+          (say (join a ["wrote " (style/strong a term path) "\n"]))
+          (let [checked (cmd-agent-check ctx path project)]
+            (say (style/muted a
+                              term
+                              (join a
+                                    ["\nedit it, then: factory agent check "
+                                     name
+                                     "   factory agent run "
+                                     name
+                                     " \"…\""])))
+            (say (style/muted a
+                              term
+                              "the whole format (run: and mcp: tools, gate:, what a run returns): factory agent guide"))
+            checked)))))

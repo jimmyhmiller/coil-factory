@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -20,7 +19,10 @@
   [(text (slice u8))
    (tool-calls JVal)
    (finish-reason (slice u8))
+   ;;; All input tokens, the cached ones included.
    (input-tokens i64)
+   ;;; The part of `input-tokens` the provider served from its prompt cache.
+   (cached-input-tokens i64)
    (output-tokens i64)
    (raw JVal)])
 
@@ -37,7 +39,7 @@
   (complete [(self (ptr Self))
              (allocator (dyn Allocator))
              (request ChatRequest)]
-            (-> ChatResult)))
+    (-> ChatResult)))
 
 (defstruct ChatDelta
   [(text (slice u8))
@@ -57,19 +59,19 @@
                     (allocator (dyn Allocator))
                     (request ChatRequest)
                     (sink (dyn ChatDeltaSink))]
-                   (-> StreamResult)))
+    (-> StreamResult)))
 
-(defn chat-error [(kind (slice u8)) (status i64) (message (slice u8))] (-> ChatError)
-  (let [(mut result) (primitive/zeroed ChatError)]
-    (set! (.kind result) kind)
-    (set! (.status result) status)
-    (set! (.message result) message)
-    (load result)))
+(defn chat-error [(kind (slice u8)) (status i64) (message (slice u8))]
+  (-> ChatError)
+  (ChatError
+    :kind kind
+    :status status
+    :message message))
 
 (defn object-new [(a (dyn Allocator))] (-> JVal)
   (JObj (box! a
               (HashMap (slice u8) JVal)
-              (hm-new [(slice u8) JVal] a (str-keyops-borrowed)))))
+              (HashMap::new [(slice u8) JVal] a (keyops-borrowed)))))
 
 (defn object-put! [(object (ptr JVal)) (key (slice u8)) (value JVal)] (-> bool)
   (match (load object)
@@ -77,7 +79,7 @@
     (_ false)))
 
 (defn array-new [(a (dyn Allocator))] (-> JVal)
-  (JArr (box! a (ArrayList JVal) (al-new [JVal] a))))
+  (JArr (box! a (ArrayList JVal) (ArrayList::new [JVal] a))))
 
 (defn array-push! [(array (ptr JVal)) (value JVal)] (-> bool)
   (match (load array)

@@ -1,7 +1,6 @@
 (module factory.reviewer-test)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "factory.library" :use *)
@@ -15,9 +14,11 @@
   (match (parse-reviewer a text)
     (ReviewerOk [spec] spec)
     (ReviewerBad [problems]
-                 (do (println "unexpected problems:\n{s}" (problems-text a problems))
-                     (assert false)
-                     (parsed-or-fail a text)))))
+                 (do
+                   (println "unexpected problems:\n{s}"
+                            (problems-text a problems))
+                   (assert false)
+                   (parsed-or-fail a text)))))
 
 (defn problems-of [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
   (match (parse-reviewer a text)
@@ -25,7 +26,7 @@
     (ReviewerBad [problems] (problems-text a problems))))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn close? [(x f64) (y f64)] (-> bool)
   (and (< (- x y) 0.0001) (< (- y x) 0.0001)))
@@ -49,7 +50,9 @@
 
 (deftest reads-every-setting
   (let [a (malloc-allocator)
-        (mut spec) (parsed-or-fail a "---\nname: security\ndescription: Looks for leaks.\nmodel: opencode/hy3-free\nharness: opencode\ntools: read\nevery: 90s\nmin-events: 3\nconfidence: 0.75\nverdicts: [clean, risky, leaking]\nok: clean\nalert: leaking\n---\n\nLook for secrets being written to disk.\n")]
+        (mut spec)
+          (parsed-or-fail a
+                          "---\nname: security\ndescription: Looks for leaks.\nmodel: opencode/hy3-free\nharness: opencode\ntools: read\nevery: 90s\nmin-events: 3\nconfidence: 0.75\nverdicts: [clean, risky, leaking]\nok: clean\nalert: leaking\n---\n\nLook for secrets being written to disk.\n")]
     (assert (= (.name spec) "security"))
     (assert (= (.model spec) "opencode/hy3-free"))
     (assert (= (.harness spec) "opencode"))
@@ -61,21 +64,37 @@
     (assert (= (.instructions spec) "Look for secrets being written to disk."))
     (let [prompt (reviewer-system-prompt a (mut spec))]
       (assert (contains? prompt "Look for secrets being written to disk."))
-      (assert (contains? prompt "{\"verdict\": \"clean\" | \"risky\" | \"leaking\""))
+      (assert (contains? prompt
+                         "{\"verdict\": \"clean\" | \"risky\" | \"leaking\""))
       (assert (contains? prompt "Never change anything there.")))
-    (assert (contains? (reviewer-context a (mut spec) "the brief" "build" "[build] tool ls\n" " a.txt | 1 +" "/w")
+    (assert (contains? (reviewer-context a
+                                         (mut spec)
+                                         "the brief"
+                                         "build"
+                                         "[build] tool ls\n"
+                                         " a.txt | 1 +"
+                                         "/w")
                        "## Workspace\n`/w`"))))
 
 (deftest reports-mistakes
   (let [a (malloc-allocator)]
-    (let [p (problems-of a "---\nname: x\nverdicts: good, bad\nok: fine\nalert: good\nmodle: fast\n---\n\nDo it.\n")]
-      (assert (contains? p "line 1: ok verdict \"fine\" is not one of the verdicts"))
+    (let [p
+            (problems-of a
+                         "---\nname: x\nverdicts: good, bad\nok: fine\nalert: good\nmodle: fast\n---\n\nDo it.\n")]
+      (assert (contains? p
+                         "line 1: ok verdict \"fine\" is not one of the verdicts"))
       (assert (contains? p "unknown reviewer key \"modle\"")))
-    (let [p (problems-of a "---\nname: x\nverdicts: good, bad\nok: good\nalert: good\n---\n\nDo it.\n")]
+    (let [p
+            (problems-of a
+                         "---\nname: x\nverdicts: good, bad\nok: good\nalert: good\n---\n\nDo it.\n")]
       (assert (contains? p "cannot be both ok and alert")))
-    (let [p (problems-of a "---\nname: x\nverdicts: good\nok: good\n---\n\nDo it.\n")]
+    (let [p
+            (problems-of a
+                         "---\nname: x\nverdicts: good\nok: good\n---\n\nDo it.\n")]
       (assert (contains? p "at least two verdicts")))
-    (let [p (problems-of a "---\nname: x\nverdicts: good, Bad\nok: good\nevery: 5s\ntools: files\nharness: claude\nconfidence: 2\n---\n\nDo it.\n")]
+    (let [p
+            (problems-of a
+                         "---\nname: x\nverdicts: good, Bad\nok: good\nevery: 5s\ntools: files\nharness: claude\nconfidence: 2\n---\n\nDo it.\n")]
       (assert (contains? p "verdict \"Bad\" must be lowercase"))
       (assert (contains? p "every must be a duration from 30s to 24h"))
       (assert (contains? p "a reviewer's tools are \"read\""))
@@ -87,41 +106,51 @@
 (deftest reads-replies-and-refuses-to-guess
   (let [a (malloc-allocator)
         (mut spec) (parsed-or-fail a (.text (get (bundled-reviewers) 0)))]
-    (match (parse-verdict a (mut spec) "Sure! {\"verdict\": \"stuck\", \"confidence\": 0.8, \"reason\": \"same test 5 times\", \"advice\": \"read the error\"} done")
+    (match (parse-verdict a
+                          (mut spec)
+                          "Sure! {\"verdict\": \"stuck\", \"confidence\": 0.8, \"reason\": \"same test 5 times\", \"advice\": \"read the error\"} done")
       (VerdictOk [verdict level confidence reason advice]
-                 (do (assert (= verdict "stuck"))
-                     (assert (= level "warn"))
-                     (assert (close? confidence 0.8))
-                     (assert (= reason "same test 5 times"))
-                     (assert (= advice "read the error"))))
+                 (do
+                   (assert (= verdict "stuck"))
+                   (assert (= level "warn"))
+                   (assert (close? confidence 0.8))
+                   (assert (= reason "same test 5 times"))
+                   (assert (= advice "read the error"))))
       (VerdictBad [message] (assert false)))
-    (match (parse-verdict a (mut spec) "{\"verdict\": \"fine\", \"confidence\": 1}")
-      (VerdictBad [message] (assert (contains? message "the verdict \"fine\" is not one of")))
+    (match (parse-verdict a
+                          (mut spec)
+                          "{\"verdict\": \"fine\", \"confidence\": 1}")
+      (VerdictBad [message]
+                  (assert (contains? message
+                                     "the verdict \"fine\" is not one of")))
       (_ (assert false)))
     (match (parse-verdict a (mut spec) "{\"verdict\": \"on_track\"}")
       (VerdictBad [message] (assert (contains? message "no confidence")))
       (_ (assert false)))
     (match (parse-verdict a (mut spec) "I think it is fine.")
-      (VerdictBad [message] (assert (contains? message "not a JSON object: I think it is fine.")))
+      (VerdictBad [message]
+                  (assert (contains? message
+                                     "not a JSON object: I think it is fine.")))
       (_ (assert false)))))
 
 (defn temp-home [(a (dyn Allocator))] (-> (slice u8))
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/factory-reviewer-test-")
-    (sb-push-i64! (mut path) (pid))
-    (let [home (sb-finish! (mut path))]
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-reviewer-test-")
+    (push-i64! (mut path) (pid))
+    (let [home (finish! (mut path))]
       (capture a "rm" ["-rf" home] "" 10000)
       (atomic/ensure-dir! a (path-join a home "reviewers") 448)
       home)))
 
-(defn names-of [(a (dyn Allocator)) (home (slice u8)) (choice (slice u8))] (-> (slice u8))
+(defn names-of [(a (dyn Allocator)) (home (slice u8)) (choice (slice u8))]
+  (-> (slice u8))
   (match (load-reviewers a home choice)
     (ChosenOk [copies]
-              (let [(mut out) (sb-new a)]
+              (let [(mut out) (StrBuf::new a)]
                 (for copy (iter copies)
-                  (sb-push-str! (mut out) (.name copy))
-                  (sb-push-str! (mut out) ";"))
-                (sb-finish! (mut out))))
+                  (push-str! (mut out) (.name copy))
+                  (push-str! (mut out) ";"))
+                (finish! (mut out))))
     (ChosenBad [message] (cat a ["error: " message]))))
 
 (deftest the-run-then-the-factory-then-the-site-chooses
@@ -136,15 +165,23 @@
     (assert (= (names-of a home "") ""))
     (assert (= (names-of a home "none") ""))
     (assert (= (names-of a home "judge") "judge;"))
-    (assert (contains? (names-of a home "none, judge") "cannot be listed with others"))
-    (assert (contains? (names-of a home "nobody") "no reviewer named \"nobody\"; `factory reviewers` lists them"))
-    (assert (contains? (names-of a home "judge, judge") "two reviewers are named \"judge\""))
+    (assert (contains? (names-of a home "none, judge")
+                       "cannot be listed with others"))
+    (assert (contains? (names-of a home "nobody")
+                       "no reviewer named \"nobody\"; `factory reviewers` lists them"))
+    (assert (contains? (names-of a home "judge, judge")
+                       "two reviewers are named \"judge\""))
     ;; The site's library shadows the bundled reviewer of the same name.
-    (atomic/write-file-atomic! a (path-join a home "reviewers/judge.md")
-                               "---\nname: judge\nverdicts: fine, bad\nok: fine\nharness: opencode\n---\n\nMine.\n" 420)
+    (atomic/write-file-atomic! a
+                               (path-join a home "reviewers/judge.md")
+                               "---\nname: judge\nverdicts: fine, bad\nok: fine\nharness: opencode\n---\n\nMine.\n"
+                               420)
     (match (load-reviewers a home "judge")
       (ChosenOk [copies] (assert (contains? (.text (get copies 0)) "Mine.")))
       (ChosenBad [message] (assert false)))
-    (atomic/write-file-atomic! a (path-join a home "reviewers/broken.md") "---\nname: broken\n---\n\nNo verdicts.\n" 420)
+    (atomic/write-file-atomic! a
+                               (path-join a home "reviewers/broken.md")
+                               "---\nname: broken\n---\n\nNo verdicts.\n"
+                               420)
     (assert (contains? (names-of a home "broken") "reviewer broken:"))
     (capture a "rm" ["-rf" home] "" 10000)))

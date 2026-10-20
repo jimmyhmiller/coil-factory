@@ -156,6 +156,39 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(brief["selection"], job["selection"])
         self.controller(now + dt.timedelta(seconds=120)).tick()
         self.assertEqual(self.api.creates, 2)
+        self.assertEqual(self.api.posts[1]["project"], self.api.posts[0]["project"])
+
+    def test_runs_start_from_a_repository_holding_the_selection(self):
+        job = self.start()
+        project = Path(self.api.posts[0]["project"])
+        self.assertEqual(project, Path(self.config["state_dir"]) / "projects" / job["id"])
+        committed = subprocess.run(["git", "show", "HEAD:SELECTION.json"], cwd=project,
+                                   capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(committed), job["selection"])
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain"], cwd=project,
+                                        capture_output=True, text=True, check=True).stdout, "")
+
+    def test_a_seed_repository_with_another_selection_is_an_error(self):
+        job = self.start()
+        project = Path(self.api.posts[0]["project"])
+        selection = dict(job["selection"], roll=0)
+        atomic_json(project / "SELECTION.json", selection)
+        git = ["git", "-c", "user.name=test", "-c", "user.email=test@localhost"]
+        subprocess.run(git + ["commit", "-qam", "tamper"], cwd=project, check=True)
+        controller = self.controller()
+        with self.assertRaisesRegex(ValueError, "does not hold the persisted selection"):
+            controller.new_attempt(controller.state["jobs"][job["id"]], "paid")
+
+    def test_streaming_reasoning_counts_as_progress(self):
+        job = self.start()
+        journal = Path(self.config["site_home"]) / "runs/papers-1/events.jsonl"
+        streamed = self.time + dt.timedelta(seconds=250)
+        journal.write_text(json.dumps({"t": int(streamed.timestamp() * 1000), "kind": "agent.streaming",
+                                       "agent": "select", "part": "reasoning", "chars": 4000}) + "\n")
+        self.controller(self.time + dt.timedelta(seconds=400)).tick()
+        self.assertEqual(self.controller().state["jobs"][job["id"]]["attempts"][0]["status"], "monitoring")
+        self.controller(streamed + dt.timedelta(seconds=301)).tick()
+        self.assertEqual(self.controller().state["jobs"][job["id"]]["attempts"][0]["status"], "stopping")
 
     def test_no_fallback_while_native_worker_is_alive(self):
         self.start()

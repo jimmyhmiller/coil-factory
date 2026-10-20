@@ -23,32 +23,41 @@
 (defstruct Recorder [(allocator (dyn Allocator)) (seen (ArrayList (slice u8)))])
 
 (defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (impl AgentObserver Recorder
   (observe [(self (ptr Recorder)) (event AgentEvent)] (-> i64)
     (let [a (.allocator self)
-          line (match event
-                 (TurnStarted [turn] "turn")
-                 (MessageDelivered [m] (cat a ["delivered " (.text m)]))
-                 (Thought [text] (cat a ["thought " text]))
-                 (Said [text] (cat a ["said " text]))
-                 (UsageReported [input output]
-                                (let [(mut b) (sb-new a)]
-                                  (sb-push-str! (mut b) "usage ")
-                                  (sb-push-i64! (mut b) input)
-                                  (sb-push-str! (mut b) "/")
-                                  (sb-push-i64! (mut b) output)
-                                  (sb-finish! (mut b))))
-                 (ToolStarted [call summary] (cat a ["tool " summary]))
-                 (ToolEnded [call summary ok output elapsed] (cat a [(if ok "ok " "failed ") output]))
-                 (ModelRetrying [attempt error delay] "retry")
-                 (PausedEvent [] "paused")
-                 (ResumedEvent [] "resumed")
-                 (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
-                 (Compacted [n bytes] "compacted"))]
+          line
+            (match event
+              (TurnStarted [turn] "turn")
+              (MessageDelivered [m] (cat a ["delivered " (.text m)]))
+              (Thought [text] (cat a ["thought " text]))
+              (Said [text] (cat a ["said " text]))
+              (Streaming [part chars]
+                         (let [(mut b) (StrBuf::new a)]
+                           (push-str! (mut b) "streaming ")
+                           (push-str! (mut b) part)
+                           (push-str! (mut b) " ")
+                           (push-i64! (mut b) chars)
+                           (finish! (mut b))))
+              (UsageReported [input cached output]
+                             (let [(mut b) (StrBuf::new a)]
+                               (push-str! (mut b) "usage ")
+                               (push-i64! (mut b) input)
+                               (push-str! (mut b) "/")
+                               (push-i64! (mut b) output)
+                               (finish! (mut b))))
+              (ToolStarted [call summary] (cat a ["tool " summary]))
+              (ToolEnded [call summary ok output elapsed]
+                         (cat a [(if ok "ok " "failed ") output]))
+              (ModelRetrying [attempt error delay] "retry")
+              (PausedEvent [] "paused")
+              (ResumedEvent [] "resumed")
+              (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
+              (Compacted [n bytes] "compacted"))]
       (push! (mut (.seen self)) line)
       0)))
 
@@ -66,37 +75,54 @@
 
 (impl AgentControl Script
   (control-check [(self (ptr Script))] (-> Control)
-    (if (and (> (.cancel-at-ms self) 0) (>= (sys/monotonic-ms) (.cancel-at-ms self)))
+    (if (and (> (.cancel-at-ms self) 0)
+             (>= (sys/monotonic-ms) (.cancel-at-ms self)))
         (Cancel)
         (Proceed)))
-  (control-inbox [(self (ptr Script)) (a (dyn Allocator))] (-> (ArrayList Inbound))
-    (let [(mut out) (al-new [Inbound] a)]
+  (control-inbox [(self (ptr Script)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (let [(mut out) (ArrayList::new [Inbound] a)]
       (set! (.inbox-calls self) (+ (.inbox-calls self) 1))
       (when (= (.inbox-calls self) (.message-on self))
-        (push! (mut out) (Inbound :from "operator" :text "use tabs" :ref 7))
+        (push! (mut out)
+               (Inbound
+                 :from "operator"
+                 :text "use tabs"
+                 :ref 7))
         0)
       (load out)))
-  (control-idle [(self (ptr Script))] (-> i64) (sys/sleep-ms 50)))
+  (control-idle [(self (ptr Script))] (-> i64)
+    (sys/sleep-ms 50)))
 
-(defn run-status [(a (dyn Allocator)) (program (slice u8)) (args (slice (slice u8)))] (-> i64)
+(defn run-status [(a (dyn Allocator))
+                  (program (slice u8))
+                  (args (slice (slice u8)))] (-> i64)
   (let [child (primitive/alloc-stack subprocess/Child)]
-    (match (subprocess/spawn a child program args (subprocess/null-stdio) (subprocess/inherit-stdio) (subprocess/inherit-stdio))
+    (match (subprocess/Child::spawn a
+                                    child
+                                    program
+                                    args
+                                    (subprocess/null-stdio)
+                                    (subprocess/inherit-stdio)
+                                    (subprocess/inherit-stdio))
       (Err [_] -1)
-      (Ok [_] (match (subprocess/child-wait child)
-                (Ok [status] (match status (subprocess/Exited [code] code) (subprocess/Signaled [signal] (+ 128 signal))))
-                (Err [_] -1))))))
+      (Ok [_]
+          (try (let [status (try-or! (wait child) -1)]
+                 (match status
+                   (subprocess/Exited [code] code)
+                   (subprocess/Signaled [signal] (+ 128 signal)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A fake `opencode`: a shell script that records how it was called and
 ;; replays `reply.N` (the Nth call), which is sourced as shell.
 
 (defn fresh-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
-  (let [(mut b) (sb-new a)]
-    (sb-push-str! (mut b) "/private/tmp/opencode-test-")
-    (sb-push-i64! (mut b) (process/id))
-    (sb-push-str! (mut b) "-")
-    (sb-push-str! (mut b) label)
-    (let [dir (sb-finish! (mut b))]
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) "/private/tmp/opencode-test-")
+    (push-i64! (mut b) (process/id))
+    (push-str! (mut b) "-")
+    (push-str! (mut b) label)
+    (let [dir (finish! (mut b))]
       (run-status a "/bin/rm" ["-rf" dir])
       (match (sys/make-directory a dir)
         (Ok [_] dir)
@@ -108,14 +134,13 @@
     (Err [_] (do (println "cannot write {}" path) (assert false) 0))))
 
 (defn read [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
-  (match (fs/read-file a path)
-    (Ok [bytes] bytes)
-    (Err [_] "")))
+  (try (let [bytes (try-or! (fs/read-file a path) "")] bytes)))
 
 (defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find text needle) (Some [_] true) (None [] false)))
+  (match (find text needle) (Some [_] true) (None [] false)))
 
-(const FAKE "#!/bin/sh
+(const FAKE
+       "#!/bin/sh
 dir=\"$(dirname \"$0\")\"
 n=$(cat \"$dir/count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$dir/count\"
 printf '%s\\n' \"$@\" > \"$dir/argv.$n\"
@@ -131,16 +156,26 @@ env > \"$dir/env.$n\"
   (ev a "\"type\":\"step_start\",\"part\":{\"type\":\"step-start\"}"))
 
 (defn step-finish [(a (dyn Allocator)) (reason (slice u8))] (-> (slice u8))
-  (ev a (cat a ["\"type\":\"step_finish\",\"part\":{\"reason\":\"" reason "\",\"tokens\":{\"input\":100,\"output\":20,\"reasoning\":5,\"cache\":{\"read\":50,\"write\":0}}}"])))
+  (ev a
+      (cat a
+           ["\"type\":\"step_finish\",\"part\":{\"reason\":\""
+            reason
+            "\",\"tokens\":{\"input\":100,\"output\":20,\"reasoning\":5,\"cache\":{\"read\":50,\"write\":0}}}"])))
 
 (defn text-event [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (ev a (cat a ["\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"" text "\"}"])))
+  (ev a
+      (cat a
+           ["\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\""
+            text
+            "\"}"])))
 
 (defn bash-event [(a (dyn Allocator))] (-> (slice u8))
-  (ev a "\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"c1\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"output\":\"a.txt\",\"title\":\"ls\",\"time\":{\"start\":10,\"end\":15}}}"))
+  (ev a
+      "\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"c1\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"output\":\"a.txt\",\"title\":\"ls\",\"time\":{\"start\":10,\"end\":15}}}"))
 
 (defn finish-event [(a (dyn Allocator))] (-> (slice u8))
-  (ev a "\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"factory_finish\",\"callID\":\"c2\",\"state\":{\"status\":\"completed\",\"input\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"output\":\"Recorded.\",\"title\":\"\",\"time\":{\"start\":20,\"end\":21}}}"))
+  (ev a
+      "\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"factory_finish\",\"callID\":\"c2\",\"state\":{\"status\":\"completed\",\"input\":{\"outcome\":\"done\",\"summary\":\"did it\"},\"output\":\"Recorded.\",\"title\":\"\",\"time\":{\"start\":20,\"end\":21}}}"))
 
 (defstruct Fixture
   [(dir (slice u8))
@@ -148,57 +183,87 @@ env > \"$dir/env.$n\"
    (recorder (ptr Recorder))
    (control (ptr Script))])
 
-(defn fixture [(a (dyn Allocator)) (label (slice u8)) (replies (slice (slice u8))) (control (ptr Script))] (-> Fixture)
+(defn fixture [(a (dyn Allocator))
+               (label (slice u8))
+               (replies (slice (slice u8)))
+               (control (ptr Script))] (-> Fixture)
   (let [dir (fresh-dir a label)
         program (cat a [dir "/opencode"])
-        recorder (box! a Recorder (Recorder :allocator a :seen (al-new [(slice u8)] a)))
+        recorder
+          (box! a
+                Recorder
+                (Recorder :allocator a :seen (ArrayList::new [(slice u8)] a)))
         (mut i) 0]
     (write! a program FAKE)
     (run-status a "/bin/chmod" ["+x" program])
     (loop (if (>= (load i) (len replies))
               (break)
-              (let [(mut name) (sb-new a)]
-                (sb-push-str! (mut name) dir)
-                (sb-push-str! (mut name) "/reply.")
-                (sb-push-i64! (mut name) (+ (load i) 1))
-                (write! a (sb-finish! (mut name)) (get replies (load i)))
+              (let [(mut name) (StrBuf::new a)]
+                (push-str! (mut name) dir)
+                (push-str! (mut name) "/reply.")
+                (push-i64! (mut name) (+ (load i) 1))
+                (write! a (finish! (mut name)) (get replies (load i)))
                 (set! i (+ (load i) 1)))))
     (let [permission (jv-object a)
           mcp (jv-object a)]
       (jv-put! permission "external_directory" (JStr "deny"))
-      (let [harness (box! a OpenCodeHarness
-                          (opencode-new a
-                                        (OpenCodeOptions :program program
-                                                         :launcher (slice-new (primitive/cast (ptr (slice u8)) 0) 0)
-                                                         :workdir dir
-                                                         :state-dir (cat a [dir "/state"])
-                                                         :config-home (cat a [dir "/config"])
-                                                         :cache-dir (cat a [dir "/cache"])
-                                                         :config-path (cat a [dir "/opencode.json"])
-                                                         :model "opencode/big-pickle"
-                                                         :agent-name "factory-build"
-                                                         :permission permission
-                                                         :mcp mcp
-                                                         :plugins (jv-array a)
-                                                         :ready-file ""
-                                                         :stop-tool "factory_finish"
-                                                         :stop-tool-as "finish"
-                                                         :idle-timeout-ms 0)
-                                        recorder control))]
-        (Fixture :dir dir :harness harness :recorder recorder :control control)))))
+      (let [harness
+              (box! a
+                    OpenCodeHarness
+                    (opencode-new a
+                                  (OpenCodeOptions
+                                    :program program
+                                    :launcher
+                                      (slice::new (primitive/cast (ptr (slice u8))
+                                                                  0)
+                                                  0)
+                                    :workdir dir
+                                    :state-dir (cat a [dir "/state"])
+                                    :config-home (cat a [dir "/config"])
+                                    :cache-dir (cat a [dir "/cache"])
+                                    :config-path (cat a [dir "/opencode.json"])
+                                    :model "opencode/big-pickle"
+                                    :agent-name "factory-build"
+                                    :permission permission
+                                    :mcp mcp
+                                    :plugins (jv-array a)
+                                    :ready-file ""
+                                    :stop-tool "factory_finish"
+                                    :stop-tool-as "finish"
+                                    :idle-timeout-ms 0)
+                                  recorder
+                                  control))]
+        (Fixture
+          :dir dir
+          :harness harness
+          :recorder recorder
+          :control control)))))
 
 (defn script [(a (dyn Allocator))] (-> (ptr Script))
-  (box! a Script (Script :cancel-at-ms 0 :message-on 0 :inbox-calls 0)))
+  (box! a
+        Script
+        (Script
+          :cancel-at-ms 0
+          :message-on 0
+          :inbox-calls 0)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests
 
 (deftest finishes-when-the-stop-tool-is-called-and-stops-the-process
   (let [a (malloc-allocator)
-        f (fixture a "finish"
-                   [(cat a [(step-start a) (text-event a "working") (bash-event a) (step-finish a "tool-calls")
-                            (step-start a) (finish-event a) (step-finish a "tool-calls")
-                            "sleep 20\necho never\n"])]
+        f
+          (fixture a
+                   "finish"
+                   [(cat a
+                         [(step-start a)
+                          (text-event a "working")
+                          (bash-event a)
+                          (step-finish a "tool-calls")
+                          (step-start a)
+                          (finish-event a)
+                          (step-finish a "tool-calls")
+                          "sleep 20\necho never\n"])]
                    (script a))
         h (.harness f)
         started (sys/monotonic-ms)]
@@ -206,9 +271,10 @@ env > \"$dir/env.$n\"
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
       (Finished [call result]
-                (do (assert (= (.name call) "finish"))
-                    (assert (= (call-string call "summary") "did it"))
-                    (assert (= result "Recorded."))))
+                (do
+                  (assert (= (.name call) "finish"))
+                  (assert (= (call-string call "summary") "did it"))
+                  (assert (= result "Recorded."))))
       (_ (assert false)))
     (assert (< (- (sys/monotonic-ms) started) 8000))
     (let [r (.recorder f)
@@ -220,7 +286,8 @@ env > \"$dir/env.$n\"
       (assert (saw? r "ok a.txt"))
       (assert (saw? r "tool finish: done"))
       (assert (saw? r "usage 150/25"))
-      (assert (contains? argv "run\n--format\njson\n--auto\n--agent\nfactory-build\n"))
+      (assert (contains? argv
+                         "run\n--format\njson\n--auto\n--thinking\n--agent\nfactory-build\n"))
       (assert (contains? argv "-m\nopencode/big-pickle\n"))
       (assert (= (read a (cat a [(.dir f) "/stdin.1"])) "Begin."))
       (assert (contains? env (cat a ["PWD=" (.dir f) "\n"])))
@@ -229,16 +296,54 @@ env > \"$dir/env.$n\"
       (assert (not (contains? argv "-s\n")))
       (assert (contains? env (cat a ["XDG_DATA_HOME=" (.dir f) "/state"])))
       (assert (contains? env (cat a ["XDG_CONFIG_HOME=" (.dir f) "/config"])))
-      (assert (contains? env (cat a ["OPENCODE_CONFIG=" (.dir f) "/opencode.json"])))
+      (assert (contains? env
+                         (cat a ["OPENCODE_CONFIG=" (.dir f) "/opencode.json"])))
       (assert (contains? config "\"prompt\":\"You are a station.\""))
       (assert (contains? config "\"external_directory\":\"deny\"")))
     (assert (= (.session h) "ses_1"))))
 
+(deftest reasoning-still-streaming-is-reported-and-the-plugin-is-installed
+  (let [a (malloc-allocator)
+        f
+          (fixture a
+                   "streaming"
+                   [(cat a
+                         [(step-start a)
+                          (ev a "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":4000")
+                          (ev a "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":120")
+                          (ev a "\"type\":\"reasoning\",\"part\":{\"type\":\"reasoning\",\"text\":\"weighing candidates\"}")
+                          (text-event a "done")
+                          (step-finish a "stop")])]
+                   (script a))
+        h (.harness f)]
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h)
+      (Replied [text] (assert (= text "done")))
+      (_ (assert false)))
+    (let [r (.recorder f)
+          plugin-path (cat a [(.dir f) "/state/factory-streaming.js"])
+          config (read a (cat a [(.dir f) "/opencode.json"]))]
+      (assert (saw? r "streaming reasoning 4000"))
+      (assert (saw? r "streaming reasoning 120"))
+      (assert (saw? r "thought weighing candidates"))
+      (assert (contains? (read a plugin-path) "message.part.delta"))
+      (assert (contains? (read a plugin-path) "factory_streaming"))
+      (assert (contains? config (cat a ["\"plugin\":[\"file://" plugin-path "\"]"]))))))
+
 (deftest continues-the-session-and-replies
   (let [a (malloc-allocator)
-        f (fixture a "continue"
-                   [(cat a [(step-start a) (finish-event a) (step-finish a "tool-calls")])
-                    (cat a [(step-start a) (text-event a "all good") (step-finish a "stop")])]
+        f
+          (fixture a
+                   "continue"
+                   [(cat a
+                         [(step-start a)
+                          (finish-event a)
+                          (step-finish a "tool-calls")])
+                    (cat a
+                         [(step-start a)
+                          (text-event a "all good")
+                          (step-finish a "stop")])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -254,8 +359,13 @@ env > \"$dir/env.$n\"
 
 (deftest a-checkpoint-restores-the-session
   (let [a (malloc-allocator)
-        f (fixture a "checkpoint"
-                   [(cat a [(step-start a) (text-event a "hello") (step-finish a "stop")])]
+        f
+          (fixture a
+                   "checkpoint"
+                   [(cat a
+                         [(step-start a)
+                          (text-event a "hello")
+                          (step-finish a "stop")])]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
@@ -276,9 +386,19 @@ env > \"$dir/env.$n\"
   (let [a (malloc-allocator)
         control (script a)
         _ (set! (.message-on control) 2)
-        f (fixture a "steer"
-                   [(cat a [(step-start a) "sleep 1\n" (bash-event a) (step-finish a "tool-calls") "sleep 20\n"])
-                    (cat a [(step-start a) (finish-event a) (step-finish a "tool-calls")])]
+        f
+          (fixture a
+                   "steer"
+                   [(cat a
+                         [(step-start a)
+                          "sleep 1\n"
+                          (bash-event a)
+                          (step-finish a "tool-calls")
+                          "sleep 20\n"])
+                    (cat a
+                         [(step-start a)
+                          (finish-event a)
+                          (step-finish a "tool-calls")])]
                    control)
         h (.harness f)
         started (sys/monotonic-ms)]
@@ -304,29 +424,47 @@ env > \"$dir/env.$n\"
 
 (deftest errors-and-failed-exits-are-failures
   (let [a (malloc-allocator)
-        f (fixture a "error"
-                   [(cat a [(step-start a) (ev a "\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Model is unavailable\"}}") "exit 1\n"])
+        f
+          (fixture a
+                   "error"
+                   [(cat a
+                         [(step-start a)
+                          (ev a
+                              "\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Model is unavailable\"}}")
+                          "exit 1\n"])
                     "echo 'boom: no such column: name' >&2\nexit 3\n"]
                    (script a))
         h (.harness f)]
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
-      (Failed [error] (do (assert (= (.kind error) "harness"))
-                          (assert (= (.message error) "APIError: Model is unavailable"))))
+      (Failed [error]
+              (do
+                (assert (= (.kind error) "harness"))
+                (assert (= (.message error) "APIError: Model is unavailable"))))
       (_ (assert false)))
     (harness-add-user! h "again")
     (match (harness-run! h)
-      (Failed [error] (assert (= (.message error) "opencode exited with status 3: boom: no such column: name")))
+      (Failed [error]
+              (assert (= (.message error)
+                         "opencode exited with status 3: boom: no such column: name")))
       (_ (assert false)))))
 
 (deftest a-stop-tool-that-never-started-is-a-failure
   (let [a (malloc-allocator)
-        f (fixture a "ready" [(cat a [(step-start a) (text-event a "done, I think") (step-finish a "stop")])] (script a))
+        f
+          (fixture a
+                   "ready"
+                   [(cat a
+                         [(step-start a)
+                          (text-event a "done, I think")
+                          (step-finish a "stop")])]
+                   (script a))
         h (.harness f)]
     (set! (.ready-file (field h options)) (cat a [(.dir f) "/ready"]))
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h)
-      (Failed [error] (assert (contains? (.message error) "never started in OpenCode")))
+      (Failed [error]
+              (assert (contains? (.message error) "never started in OpenCode")))
       (_ (assert false)))))

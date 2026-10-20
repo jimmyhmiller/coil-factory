@@ -10,7 +10,6 @@
 ;; option (`-oProxyCommand=...`), which turns a destination into command
 ;; execution.
 (module ssh.target)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -94,8 +93,8 @@
         :else (None [(slice u8)])))
 
 ;; Split `host[:port]` or `[v6]:port`; `url` rejects unbracketed IPv6.
-(defn parse-host-port [(user (slice u8)) (text (slice u8)) (url bool)] (-> (Result Target
-                                                                                   (slice u8)))
+(defn parse-host-port [(user (slice u8)) (text (slice u8)) (url bool)]
+  (-> (Result Target (slice u8)))
   (if (and (> (len text) 0) (= (cast i64 (get text 0)) 91))
       (let [close (find-byte text 93)]
         (if (< close 0)
@@ -186,42 +185,42 @@
 
 ;;; `user@host`, or `host` when there is no user: ssh's destination argument.
 (defn target-destination [(a (dyn Allocator)) (t Target)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
+  (let [(mut out) (StrBuf::new a)]
     (when (> (len (.user t)) 0)
-      (sb-push-str! (mut out) (.user t))
-      (sb-push-byte! (mut out) 64)
+      (push-str! (mut out) (.user t))
+      (push! (mut out) 64)
       0)
-    (sb-push-str! (mut out) (.host t))
-    (sb-finish! (mut out))))
+    (push-str! (mut out) (.host t))
+    (finish! (mut out))))
 
 ;;; The target as a person would write it: `user@host:port`, bracketing an IPv6
 ;;; host when a port follows.
 (defn target-display [(a (dyn Allocator)) (t Target)] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         bracket (and (> (.port t) 0) (> (count-byte (.host t) 58) 0))]
     (when (> (len (.user t)) 0)
-      (sb-push-str! (mut out) (.user t))
-      (sb-push-byte! (mut out) 64)
+      (push-str! (mut out) (.user t))
+      (push! (mut out) 64)
       0)
-    (when bracket (sb-push-byte! (mut out) 91) 0)
-    (sb-push-str! (mut out) (.host t))
-    (when bracket (sb-push-byte! (mut out) 93) 0)
+    (when bracket (push! (mut out) 91) 0)
+    (push-str! (mut out) (.host t))
+    (when bracket (push! (mut out) 93) 0)
     (when (> (.port t) 0)
-      (sb-push-byte! (mut out) 58)
-      (sb-push-i64! (mut out) (.port t))
+      (push! (mut out) 58)
+      (push-i64! (mut out) (.port t))
       0)
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; The ssh arguments naming this target: `-p PORT` when a port is set, then the
 ;;; destination, which must be the last option-position argument (a remote
 ;;; command may follow it).
 (defn target-ssh-args [(a (dyn Allocator)) (t Target)] (-> (slice (slice u8)))
-  (let [(mut args) (al-new [(slice u8)] a)]
+  (let [(mut args) (ArrayList::new [(slice u8)] a)]
     (when (> (.port t) 0)
       (push! (mut args) "-p")
-      (let [(mut port) (sb-new a)]
-        (sb-push-i64! (mut port) (.port t))
-        (push! (mut args) (sb-finish! (mut port))))
+      (let [(mut port) (StrBuf::new a)]
+        (push-i64! (mut port) (.port t))
+        (push! (mut args) (finish! (mut port))))
       0)
     (push! (mut args) (target-destination a t))
-    (al-into-slice (mut args))))
+    (into-slice (mut args))))

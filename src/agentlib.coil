@@ -181,7 +181,7 @@
         n (len (load out))]
     (loop (if (>= (load i) n)
               (break)
-              (let [listed (al-elem [AgentListing] out (load i))]
+              (let [listed (elem out (load i))]
                 (when (= (.name (.entry listed)) (.name entry))
                   (when (= (len (.shadows listed)) 0) (set! (.shadows listed) (.origin entry)) 0)
                   (set! hidden true)
@@ -216,7 +216,7 @@
 ;;; the project's, the site's, then bundled ones. An agent that a name
 ;;; would never reach is not listed; the one that hides it says so.
 (defn list-agents [(a (dyn Allocator)) (home (slice u8)) (project (slice u8))] (-> (ArrayList AgentListing))
-  (let [(mut out) (al-new [AgentListing] a)
+  (let [(mut out) (ArrayList::new [AgentListing] a)
         site (agents-dir a home)]
     (when (> (len project) 0)
       (list-dir-agents! a (mut out) (project-agents-dir a project) "project" project)

@@ -1,5 +1,4 @@
 (module factory.ui.feed)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -35,13 +34,13 @@
 
 (defn feed-init! [(feed (ptr Feed)) (parent (dyn Allocator))] (-> i64)
   (arenas-init! (field feed arenas) parent)
-  (set! (.items feed) (al-new [FeedItem] parent))
+  (set! (.items feed) (ArrayList::new [FeedItem] parent))
   (set! (.cursor feed) 0)
   (set! (.loaded feed) false)
   0)
 
 (defn feed-reset! [(feed (ptr Feed))] (-> i64)
-  (al-clear! (mut (.items feed)))
+  (clear! (mut (.items feed)))
   (arenas-clear! (field feed arenas))
   (set! (.cursor feed) 0)
   (set! (.loaded feed) false)
@@ -51,7 +50,7 @@
   (len (.items feed)))
 
 (defn feed-item [(feed (ptr Feed)) (i i64)] (-> (ptr FeedItem))
-  (al-elem (field feed items) i))
+  (elem (field feed items) i))
 
 (defn feed--copy-item [(a (dyn Allocator)) (item (ptr FeedItem))] (-> FeedItem)
   (FeedItem
@@ -72,7 +71,7 @@
     (when (> n FEED-LIMIT)
       (let [a (arenas-spare (field feed arenas))
             first (- n FEED-KEEP)
-            (mut kept) (al-new [FeedItem] (.alc (.items feed)))
+            (mut kept) (ArrayList::new [FeedItem] (.alc (.items feed)))
             (mut i) first]
         (loop (if (>= (load i) n)
                   (break)
@@ -80,7 +79,7 @@
                     (push! (mut kept)
                            (feed--copy-item a (feed-item feed (load i))))
                     (set! i (+ (load i) 1)))))
-        (al-free! (mut (.items feed)))
+        (free! (mut (.items feed)))
         (set! (.items feed) (load kept))
         (arenas-flip! (field feed arenas))))
     0))
@@ -143,7 +142,8 @@
       (set! (.result-tone item) (if (jb record "ok") (ToneSuccess) (ToneError))))
     0))
 
-(defn feed--message [(a (dyn Allocator)) (record JVal) (verb (slice u8))] (-> (slice u8))
+(defn feed--message [(a (dyn Allocator)) (record JVal) (verb (slice u8))]
+  (-> (slice u8))
   (concat a [(js record "from") verb (first-line (js record "text"))]))
 
 ;;; Append one journal record as a feed line. Unknown kinds are shown by name.
@@ -151,6 +151,7 @@
   (let [a (arenas-active (field feed arenas))
         kind (js record "kind")]
     (cond (= kind "agent.usage") 0
+          (= kind "agent.streaming") 0
           (= kind "agent.turn")
             (feed--push! feed
                          record
@@ -280,21 +281,45 @@
                            "◉"
                            (standing-tone level)
                            (concat a
-                                   [(if (> (len reviewer) 0) reviewer "overseer")
+                                   [(if (> (len reviewer) 0)
+                                        reviewer
+                                        "overseer")
                                     ": "
                                     (js record "verdict")
                                     " — "
                                     (first-line (js record "reason"))])
                            (standing-tone level)))
           (= kind "approval.requested")
-            (feed--push! feed record "◆" (ToneWarning)
-                         (concat a ["waiting for your approval: " (js record "url")]) (ToneWarning))
+            (feed--push! feed
+                         record
+                         "◆"
+                         (ToneWarning)
+                         (concat a
+                                 ["waiting for your approval: "
+                                  (js record "url")])
+                         (ToneWarning))
           (= kind "approval.decided")
             (cond (= (js record "approval_kind") "question")
-                    (feed--push! feed record "◆" (ToneWarning) "Jimmy answered; sent to the agent" (ToneWarning))
+                    (feed--push! feed
+                                 record
+                                 "◆"
+                                 (ToneWarning)
+                                 "Jimmy answered; sent to the agent"
+                                 (ToneWarning))
                   (jb record "approved_all")
-                    (feed--push! feed record "✓" (ToneSuccess) "Jimmy approved" (ToneSuccess))
-                  :else (feed--push! feed record "◆" (ToneWarning) "Jimmy sent it back to the agent" (ToneWarning)))
+                    (feed--push! feed
+                                 record
+                                 "✓"
+                                 (ToneSuccess)
+                                 "Jimmy approved"
+                                 (ToneSuccess))
+                  :else
+                    (feed--push! feed
+                                 record
+                                 "◆"
+                                 (ToneWarning)
+                                 "Jimmy sent it back to the agent"
+                                 (ToneWarning)))
           (= kind "review.started")
             (feed--push! feed
                          record
@@ -304,26 +329,47 @@
                          (TonePlain))
           (= kind "review.verdict")
             (let [failure (js record "failure")
-                  approved (and (= (len failure) 0) (= (js record "level") "ok"))]
+                  approved
+                    (and (= (len failure) 0) (= (js record "level") "ok"))]
               (feed--push! feed
                            record
                            "⚖"
                            (if approved (ToneSuccess) (ToneError))
-                           (concat a [(js record "reviewer") ": "
-                                      (if (> (len failure) 0) "no verdict" (js record "verdict"))
-                                      " — "
-                                      (first-line (if (> (len failure) 0) failure (js record "reason")))])
+                           (concat a
+                                   [(js record "reviewer")
+                                    ": "
+                                    (if (> (len failure) 0)
+                                        "no verdict"
+                                        (js record "verdict"))
+                                    " — "
+                                    (first-line (if (> (len failure) 0)
+                                                    failure
+                                                    (js record "reason")))])
                            (if approved (ToneSuccess) (ToneError))))
           (= kind "review.round")
             (if (jb record "approved")
-                (feed--push! feed record "⚖" (ToneSuccess) "review approved" (ToneSuccess))
-                (feed--push! feed record "⚖" (ToneError) "review sent the work back" (ToneError)))
+                (feed--push! feed
+                             record
+                             "⚖"
+                             (ToneSuccess)
+                             "review approved"
+                             (ToneSuccess))
+                (feed--push! feed
+                             record
+                             "⚖"
+                             (ToneError)
+                             "review sent the work back"
+                             (ToneError)))
           (= kind "oversight.failed")
             (feed--push! feed
                          record
                          "✗"
                          (ToneError)
-                         (concat a ["reviewer " (js record "reviewer") " failed: " (first-line (js record "message"))])
+                         (concat a
+                                 ["reviewer "
+                                  (js record "reviewer")
+                                  " failed: "
+                                  (first-line (js record "message"))])
                          (ToneError))
           (= kind "control")
             (feed--push! feed

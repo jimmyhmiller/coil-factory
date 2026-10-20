@@ -1,7 +1,6 @@
 (module tui.app-test)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.str" :use [str-eq])
 (import "tui.canvas" :use *)
 (import "tui.keys" :use *)
 (import "tui.widgets" :use *)

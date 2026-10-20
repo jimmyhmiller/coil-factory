@@ -1,5 +1,4 @@
 (module tui.canvas)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -19,21 +18,21 @@
 
 (impl Eq Color
   (= [(a Color) (b Color)]
-     (-> bool)
-     (match a
-       (Default [] (match b (Default [] true) (_ false)))
-       (Rgb [r g bl]
-            (match b
-              (Rgb [r2 g2 b2] (and (= r r2) (= g g2) (= bl b2)))
-              (_ false)))
-       (Indexed [n] (match b (Indexed [m] (= n m)) (_ false))))))
+    (-> bool)
+    (match a
+      (Default [] (match b (Default [] true) (_ false)))
+      (Rgb [r g bl]
+           (match b
+             (Rgb [r2 g2 b2] (and (= r r2) (= g g2) (= bl b2)))
+             (_ false)))
+      (Indexed [n] (match b (Indexed [m] (= n m)) (_ false))))))
 
 ;;; A 24-bit color from 0xRRGGBB.
 (defn hex [(value i64)] (-> Color)
   (Rgb
-    :r (cast u8 (primitive/iand (primitive/ishr value 16) 255))
-    :g (cast u8 (primitive/iand (primitive/ishr value 8) 255))
-    :b (cast u8 (primitive/iand value 255))))
+    :r (cast u8 (& (>> value 16) 255))
+    :g (cast u8 (& (>> value 8) 255))
+    :b (cast u8 (& value 255))))
 
 ;;; A 24-bit color from components (each 0-255).
 (defn rgb [(r i64) (g i64) (b i64)] (-> Color)
@@ -62,8 +61,8 @@
 
 (impl Eq Style
   (= [(a Style) (b Style)]
-     (-> bool)
-     (and (= (.attrs a) (.attrs b)) (= (.fg a) (.fg b)) (= (.bg a) (.bg b)))))
+    (-> bool)
+    (and (= (.attrs a) (.attrs b)) (= (.fg a) (.fg b)) (= (.bg a) (.bg b)))))
 
 ;;; The terminal's default style: no colors, no attributes.
 (defn style-default [] (-> Style)
@@ -95,7 +94,7 @@
   (Style
     :fg (.fg s)
     :bg (.bg s)
-    :attrs (primitive/ior (.attrs s) attrs)))
+    :attrs (| (.attrs s) attrs)))
 
 (defn bold [(s Style)] (-> Style)
   (with-attrs s ATTR-BOLD))
@@ -240,9 +239,9 @@
                                   (set! weights (+ (load weights) weight))
                                   -1)))]
                   (if (< want 0)
-                      (set! (index (slice-data sizes) (load i)) 0)
+                      (set! (index (data sizes) (load i)) 0)
                       (let [granted (layout--clamp want (load remaining))]
-                        (set! (index (slice-data sizes) (load i)) granted)
+                        (set! (index (data sizes) (load i)) granted)
                         (set! remaining (- (load remaining) granted)))))
                 (set! i (+ (load i) 1)))))
     (let [pool (load remaining)
@@ -258,14 +257,14 @@
                                   (if (= (load weights) 0)
                                       0
                                       (/ (* pool weight) (load weights)))]
-                            (set! (index (slice-data sizes) (load j)) share)
+                            (set! (index (data sizes) (load j)) share)
                             (set! given (+ (load given) share))
                             (set! last-fill (load j))))
                     (_ 0))
                   (set! j (+ (load j) 1)))))
       ;; Integer division leaves at most a few cells; the last fill part absorbs them.
       (when (>= (load last-fill) 0)
-        (let [slot (index (slice-data sizes) (load last-fill))]
+        (let [slot (index (data sizes) (load last-fill))]
           (set! slot (+ (load slot) (- pool (load given))))))
       0)))
 
@@ -282,13 +281,13 @@
     (layout-sizes (if vertical (.h r) (.w r))
                   gap
                   constraints
-                  (slice-new [i64] (index sizes 0) n))
+                  (slice::new [i64] (index sizes 0) n))
     (let [(mut at) (if vertical (.y r) (.x r))
           (mut i) 0]
       (loop (if (>= (load i) n)
                 (break)
                 (let [size (load (index sizes (load i)))]
-                  (set! (index (slice-data out) (load i))
+                  (set! (index (data out) (load i))
                         (if vertical
                             (rect (.x r) (load at) (.w r) size)
                             (rect (load at) (.y r) size (.h r))))
@@ -353,11 +352,11 @@
     :style (style-default)))
 
 (defn canvas--fill-blank! [(c (ptr Canvas))] (-> i64)
-  (al-clear! (mut (.cells c)))
-  (al-clear! (mut (.pool c)))
+  (clear! (mut (.cells c)))
+  (clear! (mut (.pool c)))
   (let [n (* (.width c) (.height c))
         (mut i) 0]
-    (al-reserve! (mut (.cells c)) n)
+    (reserve! (mut (.cells c)) n)
     (loop (if (>= (load i) n)
               (break)
               (do (push! (mut (.cells c)) (blank-cell)) (set! i (+ (load i) 1)))))
@@ -370,8 +369,8 @@
             :allocator a
             :width (if (< width 0) 0 width)
             :height (if (< height 0) 0 height)
-            :cells (al-new [Cell] a)
-            :pool (al-new [u8] a)
+            :cells (ArrayList::new [Cell] a)
+            :pool (ArrayList::new [u8] a)
             :cursor-visible false
             :cursor-x 0
             :cursor-y 0
@@ -381,8 +380,8 @@
 
 ;;; Release the canvas's storage.
 (defn canvas-free! [(c (ptr Canvas))] (-> i64)
-  (al-free! (mut (.cells c)))
-  (al-free! (mut (.pool c)))
+  (free! (mut (.cells c)))
+  (free! (mut (.pool c)))
   0)
 
 ;;; Resize and blank the canvas. It is marked invalid (it no longer mirrors the
@@ -403,7 +402,7 @@
               (do
                 (set! (index data (load i)) (blank-cell))
                 (set! i (+ (load i) 1)))))
-    (al-clear! (mut (.pool c)))
+    (clear! (mut (.pool c)))
     (set! (.cursor-visible c) false)
     0))
 
@@ -424,10 +423,13 @@
 
 ;;; The grapheme bytes of a cell (encoded from `rune` into `scratch` when it is a
 ;;; single scalar). `scratch` must hold 4 bytes and outlive the result.
-(defn cell-bytes [(c (ptr Canvas)) (cell (ptr Cell)) (scratch (ptr u8))] (-> (slice u8))
+(defn cell-bytes [(c (ptr Canvas)) (cell (ptr Cell)) (scratch (ptr u8))]
+  (-> (slice u8))
   (if (> (.ext-len cell) 0)
-      (slice-new [u8] (index (.data (.pool c)) (.ext-off cell)) (.ext-len cell))
-      (slice-new [u8] scratch (utf8-encode-into scratch (.rune cell)))))
+      (slice::new [u8]
+                  (index (.data (.pool c)) (.ext-off cell))
+                  (.ext-len cell))
+      (slice::new [u8] scratch (utf8-encode-into scratch (.rune cell)))))
 
 ;;; Show the terminal cursor at (x, y) after the frame is drawn.
 (defn canvas-set-cursor! [(c (ptr Canvas)) (x i64) (y i64)] (-> i64)
@@ -484,9 +486,9 @@
         (do
           (set! (.ext-off cell) (len (.pool c)))
           (set! (.ext-len cell) (- end start))
-          (al-extend! (mut (.pool c))
-                      (index (slice-data text) start)
-                      (- end start))))
+          (extend! (mut (.pool c))
+                   (index (data text) start)
+                   (- end start))))
     (when (= width 2)
       (let [right (canvas-cell c (+ x 1) y)]
         (set! (.rune right) 0)
@@ -507,11 +509,11 @@
         off (len (.pool c))]
     ;; `old` may live in the pool; copy it byte by byte so growth cannot move it
     ;; out from under the read.
-    (let [(mut copy) (al-new [u8] (.allocator c))]
-      (al-extend! (mut copy) (slice-data old) (len old))
-      (al-extend! (mut (.pool c)) (.data copy) (len copy))
-      (al-free! (mut copy)))
-    (al-extend! (mut (.pool c)) (slice-data bytes) (len bytes))
+    (let [(mut copy) (ArrayList::new [u8] (.allocator c))]
+      (extend! (mut copy) (data old) (len old))
+      (extend! (mut (.pool c)) (.data copy) (len copy))
+      (free! (mut copy)))
+    (extend! (mut (.pool c)) (data bytes) (len bytes))
     (set! (.ext-off cell) off)
     (set! (.ext-len cell) (- (len (.pool c)) off))
     0))
@@ -669,7 +671,8 @@
   (fill! c (rect x y 1 length) rune style))
 
 ;;; Set one cell to the single-cell glyph `rune` (ignored outside the canvas).
-(defn put-rune! [(c (ptr Canvas)) (x i64) (y i64) (rune i64) (style Style)] (-> i64)
+(defn put-rune! [(c (ptr Canvas)) (x i64) (y i64) (rune i64) (style Style)]
+  (-> i64)
   (fill! c (rect x y 1 1) rune style))
 
 ;; ---------------------------------------------------------------------------
@@ -810,7 +813,7 @@
 ;; ---------------------------------------------------------------------------
 ;; Rendering
 (defn out--str! [(out (mut (ArrayList u8))) (s (slice u8))] (-> i64)
-  (al-extend! (mut out) (slice-data s) (len s))
+  (extend! (mut out) (data s) (len s))
   0)
 
 (defn out--byte! [(out (mut (ArrayList u8))) (b i64)] (-> i64)
@@ -844,22 +847,8 @@
   (out--byte! (mut out) #\H))
 
 (const XTERM-16
-       [0x000000
-        0x800000
-        0x008000
-        0x808000
-        0x000080
-        0x800080
-        0x008080
-        0xC0C0C0
-        0x808080
-        0xFF0000
-        0x00FF00
-        0xFFFF00
-        0x0000FF
-        0xFF00FF
-        0x00FFFF
-        0xFFFFFF])
+       [0x000000 0x800000 0x008000 0x808000 0x000080 0x800080 0x008080 0xC0C0C0
+        0x808080 0xFF0000 0x00FF00 0xFFFF00 0x0000FF 0xFF00FF 0x00FFFF 0xFFFFFF])
 
 (defn color--level [(i i64)] (-> i64)
   (if (= i 0) 0 (+ 55 (* 40 i))))
@@ -869,23 +858,20 @@
   (cond (< n 16) (get XTERM-16 n)
         (< n 232)
           (let [k (- n 16)]
-            (primitive/ior (primitive/ior (primitive/ishl (color--level (/ k 36))
-                                                          16)
-                                          (primitive/ishl (color--level (% (/ k
-                                                                              6)
-                                                                           6))
-                                                          8))
-                           (color--level (% k 6))))
+            (| (<< (color--level (/ k 36)) 16)
+               (<< (color--level (% (/ k
+                                       6)
+                                    6))
+                   8)
+               (color--level (% k 6))))
         :else
           (let [v (+ 8 (* 10 (- n 232)))]
-            (primitive/ior (primitive/ior (primitive/ishl v 16)
-                                          (primitive/ishl v 8))
-                           v))))
+            (| (<< v 16) (<< v 8) v))))
 
 (defn color--dist [(rgb-a i64) (r i64) (g i64) (b i64)] (-> i64)
-  (let [dr (- (primitive/iand (primitive/ishr rgb-a 16) 255) r)
-        dg (- (primitive/iand (primitive/ishr rgb-a 8) 255) g)
-        db (- (primitive/iand rgb-a 255) b)]
+  (let [dr (- (& (>> rgb-a 16) 255) r)
+        dg (- (& (>> rgb-a 8) 255) g)
+        db (- (& rgb-a 255) b)]
     (+ (+ (* dr dr) (* dg dg)) (* db db))))
 
 (defn color--cube-index [(v i64)] (-> i64)
@@ -938,13 +924,9 @@
                        (if (< (cast i64 n) 16)
                            color
                            (let [v (palette-rgb (cast i64 n))]
-                             (indexed (rgb-to-16 (primitive/iand (primitive/ishr v
-                                                                                 16)
-                                                                 255)
-                                                 (primitive/iand (primitive/ishr v
-                                                                                 8)
-                                                                 255)
-                                                 (primitive/iand v 255))))))))))
+                             (indexed (rgb-to-16 (& (>> v 16) 255)
+                                                 (& (>> v 8) 255)
+                                                 (& v 255))))))))))
 
 ;;; `s` as it will be rendered under `mode`. Without color, a background tint
 ;;; (selection, badges) becomes reverse video so it stays visible.
@@ -954,7 +936,7 @@
           (match mode
             (NoColor []
                      (if tinted
-                         (primitive/ior (.attrs s) ATTR-REVERSE)
+                         (| (.attrs s) ATTR-REVERSE)
                          (.attrs s)))
             (_ (.attrs s)))]
     (Style
@@ -994,16 +976,18 @@
                          (out--str! (mut out) (if background "48;5;" "38;5;"))
                          (out--dec! (mut out) k)))))))
 
-(defn sgr--code! [(out (mut (ArrayList u8))) (count (mut i64)) (code i64)] (-> i64)
+(defn sgr--code! [(out (mut (ArrayList u8))) (count (mut i64)) (code i64)]
+  (-> i64)
   (sgr--param! (mut out) (mut count))
   (out--dec! (mut out) code))
 
 (defn attr? [(attrs i64) (bit i64)] (-> bool)
-  (!= (primitive/iand attrs bit) 0))
+  (!= (& attrs bit) 0))
 
 ;;; Append the shortest SGR sequence that changes the pen from `cur` to `next`
 ;;; (both already mapped for the color mode). Emits nothing when they are equal.
-(defn out-sgr-transition! [(out (mut (ArrayList u8))) (cur Style) (next Style)] (-> i64)
+(defn out-sgr-transition! [(out (mut (ArrayList u8))) (cur Style) (next Style)]
+  (-> i64)
   (let [(mut count) 0
         ca (.attrs cur)
         na (.attrs next)
@@ -1204,10 +1188,10 @@
 
 ;;; Make `dst` an exact copy of `src` (size, cells, pool, cursor, validity).
 (defn canvas-copy! [(dst (ptr Canvas)) (src (ptr Canvas))] (-> i64)
-  (al-clear! (mut (.cells dst)))
-  (al-extend! (mut (.cells dst)) (.data (.cells src)) (len (.cells src)))
-  (al-clear! (mut (.pool dst)))
-  (al-extend! (mut (.pool dst)) (.data (.pool src)) (len (.pool src)))
+  (clear! (mut (.cells dst)))
+  (extend! (mut (.cells dst)) (.data (.cells src)) (len (.cells src)))
+  (clear! (mut (.pool dst)))
+  (extend! (mut (.pool dst)) (.data (.pool src)) (len (.pool src)))
   (set! (.width dst) (.width src))
   (set! (.height dst) (.height src))
   (set! (.cursor-visible dst) (.cursor-visible src))
@@ -1219,7 +1203,7 @@
 ;;; The canvas as plain text: one line per row, right-trimmed, each ending in
 ;;; "\n", with no escape sequences. Allocated from `a`. For snapshot tests.
 (defn render-plain [(a (dyn Allocator)) (c (ptr Canvas))] (-> (slice u8))
-  (let [(mut out) (al-new [u8] a)
+  (let [(mut out) (ArrayList::new [u8] a)
         (mut scratch) (zeroed (array u8 4))
         (mut y) 0]
     (loop (if (>= (load y) (.height c))
@@ -1241,7 +1225,7 @@
                       (if (> (load keep) line-start) (load keep) line-start))
                 (out--byte! (mut out) 10)
                 (set! y (+ (load y) 1)))))
-    (al-into-slice (mut out))))
+    (into-slice (mut out))))
 
 ;;; Record that the screen now shows `next`: copy it into `prev` and mark `prev`
 ;;; valid. Call after the bytes from `render-diff!` have been written.

@@ -14,17 +14,17 @@
 ;;; factory needs, on the Mac and on the server alike.
 
 (defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) n)
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) n)
+    (finish! (mut out))))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn ends-with? [(text (slice u8)) (suffix (slice u8))] (-> bool)
   (and (>= (len text) (len suffix))
@@ -37,49 +37,55 @@
 ;;; `text` with every run of whitespace made one space, and trimmed: so a
 ;;; quote matches its source however either was wrapped.
 (defn squash [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         (mut pending) false]
-    (for byte (iter (str-trim text))
+    (for byte (iter (trim text))
       (if (space? byte)
           (set! pending true)
-          (do (when (load pending) (sb-push-byte! (mut out) (cast u8 32)) 0)
-              (set! pending false)
-              (sb-push-byte! (mut out) byte))))
-    (sb-finish! (mut out))))
+          (do
+            (when (load pending) (push! (mut out) (cast u8 32)) 0)
+            (set! pending false)
+            (push! (mut out) byte))))
+    (finish! (mut out))))
 
 (defn hex-digit [(v i64)] (-> u8)
   (cast u8 (if (< v 10) (+ v 48) (+ v 87))))
 
 ;;; The 64 bits of `n` as sixteen lowercase hex digits.
 (defn hex64 [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         (mut shift) 60]
     (loop (if (< (load shift) 0)
               (break)
-              (do (sb-push-byte! (mut out) (hex-digit (primitive/iand (primitive/ishr n (load shift)) 15)))
-                  (set! shift (- (load shift) 4)))))
-    (sb-finish! (mut out))))
+              (do
+                (push! (mut out) (hex-digit (& (>> n (load shift)) 15)))
+                (set! shift (- (load shift) 4)))))
+    (finish! (mut out))))
 
 ;;; A name for a pad cell id that is safe in a file name, a URL, and a git
 ;;; branch: lowercase letters, digits, and dashes, at most 40 of them, then a
 ;;; hash of the whole id so two ids that read alike stay apart.
 (defn slug [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         (mut dash) false]
     (for byte (iter text)
       (let [c (cast i64 byte)
             lower (if (and (>= c 65) (<= c 90)) (+ c 32) c)]
-        (when (< (len (sb-str (load out))) 40)
-          (if (or (and (>= lower 97) (<= lower 122)) (and (>= lower 48) (<= lower 57)))
-              (do (when (and (load dash) (> (len (sb-str (load out))) 0)) (sb-push-byte! (mut out) (cast u8 45)) 0)
-                  (set! dash false)
-                  (sb-push-byte! (mut out) (cast u8 lower)))
+        (when (< (len (str (load out))) 40)
+          (if (or (and (>= lower 97) (<= lower 122))
+                  (and (>= lower 48) (<= lower 57)))
+              (do
+                (when (and (load dash) (> (len (str (load out))) 0))
+                  (push! (mut out) (cast u8 45))
+                  0)
+                (set! dash false)
+                (push! (mut out) (cast u8 lower)))
               (set! dash true))
           0)))
-    (when (= (len (sb-str (load out))) 0) (sb-push-str! (mut out) "bug") 0)
-    (sb-push-str! (mut out) "-")
-    (sb-push-str! (mut out) (subslice (hex64 a (str-hash text)) 0 8))
-    (sb-finish! (mut out))))
+    (when (= (len (str (load out))) 0) (push-str! (mut out) "bug") 0)
+    (push-str! (mut out) "-")
+    (push-str! (mut out) (subslice (hex64 a (hash text)) 0 8))
+    (finish! (mut out))))
 
 ;;; The last `n` bytes of `text`.
 (defn tail [(text (slice u8)) (n i64)] (-> (slice u8))
@@ -87,12 +93,14 @@
 
 ;;; The first line of `text`, at most `n` bytes.
 (defn first-line [(text (slice u8)) (n i64)] (-> (slice u8))
-  (let [line (match (str-find (str-trim text) "\n")
-               (Some [at] (subslice (str-trim text) 0 at))
-               (None [] (str-trim text)))]
+  (let [line
+          (match (find (trim text) "\n")
+            (Some [at] (subslice (trim text) 0 at))
+            (None [] (trim text)))]
     (if (<= (len line) n) line (subslice line 0 n))))
 
-(defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))] (-> (slice u8))
+(defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))]
+  (-> (slice u8))
   (if (and (> (len base) 0) (ends-with? base "/"))
       (join a [base child])
       (join a [base "/" child])))
@@ -116,54 +124,70 @@
 ;;; `~` and `~/…` under $HOME.
 (defn expand-home [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
   (cond (= path "~") (env-or a "HOME" "/")
-        (starts-with path "~/") (path-join a (env-or a "HOME" "/") (subslice path 2 (len path)))
+        (starts-with path "~/")
+          (path-join a (env-or a "HOME" "/") (subslice path 2 (len path)))
         :else path))
 
-(defn durable-message [(a (dyn Allocator)) (what (slice u8)) (path (slice u8)) (e DurableError)] (-> (slice u8))
-  (join a [what " " path
-           (match (error-os-code e)
-             (Some [code] (join a [": " (errno-text code)]))
-             (None [] ""))]))
+(defn durable-message [(a (dyn Allocator))
+                       (what (slice u8))
+                       (path (slice u8))
+                       (e DurableError)] (-> (slice u8))
+  (join a
+        [what
+         " "
+         path
+         (match (error-os-code e)
+           (Some [code] (join a [": " (errno-text code)]))
+           (None [] ""))]))
 
 ;;; The whole file, or None when it does not exist. Anything else (a
 ;;; directory, no permission) is an error, never mistaken for absence.
-(defn read-text [(a (dyn Allocator)) (path (slice u8))] (-> (Result (Option (slice u8)) (slice u8)))
+(defn read-text [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result (Option (slice u8)) (slice u8)))
   (match (atomic/read-file-if-exists a path)
     (Ok [found] (Ok found))
     (Err [e] (Err (durable-message a "cannot read" path e)))))
 
 ;;; The whole file, which must exist.
-(defn read-required [(a (dyn Allocator)) (path (slice u8))] (-> (Result (slice u8) (slice u8)))
+(defn read-required [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result (slice u8) (slice u8)))
   (match (read-text a path)
     (Err [why] (Err why))
-    (Ok [found] (match found
-                  (Some [text] (Ok text))
-                  (None [] (Err (join a [path " does not exist"])))))))
+    (Ok [found]
+        (match found
+          (Some [text] (Ok text))
+          (None [] (Err (join a [path " does not exist"])))))))
 
-(defn ensure-dir [(a (dyn Allocator)) (path (slice u8)) (mode i64)] (-> (Result i64 (slice u8)))
+(defn ensure-dir [(a (dyn Allocator)) (path (slice u8)) (mode i64)]
+  (-> (Result i64 (slice u8)))
   (match (atomic/ensure-dir! a path mode)
     (Ok [_] (Ok 0))
     (Err [e] (Err (durable-message a "cannot create" path e)))))
 
 ;;; Replace `path` with `text`, creating its directory: a reader sees the old
 ;;; file or the new one, never a mix.
-(defn write-text [(a (dyn Allocator)) (path (slice u8)) (text (slice u8)) (mode i64)] (-> (Result i64 (slice u8)))
+(defn write-text [(a (dyn Allocator))
+                  (path (slice u8))
+                  (text (slice u8))
+                  (mode i64)] (-> (Result i64 (slice u8)))
   (match (ensure-dir a (dir-name path) 493)
     (Err [why] (Err why))
-    (Ok [_] (match (atomic/write-file-atomic! a path text mode)
-              (Ok [_] (Ok 0))
-              (Err [e] (Err (durable-message a "cannot write" path e)))))))
+    (Ok [_]
+        (match (atomic/write-file-atomic! a path text mode)
+          (Ok [_] (Ok 0))
+          (Err [e] (Err (durable-message a "cannot write" path e)))))))
 
 (defn file-exists? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
-  (match (atomic/file-exists? a path) (Ok [yes] yes) (Err [_] false)))
+  (try (let [yes (try-or! (atomic/file-exists? a path) false)] yes)))
 
 (defn dir-exists? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
-  (match (atomic/dir-exists? a path) (Ok [yes] yes) (Err [_] false)))
+  (try (let [yes (try-or! (atomic/dir-exists? a path) false)] yes)))
 
 ;;; The names in a directory, sorted; an empty list when it does not exist.
-(defn list-names [(a (dyn Allocator)) (path (slice u8))] (-> (Result (ArrayList (slice u8)) (slice u8)))
+(defn list-names [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result (ArrayList (slice u8)) (slice u8)))
   (if (not (dir-exists? a path))
-      (Ok (al-new [(slice u8)] a))
+      (Ok (ArrayList::new [(slice u8)] a))
       (match (atomic/list-dir a path)
         (Ok [names] (Ok names))
         (Err [e] (Err (durable-message a "cannot list" path e))))))
@@ -172,26 +196,33 @@
 ;; Time
 
 (defn now-ms [] (-> i64)
-  (match (time/wall-now-ms)
-    (Ok [ms] ms)
-    (Err [_] (do (println "coil-bugs: the realtime clock cannot be read") (abort) 0))))
+  (try (let [ms
+               (try-or! (time/wall-now-ms)
+                        (do
+                          (println "coil-bugs: the realtime clock cannot be read")
+                          (abort)
+                          0))]
+         ms)))
 
 (defn push-two! [(out (mut StrBuf)) (n i64)] (-> i64)
-  (when (< n 10) (sb-push-byte! (mut out) (cast u8 48)) 0)
-  (sb-push-i64! (mut out) n))
+  (when (< n 10) (push! (mut out) (cast u8 48)) 0)
+  (push-i64! (mut out) n))
 
-(defn date-text [(a (dyn Allocator)) (year i64) (month i64) (day i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) year)
-    (sb-push-str! (mut out) "-")
+(defn date-text [(a (dyn Allocator)) (year i64) (month i64) (day i64)]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) year)
+    (push-str! (mut out) "-")
     (push-two! (mut out) month)
-    (sb-push-str! (mut out) "-")
+    (push-str! (mut out) "-")
     (push-two! (mut out) day)
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; The UTC date of `ms`, YYYY-MM-DD (Howard Hinnant's civil-from-days).
 (defn utc-date [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
-  (let [days (let [d (/ ms 86400000)] (if (and (< ms 0) (!= (* d 86400000) ms)) (- d 1) d))
+  (let [days
+          (let [d (/ ms 86400000)]
+            (if (and (< ms 0) (!= (* d 86400000) ms)) (- d 1) d))
         z (+ days 719468)
         era (/ (if (>= z 0) z (- z 146096)) 146097)
         doe (- z (* era 146097))
@@ -205,25 +236,25 @@
 
 ;;; The date of `ms` in this machine's time zone, YYYY-MM-DD.
 (defn local-date [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
-  (let [secs (primitive/alloc-stack i64)
+  (let [(mut secs) (: (/ ms 1000) i64)
         tm (primitive/alloc-stack Tm)]
-    (set! secs (/ ms 1000))
     (set! tm (zeroed Tm))
-    (localtime_r secs tm)
-    (date-text a (+ 1900 (cast i64 (load (index (field tm fields) 5))))
+    (localtime_r (mut secs) tm)
+    (date-text a
+               (+ 1900 (cast i64 (load (index (field tm fields) 5))))
                (+ 1 (cast i64 (load (index (field tm fields) 4))))
                (cast i64 (load (index (field tm fields) 3))))))
 
 ;;; An ISO 8601 UTC timestamp for `ms`, to the second.
 (defn utc-stamp [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
   (let [secs (- (/ ms 1000) (* (/ ms 86400000) 86400))
-        (mut out) (sb-new a)]
-    (sb-push-str! (mut out) (utc-date a ms))
-    (sb-push-str! (mut out) "T")
+        (mut out) (StrBuf::new a)]
+    (push-str! (mut out) (utc-date a ms))
+    (push-str! (mut out) "T")
     (push-two! (mut out) (/ secs 3600))
-    (sb-push-str! (mut out) ":")
+    (push-str! (mut out) ":")
     (push-two! (mut out) (/ (- secs (* (/ secs 3600) 3600)) 60))
-    (sb-push-str! (mut out) ":")
+    (push-str! (mut out) ":")
     (push-two! (mut out) (- secs (* (/ secs 60) 60)))
-    (sb-push-str! (mut out) "Z")
-    (sb-finish! (mut out))))
+    (push-str! (mut out) "Z")
+    (finish! (mut out))))

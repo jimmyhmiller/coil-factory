@@ -1,0 +1,144 @@
+(module factory.chatgpt-test)
+(import "coil.alloc" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.responses" :as responses)
+(import "agent.json" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.chatgpt" :use *)
+(import "factory.proc" :use [capture pid])
+
+(defn scratch-file [(a (dyn Allocator)) (name (slice u8)) (text (slice u8))]
+  (-> (slice u8))
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-chatgpt-test-")
+    (push-i64! (mut path) (pid))
+    (let [dir (finish! (mut path))
+          file (cat a [dir "/" name])]
+      (atomic/ensure-dir! a dir 448)
+      (capture a "rm" ["-f" file] "" 10000)
+      (when (> (len text) 0) (atomic/write-file-atomic! a file text 384) 0)
+      file)))
+
+(defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find text needle) (Some [_] true) (None [] false)))
+
+;;; A login whose refresh would go nowhere: renewing from the network fails.
+(defn offline-login [(a (dyn Allocator)) (path (slice u8))]
+  (-> (ptr CodexLogin))
+  (box! a
+        CodexLogin
+        (CodexLogin
+          :allocator a
+          :path path
+          :refresh-url "http://127.0.0.1:9/oauth/token")))
+
+(const LOGIN
+       "{\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"id-1\",\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"account_id\":\"acct-1\"},\"last_refresh\":\"2026-10-05T22:35:57.764766Z\",\"extra\":7}")
+
+(deftest the-access-token-and-account-are-read-from-codex-s-login
+  (let [a (malloc-allocator)
+        login (offline-login a (scratch-file a "auth.json" LOGIN))]
+    (match (responses/login-current login a)
+      (responses/CredentialsBad [m] (assert false))
+      (responses/CredentialsOk [c]
+                               (do
+                                 (assert (= (.token c) "access-1"))
+                                 (assert (= (.account c) "acct-1")))))))
+
+(deftest no-login-or-an-api-key-login-says-what-to-do
+  (let [a (malloc-allocator)]
+    (match (responses/login-current (offline-login a
+                                                   (scratch-file a
+                                                                 "missing.json"
+                                                                 ""))
+                                    a)
+      (responses/CredentialsOk [c] (assert false))
+      (responses/CredentialsBad [m]
+                                (assert (contains? m
+                                                   "log in with `codex login`"))))
+    (match (responses/login-current (offline-login a
+                                                   (scratch-file a
+                                                                 "key.json"
+                                                                 "{\"OPENAI_API_KEY\":\"sk-x\"}"))
+                                    a)
+      (responses/CredentialsOk [c] (assert false))
+      (responses/CredentialsBad [m]
+                                (assert (contains? m
+                                                   "logged in with an API key, not a ChatGPT account"))))))
+
+(deftest a-login-renewed-meanwhile-by-codex-is-used-without-refreshing
+  (let [a (malloc-allocator)
+        path (scratch-file a "renewed.json" LOGIN)
+        login (offline-login a path)]
+    ;; The server refused "access-0", but the file already holds a newer one.
+    (match (responses/login-renew login
+                                  a
+                                  (responses/ResponsesCredentials
+                                    :token "access-0"
+                                    :account "acct-1"))
+      (responses/CredentialsBad [m] (do (println "{s}" m) (assert false)))
+      (responses/CredentialsOk [c] (assert (= (.token c) "access-1"))))))
+
+(deftest a-refresh-that-fails-leaves-the-login-file-alone
+  (let [a (malloc-allocator)
+        path (scratch-file a "stale.json" LOGIN)
+        login (offline-login a path)]
+    (match (responses/login-renew login
+                                  a
+                                  (responses/ResponsesCredentials
+                                    :token "access-1"
+                                    :account "acct-1"))
+      (responses/CredentialsOk [c] (assert false))
+      (responses/CredentialsBad [m]
+                                (assert (contains? m
+                                                   "cannot reach http://127.0.0.1:9/oauth/token"))))
+    (try (let [found
+                 (try-or! (atomic/read-file-if-exists a path) (assert false))]
+           (match found
+             (Some [text] (assert (= text LOGIN)))
+             (None [] (assert false)))))))
+
+(deftest a-refresh-writes-the-new-tokens-back-the-way-codex-does
+  (let [a (malloc-allocator)
+        root
+          (match (jv-parse a LOGIN)
+            (Some [r] r)
+            (None [] (do (assert false) (JNull))))
+        reply
+          (match (jv-parse a
+                           "{\"access_token\":\"access-2\",\"refresh_token\":\"refresh-2\",\"id_token\":\"id-2\",\"expires_in\":864000}")
+            (Some [r] r)
+            (None [] (do (assert false) (JNull))))]
+    (match (renewed-login a root reply 1791827859042)
+      (Err [m] (assert false))
+      (Ok [updated]
+          (let [tokens (jv-get updated "tokens")]
+            (assert (= (jv-string-or (jv-get tokens "access_token") "")
+                       "access-2"))
+            ;; Refresh tokens are used once: the new one must be kept.
+            (assert (= (jv-string-or (jv-get tokens "refresh_token") "")
+                       "refresh-2"))
+            (assert (= (jv-string-or (jv-get tokens "id_token") "") "id-2"))
+            (assert (= (jv-string-or (jv-get tokens "account_id") "") "acct-1"))
+            (assert-eq (jv-int (jv-get updated "extra")) 7)
+            (assert (= (jv-string-or (jv-get updated "last_refresh") "")
+                       "2026-10-12T17:57:39.042Z")))))
+    ;; The original is not changed in place.
+    (assert (= (jv-string-or (jv-get (jv-get root "tokens") "access_token") "")
+               "access-1"))
+    (match (renewed-login a
+                          root
+                          (match (jv-parse a "{\"error\":\"invalid_grant\"}")
+                            (Some [r] r)
+                            (None [] (JNull)))
+                          0)
+      (Ok [_] (assert false))
+      (Err [m] (assert (contains? m "without an access token"))))))
+
+(deftest timestamps-are-rfc-3339-in-utc
+  (let [a (malloc-allocator)]
+    (assert (= (rfc3339 a 1791827859042) "2026-10-12T17:57:39.042Z"))
+    (assert (= (rfc3339 a 951782400005) "2000-02-29T00:00:00.005Z"))
+    (assert (= (rfc3339 a 0) "1970-01-01T00:00:00.000Z"))))

@@ -26,67 +26,134 @@
    (refuse (slice u8))])
 
 (defn run-index [(native (ptr FakeNative)) (id (slice u8))] (-> i64)
-  (let [(mut found) -1 (mut i) 0]
-    (for run (iter (.runs native)) (when (= (.id run) id) (set! found (load i)) 0) (set! i (+ (load i) 1)))
+  (let [(mut found) -1
+        (mut i) 0]
+    (for run (iter (.runs native))
+      (when (= (.id run) id) (set! found (load i)) 0)
+      (set! i (+ (load i) 1)))
     (load found)))
 
 (impl Native FakeNative
-  (native-check [(self (ptr FakeNative)) (a (dyn Allocator))] (-> (Result i64 (slice u8))) (Ok 0))
-  (native-create [(self (ptr FakeNative)) (a (dyn Allocator)) (request JVal)] (-> Created)
-                 (if (> (len (.refuse self)) 0)
-                     (Refused (.refuse self))
-                     (let [id (join a ["run-" (int-text a (+ (len (.created self)) 1))])
-                           run (RunView :id id :status "running" :alive true :current "x" :reason "" :stations (al-new [StationView] a))]
-                       (push! (field self created) request)
-                       (push! (field self runs) run)
-                       (ensure-dir a (path-join a (path-join a (path-join a (.home self) "runs") id) "workspace") 493)
-                       (Created run))))
-  (native-run [(self (ptr FakeNative)) (a (dyn Allocator)) (id (slice u8))] (-> (Result RunView (slice u8)))
-              (let [at (run-index self id)]
-                (if (< at 0) (Err (join a ["no run " id])) (Ok (get (.runs self) at)))))
-  (native-cancel [(self (ptr FakeNative)) (a (dyn Allocator)) (id (slice u8))] (-> (Result i64 (slice u8)))
-                 (let [run (al-elem [RunView] (field self runs) (run-index self id))]
-                   (push! (field self cancelled) id)
-                   (set! (.status run) "cancelled")
-                   (set! (.alive run) false)
-                   (Ok 0)))
-  (native-reconcile [(self (ptr FakeNative)) (a (dyn Allocator)) (tag (slice u8))] (-> (Result (slice u8) (slice u8))) (Ok ""))
-  (native-home [(self (ptr FakeNative))] (-> (slice u8)) (.home self)))
+  (native-check [(self (ptr FakeNative)) (a (dyn Allocator))]
+    (-> (Result i64 (slice u8)))
+    (Ok 0))
+  (native-create [(self (ptr FakeNative)) (a (dyn Allocator)) (request JVal)]
+    (-> Created)
+    (if (> (len (.refuse self)) 0)
+        (Refused (.refuse self))
+        (let [id (join a ["run-" (int-text a (+ (len (.created self)) 1))])
+              run
+                (RunView
+                  :id id
+                  :status "running"
+                  :alive true
+                  :current "x"
+                  :reason ""
+                  :stations (ArrayList::new [StationView] a))]
+          (push! (field self created) request)
+          (push! (field self runs) run)
+          (ensure-dir a
+                      (path-join a
+                                 (path-join a
+                                            (path-join a (.home self) "runs")
+                                            id)
+                                 "workspace")
+                      493)
+          (Created run))))
+  (native-run [(self (ptr FakeNative)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result RunView (slice u8)))
+    (let [at (run-index self id)]
+      (if (< at 0) (Err (join a ["no run " id])) (Ok (get (.runs self) at)))))
+  (native-cancel [(self (ptr FakeNative)) (a (dyn Allocator)) (id (slice u8))]
+    (-> (Result i64 (slice u8)))
+    (let [run (elem (field self runs) (run-index self id))]
+      (push! (field self cancelled) id)
+      (set! (.status run) "cancelled")
+      (set! (.alive run) false)
+      (Ok 0)))
+  (native-reconcile [(self (ptr FakeNative))
+                     (a (dyn Allocator))
+                     (tag (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (Ok ""))
+  (native-home [(self (ptr FakeNative))] (-> (slice u8))
+    (.home self)))
 
 (defstruct FakeRemote [(head (slice u8))])
+
 (impl Remote FakeRemote
-  (remote-head [(self (ptr FakeRemote)) (a (dyn Allocator))] (-> (Result (slice u8) (slice u8))) (Ok (.head self))))
+  (remote-head [(self (ptr FakeRemote)) (a (dyn Allocator))]
+    (-> (Result (slice u8) (slice u8)))
+    (Ok (.head self))))
 
 (defstruct BuildResult [(commit (slice u8)) (ok bool)])
-(defstruct FakeBuilder [(dir (slice u8)) (started (ArrayList (slice u8))) (results (ArrayList BuildResult))])
-(impl Builder FakeBuilder
-  (build-start [(self (ptr FakeBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> (Result i64 (slice u8)))
-               (do (push! (field self started) commit) (Ok 0)))
-  (build-poll [(self (ptr FakeBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> BuildPoll)
-              (let [(mut poll) (Building)]
-                (for r (iter (.results self))
-                  (when (= (.commit r) commit) (set! poll (if (.ok r) (Built) (BuildFailed "exit 1"))) 0))
-                (load poll)))
-  (build-compiler [(self (ptr FakeBuilder)) (a (dyn Allocator)) (commit (slice u8))] (-> (slice u8))
-                  (path-join a (path-join a (.dir self) commit) "coil")))
 
-(defstruct Opened [(branch (slice u8)) (commit (slice u8)) (title (slice u8)) (body (slice u8))])
+(defstruct FakeBuilder
+  [(dir (slice u8))
+   (started (ArrayList (slice u8)))
+   (results (ArrayList BuildResult))])
+
+(impl Builder FakeBuilder
+  (build-start [(self (ptr FakeBuilder))
+                (a (dyn Allocator))
+                (commit (slice u8))] (-> (Result i64 (slice u8)))
+    (do (push! (field self started) commit) (Ok 0)))
+  (build-poll [(self (ptr FakeBuilder)) (a (dyn Allocator)) (commit (slice u8))]
+    (-> BuildPoll)
+    (let [(mut poll) (Building)]
+      (for r (iter (.results self))
+        (when (= (.commit r) commit)
+          (set! poll (if (.ok r) (Built) (BuildFailed "exit 1")))
+          0))
+      (load poll)))
+  (build-compiler [(self (ptr FakeBuilder))
+                   (a (dyn Allocator))
+                   (commit (slice u8))] (-> (slice u8))
+    (path-join a (path-join a (.dir self) commit) "coil")))
+
+(defstruct Opened
+  [(branch (slice u8)) (commit (slice u8)) (title (slice u8)) (body (slice u8))])
+
 (defstruct FakeGitHub [(opened (ArrayList Opened)) (fail bool)])
+
 (impl Publisher FakeGitHub
-  (publish-squash [(self (ptr FakeGitHub)) (a (dyn Allocator)) (head (slice u8)) (base (slice u8)) (message (slice u8))] (-> (Result (slice u8) (slice u8)))
-                  (Ok "cccccccccccccccccccccccccccccccccccccccc"))
-  (publish-open [(self (ptr FakeGitHub)) (a (dyn Allocator)) (branch (slice u8)) (commit (slice u8)) (title (slice u8)) (body (slice u8))] (-> (Result (slice u8) (slice u8)))
-                (if (.fail self)
-                    (Err "gh pr create failed: GitHub is down")
-                    (do (push! (field self opened) (Opened :branch branch :commit commit :title title :body body))
-                        (Ok "https://github.com/jimmyhmiller/coil/pull/1")))))
+  (publish-squash [(self (ptr FakeGitHub))
+                   (a (dyn Allocator))
+                   (head (slice u8))
+                   (base (slice u8))
+                   (message (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (Ok "cccccccccccccccccccccccccccccccccccccccc"))
+  (publish-open [(self (ptr FakeGitHub))
+                 (a (dyn Allocator))
+                 (branch (slice u8))
+                 (commit (slice u8))
+                 (title (slice u8))
+                 (body (slice u8))] (-> (Result (slice u8) (slice u8)))
+    (if (.fail self)
+        (Err "gh pr create failed: GitHub is down")
+        (do
+          (push! (field self opened)
+                 (Opened
+                   :branch branch
+                   :commit commit
+                   :title title
+                   :body body))
+          (Ok "https://github.com/jimmyhmiller/coil/pull/1")))))
 
 (defstruct FakeApprover [(asked (ArrayList (slice u8))) (answer ScopeAnswer)])
+
 (impl Approver FakeApprover
-  (approver-submit [(self (ptr FakeApprover)) (a (dyn Allocator)) (body (slice u8))] (-> (Result Ticket (slice u8)))
-                   (do (push! (field self asked) body)
-                       (Ok (Ticket :id (join a ["req-" (int-text a (len (.asked self)))]) :page "https://approvals.example/r/1"))))
-  (approver-fetch [(self (ptr FakeApprover)) (a (dyn Allocator)) (id (slice u8))] (-> ScopeAnswer) (.answer self)))
+  (approver-submit [(self (ptr FakeApprover))
+                    (a (dyn Allocator))
+                    (body (slice u8))] (-> (Result Ticket (slice u8)))
+    (do
+      (push! (field self asked) body)
+      (Ok (Ticket
+            :id (join a ["req-" (int-text a (len (.asked self)))])
+            :page "https://approvals.example/r/1"))))
+  (approver-fetch [(self (ptr FakeApprover))
+                   (a (dyn Allocator))
+                   (id (slice u8))] (-> ScopeAnswer)
+    (.answer self)))
 
 (defstruct Env
   [(a (dyn Allocator))
@@ -102,42 +169,84 @@
 (const MAIN "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 (defn recipes [(a (dyn Allocator))] (-> (slice u8))
-  (match (os/current-dir a)
-    (Ok [dir] (path-join a (os/owned-string-slice dir) "../../factories/coil-bugs"))
-    (Err [_] (do (assert false) ""))))
+  (try (let [dir (try-or! (os/current-dir a) (do (assert false) ""))]
+         (path-join a (slice dir) "../../factories/coil-bugs"))))
 
 (defn env [(a (dyn Allocator)) (label (slice u8))] (-> Env)
   (let [dir (temp-dir a label)]
-    (Env :a a :dir dir
-         :config (ServerConfig :enabled true :state-dir (path-join a dir "state") :site-home (path-join a dir "site") :port 1
-                               :program "/opt/coil-bugs/bin/coil-bugs" :recipes (recipes a) :checkout (path-join a dir "coil")
-                               :repository "x" :github-repo "jimmyhmiller/coil" :branch "main"
-                               :snapshot-dir (path-join a dir "snapshots") :notes-dir (path-join a dir "notes")
-                               :notebook "coil-bugs" :status-notebook "coil-factory-coil-bugs" :model "gpt-test"
-                               :review-model "gpt-review" :gh "/usr/bin/gh" :llvm-bin "/usr/bin"
-                               :idle-seconds 600 :gate-idle-seconds 3600 :max-seconds 36000
-                               :triage-idle-seconds 600 :triage-max-seconds 3600 :base-build-max-seconds 3600
-                               :base-build-memory "20G" :scope-file (path-join a (recipes a) "SCOPE.md")
-                               :approvals-url "https://approvals.example" :approvals-token-file "/dev/null")
-         :native (FakeNative :home (path-join a dir "site") :runs (al-new [RunView] a) :created (al-new [JVal] a)
-                             :cancelled (al-new [(slice u8)] a) :refuse "")
-         :remote (FakeRemote :head MAIN)
-         :builder (FakeBuilder :dir (path-join a dir "compilers") :started (al-new [(slice u8)] a) :results (al-new [BuildResult] a))
-         :github (FakeGitHub :opened (al-new [Opened] a) :fail false)
-         :approver (FakeApprover :asked (al-new [(slice u8)] a) :answer (ScopeWaiting))
-         :now 1000000000)))
+    (Env
+      :a a
+      :dir dir
+      :config
+        (ServerConfig
+          :enabled true
+          :state-dir (path-join a dir "state")
+          :site-home (path-join a dir "site")
+          :port 1
+          :program "/opt/coil-bugs/bin/coil-bugs"
+          :recipes (recipes a)
+          :checkout (path-join a dir "coil")
+          :repository "x"
+          :github-repo "jimmyhmiller/coil"
+          :branch "main"
+          :snapshot-dir (path-join a dir "snapshots")
+          :notes-dir (path-join a dir "notes")
+          :notebook "coil-bugs"
+          :status-notebook "coil-factory-coil-bugs"
+          :model "gpt-test"
+          :review-model "gpt-review"
+          :gh "/usr/bin/gh"
+          :llvm-bin "/usr/bin"
+          :idle-seconds 600
+          :gate-idle-seconds 3600
+          :max-seconds 36000
+          :triage-idle-seconds 600
+          :triage-max-seconds 3600
+          :base-build-max-seconds 3600
+          :base-build-memory "20G"
+          :scope-file (path-join a (recipes a) "SCOPE.md")
+          :approvals-url "https://approvals.example"
+          :approvals-token-file "/dev/null")
+      :native
+        (FakeNative
+          :home (path-join a dir "site")
+          :runs (ArrayList::new [RunView] a)
+          :created (ArrayList::new [JVal] a)
+          :cancelled (ArrayList::new [(slice u8)] a)
+          :refuse "")
+      :remote (FakeRemote :head MAIN)
+      :builder
+        (FakeBuilder
+          :dir (path-join a dir "compilers")
+          :started (ArrayList::new [(slice u8)] a)
+          :results (ArrayList::new [BuildResult] a))
+      :github (FakeGitHub :opened (ArrayList::new [Opened] a) :fail false)
+      :approver
+        (FakeApprover
+          :asked (ArrayList::new [(slice u8)] a)
+          :answer (ScopeWaiting))
+      :now 1000000000)))
 
 (defn state-of [(e (ptr Env))] (-> ServerState)
   (match (load-server-state (.a e) (.config e))
     (Ok [state] state)
-    (Err [why] (do (println "{s}" why) (assert false) (empty-server-state (.a e))))))
+    (Err [why]
+         (do (println "{s}" why) (assert false) (empty-server-state (.a e))))))
 
 ;;; One heartbeat, `advance` ms after the last; its result and the state after.
 (defn beat [(e (ptr Env)) (advance i64)] (-> (Result ServerState (slice u8)))
   (set! (.now e) (+ (.now e) advance))
-  (let [(mut ctl) (Ctl :a (.a e) :config (.config e) :state (state-of e) :native (field e native) :remote (field e remote)
-                       :builder (field e builder) :publisher (field e github)
-                       :approver (field e approver) :now (.now e))]
+  (let [(mut ctl)
+          (Ctl
+            :a (.a e)
+            :config (.config e)
+            :state (state-of e)
+            :native (field e native)
+            :remote (field e remote)
+            :builder (field e builder)
+            :publisher (field e github)
+            :approver (field e approver)
+            :now (.now e))]
     (match (tick (mut ctl))
       (Ok [_] (Ok (.state ctl)))
       (Err [why] (Err why)))))
@@ -145,63 +254,108 @@
 (defn tick! [(e (ptr Env))] (-> ServerState)
   (match (beat e 5000)
     (Ok [state] state)
-    (Err [why] (do (println "heartbeat failed: {s}" why) (assert false) (empty-server-state (.a e))))))
+    (Err [why]
+         (do
+           (println "heartbeat failed: {s}" why)
+           (assert false)
+           (empty-server-state (.a e))))))
 
 (defn cell [(id (slice u8)) (source (slice u8))] (-> Cell)
-  (Cell :id id :ts 1 :kind "markdown" :source source))
+  (Cell
+    :id id
+    :ts 1
+    :kind "markdown"
+    :source source))
 
 (defn snapshot! [(e (ptr Env)) (id (slice u8)) (cells (slice Cell))] (-> i64)
   (let [a (.a e)
-        (mut list) (al-new [Cell] a)]
+        (mut list) (ArrayList::new [Cell] a)]
     (for c (iter cells) (push! (mut list) c))
-    (match (write-json-file a (path-join a (.snapshot-dir (field e config)) (join a [id ".json"]))
-                            (Snapshot :id id :received 1 :principal "device" :notebook "coil-bugs" :taken 1 :cells (load list)) 420)
+    (match (write-json-file a
+                            (path-join a
+                                       (.snapshot-dir (field e config))
+                                       (join a [id ".json"]))
+                            (Snapshot
+                              :id id
+                              :received 1
+                              :principal "device"
+                              :notebook "coil-bugs"
+                              :taken 1
+                              :cells (load list))
+                            420)
       (Ok [_] 0)
       (Err [why] (do (println "{s}" why) (assert false) 0)))))
 
 (defn notes [(e (ptr Env)) (notebook (slice u8))] (-> (ArrayList Note))
   (let [a (.a e)
         dir (.notes-dir (field e config))
-        (mut out) (al-new [Note] a)]
+        (mut out) (ArrayList::new [Note] a)]
     (match (list-names a dir)
-      (Ok [names] (for name (iter names)
-                    (match (read-json-file [Note] a (path-join a dir name))
-                      (Ok [n] (when (= (.notebook n) notebook) (push! (mut out) n) 0))
-                      (Err [why] (do (println "{s}" why) (assert false) 0)))))
+      (Ok [names]
+          (for name (iter names)
+            (match (read-json-file [Note] a (path-join a dir name))
+              (Ok [n] (when (= (.notebook n) notebook) (push! (mut out) n) 0))
+              (Err [why] (do (println "{s}" why) (assert false) 0)))))
       (Err [why] (do (println "{s}" why) (assert false) 0)))
     (load out)))
 
-(defn bug-notes [(e (ptr Env))] (-> (ArrayList Note)) (notes e "coil-bugs"))
+(defn bug-notes [(e (ptr Env))] (-> (ArrayList Note))
+  (notes e "coil-bugs"))
 
 (defn the-bug [(state ServerState) (id (slice u8))] (-> Bug)
   (let [(mut found) (: (None) (Option Bug))]
     (for b (iter (.bugs state)) (when (= (.id b) id) (set! found (Some b)) 0))
     (match (load found)
       (Some [b] b)
-      (None [] (do (println "no bug {s}" id) (assert false) (get (.bugs state) 0))))))
+      (None []
+            (do (println "no bug {s}" id) (assert false) (get (.bugs state) 0))))))
 
 (defn outcome-is [(bug Bug) (want (slice u8))] (-> bool)
   (= (match (.outcome bug)
-       (Pending [] "pending") (PullRequest [] "pull_request") (DoesNotReproduce [] "does_not_reproduce")
-       (CannotVerify [] "cannot_verify") (Failed [] "failed") (Noted [] "noted") (OutOfScope [] "out_of_scope"))
+       (Pending [] "pending")
+       (PullRequest [] "pull_request")
+       (DoesNotReproduce [] "does_not_reproduce")
+       (CannotVerify [] "cannot_verify")
+       (Failed [] "failed")
+       (Noted [] "noted")
+       (OutOfScope [] "out_of_scope"))
      want))
 
 (defn status-is [(bug Bug) (want (slice u8))] (-> bool)
   (= (status-name (.status bug)) want))
 
-(const CELLS [(Cell :id "title" :ts 1 :kind "markdown" :source "# coil-bugs")
-              (Cell :id "b1" :ts 1 :kind "markdown" :source "### Bug one crashes")
-              (Cell :id "b2" :ts 1 :kind "markdown" :source "### Bug two\nFIXED in abc123 by x")
-              (Cell :id "b3" :ts 1 :kind "markdown" :source "### Bug three is slow")])
+(const CELLS
+       [(Cell
+          :id "title"
+          :ts 1
+          :kind "markdown"
+          :source "# coil-bugs")
+        (Cell
+          :id "b1"
+          :ts 1
+          :kind "markdown"
+          :source "### Bug one crashes")
+        (Cell
+          :id "b2"
+          :ts 1
+          :kind "markdown"
+          :source "### Bug two\nFIXED in abc123 by x")
+        (Cell
+          :id "b3"
+          :ts 1
+          :kind "markdown"
+          :source "### Bug three is slow")])
 
-(const TRIAGED "{\"bugs\": [
+(const TRIAGED
+       "{\"bugs\": [
   {\"id\": \"title\", \"cells\": [\"title\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"heading\"},
   {\"id\": \"b1\", \"cells\": [\"b1\"], \"title\": \"Bug one crashes the checker\", \"status\": \"open\", \"reason\": \"no fix\", \"scope\": \"in\"},
   {\"id\": \"b2\", \"cells\": [\"b2\"], \"title\": \"Bug two\", \"status\": \"fixed\", \"reason\": \"says so\", \"quote\": \"FIXED in abc123\"},
   {\"id\": \"b3\", \"cells\": [\"b3\"], \"title\": \"Bug three is slow\", \"status\": \"open\", \"reason\": \"no fix\", \"scope\": \"in\"}]}")
 
 ;; b1 is judged out of scope under rule 1.
-(const TRIAGED-OUT "{\"bugs\": [
+(const TRIAGED-OUT
+       "{\"bugs\": [
   {\"id\": \"title\", \"cells\": [\"title\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"heading\"},
   {\"id\": \"b1\", \"cells\": [\"b1\"], \"title\": \"Bug one crashes the checker\", \"status\": \"open\", \"reason\": \"no fix\",
    \"scope\": \"out\", \"rule\": \"1\", \"scope_reason\": \"It asks the JIT to change a published type.\", \"scope_quote\": \"Bug one crashes\"},
@@ -211,12 +365,21 @@
 (defn workspace [(e (ptr Env)) (run-id (slice u8))] (-> (slice u8))
   (run-workspace (.a e) (field e native) run-id))
 
-(defn finish-run! [(e (ptr Env)) (run-id (slice u8)) (status (slice u8)) (names (slice (slice u8))) (reason (slice u8))] (-> i64)
+(defn finish-run! [(e (ptr Env))
+                   (run-id (slice u8))
+                   (status (slice u8))
+                   (names (slice (slice u8)))
+                   (reason (slice u8))] (-> i64)
   (let [a (.a e)
-        run (al-elem [RunView] (field (field e native) runs) (run-index (field e native) run-id))
-        (mut stations) (al-new [StationView] a)]
+        run
+          (elem (field (field e native) runs)
+                (run-index (field e native) run-id))
+        (mut stations) (ArrayList::new [StationView] a)]
     (for name (iter names)
-      (push! (mut stations) (StationView :name name :status (if (= status "succeeded") "passed" "failed"))))
+      (push! (mut stations)
+             (StationView
+               :name name
+               :status (if (= status "succeeded") "passed" "failed"))))
     (set! (.status run) status)
     (set! (.alive run) false)
     (set! (.reason run) reason)
@@ -234,7 +397,8 @@
   (let [a (.a e)
         state (tick! e)
         run-id (.run-id (.watch (.triage state)))
-        project (created-field e (- (len (.created (field e native))) 1) "project")
+        project
+          (created-field e (- (len (.created (field e native))) 1) "project")
         ws (workspace e run-id)]
     (sh! a ws (join a ["cp -R " project "/. ."]))
     (write! a (path-join a ws "TRIAGE.json") triage-json)
@@ -250,14 +414,19 @@
         (mut started) false
         (mut finished) false]
     (for s (iter (.started builder)) (when (= s head) (set! started true) 0))
-    (for r (iter (.results builder)) (when (= (.commit r) head) (set! finished true) 0))
+    (for r (iter (.results builder))
+      (when (= (.commit r) head) (set! finished true) 0))
     (if (and (load started) (not (load finished)))
-        (do (push! (field builder results) (BuildResult :commit head :ok true))
-            (write! a (build-compiler builder a head) "")
-            (tick! e))
+        (do
+          (push! (field builder results) (BuildResult :commit head :ok true))
+          (write! a (build-compiler builder a head) "")
+          (tick! e))
         state)))
 
-(defn write-repro! [(e (ptr Env)) (run-id (slice u8)) (repro (slice u8)) (fix (slice u8))] (-> (slice u8))
+(defn write-repro! [(e (ptr Env))
+                    (run-id (slice u8))
+                    (repro (slice u8))
+                    (fix (slice u8))] (-> (slice u8))
   (let [a (.a e)
         ws (workspace e run-id)]
     (write! a (path-join a ws ".coil-bug/REPRO.json") repro)
@@ -265,18 +434,28 @@
     ws))
 
 (defn fix-text [(a (dyn Allocator))] (-> (slice u8))
-  (let [(mut out) (sb-new a) (mut i) 0]
-    (loop (if (>= (load i) 20) (break) (do (sb-push-str! (mut out) "The checker forgot a case. ") (set! i (+ (load i) 1)))))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)
+        (mut i) 0]
+    (loop (if (>= (load i) 20)
+              (break)
+              (do
+                (push-str! (mut out) "The checker forgot a case. ")
+                (set! i (+ (load i) 1)))))
+    (finish! (mut out))))
 
 (defn set-bug-base! [(e (ptr Env)) (id (slice u8)) (base (slice u8))] (-> i64)
   (let [a (.a e)
         (mut state) (state-of e)
         (mut i) 0]
     (for b (iter (.bugs state))
-      (when (= (.id b) id) (set! (.base (al-elem [Bug] (field (mut state) bugs) (load i))) base) 0)
+      (when (= (.id b) id)
+        (set! (.base (elem (field (mut state) bugs) (load i))) base)
+        0)
       (set! i (+ (load i) 1)))
-    (write-json-file a (path-join a (.state-dir (field e config)) "state.json") (load state) 384)
+    (write-json-file a
+                     (path-join a (.state-dir (field e config)) "state.json")
+                     (load state)
+                     384)
     0))
 
 (deftest a-snapshot-is-triaged-and-open-bugs-queued-in-pad-order
@@ -289,8 +468,10 @@
       (assert (contains? text "model: gpt-test"))
       (assert (contains? text "gate: /opt/coil-bugs/bin/coil-bugs gate triage"))
       (assert (not (contains? text "{{")))
-      (assert (contains? (read! a (path-join a project "CELLS.json")) "\"id\":\"b3\""))
-      (assert (= (read! a (path-join a project "cells/0001.md")) "### Bug one crashes"))
+      (assert (contains? (read! a (path-join a project "CELLS.json"))
+                         "\"id\":\"b3\""))
+      (assert (= (read! a (path-join a project "cells/0001.md"))
+                 "### Bug one crashes"))
       (assert (match (.phase (.triage state)) (TriageRunning [] true) (_ false))))
     (let [state (triage! (mut e) TRIAGED)]
       (assert-eq (len (.bugs state)) 2)
@@ -303,8 +484,11 @@
   (let [a (malloc-allocator)
         (mut e) (env a "triage-quote")]
     (snapshot! (mut e) "0001-a" CELLS)
-    (let [state (triage! (mut e) (join a ["{\"bugs\": [{\"id\": \"title\", \"cells\": [\"title\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"h\"},"
-                                          "{\"id\": \"b1\", \"cells\": [\"b1\", \"b2\", \"b3\"], \"title\": \"b\", \"status\": \"fixed\", \"reason\": \"r\", \"quote\": \"it was fixed long ago\"}]}"]))]
+    (let [state
+            (triage! (mut e)
+                     (join a
+                           ["{\"bugs\": [{\"id\": \"title\", \"cells\": [\"title\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"h\"},"
+                            "{\"id\": \"b1\", \"cells\": [\"b1\", \"b2\", \"b3\"], \"title\": \"b\", \"status\": \"fixed\", \"reason\": \"r\", \"quote\": \"it was fixed long ago\"}]}"]))]
       (assert (match (.phase (.triage state)) (TriageFailed [] true) (_ false)))
       (assert (contains? (.failure (.triage state)) "not in any of its cells"))
       (assert-eq (len (.bugs state)) 0))
@@ -325,14 +509,28 @@
       (assert (status-is bug "running"))
       (assert (= (created-field (mut e) last "base") MAIN))
       (assert (= (created-field (mut e) last "project") (.checkout (.config e))))
-      (assert (contains? text (join a ["gate fix --bug b1 --base " MAIN " --base-compiler "])))
+      (assert (contains? text
+                         (join a
+                               ["gate fix --bug b1 --base "
+                                MAIN
+                                " --base-compiler "])))
       (assert (contains? text (build-compiler (field (mut e) builder) a MAIN)))
-      (assert (contains? (read! a (path-join a (.state-dir (.config e)) "rendered/reviewers/fix-review.md")) "model: gpt-review"))
-      (assert (contains? (created-field (mut e) last "brief") "--- pad cell b1 ---\n### Bug one crashes"))
-      (write-repro! (mut e) (.run-id (.watch bug))
+      (assert (contains? (read! a
+                                (path-join a
+                                           (.state-dir (.config e))
+                                           "rendered/reviewers/fix-review.md"))
+                         "model: gpt-review"))
+      (assert (contains? (created-field (mut e) last "brief")
+                         "--- pad cell b1 ---\n### Bug one crashes"))
+      (write-repro! (mut e)
+                    (.run-id (.watch bug))
                     "{\"bug\": \"b1\", \"verdict\": \"does_not_reproduce\", \"summary\": \"Fixed by 123.\", \"check\": \"$COIL run t.coil\", \"attempts\": [{\"what\": \"ran it\", \"command\": \"coil run t.coil\", \"result\": \"ok\"}]}"
                     "")
-      (finish-run! (mut e) (.run-id (.watch bug)) "succeeded" ["reproduce" "fix"] ""))
+      (finish-run! (mut e)
+                   (.run-id (.watch bug))
+                   "succeeded"
+                   ["reproduce" "fix"]
+                   ""))
     (let [state (tick! (mut e))
           found (bug-notes (mut e))]
       (assert (outcome-is (the-bug state "b1") "does_not_reproduce"))
@@ -353,15 +551,23 @@
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))
           run-id (.run-id (.watch (the-bug state "b1")))
-          ws (write-repro! (mut e) run-id
-                           "{\"bug\": \"b1\", \"verdict\": \"reproduces\", \"summary\": \"Crashes.\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"], \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
-                           (fix-text a))]
-      (sh! a ws "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base")
+          ws
+            (write-repro! (mut e)
+                          run-id
+                          "{\"bug\": \"b1\", \"verdict\": \"reproduces\", \"summary\": \"Crashes.\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"], \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
+                          (fix-text a))]
+      (sh! a
+           ws
+           "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base")
       (set-bug-base! (mut e) "b1" (sh! a ws "git rev-parse HEAD"))
       (write! a (path-join a ws "tests/t.sh") "exit 0\n")
-      (sh! a ws "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'reproduce: adds a failing test'")
+      (sh! a
+           ws
+           "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'reproduce: adds a failing test'")
       (write! a (path-join a ws "src.txt") "fixed\n")
-      (sh! a ws "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'fix: fixes it'")
+      (sh! a
+           ws
+           "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'fix: fixes it'")
       (finish-run! (mut e) run-id "succeeded" ["reproduce" "fix"] ""))
     (set! (.fail (field (mut e) github)) true)
     (let [state (tick! (mut e))]
@@ -381,7 +587,8 @@
       (assert (= (.title (get opened 0)) "Bug one crashes the checker"))
       (assert (contains? (.body (get opened 0)) "The checker forgot a case."))
       (assert (contains? (.body (get opened 0)) "sh tests/t.sh"))
-      (assert (contains? (.markdown (get found 0)) "https://github.com/jimmyhmiller/coil/pull/1")))))
+      (assert (contains? (.markdown (get found 0))
+                         "https://github.com/jimmyhmiller/coil/pull/1")))))
 
 (deftest bugs-an-agent-found-on-the-way-are-filed-as-reports
   (let [a (malloc-allocator)
@@ -390,25 +597,39 @@
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))
           run-id (.run-id (.watch (the-bug state "b1")))
-          ws (write-repro! (mut e) run-id
-                           "{\"bug\": \"b1\", \"verdict\": \"cannot_verify\", \"summary\": \"Needs a Mac.\", \"needs\": \"a Mac\", \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
-                           "")]
-      (write! a (path-join a ws ".coil-bug/OTHER-BUGS.md") "### The JIT rejects a static pointer initializer\n\n<details>...</details>\n")
+          ws
+            (write-repro! (mut e)
+                          run-id
+                          "{\"bug\": \"b1\", \"verdict\": \"cannot_verify\", \"summary\": \"Needs a Mac.\", \"needs\": \"a Mac\", \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
+                          "")]
+      (write! a
+              (path-join a ws ".coil-bug/OTHER-BUGS.md")
+              "### The JIT rejects a static pointer initializer\n\n<details>...</details>\n")
       (finish-run! (mut e) run-id "succeeded" ["reproduce" "fix"] ""))
     (tick! (mut e))
     (let [found (bug-notes (mut e))]
       (assert-eq (len found) 2)
       (assert (= (.cell-id (get found 1)) "coil-bugs-factory-found-b1"))
-      (assert (contains? (.markdown (get found 1)) "### Found while working on [Bug one crashes the checker](pad://coil-bugs#b1)"))
-      (assert (contains? (.markdown (get found 1)) "### The JIT rejects a static pointer initializer")))
+      (assert (contains? (.markdown (get found 1))
+                         "### Found while working on [Bug one crashes the checker](pad://coil-bugs#b1)"))
+      (assert (contains? (.markdown (get found 1))
+                         "### The JIT rejects a static pointer initializer")))
     ;; Once in the pad, a found report is triaged like any other cell.
-    (snapshot! (mut e) "0002-b" [(get CELLS 0) (get CELLS 1) (get CELLS 2) (get CELLS 3)
-                                 (cell "coil-bugs-factory-b1" "### Factory: could not verify")
-                                 (cell "coil-bugs-factory-found-b1" "### The JIT rejects a static pointer initializer")])
+    (snapshot! (mut e)
+               "0002-b"
+               [(get CELLS 0)
+                (get CELLS 1)
+                (get CELLS 2)
+                (get CELLS 3)
+                (cell "coil-bugs-factory-b1" "### Factory: could not verify")
+                (cell "coil-bugs-factory-found-b1"
+                      "### The JIT rejects a static pointer initializer")])
     (let [state (tick! (mut e))
-          project (created-field (mut e) (- (len (.created (.native e))) 1) "project")]
+          project
+            (created-field (mut e) (- (len (.created (.native e))) 1) "project")]
       (assert (match (.phase (.triage state)) (TriageRunning [] true) (_ false)))
-      (assert (contains? (read! a (path-join a project "CELLS.json")) "coil-bugs-factory-found-b1")))))
+      (assert (contains? (read! a (path-join a project "CELLS.json"))
+                         "coil-bugs-factory-found-b1")))))
 
 (deftest a-regression-test-changed-by-the-fix-is-refused
   (let [a (malloc-allocator)
@@ -417,15 +638,23 @@
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))
           run-id (.run-id (.watch (the-bug state "b1")))
-          ws (write-repro! (mut e) run-id
-                           "{\"bug\": \"b1\", \"verdict\": \"reproduces\", \"summary\": \"Crashes.\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"], \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
-                           (fix-text a))]
-      (sh! a ws "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base")
+          ws
+            (write-repro! (mut e)
+                          run-id
+                          "{\"bug\": \"b1\", \"verdict\": \"reproduces\", \"summary\": \"Crashes.\", \"check\": \"sh tests/t.sh\", \"tests\": [\"tests/t.sh\"], \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
+                          (fix-text a))]
+      (sh! a
+           ws
+           "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base")
       (set-bug-base! (mut e) "b1" (sh! a ws "git rev-parse HEAD"))
       (write! a (path-join a ws "tests/t.sh") "exit 1\n")
-      (sh! a ws "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'reproduce: test'")
+      (sh! a
+           ws
+           "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'reproduce: test'")
       (write! a (path-join a ws "tests/t.sh") "exit 0\n")
-      (sh! a ws "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'fix: weakened'")
+      (sh! a
+           ws
+           "git add -A && git -c user.name=t -c user.email=t@t commit -q -m 'fix: weakened'")
       (finish-run! (mut e) run-id "succeeded" ["reproduce" "fix"] ""))
     (let [state (tick! (mut e))
           bug (the-bug state "b1")]
@@ -440,7 +669,9 @@
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))
           run-id (.run-id (.watch (the-bug state "b1")))
-          run (al-elem [RunView] (field (field (mut e) native) runs) (run-index (field (mut e) native) run-id))]
+          run
+            (elem (field (field (mut e) native) runs)
+                  (run-index (field (mut e) native) run-id))]
       (set! (.status run) "blocked")
       (set! (.reason run) "Which backend did the report use?")
       (tick! (mut e))
@@ -448,7 +679,8 @@
     (let [state (tick! (mut e))
           found (bug-notes (mut e))]
       (assert (outcome-is (the-bug state "b1") "failed"))
-      (assert (contains? (.markdown (get found 0)) "Which backend did the report use?")))))
+      (assert (contains? (.markdown (get found 0))
+                         "Which backend did the report use?")))))
 
 (deftest a-broken-run-halts-the-factory-and-keeps-the-bug
   (let [a (malloc-allocator)
@@ -456,7 +688,11 @@
     (snapshot! (mut e) "0001-a" CELLS)
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))]
-      (finish-run! (mut e) (.run-id (.watch (the-bug state "b1"))) "failed" ["reproduce"] "codex: 401 Unauthorized"))
+      (finish-run! (mut e)
+                   (.run-id (.watch (the-bug state "b1")))
+                   "failed"
+                   ["reproduce"]
+                   "codex: 401 Unauthorized"))
     (let [state (tick! (mut e))
           created (len (.created (.native e)))]
       (assert (status-is (the-bug state "b1") "queued"))
@@ -483,12 +719,16 @@
     (triage! (mut e) TRIAGED)
     (start-bug! (mut e))
     (match (beat (mut e) 601000)
-      (Ok [state] (assert (match (.phase (.watch (the-bug state "b1"))) (Stopping [] true) (_ false))))
+      (Ok [state]
+          (assert (match (.phase (.watch (the-bug state "b1")))
+                    (Stopping [] true)
+                    (_ false))))
       (Err [why] (do (println "{s}" why) (assert false))))
     (assert-eq (len (.cancelled (.native e))) 1)
     (let [state (tick! (mut e))]
       (assert (outcome-is (the-bug state "b1") "failed"))
-      (assert (contains? (.markdown (get (bug-notes (mut e)) 0)) "no agent, tool, gate or station progress")))))
+      (assert (contains? (.markdown (get (bug-notes (mut e)) 0))
+                         "no agent, tool, gate or station progress")))))
 
 (deftest a-main-that-does-not-build-falls-back-to-the-last-good-base
   (let [a (malloc-allocator)
@@ -497,24 +737,36 @@
     (triage! (mut e) TRIAGED)
     (let [state (start-bug! (mut e))
           run-id (.run-id (.watch (the-bug state "b1")))]
-      (write-repro! (mut e) run-id
+      (write-repro! (mut e)
+                    run-id
                     "{\"bug\": \"b1\", \"verdict\": \"cannot_verify\", \"summary\": \"Needs a Mac.\", \"needs\": \"an arm64 Mac\", \"attempts\": [{\"what\": \"a\", \"command\": \"b\", \"result\": \"c\"}]}"
                     "")
       (finish-run! (mut e) run-id "succeeded" ["reproduce" "fix"] ""))
-    (set! (.head (field (mut e) remote)) "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    (set! (.head (field (mut e) remote))
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     (tick! (mut e))
     (tick! (mut e))
-    (push! (mut (.results (.builder e))) (BuildResult :commit "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" :ok false))
+    (push! (mut (.results (.builder e)))
+           (BuildResult
+             :commit "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+             :ok false))
     (let [state (tick! (mut e))]
       (assert (= (.base (the-bug state "b3")) MAIN))
-      (assert (= (.broken-main state) "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
-      (assert (contains? (.markdown (get (bug-notes (mut e)) 0)) "could not verify")))))
+      (assert (= (.broken-main state)
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+      (assert (contains? (.markdown (get (bug-notes (mut e)) 0))
+                         "could not verify")))))
 
 (deftest bugs-already-noted-in-the-pad-are-never-attempted-again
   (let [a (malloc-allocator)
         (mut e) (env a "noted")]
-    (snapshot! (mut e) "0001-a" [(get CELLS 0) (get CELLS 1) (get CELLS 2) (get CELLS 3)
-                                 (cell "coil-bugs-factory-b1" "### Factory: unable to reproduce")])
+    (snapshot! (mut e)
+               "0001-a"
+               [(get CELLS 0)
+                (get CELLS 1)
+                (get CELLS 2)
+                (get CELLS 3)
+                (cell "coil-bugs-factory-b1" "### Factory: unable to reproduce")])
     (let [state (triage! (mut e) TRIAGED)]
       (assert (outcome-is (the-bug state "b1") "noted"))
       (assert (status-is (the-bug state "b3") "queued"))
@@ -525,7 +777,13 @@
         (mut e) (env a "notes-only")]
     (snapshot! (mut e) "0001-a" CELLS)
     (triage! (mut e) TRIAGED)
-    (snapshot! (mut e) "0002-b" [(get CELLS 0) (get CELLS 1) (get CELLS 2) (get CELLS 3) (cell "coil-bugs-factory-b9" "note")])
+    (snapshot! (mut e)
+               "0002-b"
+               [(get CELLS 0)
+                (get CELLS 1)
+                (get CELLS 2)
+                (get CELLS 3)
+                (cell "coil-bugs-factory-b9" "note")])
     (let [before (len (.created (.native e)))]
       (start-bug! (mut e))
       (assert-eq (len (.created (.native e))) (+ before 1))
@@ -540,7 +798,8 @@
           count (len status)]
       (assert (> count 0))
       (assert (= (.cell-id (get status (- count 1))) "coil-bugs-factory-status"))
-      (assert (contains? (.markdown (get status (- count 1))) "Bug one crashes the checker"))
+      (assert (contains? (.markdown (get status (- count 1)))
+                         "Bug one crashes the checker"))
       (tick! (mut e))
       (tick! (mut e))
       ;; Only the move into building a base compiler changed anything.
@@ -558,13 +817,19 @@
           asked (.asked (.approver e))]
       (assert-eq (len asked) 1)
       (assert (contains? (get asked 0) "is outside Coil's scope (rule 1)"))
-      (assert (contains? (get asked 0) "It asks the JIT to change a published type."))
+      (assert (contains? (get asked 0)
+                         "It asks the JIT to change a published type."))
       (assert (contains? (get asked 0) "No live coding in the core"))
       (assert (contains? (get asked 0) "### Bug one crashes"))
       (assert (= (.scope-request (the-bug state "b1")) "req-1"))
       (assert (not (status-is (the-bug state "b3") "queued"))))
-    (set! (.answer (field (mut e) approver)) (ScopeConfirmed "Live coding is an add-on."))
-    (let [state (match (beat (mut e) 61000) (Ok [s] s) (Err [why] (do (println "{s}" why) (assert false) (state-of (mut e)))))
+    (set! (.answer (field (mut e) approver))
+          (ScopeConfirmed "Live coding is an add-on."))
+    (let [state
+            (match (beat (mut e) 61000)
+              (Ok [s] s)
+              (Err [why]
+                   (do (println "{s}" why) (assert false) (state-of (mut e)))))
           notes (bug-notes (mut e))]
       (assert (outcome-is (the-bug state "b1") "out_of_scope"))
       (assert-eq (len (.asked (.approver e))) 1)
@@ -576,16 +841,21 @@
   (let [a (malloc-allocator)
         (mut e) (env a "scope-in")]
     (snapshot! (mut e) "0001-a" [(get CELLS 0) (get CELLS 1) (get CELLS 2)])
-    (triage! (mut e) "{\"bugs\": [
+    (triage! (mut e)
+             "{\"bugs\": [
   {\"id\": \"title\", \"cells\": [\"title\"], \"title\": \"t\", \"status\": \"not_a_bug\", \"reason\": \"heading\"},
   {\"id\": \"b1\", \"cells\": [\"b1\"], \"title\": \"Bug one crashes the checker\", \"status\": \"open\", \"reason\": \"no fix\",
    \"scope\": \"out\", \"rule\": \"1\", \"scope_reason\": \"unsure\", \"scope_quote\": \"Bug one crashes\"},
   {\"id\": \"b2\", \"cells\": [\"b2\"], \"title\": \"Bug two\", \"status\": \"fixed\", \"reason\": \"says so\", \"quote\": \"FIXED in abc123\"}]}")
     (tick! (mut e))
-    (set! (.answer (field (mut e) approver)) (ScopeOverruled "A crash is a crash; fix it."))
-    (match (beat (mut e) 61000) (Ok [_] 0) (Err [why] (do (println "{s}" why) (assert false) 0)))
+    (set! (.answer (field (mut e) approver))
+          (ScopeOverruled "A crash is a crash; fix it."))
+    (match (beat (mut e) 61000)
+      (Ok [_] 0)
+      (Err [why] (do (println "{s}" why) (assert false) 0)))
     (let [state (start-bug! (mut e))
           last (- (len (.created (.native e))) 1)]
       (assert (status-is (the-bug state "b1") "running"))
-      (assert (contains? (created-field (mut e) last "brief") "Jimmy ruled it in scope: A crash is a crash; fix it."))
+      (assert (contains? (created-field (mut e) last "brief")
+                         "Jimmy ruled it in scope: A crash is a crash; fix it."))
       (assert (contains? (created-text (mut e) last) "SCOPE.md")))))

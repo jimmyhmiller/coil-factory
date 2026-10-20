@@ -1,7 +1,6 @@
 (module factory.specparse)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "mddoc.doc" :as md)
@@ -16,18 +15,38 @@
   (SpecOk [(spec FactorySpec)])
   (SpecBad [(problems (ArrayList SpecProblem))]))
 
-(defn problem! [(a (dyn Allocator)) (problems (mut (ArrayList SpecProblem))) (line i64) (parts (slice (slice u8)))] (-> i64)
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (let [message (sb-finish! (mut out))]
-      (push! [SpecProblem] (mut problems) (SpecProblem :line line :message message)))))
+(defn problem! [(a (dyn Allocator))
+                (problems (mut (ArrayList SpecProblem)))
+                (line i64)
+                (parts (slice (slice u8)))] (-> i64)
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (let [message (finish! (mut out))]
+      (push! [SpecProblem]
+             (mut problems)
+             (SpecProblem :line line :message message)))))
 
 (defn known-front-key? [(key (slice u8))] (-> bool)
-  (or (= key "name") (= key "description") (= key "input") (= key "model")
-      (= key "harness") (= key "reviewers") (= key "review") (= key "approve") (= key "summarizer") (= key "tools") (= key "attempts")))
+  (or (= key "name")
+      (= key "description")
+      (= key "input")
+      (= key "model")
+      (= key "harness")
+      (= key "reviewers")
+      (= key "review")
+      (= key "approve")
+      (= key "summarizer")
+      (= key "tools")
+      (= key "attempts")))
 
 (defn known-station-key? [(key (slice u8))] (-> bool)
-  (or (= key "gate") (= key "attempts") (= key "model") (= key "harness") (= key "tools") (= key "review") (= key "approve")))
+  (or (= key "gate")
+      (= key "attempts")
+      (= key "model")
+      (= key "harness")
+      (= key "tools")
+      (= key "review")
+      (= key "approve")))
 
 (defn lower-ascii [(c i64)] (-> i64)
   (if (and (>= c 65) (<= c 90)) (+ c 32) c))
@@ -42,56 +61,72 @@
               (mut same) true]
           (loop (if (>= (load i) n)
                     (break)
-                    (do (when (!= (lower-ascii (cast i64 (get title (load i))))
-                                  (cast i64 (get prefix (load i))))
-                          (set! same false)
-                          0)
-                        (set! i (+ (load i) 1)))))
+                    (do
+                      (when (!= (lower-ascii (cast i64 (get title (load i))))
+                                (cast i64 (get prefix (load i))))
+                        (set! same false)
+                        0)
+                      (set! i (+ (load i) 1)))))
           (if (load same)
-              (Some (str-trim (subslice [u8] title n (len title))))
+              (Some (trim (subslice [u8] title n (len title))))
               (None))))))
 
 ;;; A tool list written either `files, shell` or `[files, shell]`, as the
 ;;; canonical comma-separated text.
 (defn front-tools [(a (dyn Allocator)) (entry md/FrontEntry)] (-> (slice u8))
   (if (.is-list entry)
-      (let [(mut out) (sb-new a)
+      (let [(mut out) (StrBuf::new a)
             (mut first) true]
         (for item (iter (.items entry))
-          (when (not (load first)) (sb-push-str! (mut out) ", ") 0)
-          (sb-push-str! (mut out) (str-trim item))
+          (when (not (load first)) (push-str! (mut out) ", ") 0)
+          (push-str! (mut out) (trim item))
           (set! first false))
-        (sb-finish! (mut out)))
+        (finish! (mut out)))
       (.scalar entry)))
 
 (defn parse-attempts [(a (dyn Allocator))
                       (problems (mut (ArrayList SpecProblem)))
                       (text (slice u8))
                       (line i64)] (-> i64)
-  (match (str-parse-int (str-trim text))
-    (Some [n] (if (and (>= n 1) (<= n 20))
-                  n
-                  (do (problem! a (mut problems) line ["attempts must be between 1 and 20, not " text]) 0)))
-    (None [] (do (problem! a (mut problems) line ["attempts must be a whole number, not \"" text "\""]) 0))))
+  (match (parse-int (trim text))
+    (Some [n]
+          (if (and (>= n 1) (<= n 20))
+              n
+              (do
+                (problem! a
+                          (mut problems)
+                          line
+                          ["attempts must be between 1 and 20, not " text])
+                0)))
+    (None []
+          (do
+            (problem! a
+                      (mut problems)
+                      line
+                      ["attempts must be a whole number, not \"" text "\""])
+            0))))
 
 ;;; Lines of `body` (whose first line is `body-line`) before `stop-line`.
-(defn text-before-line [(body (slice u8)) (body-line i64) (stop-line i64)] (-> (slice u8))
+(defn text-before-line [(body (slice u8)) (body-line i64) (stop-line i64)]
+  (-> (slice u8))
   (let [(mut at) 0
         (mut line) body-line
         n (len body)]
     (loop (if (or (>= (load at) n) (>= (load line) stop-line))
               (break)
-              (do (loop (if (or (>= (load at) n) (= (cast i64 (get body (load at))) 10))
-                            (break)
-                            (set! at (+ (load at) 1))))
-                  (when (< (load at) n) (set! at (+ (load at) 1)) 0)
-                  (set! line (+ (load line) 1)))))
+              (do
+                (loop (if (or (>= (load at) n)
+                              (= (cast i64 (get body (load at))) 10))
+                          (break)
+                          (set! at (+ (load at) 1))))
+                (when (< (load at) n) (set! at (+ (load at) 1)) 0)
+                (set! line (+ (load line) 1)))))
     (subslice [u8] body 0 (load at))))
 
 (defn parse-factory [(a (dyn Allocator)) (text (slice u8))] (-> SpecResult)
-  (let [(mut problems) (al-new [SpecProblem] a)
-        (mut spec) (primitive/zeroed FactorySpec)]
-    (set! (.stations spec) (al-new [StationSpec] a))
+  (let [(mut problems) (ArrayList::new [SpecProblem] a)
+        (mut spec) (zeroed FactorySpec)]
+    (set! (.stations spec) (ArrayList::new [StationSpec] a))
     (set! (.name spec) "")
     (set! (.description spec) "")
     (set! (.input spec) "")
@@ -110,69 +145,130 @@
       (Ok [parsed]
           (let [doc parsed]
             (when (not (md/doc-has-front-matter? doc))
-              (problem! a (mut problems) 1 ["a factory starts with front matter: a line `---`, then `name: my-factory`, then `---`"])
+              (problem! a
+                        (mut problems)
+                        1
+                        ["a factory starts with front matter: a line `---`, then `name: my-factory`, then `---`"])
               0)
             (for front (iter (md/front-entries doc))
               (let [entry front
                     key (.key entry)]
                 (cond (not (known-front-key? key))
-                        (problem! a (mut problems) (.line entry)
-                                  ["unknown front-matter key \"" key "\"; the keys are name, description, input, model, harness, reviewers, review, approve, summarizer, tools, attempts"])
+                        (problem! a
+                                  (mut problems)
+                                  (.line entry)
+                                  ["unknown front-matter key \""
+                                   key
+                                   "\"; the keys are name, description, input, model, harness, reviewers, review, approve, summarizer, tools, attempts"])
                       (= key "name") (do (set! (.name spec) (.scalar entry)) 0)
-                      (= key "description") (do (set! (.description spec) (.scalar entry)) 0)
-                      (= key "input") (do (set! (.input spec) (.scalar entry)) 0)
-                      (= key "model") (do (set! (.model spec) (.scalar entry)) 0)
+                      (= key "description")
+                        (do (set! (.description spec) (.scalar entry)) 0)
+                      (= key "input")
+                        (do (set! (.input spec) (.scalar entry)) 0)
+                      (= key "model")
+                        (do (set! (.model spec) (.scalar entry)) 0)
                       (= key "harness")
                         (let [trouble (harness-problem a (.scalar entry))]
                           (set! (.harness spec) (.scalar entry))
-                          (when (> (len trouble) 0) (problem! a (mut problems) (.line entry) [trouble]) 0)
-                          0)
-                      (= key "reviewers") (do (set! (.reviewers spec) (front-tools a entry)) 0)
-                      (= key "review") (do (set! (.review spec) (front-tools a entry)) 0)
-                      (= key "approve")
-                        (do (set! (.approve spec) (str-trim (.scalar entry)))
-                            (when (not (or (= (.approve spec) "yes") (= (.approve spec) "no")))
-                              (problem! a (mut problems) (.line entry) ["approve is yes or no, not \"" (.scalar entry) "\""])
-                              0)
+                          (when (> (len trouble) 0)
+                            (problem! a (mut problems) (.line entry) [trouble])
                             0)
-                      (= key "summarizer") (do (set! (.summarizer spec) (str-trim (.scalar entry))) 0)
+                          0)
+                      (= key "reviewers")
+                        (do (set! (.reviewers spec) (front-tools a entry)) 0)
+                      (= key "review")
+                        (do (set! (.review spec) (front-tools a entry)) 0)
+                      (= key "approve")
+                        (do
+                          (set! (.approve spec) (trim (.scalar entry)))
+                          (when (not (or (= (.approve spec) "yes")
+                                         (= (.approve spec) "no")))
+                            (problem! a
+                                      (mut problems)
+                                      (.line entry)
+                                      ["approve is yes or no, not \""
+                                       (.scalar entry)
+                                       "\""])
+                            0)
+                          0)
+                      (= key "summarizer")
+                        (do (set! (.summarizer spec) (trim (.scalar entry))) 0)
                       (= key "tools")
                         (let [tools (front-tools a entry)
                               trouble (tool-list-problem a tools)]
                           (set! (.tools spec) tools)
-                          (when (> (len trouble) 0) (problem! a (mut problems) (.line entry) [trouble]) 0)
+                          (when (> (len trouble) 0)
+                            (problem! a (mut problems) (.line entry) [trouble])
+                            0)
                           0)
                       (= key "attempts")
-                        (do (set! (.attempts spec) (parse-attempts a (mut problems) (.scalar entry) (.line entry))) 0)
+                        (do
+                          (set! (.attempts spec)
+                                (parse-attempts a
+                                                (mut problems)
+                                                (.scalar entry)
+                                                (.line entry)))
+                          0)
                       :else 0)))
             (when (and (md/doc-has-front-matter? doc) (= (len (.name spec)) 0))
-              (problem! a (mut problems) 1 ["the front matter needs a name, for example `name: fix-issue`"])
+              (problem! a
+                        (mut problems)
+                        1
+                        ["the front matter needs a name, for example `name: fix-issue`"])
               0)
-            (when (and (> (len (.name spec)) 0) (not (kebab-name? (.name spec))))
-              (problem! a (mut problems) 1 ["the name \"" (.name spec) "\" must be lowercase letters, digits, and dashes"])
+            (when (and (> (len (.name spec)) 0)
+                       (not (kebab-name? (.name spec))))
+              (problem! a
+                        (mut problems)
+                        1
+                        ["the name \""
+                         (.name spec)
+                         "\" must be lowercase letters, digits, and dashes"])
               0)
             (let [(mut first-station-line) -1
-                  (mut extra) (sb-new a)]
+                  (mut extra) (StrBuf::new a)]
               (for section (iter (md/doc-sections doc))
                 (let [s section]
                   (match (station-title (.title s))
                     (Some [name]
                           (if (!= (.level s) 2)
-                              (problem! a (mut problems) (.line s) ["a station heading must be level 2: `## Station: " name "`"])
+                              (problem! a
+                                        (mut problems)
+                                        (.line s)
+                                        ["a station heading must be level 2: `## Station: "
+                                         name
+                                         "`"])
                               (do
-                                (when (< (load first-station-line) 0) (set! first-station-line (.line s)) 0)
+                                (when (< (load first-station-line) 0)
+                                  (set! first-station-line (.line s))
+                                  0)
                                 (cond (not (kebab-name? name))
-                                        (problem! a (mut problems) (.line s)
-                                                  ["station name \"" name "\" must be lowercase letters, digits, and dashes"])
+                                        (problem! a
+                                                  (mut problems)
+                                                  (.line s)
+                                                  ["station name \""
+                                                   name
+                                                   "\" must be lowercase letters, digits, and dashes"])
                                       (>= (find-station (mut spec) name) 0)
-                                        (problem! a (mut problems) (.line s) ["there is already a station named \"" name "\""])
+                                        (problem! a
+                                                  (mut problems)
+                                                  (.line s)
+                                                  ["there is already a station named \""
+                                                   name
+                                                   "\""])
                                       :else 0)
-                                (match (md/section-attributes a (.body s) (.body-line s))
+                                (match (md/section-attributes a
+                                                              (.body s)
+                                                              (.body-line s))
                                   (Err [failure]
-                                       (let [e failure] (problem! a (mut problems) (.line e) [(.message e)])))
+                                       (let [e failure]
+                                         (problem! a
+                                                   (mut problems)
+                                                   (.line e)
+                                                   [(.message e)])))
                                   (Ok [found]
                                       (let [settings found
-                                            (mut station) (primitive/zeroed StationSpec)]
+                                            (mut station) (zeroed StationSpec)]
                                         (set! (.name station) name)
                                         (set! (.line station) (.line s))
                                         (set! (.gate station) "")
@@ -181,76 +277,139 @@
                                         (set! (.tools station) "")
                                         (set! (.review station) "")
                                         (set! (.approve station) "")
-                                        (set! (.instructions station) (str-trim (.rest settings)))
+                                        (set! (.instructions station)
+                                              (trim (.rest settings)))
                                         (for attribute (iter (.attrs settings))
                                           (let [attr attribute
                                                 key (.key attr)]
                                             (cond (not (known-station-key? key))
-                                                    (problem! a (mut problems) (.line attr)
-                                                              ["unknown station setting \"" key "\"; the settings are gate, attempts, model, harness, tools, review, approve"])
-                                                  (= key "gate") (do (set! (.gate station) (.value attr)) 0)
-                                                  (= key "review") (do (set! (.review station) (.value attr)) 0)
+                                                    (problem! a
+                                                              (mut problems)
+                                                              (.line attr)
+                                                              ["unknown station setting \""
+                                                               key
+                                                               "\"; the settings are gate, attempts, model, harness, tools, review, approve"])
+                                                  (= key "gate")
+                                                    (do
+                                                      (set! (.gate station)
+                                                            (.value attr))
+                                                      0)
+                                                  (= key "review")
+                                                    (do
+                                                      (set! (.review station)
+                                                            (.value attr))
+                                                      0)
                                                   (= key "approve")
-                                                    (do (set! (.approve station) (str-trim (.value attr)))
-                                                        (when (not (or (= (.approve station) "yes") (= (.approve station) "no")))
-                                                          (problem! a (mut problems) (.line attr) ["approve is yes or no, not \"" (.value attr) "\""])
-                                                          0)
+                                                    (do
+                                                      (set! (.approve station)
+                                                            (trim (.value attr)))
+                                                      (when (not (or (= (.approve station)
+                                                                        "yes")
+                                                                     (= (.approve station)
+                                                                        "no")))
+                                                        (problem! a
+                                                                  (mut problems)
+                                                                  (.line attr)
+                                                                  ["approve is yes or no, not \""
+                                                                   (.value attr)
+                                                                   "\""])
                                                         0)
-                                                  (= key "model") (do (set! (.model station) (.value attr)) 0)
+                                                      0)
+                                                  (= key "model")
+                                                    (do
+                                                      (set! (.model station)
+                                                            (.value attr))
+                                                      0)
                                                   (= key "harness")
-                                                    (let [trouble (harness-problem a (.value attr))]
-                                                      (set! (.harness station) (.value attr))
-                                                      (when (> (len trouble) 0) (problem! a (mut problems) (.line attr) [trouble]) 0)
+                                                    (let [trouble
+                                                            (harness-problem a
+                                                                             (.value attr))]
+                                                      (set! (.harness station)
+                                                            (.value attr))
+                                                      (when (> (len trouble) 0)
+                                                        (problem! a
+                                                                  (mut problems)
+                                                                  (.line attr)
+                                                                  [trouble])
+                                                        0)
                                                       0)
                                                   (= key "tools")
-                                                    (let [trouble (tool-list-problem a (.value attr))]
-                                                      (set! (.tools station) (.value attr))
-                                                      (when (> (len trouble) 0) (problem! a (mut problems) (.line attr) [trouble]) 0)
+                                                    (let [trouble
+                                                            (tool-list-problem a
+                                                                               (.value attr))]
+                                                      (set! (.tools station)
+                                                            (.value attr))
+                                                      (when (> (len trouble) 0)
+                                                        (problem! a
+                                                                  (mut problems)
+                                                                  (.line attr)
+                                                                  [trouble])
+                                                        0)
                                                       0)
                                                   (= key "attempts")
-                                                    (do (set! (.attempts station)
-                                                              (parse-attempts a (mut problems) (.value attr) (.line attr)))
-                                                        0)
+                                                    (do
+                                                      (set! (.attempts station)
+                                                            (parse-attempts a
+                                                                            (mut problems)
+                                                                            (.value attr)
+                                                                            (.line attr)))
+                                                      0)
                                                   :else 0)))
-                                        (when (= (len (.instructions station)) 0)
-                                          (problem! a (mut problems) (.line s) ["station \"" name "\" has no instructions"])
+                                        (when (= (len (.instructions station))
+                                                 0)
+                                          (problem! a
+                                                    (mut problems)
+                                                    (.line s)
+                                                    ["station \""
+                                                     name
+                                                     "\" has no instructions"])
                                           0)
-                                        (push! [StationSpec] (mut (.stations spec)) (load station))
+                                        (push! [StationSpec]
+                                               (mut (.stations spec))
+                                               (load station))
                                         0)))
                                 0)))
                     (None []
                           ;; Sections after the first station that are not
                           ;; stations are shared context too.
-                          (when (and (>= (load first-station-line) 0) (= (.level s) 2))
-                            (sb-push-str! (mut extra) "\n## ")
-                            (sb-push-str! (mut extra) (.title s))
-                            (sb-push-str! (mut extra) "\n\n")
-                            (sb-push-str! (mut extra) (.body s))
+                          (when (and (>= (load first-station-line) 0)
+                                     (= (.level s) 2))
+                            (push-str! (mut extra) "\n## ")
+                            (push-str! (mut extra) (.title s))
+                            (push-str! (mut extra) "\n\n")
+                            (push-str! (mut extra) (.body s))
                             0)))))
               (when (= (len (.stations spec)) 0)
-                (problem! a (mut problems) 1 ["a factory needs at least one `## Station: name` section"])
+                (problem! a
+                          (mut problems)
+                          1
+                          ["a factory needs at least one `## Station: name` section"])
                 0)
-              (let [before (if (>= (load first-station-line) 0)
-                               (text-before-line (md/doc-body doc) (md/doc-body-line doc) (load first-station-line))
-                               (md/doc-body doc))
-                    (mut context) (sb-new a)]
-                (sb-push-str! (mut context) (str-trim before))
-                (sb-push-str! (mut context) (sb-str (load extra)))
-                (set! (.context spec) (sb-finish! (mut context)))
+              (let [before
+                      (if (>= (load first-station-line) 0)
+                          (text-before-line (md/doc-body doc)
+                                            (md/doc-body-line doc)
+                                            (load first-station-line))
+                          (md/doc-body doc))
+                    (mut context) (StrBuf::new a)]
+                (push-str! (mut context) (trim before))
+                (push-str! (mut context) (str (load extra)))
+                (set! (.context spec) (finish! (mut context)))
                 0)))))
     (if (> (len problems) 0)
         (SpecBad (load problems))
         (SpecOk (load spec)))))
 
-(defn problems-text [(a (dyn Allocator)) (problems (ArrayList SpecProblem))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+(defn problems-text [(a (dyn Allocator)) (problems (ArrayList SpecProblem))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
         (mut first) true]
     (for problem (iter problems)
       (let [p problem]
-        (when (not (load first)) (sb-push-str! (mut out) "\n") 0)
-        (sb-push-str! (mut out) "line ")
-        (sb-push-i64! (mut out) (.line p))
-        (sb-push-str! (mut out) ": ")
-        (sb-push-str! (mut out) (.message p))
+        (when (not (load first)) (push-str! (mut out) "\n") 0)
+        (push-str! (mut out) "line ")
+        (push-i64! (mut out) (.line p))
+        (push-str! (mut out) ": ")
+        (push-str! (mut out) (.message p))
         (set! first false)))
-    (sb-finish! (mut out))))
+    (finish! (mut out))))

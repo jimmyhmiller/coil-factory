@@ -21,7 +21,7 @@
     (when (> (len text) 0)
       (assert-eq (cast i64
                        (io/write (.write p)
-                                 (cast (ptr i8) (slice-data text))
+                                 (cast (ptr i8) (data text))
                                  (cast isize (len text))))
                  (len text))
       0)

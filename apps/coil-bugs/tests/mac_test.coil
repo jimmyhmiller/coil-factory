@@ -18,7 +18,7 @@
 
 (impl MacGate FakeGate
   (gate-notes [(self (ptr FakeGate)) (a (dyn Allocator))] (-> (Result (ArrayList NoteListing) (slice u8)))
-              (let [(mut out) (al-new [NoteListing] a)]
+              (let [(mut out) (ArrayList::new [NoteListing] a)]
                 (for note (iter (.notes self))
                   (let [(mut copy) note
                         (mut done) false]
@@ -56,7 +56,7 @@
 
 (defn setup [(a (dyn Allocator)) (label (slice u8))] (-> MacConfig)
   (let [dir (temp-dir a label)
-        (mut notebooks) (al-new [(slice u8)] a)]
+        (mut notebooks) (ArrayList::new [(slice u8)] a)]
     (write! a (path-join a dir "notebooks/coil-bugs.jsonl") JOURNAL)
     (push! (mut notebooks) "coil-bugs")
     (push! (mut notebooks) "coil-factory-coil-bugs")
@@ -65,8 +65,8 @@
                :notebooks (load notebooks) :state-dir (path-join a dir "state"))))
 
 (defn fake-gate [(a (dyn Allocator))] (-> FakeGate)
-  (FakeGate :notes (al-new [NoteListing] a) :delivered (al-new [(slice u8)] a)
-            :snapshots (al-new [SnapshotUpload] a) :fail-delivery false))
+  (FakeGate :notes (ArrayList::new [NoteListing] a) :delivered (ArrayList::new [(slice u8)] a)
+            :snapshots (ArrayList::new [SnapshotUpload] a) :fail-delivery false))
 
 ;; Sunday 2026-10-11, 07:00 local is somewhere around here; the tests only
 ;; need days to differ, so they step in whole days from noon UTC.
@@ -76,7 +76,7 @@
 (defn beat [(a (dyn Allocator)) (config MacConfig) (gate (ptr FakeGate)) (pad (ptr FakePad)) (now i64)] (-> HeartbeatResult)
   (match (heartbeat a config gate pad now)
     (Ok [result] result)
-    (Err [why] (do (println "{s}" why) (assert false) (HeartbeatResult :delivered (al-new [(slice u8)] a) :snapshot "")))))
+    (Err [why] (do (println "{s}" why) (assert false) (HeartbeatResult :delivered (ArrayList::new [(slice u8)] a) :snapshot "")))))
 
 (deftest live-cells-fold-the-journal-in-first-written-order
   (let [a (malloc-allocator)]
@@ -99,7 +99,7 @@
   (let [a (malloc-allocator)
         config (setup a "daily")
         (mut gate) (fake-gate a)
-        (mut pad) (FakePad :written (al-new [Written] a))]
+        (mut pad) (FakePad :written (ArrayList::new [Written] a))]
     (assert (= (.snapshot (beat a config (mut gate) (mut pad) NOON)) "s1"))
     (let [posted (get (.snapshots gate) 0)]
       (assert (= (.notebook posted) "coil-bugs"))
@@ -114,7 +114,7 @@
   (let [a (malloc-allocator)
         config (setup a "notes")
         (mut gate) (fake-gate a)
-        (mut pad) (FakePad :written (al-new [Written] a))]
+        (mut pad) (FakePad :written (ArrayList::new [Written] a))]
     (push! (mut (.notes gate)) (note "n1" "coil-bugs" "coil-bugs-factory-b"))
     (push! (mut (.notes gate)) (note "n2" "coil-factory-coil-bugs" "coil-bugs-factory-status"))
     (let [first (beat a config (mut gate) (mut pad) NOON)]
@@ -129,7 +129,7 @@
   (let [a (malloc-allocator)
         config (setup a "redeliver")
         (mut gate) (fake-gate a)
-        (mut pad) (FakePad :written (al-new [Written] a))]
+        (mut pad) (FakePad :written (ArrayList::new [Written] a))]
     (push! (mut (.notes gate)) (note "n1" "coil-bugs" "coil-bugs-factory-b"))
     (set! (.fail-delivery gate) true)
     (match (heartbeat a config (mut gate) (mut pad) NOON)
@@ -144,7 +144,7 @@
 (deftest a-note-for-someone-elses-cell-or-pad-is-refused
   (let [a (malloc-allocator)
         config (setup a "refused")
-        (mut pad) (FakePad :written (al-new [Written] a))]
+        (mut pad) (FakePad :written (ArrayList::new [Written] a))]
     (let [(mut gate) (fake-gate a)]
       (push! (mut (.notes gate)) (note "n1" "coil-bugs" "b"))
       (match (heartbeat a config (mut gate) (mut pad) NOON)

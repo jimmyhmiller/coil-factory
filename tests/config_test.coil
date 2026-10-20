@@ -8,17 +8,17 @@
 (import "factory.harnesses" :use [codex-settings])
 
 (defn home-with [(a (dyn Allocator)) (site-json (slice u8))] (-> (slice u8))
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/factory-config-test-")
-    (sb-push-i64! (mut path) (pid))
-    (let [home (sb-finish! (mut path))]
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-config-test-")
+    (push-i64! (mut path) (pid))
+    (let [home (finish! (mut path))]
       (capture a "rm" ["-rf" home] "" 10000)
       (atomic/ensure-dir! a home 448)
       (atomic/write-file-atomic! a (path-join a home "site.json") site-json 420)
       home)))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (deftest reviewers-are-a-list-or-a-string-and-default-to-none
   (let [a (malloc-allocator)]

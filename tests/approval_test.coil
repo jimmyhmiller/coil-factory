@@ -8,7 +8,7 @@
 (import "factory.approval" :use *)
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn summary-of [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> Summary)
   (match (parse-summary a kind reply)
@@ -16,7 +16,7 @@
     (Err [why] (do (println "{s}" why) (assert false) (empty-summary)))))
 
 (defn empty-summary [] (-> Summary)
-  (Summary :title "" :summary "" :proposals (al-new [Proposal] (malloc-allocator)) :questions (al-new [Question] (malloc-allocator))))
+  (Summary :title "" :summary "" :proposals (ArrayList::new [Proposal] (malloc-allocator)) :questions (ArrayList::new [Question] (malloc-allocator))))
 
 (defn refusal [(a (dyn Allocator)) (kind (slice u8)) (reply (slice u8))] (-> (slice u8))
   (match (parse-summary a kind reply)
@@ -26,22 +26,22 @@
 (const WHAT "In experiments/host_attachment.coil the program defines f returning 1 and caller calling f, opens a JIT session, and redefines f there to return 2; the program's own caller still returns 1 afterwards.")
 
 (defn proposal-json [(a (dyn Allocator)) (title (slice u8)) (what (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) "{\"title\": \"")
-    (sb-push-str! (mut out) title)
-    (sb-push-str! (mut out) "\", \"what\": \"")
-    (sb-push-str! (mut out) what)
-    (sb-push-str! (mut out) "\", \"why\": \"It decides the design.\", \"if_approved\": \"It is treated as established.\", \"if_rejected\": \"The agent investigates further.\", \"evidence\": \"host-after=1\"}")
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "{\"title\": \"")
+    (push-str! (mut out) title)
+    (push-str! (mut out) "\", \"what\": \"")
+    (push-str! (mut out) what)
+    (push-str! (mut out) "\", \"why\": \"It decides the design.\", \"if_approved\": \"It is treated as established.\", \"if_rejected\": \"The agent investigates further.\", \"evidence\": \"host-after=1\"}")
+    (finish! (mut out))))
 
 (defn reply-with [(a (dyn Allocator)) (proposals (slice u8)) (questions (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) "{\"title\": \"plan: host attachment\", \"summary\": \"It says X.\", \"proposals\": [")
-    (sb-push-str! (mut out) proposals)
-    (sb-push-str! (mut out) "], \"questions\": [")
-    (sb-push-str! (mut out) questions)
-    (sb-push-str! (mut out) "]}")
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "{\"title\": \"plan: host attachment\", \"summary\": \"It says X.\", \"proposals\": [")
+    (push-str! (mut out) proposals)
+    (push-str! (mut out) "], \"questions\": [")
+    (push-str! (mut out) questions)
+    (push-str! (mut out) "]}")
+    (finish! (mut out))))
 
 (deftest reads-a-self-contained-summary
   (let [a (malloc-allocator)
@@ -74,13 +74,13 @@
     (assert (= (refusal a "question" (reply-with a "" "{\"text\": \"Which?\", \"context\": \"c\"}")) ""))))
 
 (defn str-replace-why [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (match (str-find text "\"why\": \"It decides the design.\"")
+  (match (find text "\"why\": \"It decides the design.\"")
     (None [] text)
-    (Some [at] (let [(mut out) (sb-new a)]
-                 (sb-push-str! (mut out) (subslice text 0 at))
-                 (sb-push-str! (mut out) "\"why\": \"\"")
-                 (sb-push-str! (mut out) (subslice text (+ at 31) (len text)))
-                 (sb-finish! (mut out))))))
+    (Some [at] (let [(mut out) (StrBuf::new a)]
+                 (push-str! (mut out) (subslice text 0 at))
+                 (push-str! (mut out) "\"why\": \"\"")
+                 (push-str! (mut out) (subslice text (+ at 31) (len text)))
+                 (finish! (mut out))))))
 
 (deftest reads-a-summarizer
   (let [a (malloc-allocator)]
@@ -106,7 +106,7 @@
 (deftest the-request-carries-the-summary-and-the-raw-material
   (let [a (malloc-allocator)
         s (summary-of a "station" (reply-with a (proposal-json a "p is done" WHAT) ""))
-        (mut evidence) (al-new [Evidence] a)]
+        (mut evidence) (ArrayList::new [Evidence] a)]
     (push! (mut evidence) (Evidence :name "The agent's own words" :content "I did it" :format "text"))
     (let [body (request-json a (RequestSource :site "laptop" :run "r-1" :station "plan" :kind "station" :round 2) s (load evidence))]
       (match (jv-parse a body)

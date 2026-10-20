@@ -19,11 +19,17 @@
 
 ;;; One live pad cell. `source` is a markdown cell's Markdown, else the
 ;;; cell's JSON.
-(defstruct Cell [(id (slice u8)) (ts i64) (kind (slice u8)) (source (slice u8))])
-(derive (Serialize (field kind (rename "type"))) (Deserialize (field kind (rename "type"))) Cell)
+(defstruct Cell
+  [(id (slice u8)) (ts i64) (kind (slice u8)) (source (slice u8))])
+
+(derive (Serialize (field kind (rename "type")))
+        (Deserialize (field kind (rename "type")))
+        Cell)
 
 ;;; What the Mac posts.
-(defstruct SnapshotUpload [(notebook (slice u8)) (taken i64) (cells (ArrayList Cell))])
+(defstruct SnapshotUpload
+  [(notebook (slice u8)) (taken i64) (cells (ArrayList Cell))])
+
 (derive Serialize Deserialize SnapshotUpload)
 
 ;;; A snapshot as the function stores it, and the controller reads it.
@@ -34,9 +40,11 @@
    (notebook (slice u8))
    (taken i64)
    (cells (ArrayList Cell))])
+
 (derive Serialize Deserialize Snapshot)
 
 (defstruct SnapshotReceipt [(id (slice u8)) (received i64) (cells i64)])
+
 (derive Serialize Deserialize SnapshotReceipt)
 
 ;;; A note as the controller writes it. Writing it into the pad under
@@ -48,10 +56,17 @@
    (notebook (slice u8))
    (cell-id (slice u8))
    (markdown (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) Note)
 
-(defstruct Delivery [(id (slice u8)) (cell-id (slice u8)) (delivered i64) (principal (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) Delivery)
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        Note)
+
+(defstruct Delivery
+  [(id (slice u8)) (cell-id (slice u8)) (delivered i64) (principal (slice u8))])
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        Delivery)
 
 ;;; A note as the function lists it: with its delivery, or none yet.
 (defstruct NoteListing
@@ -61,10 +76,16 @@
    (cell-id (slice u8))
    (markdown (slice u8))
    (delivered (Option Delivery))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) NoteListing)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        NoteListing)
 
 (defstruct DeliveryUpload [(cell-id (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) DeliveryUpload)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        DeliveryUpload)
 
 ;;; Every cell id the factory writes starts with this, so it never replaces a
 ;;; cell a person or another agent wrote. The function refuses any other.
@@ -77,7 +98,8 @@
 
 ;;; One of the factory's notes about an outcome: triage leaves these out.
 (defn outcome-note? [(id (slice u8))] (-> bool)
-  (and (starts-with id NOTE-CELL-PREFIX) (not (starts-with id FOUND-CELL-PREFIX))))
+  (and (starts-with id NOTE-CELL-PREFIX)
+       (not (starts-with id FOUND-CELL-PREFIX))))
 
 ;; ---------------------------------------------------------------------------
 ;; The Mac
@@ -91,9 +113,13 @@
    ;;; The pads a note may go to.
    (notebooks (ArrayList (slice u8)))
    (state-dir (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) MacConfig)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        MacConfig)
 
 (defstruct SnapshotRecord [(day (slice u8)) (id (slice u8)) (cells i64)])
+
 (derive Serialize Deserialize SnapshotRecord)
 
 (defstruct MacState
@@ -101,14 +127,17 @@
    (last-heartbeat (slice u8))
    ;;; The latest thirty.
    (snapshots (ArrayList SnapshotRecord))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) MacState)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        MacState)
 
 ;; ---------------------------------------------------------------------------
 ;; The server
 
 (defstruct ServerConfig
-  [;;; false holds new triage and bug runs; runs already going finish.
-   (enabled bool)
+  ;;; false holds new triage and bug runs; runs already going finish.
+  [(enabled bool)
    (state-dir (slice u8))
    ;;; This factory's own native site (`factory daemon` with FACTORY_HOME here).
    (site-home (slice u8))
@@ -144,11 +173,15 @@
    ;;; and the file holding this machine's Gatekeeper device token.
    (approvals-url (slice u8))
    (approvals-token-file (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) ServerConfig)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        ServerConfig)
 
 ;;; A native factory run the controller is watching.
 ;;; `Idle` when no run is being watched.
 (defsum WatchPhase (Idle) (Submitting) (Watching) (Stopping))
+
 (derive Serialize Deserialize WatchPhase)
 
 (defstruct RunWatch
@@ -166,20 +199,43 @@
    (stop-started i64)
    ;;; Why the controller stopped it, or why it ended badly; "" while fine.
    (failure (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) RunWatch)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        RunWatch)
 
 (defn new-watch [(tag (slice u8)) (request (slice u8)) (now i64)] (-> RunWatch)
-  (RunWatch :phase (Submitting) :tag tag :request request :run-id "" :started now :last-progress now
-            :journal-offset 0 :station "" :stop-started 0 :failure ""))
+  (RunWatch
+    :phase (Submitting)
+    :tag tag
+    :request request
+    :run-id ""
+    :started now
+    :last-progress now
+    :journal-offset 0
+    :station ""
+    :stop-started 0
+    :failure ""))
 
 (defn idle-watch [] (-> RunWatch)
-  (RunWatch :phase (Idle) :tag "" :request "" :run-id "" :started 0 :last-progress 0
-            :journal-offset 0 :station "" :stop-started 0 :failure ""))
+  (RunWatch
+    :phase (Idle)
+    :tag ""
+    :request ""
+    :run-id ""
+    :started 0
+    :last-progress 0
+    :journal-offset 0
+    :station ""
+    :stop-started 0
+    :failure ""))
 
 (defstruct Event [(time (slice u8)) (message (slice u8))])
+
 (derive Serialize Deserialize Event)
 
 (defsum TriagePhase (TriageNone) (TriageRunning) (TriageDone) (TriageFailed))
+
 (derive Serialize Deserialize TriagePhase)
 
 (defstruct Triage
@@ -193,22 +249,43 @@
    (fixed i64)
    (not-a-bug i64)
    (events (ArrayList Event))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) Triage)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        Triage)
 
 ;;; `ScopeReview`: triage judged it out of Coil's scope (SCOPE.md), and Jimmy
 ;;; is asked to confirm on his approvals page before anything else happens.
-(defsum BugStatus (Queued) (Preparing) (Running) (Publishing) (Done) (Skipped) (ScopeReview))
+(defsum BugStatus
+  (Queued)
+  (Preparing)
+  (Running)
+  (Publishing)
+  (Done)
+  (Skipped)
+  (ScopeReview))
+
 (derive Serialize Deserialize BugStatus)
 
 ;;; How an attempt ended. `Noted` is a bug the pad already shows the factory
 ;;; attempted, found when this controller's own state did not know it.
-(defsum Outcome (Pending) (PullRequest) (DoesNotReproduce) (CannotVerify) (Failed) (Noted) (OutOfScope))
+(defsum Outcome
+  (Pending)
+  (PullRequest)
+  (DoesNotReproduce)
+  (CannotVerify)
+  (Failed)
+  (Noted)
+  (OutOfScope))
+
 (derive Serialize Deserialize Outcome)
 
 (defstruct BaseBuild [(commit (slice u8)) (started i64)])
+
 (derive Serialize Deserialize BaseBuild)
 
 (defstruct Attempt [(what (slice u8)) (command (slice u8)) (result (slice u8))])
+
 (derive Serialize Deserialize Attempt)
 
 ;;; The reproduce station's record, `.coil-bug/REPRO.json`. Agents write it,
@@ -221,11 +298,12 @@
    (tests (ArrayList (slice u8)))
    (attempts (ArrayList Attempt))
    (needs (slice u8))])
+
 (derive Serialize Deserialize Repro)
 
 (defstruct Bug
-  [;;; The id of the pad cell that reports it.
-   (id (slice u8))
+  ;;; The id of the pad cell that reports it.
+  [(id (slice u8))
    (title (slice u8))
    (cells (ArrayList (slice u8)))
    (reason (slice u8))
@@ -261,26 +339,41 @@
    ;;; Jimmy's words when he ruled the bug in scope after all; the agent sees them.
    (scope-comment (slice u8))
    (events (ArrayList Event))])
+
 (derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case) (field other-bugs (default "")) (field scope-rule (default ""))
-                     (field scope-reason (default "")) (field scope-quote (default "")) (field scope-request (default ""))
-                     (field scope-url (default "")) (field scope-polled (default 0)) (field scope-comment (default "")))
+        (Deserialize (rename-all :snake_case)
+                     (field other-bugs (default ""))
+                     (field scope-rule (default ""))
+                     (field scope-reason (default ""))
+                     (field scope-quote (default ""))
+                     (field scope-request (default ""))
+                     (field scope-url (default ""))
+                     (field scope-polled (default 0))
+                     (field scope-comment (default "")))
         Bug)
 
 ;;; The newest snapshot read, and a hash of the cells triage reads from it
 ;;; (every cell but the factory's own notes), to tell when triage is due.
-(defstruct SnapshotSeen [(id (slice u8)) (received i64) (cells i64) (seen (slice u8)) (digest (slice u8))])
+(defstruct SnapshotSeen
+  [(id (slice u8))
+   (received i64)
+   (cells i64)
+   (seen (slice u8))
+   (digest (slice u8))])
+
 (derive Serialize Deserialize SnapshotSeen)
 
 (defstruct Base [(commit (slice u8)) (compiler (slice u8)) (built (slice u8))])
+
 (derive Serialize Deserialize Base)
 
 (defstruct Halt [(reason (slice u8)) (time (slice u8))])
+
 (derive Serialize Deserialize Halt)
 
 (defstruct ServerState
-  [;;; id "" before the first snapshot.
-   (snapshot SnapshotSeen)
+  ;;; id "" before the first snapshot.
+  [(snapshot SnapshotSeen)
    (triage Triage)
    ;;; Bugs in pad order, the order they are attempted in.
    (bugs (ArrayList Bug))
@@ -295,36 +388,87 @@
    (halted Halt)
    ;;; What the last status note said, so a note is written only on a change.
    (status-summary (slice u8))])
-(derive (Serialize (rename-all :snake_case)) (Deserialize (rename-all :snake_case)) ServerState)
+
+(derive (Serialize (rename-all :snake_case))
+        (Deserialize (rename-all :snake_case))
+        ServerState)
 
 (defn empty-repro [(a (dyn Allocator))] (-> Repro)
-  (Repro :bug "" :verdict "" :summary "" :check "" :tests (al-new [(slice u8)] a) :attempts (al-new [Attempt] a) :needs ""))
+  (Repro
+    :bug ""
+    :verdict ""
+    :summary ""
+    :check ""
+    :tests (ArrayList::new [(slice u8)] a)
+    :attempts (ArrayList::new [Attempt] a)
+    :needs ""))
 
 (defn empty-server-state [(a (dyn Allocator))] (-> ServerState)
-  (ServerState :snapshot (SnapshotSeen :id "" :received 0 :cells 0 :seen "" :digest "")
-               :triage (Triage :snapshot "" :digest "" :phase (TriageNone) :watch (idle-watch) :failure ""
-                               :open 0 :fixed 0 :not-a-bug 0 :events (al-new [Event] a))
-               :bugs (al-new [Bug] a) :base (Base :commit "" :compiler "" :built "")
-               :broken-main "" :triaged-digest "" :notes 0 :halted (Halt :reason "" :time "") :status-summary ""))
+  (ServerState
+    :snapshot
+      (SnapshotSeen
+        :id ""
+        :received 0
+        :cells 0
+        :seen ""
+        :digest "")
+    :triage
+      (Triage
+        :snapshot ""
+        :digest ""
+        :phase (TriageNone)
+        :watch (idle-watch)
+        :failure ""
+        :open 0
+        :fixed 0
+        :not-a-bug 0
+        :events (ArrayList::new [Event] a))
+    :bugs (ArrayList::new [Bug] a)
+    :base
+      (Base
+        :commit ""
+        :compiler ""
+        :built "")
+    :broken-main ""
+    :triaged-digest ""
+    :notes 0
+    :halted (Halt :reason "" :time "")
+    :status-summary ""))
 
 ;; ---------------------------------------------------------------------------
 ;; Reading and writing
 
-(defn decode-error [(a (dyn Allocator)) (what (slice u8)) (e DeError)] (-> (slice u8))
-  (join a [what " is not in the expected format (" (.ctx e) " at byte " (int-text a (.offset e)) ")"]))
+(defn decode-error [(a (dyn Allocator)) (what (slice u8)) (e DeError)]
+  (-> (slice u8))
+  (join a
+        [what
+         " is not in the expected format ("
+         (.ctx e)
+         " at byte "
+         (int-text a (.offset e))
+         ")"]))
 
 ;;; A JSON file decoded as `T`; a missing file is an error.
-(defn read-json-file [(T Deserialize)] [(a (dyn Allocator)) (path (slice u8))] (-> (Result T (slice u8)))
+(defn read-json-file [(T Deserialize)] [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result T (slice u8)))
   (match (read-required a path)
     (Err [why] (Err why))
-    (Ok [text] (match (from-json [T] a text)
-                 (Ok [value] (Ok value))
-                 (Err [e] (Err (decode-error a path e)))))))
+    (Ok [text]
+        (match (from-json [T] a text)
+          (Ok [value] (Ok value))
+          (Err [e] (Err (decode-error a path e)))))))
 
 (defn encode [(T Serialize)] [(a (dyn Allocator)) (value T)] (-> (slice u8))
-  (match (to-json-str a value)
-    (Ok [text] text)
-    (Err [_] (do (println "coil-bugs: a record could not be encoded as JSON") (abort) ""))))
+  (try (let [text
+               (try-or! (to-json-str a value)
+                        (do
+                          (println "coil-bugs: a record could not be encoded as JSON")
+                          (abort)
+                          ""))]
+         text)))
 
-(defn write-json-file [(T Serialize)] [(a (dyn Allocator)) (path (slice u8)) (value T) (mode i64)] (-> (Result i64 (slice u8)))
+(defn write-json-file [(T Serialize)] [(a (dyn Allocator))
+                                       (path (slice u8))
+                                       (value T)
+                                       (mode i64)] (-> (Result i64 (slice u8)))
   (write-text a path (join a [(encode a value) "\n"]) mode))

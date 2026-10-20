@@ -17,25 +17,25 @@
                :output (.output result)
                :message (if (.ok result)
                             ""
-                            (let [text (str-trim (.error result))]
+                            (let [text (trim (.error result))]
                               (if (> (len text) 0) text "git failed"))))))
 
 ;;; The top of the repository containing `path`, or None if it is not in one.
 (defn git-toplevel [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
   (let [result (git a path ["rev-parse" "--show-toplevel"])]
-    (if (.ok result) (Some (str-trim (.output result))) (None))))
+    (if (.ok result) (Some (trim (.output result))) (None))))
 
 (defn git-head [(a (dyn Allocator)) (repo (slice u8))] (-> (Option (slice u8)))
   (let [result (git a repo ["rev-parse" "HEAD"])]
-    (if (.ok result) (Some (str-trim (.output result))) (None))))
+    (if (.ok result) (Some (trim (.output result))) (None))))
 
 (defn git-short [(a (dyn Allocator)) (repo (slice u8)) (rev (slice u8))] (-> (slice u8))
   (let [result (git a repo ["rev-parse" "--short" rev])]
-    (if (.ok result) (str-trim (.output result)) rev)))
+    (if (.ok result) (trim (.output result)) rev)))
 
 (defn git-has-identity? [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
   (let [result (git a dir ["config" "user.email"])]
-    (and (.ok result) (> (len (str-trim (.output result))) 0))))
+    (and (.ok result) (> (len (trim (.output result))) 0))))
 
 ;;; Commit with the user's identity when git has one, and a clearly labelled
 ;;; factory identity otherwise.
@@ -67,7 +67,7 @@
 
 (defn git-dirty? [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
   (let [result (git a dir ["status" "--porcelain"])]
-    (and (.ok result) (> (len (str-trim (.output result))) 0))))
+    (and (.ok result) (> (len (trim (.output result))) 0))))
 
 ;;; Stage everything and commit it, if anything changed. `ok` with an empty
 ;;; output means there was nothing to commit.
@@ -87,13 +87,13 @@
 (defn git-diff-stat [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
   (let [committed (git a dir ["diff" "--stat" base])
         untracked (git a dir ["ls-files" "--others" "--exclude-standard"])
-        (mut out) (sb-new a)]
-    (sb-push-str! (mut out) (.output committed))
-    (when (> (len (str-trim (.output untracked))) 0)
-      (sb-push-str! (mut out) "untracked:\n")
-      (sb-push-str! (mut out) (.output untracked))
+        (mut out) (StrBuf::new a)]
+    (push-str! (mut out) (.output committed))
+    (when (> (len (trim (.output untracked))) 0)
+      (push-str! (mut out) "untracked:\n")
+      (push-str! (mut out) (.output untracked))
       0)
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; The full diff since `base` (tracked files), for review.
 (defn git-diff [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
@@ -104,22 +104,22 @@
 ;;; tracked changes, then each untracked file as a new file. The index is
 ;;; left alone. Longer than `limit` bytes, it is cut there with a note.
 (defn git-work-diff [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8)) (limit i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         tracked (git a dir ["diff" base])
         untracked (git a dir ["ls-files" "--others" "--exclude-standard" "-z"])]
-    (sb-push-str! (mut out) (.output tracked))
-    (for path (iter (str-split a (.output untracked) "\x00;"))
+    (push-str! (mut out) (.output tracked))
+    (for path (iter (split a (.output untracked) "\x00;"))
       (when (> (len path) 0)
         ;; `--no-index` exits 1 when the files differ, which is the point.
-        (sb-push-str! (mut out) (.output (git a dir ["diff" "--no-index" "--" "/dev/null" path])))
+        (push-str! (mut out) (.output (git a dir ["diff" "--no-index" "--" "/dev/null" path])))
         0))
-    (let [text (sb-finish! (mut out))]
+    (let [text (finish! (mut out))]
       (if (<= (len text) limit)
           text
-          (let [(mut cut) (sb-new a)]
-            (sb-push-str! (mut cut) (subslice text 0 limit))
-            (sb-push-str! (mut cut) "\n… (the diff is longer than this; it was cut here)\n")
-            (sb-finish! (mut cut)))))))
+          (let [(mut cut) (StrBuf::new a)]
+            (push-str! (mut cut) (subslice text 0 limit))
+            (push-str! (mut cut) "\n… (the diff is longer than this; it was cut here)\n")
+            (finish! (mut cut)))))))
 
 (defn git-deleted-files [(a (dyn Allocator)) (dir (slice u8)) (base (slice u8))] (-> (slice u8))
   (git-output (git a dir ["diff" "--name-only" "--diff-filter=D" base])))

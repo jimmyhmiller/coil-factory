@@ -220,6 +220,25 @@ mirror; `factory pull <run>` fetches the run branch back. Nothing but git and ss
 (`providers: [{name, base_url, key_env}]`). Keys come from the environment or
 `~/.factory/secrets.env` on that site.
 
+`chatgpt/…` is a ChatGPT subscription's models, reached the way Codex reaches
+them but without Codex: ChatGPT's Codex endpoint, over the Responses API
+(`ai.responses`), with the login Codex keeps in `CODEX_HOME/auth.json`
+(`factory.chatgpt`). The agent gets the factory's prompt and tools and nothing
+else, so it costs what the builtin harness costs, not what Codex costs (Codex
+adds about 10k tokens of its own to every request and, for some models, makes
+one model call per tool call). Details:
+
+- **Caching.** Every request of a conversation starts the same way: the same
+  instructions and tools, then the earlier items exactly as the model made
+  them, encrypted reasoning included (the server keeps nothing: `store:
+  false`). The conversation is named with `prompt_cache_key` and a
+  `session_id` header; without the header the endpoint caches nothing.
+  Reported usage includes `cached_input_tokens`.
+- **The login.** When the server refuses the access token, the file is read
+  again (Codex or the ChatGPT app may have renewed it), and only if it is
+  unchanged is it renewed with Codex's own OAuth refresh and written back in
+  Codex's format, so one login stays shared. Refresh tokens are single use.
+
 There is no built-in model: a station's model is the run's `--model`, then the
 station's `model:`, then the factory's, then the site's `default_model`
 (`opencode_model` for the opencode harness). `POST /v1/runs` refuses a run that

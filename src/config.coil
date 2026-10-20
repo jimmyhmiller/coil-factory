@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :as fs)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -20,14 +19,15 @@
 ;;;       agents/*.md          the site's standalone agents
 ;;;       runs/<id>/…          one directory per run
 
-(defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) base)
+(defn path-join [(a (dyn Allocator)) (base (slice u8)) (child (slice u8))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) base)
     (when (and (> (len base) 0) (!= (cast i64 (get base (- (len base) 1))) 47))
-      (sb-push-str! (mut out) "/")
+      (push-str! (mut out) "/")
       0)
-    (sb-push-str! (mut out) child)
-    (sb-finish! (mut out))))
+    (push-str! (mut out) child)
+    (finish! (mut out))))
 
 (defn factory-home [(a (dyn Allocator))] (-> (slice u8))
   (let [explicit (env-or a "FACTORY_HOME" "")]
@@ -38,24 +38,33 @@
 (defn runs-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
   (path-join a home "runs"))
 
-(defn run-dir [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+(defn run-dir [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))]
+  (-> (slice u8))
   (path-join a (runs-dir a home) run-id))
 
-(defn run-file [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8)) (name (slice u8))] (-> (slice u8))
+(defn run-file [(a (dyn Allocator))
+                (home (slice u8))
+                (run-id (slice u8))
+                (name (slice u8))] (-> (slice u8))
   (path-join a (run-dir a home run-id) name))
 
-(defn events-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+(defn events-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))]
+  (-> (slice u8))
   (run-file a home run-id "events.jsonl"))
 
-(defn workspace-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> (slice u8))
+(defn workspace-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))]
+  (-> (slice u8))
   (run-file a home run-id "workspace"))
 
-(defn transcript-path [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8)) (agent (slice u8))] (-> (slice u8))
-  (let [(mut name) (sb-new a)]
-    (sb-push-str! (mut name) "agents/")
-    (sb-push-str! (mut name) agent)
-    (sb-push-str! (mut name) ".json")
-    (run-file a home run-id (sb-finish! (mut name)))))
+(defn transcript-path [(a (dyn Allocator))
+                       (home (slice u8))
+                       (run-id (slice u8))
+                       (agent (slice u8))] (-> (slice u8))
+  (let [(mut name) (StrBuf::new a)]
+    (push-str! (mut name) "agents/")
+    (push-str! (mut name) agent)
+    (push-str! (mut name) ".json")
+    (run-file a home run-id (finish! (mut name)))))
 
 (defn factories-dir [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
   (path-join a home "factories"))
@@ -125,7 +134,8 @@
     (Ok [bytes] (Some bytes))
     (Err [failure] (None))))
 
-(defn json-str-or [(object JVal) (key (slice u8)) (fallback (slice u8))] (-> (slice u8))
+(defn json-str-or [(object JVal) (key (slice u8)) (fallback (slice u8))]
+  (-> (slice u8))
   (match (jv-get object key)
     (JStr [s] (if (> (len s) 0) s fallback))
     (_ fallback)))
@@ -146,13 +156,13 @@
   (match value
     (JStr [s] s)
     (JArr [items]
-          (let [(mut out) (sb-new a)
+          (let [(mut out) (StrBuf::new a)
                 (mut first) true]
             (for item (iter items)
-              (when (not (load first)) (sb-push-str! (mut out) ", ") 0)
-              (sb-push-str! (mut out) (jv-string-or item ""))
+              (when (not (load first)) (push-str! (mut out) ", ") 0)
+              (push-str! (mut out) (jv-string-or item ""))
               (set! first false))
-            (sb-finish! (mut out))))
+            (finish! (mut out))))
     (_ "")))
 
 ;;; The site's configuration: site.json when present, otherwise defaults.
@@ -161,14 +171,16 @@
   (SiteConfigOk [(config SiteConfig)])
   (SiteConfigBad [(message (slice u8))]))
 
-(defn load-site-config [(a (dyn Allocator)) (home (slice u8))] (-> SiteConfigResult)
-  (let [(mut config) (primitive/zeroed SiteConfig)
+(defn load-site-config [(a (dyn Allocator)) (home (slice u8))]
+  (-> SiteConfigResult)
+  (let [(mut config) (zeroed SiteConfig)
         path (path-join a home "site.json")]
     (set! (.home config) home)
-    (set! (.providers config) (al-new [ProviderDecl] a))
-    (let [root (match (read-text a path)
-                 (None [] (Some (jv-object a)))
-                 (Some [text] (jv-parse a text)))]
+    (set! (.providers config) (ArrayList::new [ProviderDecl] a))
+    (let [root
+            (match (read-text a path)
+              (None [] (Some (jv-object a)))
+              (Some [text] (jv-parse a text)))]
       (match root
         (None [] (SiteConfigBad "site.json is not valid JSON"))
         (Some [object]
@@ -176,46 +188,68 @@
                 (set! (.name config) (json-str-or object "name" (hostname a)))
                 (set! (.port config) (json-int-or object "port" 7788))
                 (set! (.max-runs config) (json-int-or object "max_runs" 4))
-                (set! (.isolation config) (json-str-or object "isolation" "none"))
-                (set! (.default-model config) (json-str-or object "default_model" ""))
-                (set! (.default-harness config) (json-str-or object "default_harness" "builtin"))
+                (set! (.isolation config)
+                      (json-str-or object "isolation" "none"))
+                (set! (.default-model config)
+                      (json-str-or object "default_model" ""))
+                (set! (.default-harness config)
+                      (json-str-or object "default_harness" "builtin"))
                 (set! (.opencode config) (json-str-or object "opencode" ""))
-                (set! (.opencode-model config) (json-str-or object "opencode_model" ""))
+                (set! (.opencode-model config)
+                      (json-str-or object "opencode_model" ""))
                 (set! (.codex config) (json-str-or object "codex" ""))
-                (set! (.codex-model config) (json-str-or object "codex_model" ""))
-                (set! (.codex-writable config) (names-text a (jv-get object "codex_writable")))
+                (set! (.codex-model config)
+                      (json-str-or object "codex_model" ""))
+                (set! (.codex-writable config)
+                      (names-text a (jv-get object "codex_writable")))
                 (set! (.codex-network config)
-                      (match (jv-get object "codex_network") (JBool [allowed] allowed) (_ false)))
-                (set! (.approvals-url config) (json-str-or (jv-get object "approvals") "url" ""))
-                (set! (.approvals-token-file config) (json-str-or (jv-get object "approvals") "token_file" ""))
-                (set! (.reviewers config) (names-text a (jv-get object "reviewers")))
+                      (match (jv-get object "codex_network")
+                        (JBool [allowed] allowed)
+                        (_ false)))
+                (set! (.approvals-url config)
+                      (json-str-or (jv-get object "approvals") "url" ""))
+                (set! (.approvals-token-file config)
+                      (json-str-or (jv-get object "approvals") "token_file" ""))
+                (set! (.reviewers config)
+                      (names-text a (jv-get object "reviewers")))
                 (let [overseer (jv-get object "overseer")]
-                  (set! (.overseer-policy config) (json-str-or overseer "policy" "nudge"))
-                  (set! (.overseer-interval-s config) (json-int-or overseer "interval_seconds" 20)))
+                  (set! (.overseer-policy config)
+                        (json-str-or overseer "policy" "nudge"))
+                  (set! (.overseer-interval-s config)
+                        (json-int-or overseer "interval_seconds" 20)))
                 (let [providers (jv-get object "providers")
                       n (jv-count providers)
                       (mut i) 0]
                   (loop (if (>= (load i) n)
                             (break)
                             (let [entry (jv-nth providers (load i))
-                                  (mut decl) (primitive/zeroed ProviderDecl)]
+                                  (mut decl) (zeroed ProviderDecl)]
                               (set! (.name decl) (json-str-or entry "name" ""))
-                              (set! (.base-url decl) (json-str-or entry "base_url" ""))
-                              (set! (.key-env decl) (json-str-or entry "key_env" ""))
-                              (push! [ProviderDecl] (mut (.providers config)) (load decl))
+                              (set! (.base-url decl)
+                                    (json-str-or entry "base_url" ""))
+                              (set! (.key-env decl)
+                                    (json-str-or entry "key_env" ""))
+                              (push! [ProviderDecl]
+                                     (mut (.providers config))
+                                     (load decl))
                               (set! i (+ (load i) 1))))))
                 (cond (not (match (jv-get object "codex_network")
-                             (JNull [] true) (JBool [allowed] true) (_ false)))
+                             (JNull [] true)
+                             (JBool [allowed] true)
+                             (_ false)))
                         (SiteConfigBad "site.json: codex_network must be a boolean")
                       (not (jv-null? (jv-get (jv-get object "overseer") "model")))
                         (SiteConfigBad "site.json: overseer.model is gone. Judging is done by reviewers, each with its own model and harness: name them in site.json \"reviewers\", a factory's `reviewers:`, or `factory start --reviewers`")
-                      (not (or (= (.isolation config) "none") (= (.isolation config) "sandbox")))
+                      (not (or (= (.isolation config) "none")
+                               (= (.isolation config) "sandbox")))
                         (SiteConfigBad "site.json: isolation must be \"none\" or \"sandbox\"")
                       (not (or (= (.overseer-policy config) "observe")
                                (= (.overseer-policy config) "nudge")
                                (= (.overseer-policy config) "pause")))
                         (SiteConfigBad "site.json: overseer.policy must be observe, nudge, or pause")
-                      (not (or (= (.default-harness config) "builtin") (= (.default-harness config) "opencode") (= (.default-harness config) "codex")))
+                      (not (or (= (.default-harness config) "builtin")
+                               (= (.default-harness config) "opencode")
+                               (= (.default-harness config) "codex")))
                         (SiteConfigBad "site.json: default_harness must be \"builtin\", \"opencode\", or \"codex\"")
                       (< (.max-runs config) 1)
                         (SiteConfigBad "site.json: max_runs must be at least 1")
@@ -223,24 +257,29 @@
 
 ;;; A secret by name: the environment first, then `secrets.env` in the site
 ;;; home (`NAME=value` lines; `#` comments). "" when absent.
-(defn secret [(a (dyn Allocator)) (home (slice u8)) (name (slice u8))] (-> (slice u8))
+(defn secret [(a (dyn Allocator)) (home (slice u8)) (name (slice u8))]
+  (-> (slice u8))
   (let [from-env (env-or a name "")]
     (if (> (len from-env) 0)
         from-env
         (match (read-text a (path-join a home "secrets.env"))
           (None [] "")
           (Some [text]
-                (let [lines (str-split a text "\n")
+                (let [lines (split a text "\n")
                       (mut found) ""]
                   (for raw (iter lines)
-                    (let [line (str-trim raw)]
+                    (let [line (trim raw)]
                       (when (and (> (len line) 0)
                                  (!= (cast i64 (get line 0)) 35)
                                  (= (len (load found)) 0))
-                        (match (str-find line "=")
+                        (match (find line "=")
                           (Some [at]
-                                (when (= (str-trim (subslice [u8] line 0 at)) name)
-                                  (set! found (str-trim (subslice [u8] line (+ at 1) (len line))))
+                                (when (= (trim (subslice [u8] line 0 at)) name)
+                                  (set! found
+                                        (trim (subslice [u8]
+                                                        line
+                                                        (+ at 1)
+                                                        (len line))))
                                   0))
                           (None [] 0))
                         0)))

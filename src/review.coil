@@ -1,7 +1,6 @@
 (module factory.review)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.scratch" :as scratch)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
@@ -23,16 +22,21 @@
 ;;; one of them approves (`run-reviews!`).
 
 (defn text-join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 ;;; Who an asked agent is: its name, and what it runs on. A reviewer is one;
 ;;; so is a station's summarizer.
-(defstruct AgentRole [(name (slice u8)) (harness (slice u8)) (model (slice u8)) (tools (slice u8))])
+(defstruct AgentRole
+  [(name (slice u8)) (harness (slice u8)) (model (slice u8)) (tools (slice u8))])
 
 (defn reviewer-role [(spec (ptr ReviewerSpec))] (-> AgentRole)
-  (AgentRole :name (.name spec) :harness (.harness spec) :model (.model spec) :tools (.tools spec)))
+  (AgentRole
+    :name (.name spec)
+    :harness (.harness spec)
+    :model (.model spec)
+    :tools (.tools spec)))
 
 ;;; Everything one asked agent needs, owned by its thread until `done`, and its
 ;;; reply. Strings live in `arena`.
@@ -59,44 +63,52 @@
 
 (impl AgentControl ReviewControl
   (control-check [(self (ptr ReviewControl))] (-> Control)
-                 (if (!= (atomic-ops/atomic-load (.stopping self)) 0) (Cancel) (Proceed)))
-  (control-inbox [(self (ptr ReviewControl)) (a (dyn Allocator))] (-> (ArrayList Inbound))
-                 (al-new [Inbound] a))
-  (control-idle [(self (ptr ReviewControl))] (-> i64) (sleep-ms 250)))
+    (if (!= (atomic-ops/read (.stopping self)) 0) (Cancel) (Proceed)))
+  (control-inbox [(self (ptr ReviewControl)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (ArrayList::new [Inbound] a))
+  (control-idle [(self (ptr ReviewControl))] (-> i64)
+    (sleep-ms 250)))
 
 ;;; A review's observer: it keeps only the token counts.
 (defstruct ReviewObserver [(input i64) (output i64)])
 
 (impl AgentObserver ReviewObserver
   (observe [(self (ptr ReviewObserver)) (event AgentEvent)] (-> i64)
-           (match event
-             (UsageReported [input output]
-                            (do (set! (.input self) (+ (.input self) input))
-                                (set! (.output self) (+ (.output self) output))
-                                0))
-             (_ 0))))
+    (match event
+      (UsageReported [input cached output]
+                     (do
+                       (set! (.input self) (+ (.input self) input))
+                       (set! (.output self) (+ (.output self) output))
+                       0))
+      (_ 0))))
 
 ;;; The body of a review's thread.
 (defn review-main [(arg (ptr i8))] (-> (ptr i8))
   (let [job (cast (ptr ReviewJob) arg)
-        a (scratch/scratch-allocator (.arena job))
+        a (allocator (.arena job))
         role (.role job)
         config (.config job)
         control (box! a ReviewControl (ReviewControl :stopping (.stopping job)))
         observer (box! a ReviewObserver (ReviewObserver :input 0 :output 0))
-        harness-name (if (> (len (.harness role)) 0) (.harness role) (.default-harness config))
-        request (AgentRequest :harness harness-name
-                              :model (.model role)
-                              :tools (.tools role)
-                              :finish false
-                              :gate ""
-                              :workspace (.workspace job)
-                              :run-dir (.run-dir job)
-                              :station (text-join a ["review-" (.name role)])
-                              :state-key (text-join a ["review-" (.name role)])
-                              :extra-tools (no-extra-tools)
-                              :agent-server (no-agent-server)
-                              :stop-tool "")]
+        harness-name
+          (if (> (len (.harness role)) 0)
+              (.harness role)
+              (.default-harness config))
+        request
+          (AgentRequest
+            :harness harness-name
+            :model (.model role)
+            :tools (.tools role)
+            :finish false
+            :gate ""
+            :workspace (.workspace job)
+            :run-dir (.run-dir job)
+            :station (text-join a ["review-" (.name role)])
+            :state-key (text-join a ["review-" (.name role)])
+            :extra-tools (no-extra-tools)
+            :agent-server (no-agent-server)
+            :stop-tool "")]
     (match (station-agent a config request observer control)
       (AgentUnavailable [message] (set! (.failure job) message))
       (AgentReady [ready]
@@ -106,13 +118,23 @@
                     (harness-add-user! agent (.context job))
                     (match (harness-run! agent)
                       (Replied [text] (set! (.reply job) text))
-                      (Finished [call result] (set! (.failure job) "the agent called a tool it was never given"))
+                      (Finished [call result]
+                                (set! (.failure job)
+                                      "the agent called a tool it was never given"))
                       (Cancelled [] (set! (.cancelled job) true))
-                      (Failed [failure] (let [e failure]
-                                          (set! (.failure job) (text-join a ["the model failed (" (.kind e) "): " (first-line a (.message e) 400)]))))))))
+                      (Failed [failure]
+                              (let [e failure]
+                                (set! (.failure job)
+                                      (text-join a
+                                                 ["the model failed ("
+                                                  (.kind e)
+                                                  "): "
+                                                  (first-line a
+                                                              (.message e)
+                                                              400)]))))))))
     (set! (.input-tokens job) (.input observer))
     (set! (.output-tokens job) (.output observer))
-    (atomic-ops/atomic-store (field job done) 1)
+    (atomic-ops/store (field job done) 1)
     (cast (ptr i8) 0)))
 
 ;; ---------------------------------------------------------------------------
@@ -140,13 +162,17 @@
 
 ;;; The instructions a reviewer judges a station's finished work under: its
 ;;; own instructions and reply format, and what its verdict does.
-(defn station-review-system-prompt [(a (dyn Allocator)) (spec (ptr ReviewerSpec))] (-> (slice u8))
-  (text-join a ["You are reviewing the finished work of one station of a software factory before it is accepted. "
-                "The station has called `finish` and its gate passed. Your verdict decides what happens next: "
-                "an ok verdict (" (quoted-alternatives a (.ok spec)) ") accepts the work; any other verdict sends it back to the "
-                "agent, with your reason and advice, to be redone. Judge the work in the workspace, not the agent's description of it. "
-                "Reject anything that breaks the rules below, even when the gate passed.\n\n"
-                (reviewer-system-prompt a spec)]))
+(defn station-review-system-prompt [(a (dyn Allocator))
+                                    (spec (ptr ReviewerSpec))] (-> (slice u8))
+  (text-join a
+             ["You are reviewing the finished work of one station of a software factory before it is accepted. "
+              "The station has called `finish` and its gate passed. Your verdict decides what happens next: "
+              "an ok verdict ("
+              (quoted-alternatives a (.ok spec))
+              ") accepts the work; any other verdict sends it back to the "
+              "agent, with your reason and advice, to be redone. Judge the work in the workspace, not the agent's description of it. "
+              "Reject anything that breaks the rules below, even when the gate passed.\n\n"
+              (reviewer-system-prompt a spec)]))
 
 ;;; What a reviewer of a station's finished work is shown.
 (defn station-review-context [(a (dyn Allocator))
@@ -162,19 +188,43 @@
                               (diff (slice u8))
                               (workspace (slice u8))
                               (round i64)] (-> (slice u8))
-  (let [(mut r) (sb-new a)]
-    (sb-push-i64! (mut r) round)
-    (text-join a ["## Brief\n" (if (> (len (str-trim brief)) 0) brief "(none)")
-                  "\n\n## The factory's shared context (rules every station works under)\n" (if (> (len (str-trim context)) 0) context "(none)")
-                  "\n\n## Station `" station "`: its instructions\n" instructions
-                  "\n\n## The agent's finish summary (review round " (sb-finish! (mut r)) ")\n" summary
-                  "\n\n## Gate\n" (if (> (len gate) 0) (text-join a ["`" gate "` passed. Its output ended:\n```\n" gate-output "\n```"]) "(this station has no gate)")
-                  "\n\n## What this station changed (against `" base "`, the commit it started from; untracked files are shown as new)\n```diff\n"
-                  (if (> (len (str-trim diff)) 0) diff "(no changes)")
-                  "\n```"
-                  (if (= (.tools spec) "read")
-                      (text-join a ["\n\n## Workspace\n`" workspace "` (read it, and run `git diff " base "` there for anything the diff above cut off)"])
-                      "")])))
+  (let [(mut r) (StrBuf::new a)]
+    (push-i64! (mut r) round)
+    (text-join a
+               ["## Brief\n"
+                (if (> (len (trim brief)) 0) brief "(none)")
+                "\n\n## The factory's shared context (rules every station works under)\n"
+                (if (> (len (trim context)) 0) context "(none)")
+                "\n\n## Station `"
+                station
+                "`: its instructions\n"
+                instructions
+                "\n\n## The agent's finish summary (review round "
+                (finish! (mut r))
+                ")\n"
+                summary
+                "\n\n## Gate\n"
+                (if (> (len gate) 0)
+                    (text-join a
+                               ["`"
+                                gate
+                                "` passed. Its output ended:\n```\n"
+                                gate-output
+                                "\n```"])
+                    "(this station has no gate)")
+                "\n\n## What this station changed (against `"
+                base
+                "`, the commit it started from; untracked files are shown as new)\n```diff\n"
+                (if (> (len (trim diff)) 0) diff "(no changes)")
+                "\n```"
+                (if (= (.tools spec) "read")
+                    (text-join a
+                               ["\n\n## Workspace\n`"
+                                workspace
+                                "` (read it, and run `git diff "
+                                base
+                                "` there for anything the diff above cut off)"])
+                    "")])))
 
 (defn new-job [(stable (dyn Allocator))
                (config (ptr SiteConfig))
@@ -185,21 +235,33 @@
                (agent (slice u8))
                (system (slice u8))
                (context (slice u8))] (-> (ptr ReviewJob))
-  (let [arena (box! stable scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))]
-    (scratch/scratch-init arena stable)
-    (let [ja (scratch/scratch-allocator arena)]
-      (box! ja ReviewJob
-            (ReviewJob :arena arena :config config
-                       :role (AgentRole :name (copy-bytes ja (.name role)) :harness (copy-bytes ja (.harness role))
-                                        :model (copy-bytes ja (.model role)) :tools (copy-bytes ja (.tools role)))
-                       :stopping stopping
-                       :workspace (copy-bytes ja workspace)
-                       :run-dir (copy-bytes ja run-dir)
-                       :agent (copy-bytes ja agent)
-                       :system (copy-bytes ja system)
-                       :context (copy-bytes ja context)
-                       :done 0 :cancelled false :reply "" :failure "" :label ""
-                       :input-tokens 0 :output-tokens 0)))))
+  (let [arena (box! stable scratch/ScratchArena (zeroed scratch/ScratchArena))]
+    (scratch/ScratchArena::init arena stable)
+    (let [ja (allocator arena)]
+      (box! ja
+            ReviewJob
+            (ReviewJob
+              :arena arena
+              :config config
+              :role
+                (AgentRole
+                  :name (copy-bytes ja (.name role))
+                  :harness (copy-bytes ja (.harness role))
+                  :model (copy-bytes ja (.model role))
+                  :tools (copy-bytes ja (.tools role)))
+              :stopping stopping
+              :workspace (copy-bytes ja workspace)
+              :run-dir (copy-bytes ja run-dir)
+              :agent (copy-bytes ja agent)
+              :system (copy-bytes ja system)
+              :context (copy-bytes ja context)
+              :done 0
+              :cancelled false
+              :reply ""
+              :failure ""
+              :label ""
+              :input-tokens 0
+              :output-tokens 0)))))
 
 ;;; What one asked agent replied, copied out of its job. `failure` is set
 ;;; when there is no reply (it could not start, or its model failed).
@@ -228,64 +290,101 @@
                    (agent (slice u8))
                    (control (dyn AgentControl))] (-> AgentsAsked)
   (let [stopping (box! a i64 0)
-        (mut jobs) (al-new [(ptr ReviewJob)] a)
-        (mut threads) (al-new [(ptr thread/Thread)] a)
-        (mut answers) (al-new [AgentAnswer] a)
+        (mut jobs) (ArrayList::new [(ptr ReviewJob)] a)
+        (mut threads) (ArrayList::new [(ptr thread/Thread)] a)
+        (mut answers) (ArrayList::new [AgentAnswer] a)
         (mut cancelled) false
         (mut i) 0]
     (loop (if (>= (load i) (len roles))
               (break)
-              (let [job (new-job a config (get roles (load i)) stopping workspace run-dir agent
-                                 (get systems (load i)) (get contexts (load i)))
-                    handle (box! a thread/Thread (primitive/zeroed thread/Thread))]
-                (if (= (thread/thread-spawn handle (fnptr-of review-main) (cast (ptr i8) job)) (cast i32 0))
+              (let [job
+                      (new-job a
+                               config
+                               (get roles (load i))
+                               stopping
+                               workspace
+                               run-dir
+                               agent
+                               (get systems (load i))
+                               (get contexts (load i)))
+                    handle (box! a thread/Thread (zeroed thread/Thread))]
+                (if (= (thread/Thread::spawn handle
+                                             (fnptr-of review-main)
+                                             (cast (ptr i8) job))
+                       (cast i32 0))
                     (do (push! (mut jobs) job) (push! (mut threads) handle) 0)
-                    (do (set! (.failure job) "could not start a thread for the agent")
-                        (atomic-ops/atomic-store (field job done) 1)
-                        (push! (mut jobs) job)
-                        (push! (mut threads) (cast (ptr thread/Thread) 0))
-                        0))
+                    (do
+                      (set! (.failure job)
+                            "could not start a thread for the agent")
+                      (atomic-ops/store (field job done) 1)
+                      (push! (mut jobs) job)
+                      (push! (mut threads) (cast (ptr thread/Thread) 0))
+                      0))
                 (set! i (+ (load i) 1)))))
-    (loop
-      (let [(mut all-done) true]
-        (for job (iter jobs)
-          (when (= (atomic-ops/atomic-load (field job done)) 0) (set! all-done false) 0))
-        (if (load all-done)
-            (break)
-            (do (match (control-check control)
-                  (Cancel [] (do (set! cancelled true) (atomic-ops/atomic-store stopping 1) 0))
-                  (_ 0))
-                (sleep-ms 250)))))
+    (loop (let [(mut all-done) true]
+            (for job (iter jobs)
+              (when (= (atomic-ops/read (field job done)) 0)
+                (set! all-done false)
+                0))
+            (if (load all-done)
+                (break)
+                (do
+                  (match (control-check control)
+                    (Cancel []
+                            (do
+                              (set! cancelled true)
+                              (atomic-ops/store stopping 1)
+                              0))
+                    (_ 0))
+                  (sleep-ms 250)))))
     (set! i 0)
     (loop (if (>= (load i) (len jobs))
               (break)
               (let [job (get jobs (load i))
                     handle (get threads (load i))]
                 (when (!= (cast i64 handle) 0)
-                  (thread/thread-join handle)
+                  (join handle)
                   (destroy a handle)
                   0)
-                (push! (mut answers) (AgentAnswer :name (copy-bytes a (.name (field job role))) :label (copy-bytes a (.label job))
-                                                  :reply (copy-bytes a (.reply job))
-                                                  :failure (if (and (.cancelled job) (= (len (.failure job)) 0))
-                                                               "cancelled"
-                                                               (copy-bytes a (.failure job)))
-                                                  :input-tokens (.input-tokens job) :output-tokens (.output-tokens job)))
+                (push! (mut answers)
+                       (AgentAnswer
+                         :name (copy-bytes a (.name (field job role)))
+                         :label (copy-bytes a (.label job))
+                         :reply (copy-bytes a (.reply job))
+                         :failure
+                           (if (and (.cancelled job) (= (len (.failure job)) 0))
+                               "cancelled"
+                               (copy-bytes a (.failure job)))
+                         :input-tokens (.input-tokens job)
+                         :output-tokens (.output-tokens job)))
                 (let [arena (.arena job)]
-                  (scratch/scratch-close! arena)
+                  (close! arena)
                   (destroy a arena))
                 (set! i (+ (load i) 1)))))
     (if (load cancelled) (AgentsCancelled) (AgentsAnswered (load answers)))))
 
-(defn outcome-of [(a (dyn Allocator)) (spec (ptr ReviewerSpec)) (answer AgentAnswer)] (-> ReviewOutcome)
-  (let [base (ReviewOutcome :reviewer (.name answer) :label (.label answer)
-                            :verdict "" :level "" :confidence 0.0 :reason "" :advice ""
-                            :failure (.failure answer)
-                            :input-tokens (.input-tokens answer) :output-tokens (.output-tokens answer))]
+(defn outcome-of [(a (dyn Allocator))
+                  (spec (ptr ReviewerSpec))
+                  (answer AgentAnswer)] (-> ReviewOutcome)
+  (let [base
+          (ReviewOutcome
+            :reviewer (.name answer)
+            :label (.label answer)
+            :verdict ""
+            :level ""
+            :confidence 0.0
+            :reason ""
+            :advice ""
+            :failure (.failure answer)
+            :input-tokens (.input-tokens answer)
+            :output-tokens (.output-tokens answer))]
     (if (> (len (.failure answer)) 0)
         base
         (match (parse-verdict a spec (.reply answer))
-          (VerdictBad [message] (let [(mut o) base] (set! (.failure o) (copy-bytes a message)) (load o)))
+          (VerdictBad [message]
+                      (let [(mut o) base]
+                        (set! (.failure o) (copy-bytes a message))
+                        (load o)))
           (VerdictOk [verdict level confidence reason advice]
                      (let [(mut o) base]
                        (set! (.verdict o) (copy-bytes a verdict))
@@ -306,15 +405,27 @@
                     (run-dir (slice u8))
                     (agent (slice u8))
                     (control (dyn AgentControl))] (-> ReviewsResult)
-  (let [(mut roles) (al-new [AgentRole] a)]
+  (let [(mut roles) (ArrayList::new [AgentRole] a)]
     (for spec (iter specs) (push! (mut roles) (reviewer-role spec)))
-    (match (ask-agents! a config (al-slice roles) systems contexts workspace run-dir agent control)
+    (match (ask-agents! a
+                        config
+                        (slice roles)
+                        systems
+                        contexts
+                        workspace
+                        run-dir
+                        agent
+                        control)
       (AgentsCancelled [] (ReviewsCancelled))
       (AgentsAnswered [answers]
-                      (let [(mut outcomes) (al-new [ReviewOutcome] a)
+                      (let [(mut outcomes) (ArrayList::new [ReviewOutcome] a)
                             (mut i) 0]
                         (loop (if (>= (load i) (len answers))
                                   (break)
-                                  (do (push! (mut outcomes) (outcome-of a (get specs (load i)) (get answers (load i))))
-                                      (set! i (+ (load i) 1)))))
+                                  (do
+                                    (push! (mut outcomes)
+                                           (outcome-of a
+                                                       (get specs (load i))
+                                                       (get answers (load i))))
+                                    (set! i (+ (load i) 1)))))
                         (ReviewsDone (load outcomes)))))))

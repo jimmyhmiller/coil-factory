@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.json" :use *)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
@@ -16,23 +15,24 @@
 (defn copy-bytes [(a (dyn Allocator)) (bytes (slice u8))] (-> (slice u8))
   (if (= (len bytes) 0)
       ""
-      (match (str-concat a "" bytes)
+      (match (concat a "" bytes)
         (Some [owned] owned)
-        (None [] (fail [(slice u8)] "agent.json: out of memory copying a string")))))
+        (None []
+              (fail [(slice u8)] "agent.json: out of memory copying a string")))))
 
 (defn jv-object [(a (dyn Allocator))] (-> JVal)
   (JObj (box! a
               (HashMap (slice u8) JVal)
-              (hm-new [(slice u8) JVal] a (str-keyops-borrowed)))))
+              (HashMap::new [(slice u8) JVal] a (keyops-borrowed)))))
 
 (defn jv-array [(a (dyn Allocator))] (-> JVal)
-  (JArr (box! a (ArrayList JVal) (al-new [JVal] a))))
+  (JArr (box! a (ArrayList JVal) (ArrayList::new [JVal] a))))
 
 ;;; Store `value` under `key`. The key is borrowed: pass a literal or a copy
 ;;; that lives as long as the object.
 (defn jv-put! [(object JVal) (key (slice u8)) (value JVal)] (-> i64)
   (match object
-    (JObj [map] (do (hm-put! map key value) 0))
+    (JObj [map] (do (set! map key value) 0))
     (_ (fail [i64] "agent.json: jv-put! on a value that is not an object"))))
 
 (defn jv-push! [(array JVal) (value JVal)] (-> i64)
@@ -66,14 +66,15 @@
             result))
     (JObj [map]
           (let [result (jv-object a)]
-            (hm-for [k v map]
-                    (jv-put! result (copy-bytes a k) (jv-clone a v)))
+            (for-entries [k v map]
+                         (jv-put! result (copy-bytes a k) (jv-clone a v)))
             result))))
 
 (defn jv-encode [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
   (match (to-json-str a value)
     (Ok [encoded] encoded)
-    (Err [failure] (fail [(slice u8)] "agent.json: could not encode a JSON value"))))
+    (Err [failure]
+         (fail [(slice u8)] "agent.json: could not encode a JSON value"))))
 
 (defn jv-parse [(a (dyn Allocator)) (text (slice u8))] (-> (Option JVal))
   (match (from-json [JVal] a text)
@@ -86,7 +87,8 @@
     (_ fallback)))
 
 ;;; `{"role": role, "content": text}` with the text copied into `a`.
-(defn chat-message [(a (dyn Allocator)) (role (slice u8)) (text (slice u8))] (-> JVal)
+(defn chat-message [(a (dyn Allocator)) (role (slice u8)) (text (slice u8))]
+  (-> JVal)
   (let [message (jv-object a)]
     (jv-put! message "role" (JStr role))
     (jv-put! message "content" (JStr (copy-bytes a text)))

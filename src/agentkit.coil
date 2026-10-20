@@ -1,7 +1,6 @@
 (module factory.agentkit)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -57,8 +56,16 @@
    ;;; this program, which must then dispatch it to `agent-server-main`.
    (server-program (slice u8))])
 
-(defn agent-call [(input (slice u8)) (workdir (slice u8)) (home (slice u8))] (-> AgentCall)
-  (AgentCall :input input :model "" :harness "" :workdir workdir :home home :state-dir "" :server-program ""))
+(defn agent-call [(input (slice u8)) (workdir (slice u8)) (home (slice u8))]
+  (-> AgentCall)
+  (AgentCall
+    :input input
+    :model ""
+    :harness ""
+    :workdir workdir
+    :home home
+    :state-dir ""
+    :server-program ""))
 
 (defstruct AgentResult
   [(ok bool)
@@ -71,6 +78,8 @@
    ;;; The model, and the harness when it is not the builtin one.
    (label (slice u8))
    (input-tokens i64)
+   ;;; The part of `input-tokens` served from the provider's prompt cache.
+   (cached-input-tokens i64)
    (output-tokens i64)
    ;;; Why the token counts are too low, when the harness could not count
    ;;; every run; "" when they are complete.
@@ -83,51 +92,84 @@
 (defstruct Unattended [(unused u8)])
 
 (impl AgentControl Unattended
-  (control-check [(self (ptr Unattended))] (-> Control) (Proceed))
-  (control-inbox [(self (ptr Unattended)) (a (dyn Allocator))] (-> (ArrayList Inbound)) (al-new [Inbound] a))
-  (control-idle [(self (ptr Unattended))] (-> i64) (sleep-ms 250)))
+  (control-check [(self (ptr Unattended))] (-> Control)
+    (Proceed))
+  (control-inbox [(self (ptr Unattended)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (ArrayList::new [Inbound] a))
+  (control-idle [(self (ptr Unattended))] (-> i64)
+    (sleep-ms 250)))
 
 ;;; An observer for an agent nobody watches.
 (defstruct Unobserved [(unused u8)])
 
 (impl AgentObserver Unobserved
-  (observe [(self (ptr Unobserved)) (event AgentEvent)] (-> i64) 0))
+  (observe [(self (ptr Unobserved)) (event AgentEvent)] (-> i64)
+    0))
 
 ;;; Counts tokens on the way to the caller's observer. `unknown` is why the
 ;;; counts are low (the first reason given), or "".
-(defstruct Counting [(inner (dyn AgentObserver)) (allocator (dyn Allocator)) (input i64) (output i64) (unknown (slice u8))])
+(defstruct Counting
+  [(inner (dyn AgentObserver))
+   (allocator (dyn Allocator))
+   (input i64)
+   (cached i64)
+   (output i64)
+   (unknown (slice u8))])
 
-(defn counting-new [(a (dyn Allocator)) (inner (dyn AgentObserver))] (-> Counting)
-  (Counting :inner inner :allocator a :input 0 :output 0 :unknown ""))
+(defn counting-new [(a (dyn Allocator)) (inner (dyn AgentObserver))]
+  (-> Counting)
+  (Counting
+    :inner inner
+    :allocator a
+    :input 0
+    :cached 0
+    :output 0
+    :unknown ""))
 
 (impl AgentObserver Counting
   (observe [(self (ptr Counting)) (event AgentEvent)] (-> i64)
-           (do (match event
-                 (UsageReported [input output]
-                                (do (set! (.input self) (+ (.input self) input))
-                                    (set! (.output self) (+ (.output self) output))
-                                    0))
-                 (UsageUnknown [reason]
-                               (do (when (= (len (.unknown self)) 0)
-                                     (set! (.unknown self) (copy-bytes (.allocator self) reason))
-                                     0)
-                                   0))
-                 (_ 0))
-               (observe (.inner self) event))))
+    (do
+      (match event
+        (UsageReported [input cached output]
+                       (do
+                         (set! (.input self) (+ (.input self) input))
+                         (set! (.cached self) (+ (.cached self) cached))
+                         (set! (.output self) (+ (.output self) output))
+                         0))
+        (UsageUnknown [reason]
+                      (do
+                        (when (= (len (.unknown self)) 0)
+                          (set! (.unknown self)
+                                (copy-bytes (.allocator self) reason))
+                          0)
+                        0))
+        (_ 0))
+      (observe (.inner self) event))))
 
 (defn kit-cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 (defn failed-result [(a (dyn Allocator)) (failure (slice u8))] (-> AgentResult)
-  (AgentResult :ok false :reports (al-new [Report] a) :summary "" :failure failure :label ""
-               :input-tokens 0 :output-tokens 0 :usage-unknown "" :checkpoint ""))
+  (AgentResult
+    :ok false
+    :reports (ArrayList::new [Report] a)
+    :summary ""
+    :failure failure
+    :label ""
+    :input-tokens 0
+    :cached-input-tokens 0
+    :output-tokens 0
+    :usage-unknown ""
+    :checkpoint ""))
 
 ;;; Whether the agent runs commands: run tools, mcp servers, or a gate.
 (defn has-commands? [(spec (ptr AgentSpec))] (-> bool)
   (let [(mut found) (> (len (.gate spec)) 0)]
-    (for tool (iter (.agent-tools spec)) (when (not (= (.kind tool) "collect")) (set! found true) 0))
+    (for tool (iter (.agent-tools spec))
+      (when (not (= (.kind tool) "collect")) (set! found true) 0))
     (load found)))
 
 ;; ---------------------------------------------------------------------------
@@ -135,42 +177,82 @@
 
 ;;; The instructions an agent works under: its own, then how its output is
 ;;; read. `prefix` is what the harness puts in front of its tools' names.
-(defn agent-system-prompt [(a (dyn Allocator)) (spec (ptr AgentSpec)) (workdir (slice u8)) (tools-note (slice u8)) (prefix (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
-        (mut collect) (sb-new a)
-        (mut rules) (sb-new a)]
+(defn agent-system-prompt [(a (dyn Allocator))
+                           (spec (ptr AgentSpec))
+                           (workdir (slice u8))
+                           (tools-note (slice u8))
+                           (prefix (slice u8))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
+        (mut collect) (StrBuf::new a)
+        (mut rules) (StrBuf::new a)]
     (for tool (iter (.agent-tools spec))
       (when (= (.kind tool) "collect")
-        (when (> (len (sb-str (load collect))) 0) (sb-push-str! (mut collect) ", ") 0)
-        (sb-push-str! (mut collect) (kit-cat a ["`" prefix (.name tool) "`"]))
+        (when (> (len (str (load collect))) 0) (push-str! (mut collect) ", ") 0)
+        (push-str! (mut collect) (kit-cat a ["`" prefix (.name tool) "`"]))
         0)
       (for field-name (iter (.verbatim tool))
-        (sb-push-str! (mut rules) (kit-cat a ["\n- `" prefix (.name tool) "`'s `" field-name "` must be copied exactly from the input; a call whose `"
-                                              field-name "` is not in the input is refused."]))))
-    (sb-push-str! (mut out) (.instructions spec))
-    (sb-push-str! (mut out) (kit-cat a ["\n\n## How you work\n\nYou are `" (.name spec) "`, a standalone agent. "]))
-    (when (> (len (.input spec)) 0) (sb-push-str! (mut out) (kit-cat a ["Your input: " (.input spec) " "])) 0)
-    (sb-push-str! (mut out) "It is in the next message, between <input> and </input>.\n\n")
-    (if (> (len (sb-str (load collect))) 0)
-        (sb-push-str! (mut out) (kit-cat a ["Your output is the calls you make to " (sb-str (load collect))
-                                            "; text you write outside of tool calls is not kept. Each call is recorded with a number, and `"
-                                            prefix RETRACT-TOOL "` takes one back if it turns out to be wrong."]))
-        (sb-push-str! (mut out) "Your output is what you do with your tools and the summary you give `done`; text you write outside of tool calls is not kept."))
-    (sb-push-str! (mut out) (sb-str (load rules)))
+        (push-str! (mut rules)
+                   (kit-cat a
+                            ["\n- `"
+                             prefix
+                             (.name tool)
+                             "`'s `"
+                             field-name
+                             "` must be copied exactly from the input; a call whose `"
+                             field-name
+                             "` is not in the input is refused."]))))
+    (push-str! (mut out) (.instructions spec))
+    (push-str! (mut out)
+               (kit-cat a
+                        ["\n\n## How you work\n\nYou are `"
+                         (.name spec)
+                         "`, a standalone agent. "]))
+    (when (> (len (.input spec)) 0)
+      (push-str! (mut out) (kit-cat a ["Your input: " (.input spec) " "]))
+      0)
+    (push-str! (mut out)
+               "It is in the next message, between <input> and </input>.\n\n")
+    (if (> (len (str (load collect))) 0)
+        (push-str! (mut out)
+                   (kit-cat a
+                            ["Your output is the calls you make to "
+                             (str (load collect))
+                             "; text you write outside of tool calls is not kept. Each call is recorded with a number, and `"
+                             prefix
+                             RETRACT-TOOL
+                             "` takes one back if it turns out to be wrong."]))
+        (push-str! (mut out)
+                   "Your output is what you do with your tools and the summary you give `done`; text you write outside of tool calls is not kept."))
+    (push-str! (mut out) (str (load rules)))
     (when (> (len (.tools spec)) 0)
-      (sb-push-str! (mut out) (kit-cat a ["\n\nYou also have the " (.tools spec) " tools (" tools-note "), which work in `" workdir "`."]))
+      (push-str! (mut out)
+                 (kit-cat a
+                          ["\n\nYou also have the "
+                           (.tools spec)
+                           " tools ("
+                           tools-note
+                           "), which work in `"
+                           workdir
+                           "`."]))
       0)
     (when (> (len (.gate spec)) 0)
-      (sb-push-str! (mut out) "\n\nWhen you call `done`, your results are checked; if the check fails you are told why and continue.")
+      (push-str! (mut out)
+                 "\n\nWhen you call `done`, your results are checked; if the check fails you are told why and continue.")
       0)
-    (sb-push-str! (mut out) (kit-cat a ["\n\nWhen you have done everything your instructions ask, call `" prefix DONE-TOOL
-                                        "` with a short summary. Until then, every reply calls a tool."]))
-    (sb-finish! (mut out))))
+    (push-str! (mut out)
+               (kit-cat a
+                        ["\n\nWhen you have done everything your instructions ask, call `"
+                         prefix
+                         DONE-TOOL
+                         "` with a short summary. Until then, every reply calls a tool."]))
+    (finish! (mut out))))
 
-(defn agent-input-message [(a (dyn Allocator)) (input (slice u8))] (-> (slice u8))
+(defn agent-input-message [(a (dyn Allocator)) (input (slice u8))]
+  (-> (slice u8))
   (kit-cat a ["<input>\n" input "\n</input>"]))
 
-(const REMINDER "You replied without calling a tool. Only your tool calls are kept: use your tools, then call `done`.")
+(const REMINDER
+       "You replied without calling a tool. Only your tool calls are kept: use your tools, then call `done`.")
 
 ;;; The reports as JSON: `[{"number": N, "tool": …, "arguments": {…}}]`.
 (defn reports-json [(a (dyn Allocator)) (reports (ArrayList Report))] (-> JVal)
@@ -196,26 +278,51 @@
 ;;; What checks an agent's results when it calls `done`. `results` is
 ;;; `{"agent": …, "summary": …, "reports": [...]}`.
 (deftrait ResultGate [Self]
-  (gate-check [(self (ptr Self)) (a (dyn Allocator)) (results (slice u8))] (-> GateOutcome)))
+  (gate-check [(self (ptr Self)) (a (dyn Allocator)) (results (slice u8))]
+    (-> GateOutcome)))
 
 (defstruct NoGate [(unused u8)])
 
 (impl ResultGate NoGate
-  (gate-check [(self (ptr NoGate)) (a (dyn Allocator)) (results (slice u8))] (-> GateOutcome) (GatePassed)))
+  (gate-check [(self (ptr NoGate)) (a (dyn Allocator)) (results (slice u8))]
+    (-> GateOutcome)
+    (GatePassed)))
 
 ;;; The agent's `gate:` command, with the results on its standard input.
-(defstruct CommandGate [(command (slice u8)) (place AgentPlace) (control (dyn AgentControl))])
+(defstruct CommandGate
+  [(command (slice u8)) (place AgentPlace) (control (dyn AgentControl))])
 
 (impl ResultGate CommandGate
-  (gate-check [(self (ptr CommandGate)) (a (dyn Allocator)) (results (slice u8))] (-> GateOutcome)
-              (let [context (box! a ControlledContext (ControlledContext :control (.control self)))]
-                (match (run-agent-command a (.place self) (.command self) results GATE-TIMEOUT-MS context)
-                  (Err [message] (GateBroken (kit-cat a ["the gate `" (.command self) "` could not run: " message])))
-                  (Ok [finished]
-                      (let [(mut ran) finished]
-                        (cond (command-ok? (mut ran)) (GatePassed)
-                              (.cancelled ran) (GateBroken "the agent was cancelled while its gate ran")
-                              :else (GateFailed (kit-cat a ["`" (.command self) "` " (command-failure a (mut ran))])))))))))
+  (gate-check [(self (ptr CommandGate))
+               (a (dyn Allocator))
+               (results (slice u8))] (-> GateOutcome)
+    (let [context
+            (box! a
+                  ControlledContext
+                  (ControlledContext :control (.control self)))]
+      (match (run-agent-command a
+                                (.place self)
+                                (.command self)
+                                results
+                                GATE-TIMEOUT-MS
+                                context)
+        (Err [message]
+             (GateBroken (kit-cat a
+                                  ["the gate `"
+                                   (.command self)
+                                   "` could not run: "
+                                   message])))
+        (Ok [finished]
+            (let [(mut ran) finished]
+              (cond (command-ok? (mut ran)) (GatePassed)
+                    (.cancelled ran)
+                      (GateBroken "the agent was cancelled while its gate ran")
+                    :else
+                      (GateFailed (kit-cat a
+                                           ["`"
+                                            (.command self)
+                                            "` "
+                                            (command-failure a (mut ran))])))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The conversation
@@ -241,67 +348,118 @@
         attempts (agent-attempts spec)]
     (harness-add-system! harness system)
     (harness-add-user! harness (agent-input-message a input))
-    (loop
-      (match (harness-run! harness)
-        (Finished [call result]
-                  (let [said (call-string call "summary")
-                        loaded (if (> (len results-file) 0) (collected-load! sink results-file) (Ok [i64 (slice u8)] 0))]
-                    (match loaded
-                      (Err [message] (do (set! failure message) (break)))
-                      (Ok [_]
-                          (let [results (jv-object a)]
-                            (jv-put! results "agent" (JStr (.name spec)))
-                            (jv-put! results "summary" (JStr said))
-                            (jv-put! results "reports" (reports-json a (.reports sink)))
-                            (match (gate-check gate a (jv-encode a results))
-                              (GatePassed [] (do (set! ok true) (set! summary said) (break)))
-                              (GateBroken [message] (do (set! failure message) (break)))
-                              (GateFailed [report]
-                                          (do (set! gate-failures (+ (load gate-failures) 1))
-                                              (if (>= (load gate-failures) attempts)
-                                                  (do (set! failure (kit-cat a ["the gate failed " (int-text a (load gate-failures))
-                                                                                " times; the last time " report]))
+    (loop (match (harness-run! harness)
+            (Finished [call result]
+                      (let [said (call-string call "summary")
+                            loaded
+                              (if (> (len results-file) 0)
+                                  (collected-load! sink results-file)
+                                  (Ok [i64 (slice u8)] 0))]
+                        (match loaded
+                          (Err [message] (do (set! failure message) (break)))
+                          (Ok [_]
+                              (let [results (jv-object a)]
+                                (jv-put! results "agent" (JStr (.name spec)))
+                                (jv-put! results "summary" (JStr said))
+                                (jv-put! results
+                                         "reports"
+                                         (reports-json a (.reports sink)))
+                                (match (gate-check gate a (jv-encode a results))
+                                  (GatePassed []
+                                              (do
+                                                (set! ok true)
+                                                (set! summary said)
+                                                (break)))
+                                  (GateBroken [message]
+                                              (do
+                                                (set! failure message)
+                                                (break)))
+                                  (GateFailed [report]
+                                              (do
+                                                (set! gate-failures
+                                                      (+ (load gate-failures) 1))
+                                                (if (>= (load gate-failures)
+                                                        attempts)
+                                                    (do
+                                                      (set! failure
+                                                            (kit-cat a
+                                                                     ["the gate failed "
+                                                                      (int-text a
+                                                                                (load gate-failures))
+                                                                      " times; the last time "
+                                                                      report]))
                                                       (break))
-                                                  (do (harness-add-user! harness (kit-cat a ["[gate] Your results did not pass the check: " report
-                                                                                             "\n\nFix what it says"
-                                                                                             (if (has-collect? spec) " (`retract` takes a report back)" "")
-                                                                                             ", then call `done` again."]))
+                                                    (do
+                                                      (harness-add-user! harness
+                                                                         (kit-cat a
+                                                                                  ["[gate] Your results did not pass the check: "
+                                                                                   report
+                                                                                   "\n\nFix what it says"
+                                                                                   (if (has-collect? spec)
+                                                                                       " (`retract` takes a report back)"
+                                                                                       "")
+                                                                                   ", then call `done` again."]))
                                                       0))))))))))
-        (Replied [text]
-                 (if (load reminded)
-                     (do (set! failure (kit-cat a ["the agent replied twice without calling a tool; its last reply: "
-                                                   (clipped a (str-trim text) 400)]))
-                         (break))
-                     (do (set! reminded true)
-                         (harness-add-user! harness REMINDER)
-                         0)))
-        (Cancelled [] (do (set! failure "the agent was cancelled") (break)))
-        (Failed [error]
-                (let [e error]
-                  (set! failure (kit-cat a ["the model failed (" (.kind e) "): " (clipped a (.message e) 400)]))
-                  (break)))))
+            (Replied [text]
+                     (if (load reminded)
+                         (do
+                           (set! failure
+                                 (kit-cat a
+                                          ["the agent replied twice without calling a tool; its last reply: "
+                                           (clipped a (trim text) 400)]))
+                           (break))
+                         (do
+                           (set! reminded true)
+                           (harness-add-user! harness REMINDER)
+                           0)))
+            (Cancelled [] (do (set! failure "the agent was cancelled") (break)))
+            (Failed [error]
+                    (let [e error]
+                      (set! failure
+                            (kit-cat a
+                                     ["the model failed ("
+                                      (.kind e)
+                                      "): "
+                                      (clipped a (.message e) 400)]))
+                      (break)))))
     (when (and (not (load ok)) (> (len results-file) 0))
       (collected-load! sink results-file)
       0)
-    (AgentResult :ok (load ok) :reports (.reports sink) :summary (load summary) :failure (load failure)
-                 :label "" :input-tokens 0 :output-tokens 0 :usage-unknown ""
-                 :checkpoint (harness-checkpoint harness a))))
+    (AgentResult
+      :ok (load ok)
+      :reports (.reports sink)
+      :summary (load summary)
+      :failure (load failure)
+      :label ""
+      :input-tokens 0
+      :cached-input-tokens 0
+      :output-tokens 0
+      :usage-unknown ""
+      :checkpoint (harness-checkpoint harness a))))
 
 ;; ---------------------------------------------------------------------------
 ;; Running an agent
 
 ;;; A new directory for one call's state, canonical (the macOS sandbox
 ;;; compares resolved paths).
-(defn make-temp-dir [(a (dyn Allocator)) (name (slice u8))] (-> (Result (slice u8) (slice u8)))
+(defn make-temp-dir [(a (dyn Allocator)) (name (slice u8))]
+  (-> (Result (slice u8) (slice u8)))
   (match (ids/random-hex a 8)
     (Err [e] (Err "could not make a name for the agent's temporary directory"))
     (Ok [hex]
-        (let [path (path-join a (env-or a "TMPDIR" "/tmp") (kit-cat a ["factory-agent-" name "-" hex]))]
+        (let [path
+                (path-join a
+                           (env-or a "TMPDIR" "/tmp")
+                           (kit-cat a ["factory-agent-" name "-" hex]))]
           (match (atomic/ensure-dir! a path 448)
             (Err [e] (Err (kit-cat a ["could not create " path])))
-            (Ok [_] (Ok (match (real-path a path) (Some [canonical] canonical) (None [] path)))))))))
+            (Ok [_]
+                (Ok (match (real-path a path)
+                      (Some [canonical] canonical)
+                      (None [] path)))))))))
 
-(defn write-state! [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> (Option (slice u8)))
+(defn write-state! [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))]
+  (-> (Option (slice u8)))
   (match (atomic/write-file-atomic! a path text 384)
     (Ok [_] (None))
     (Err [e] (Some (kit-cat a ["could not write " path])))))
@@ -316,44 +474,89 @@
                   (observer (dyn AgentObserver))
                   (control (dyn AgentControl))] (-> AgentResult)
   (block :run
-         (when (and (or (> (len (.tools spec)) 0) (has-commands? spec)) (= (len (.workdir call)) 0))
-           (return-from :run (failed-result a (kit-cat a ["agent \"" (.name spec) "\" has "
-                                                          (if (> (len (.tools spec)) 0) (kit-cat a ["the " (.tools spec) " tools"]) "commands")
-                                                          " but was given no directory to work in"])))
-           0)
-         (let [harness-name (cond (> (len (.harness call)) 0) (.harness call)
-                                  (> (len (.harness spec)) 0) (.harness spec)
-                                  :else (.default-harness config))
-               place (AgentPlace :home (.home call) :workdir (.workdir call) :isolation (.isolation config))
-               gate (if (> (len (.gate spec)) 0)
-                        (as-gate (box! a CommandGate (CommandGate :command (.gate spec) :place place :control control)))
-                        (as-gate (box! a NoGate (NoGate :unused 0))))]
-           (if (= harness-name "builtin")
-               (run-in-process! a config spec call harness-name place gate observer control)
-               (run-outside! a config spec call harness-name place gate observer control)))))
+    (when (and (or (> (len (.tools spec)) 0) (has-commands? spec))
+               (= (len (.workdir call)) 0))
+      (return-from
+        :run
+          (failed-result a
+                         (kit-cat a
+                                  ["agent \""
+                                   (.name spec)
+                                   "\" has "
+                                   (if (> (len (.tools spec)) 0)
+                                       (kit-cat a
+                                                ["the " (.tools spec) " tools"])
+                                       "commands")
+                                   " but was given no directory to work in"])))
+      0)
+    (let [harness-name
+            (cond (> (len (.harness call)) 0) (.harness call)
+                  (> (len (.harness spec)) 0) (.harness spec)
+                  :else (.default-harness config))
+          place
+            (AgentPlace
+              :home (.home call)
+              :workdir (.workdir call)
+              :isolation (.isolation config))
+          gate
+            (if (> (len (.gate spec)) 0)
+                (as-gate (box! a
+                               CommandGate
+                               (CommandGate
+                                 :command (.gate spec)
+                                 :place place
+                                 :control control)))
+                (as-gate (box! a NoGate (NoGate :unused 0))))]
+      (if (= harness-name "builtin")
+          (run-in-process! a
+                           config
+                           spec
+                           call
+                           harness-name
+                           place
+                           gate
+                           observer
+                           control)
+          (run-outside! a
+                        config
+                        spec
+                        call
+                        harness-name
+                        place
+                        gate
+                        observer
+                        control)))))
 
-(defn as-gate [(gate (dyn ResultGate))] (-> (dyn ResultGate)) gate)
+(defn as-gate [(gate (dyn ResultGate))] (-> (dyn ResultGate))
+  gate)
 
-(defn base-request [(spec (ptr AgentSpec)) (call AgentCall) (harness-name (slice u8))] (-> AgentRequest)
-  (AgentRequest :harness harness-name
-                :model (if (> (len (.model call)) 0) (.model call) (.model spec))
-                :tools (.tools spec)
-                :finish false
-                :gate ""
-                :workspace (.workdir call)
-                :run-dir ""
-                :station (.name spec)
-                :state-key ""
-                :extra-tools (no-extra-tools)
-                :agent-server (no-agent-server)
-                :stop-tool DONE-TOOL))
+(defn base-request [(spec (ptr AgentSpec))
+                    (call AgentCall)
+                    (harness-name (slice u8))] (-> AgentRequest)
+  (AgentRequest
+    :harness harness-name
+    :model (if (> (len (.model call)) 0) (.model call) (.model spec))
+    :tools (.tools spec)
+    :finish false
+    :gate ""
+    :workspace (.workdir call)
+    :run-dir ""
+    :station (.name spec)
+    :state-key ""
+    :extra-tools (no-extra-tools)
+    :agent-server (no-agent-server)
+    :stop-tool DONE-TOOL))
 
-(defn finish-result [(result (ptr AgentResult)) (ready StationAgent) (counting (ptr Counting))] (-> i64)
-  (do (set! (.label result) (.label ready))
-      (set! (.input-tokens result) (.input counting))
-      (set! (.output-tokens result) (.output counting))
-      (set! (.usage-unknown result) (.unknown counting))
-      0))
+(defn finish-result [(result (ptr AgentResult))
+                     (ready StationAgent)
+                     (counting (ptr Counting))] (-> i64)
+  (do
+    (set! (.label result) (.label ready))
+    (set! (.input-tokens result) (.input counting))
+    (set! (.cached-input-tokens result) (.cached counting))
+    (set! (.output-tokens result) (.output counting))
+    (set! (.usage-unknown result) (.unknown counting))
+    0))
 
 ;;; The builtin harness: the tools run here.
 (defn run-in-process! [(a (dyn Allocator))
@@ -373,14 +576,32 @@
           (let [(mut tools) made
                 counting (box! a Counting (counting-new a observer))
                 (mut request) (base-request spec call harness-name)]
-            (set! (.extra-tools request) (al-slice (.tools tools)))
-            (let [result (match (station-agent a config (load request) counting control)
-                           (AgentUnavailable [message] (failed-result a message))
-                           (AgentReady [ready]
-                                       (let [system (agent-system-prompt a spec (.workdir call) (.tools-note ready) (.tool-prefix ready))
-                                             (mut result) (converse! a (.harness ready) spec (.input call) system sink gate "")]
-                                         (finish-result (mut result) ready counting)
-                                         (load result))))]
+            (set! (.extra-tools request) (slice (.tools tools)))
+            (let [result
+                    (match (station-agent a
+                                          config
+                                          (load request)
+                                          counting
+                                          control)
+                      (AgentUnavailable [message] (failed-result a message))
+                      (AgentReady [ready]
+                                  (let [system
+                                          (agent-system-prompt a
+                                                               spec
+                                                               (.workdir call)
+                                                               (.tools-note ready)
+                                                               (.tool-prefix ready))
+                                        (mut result)
+                                          (converse! a
+                                                     (.harness ready)
+                                                     spec
+                                                     (.input call)
+                                                     system
+                                                     sink
+                                                     gate
+                                                     "")]
+                                    (finish-result (mut result) ready counting)
+                                    (load result))))]
               (agent-tools-close! (mut tools))
               result))))))
 
@@ -395,59 +616,115 @@
                     (gate (dyn ResultGate))
                     (observer (dyn AgentObserver))
                     (control (dyn AgentControl))] (-> AgentResult)
-  (block :outside
-         (let [temporary (= (len (.state-dir call)) 0)
-               dir (if temporary
-                       (match (make-temp-dir a (.name spec))
-                         (Err [message] (return-from :outside (failed-result a message)))
-                         (Ok [made] made))
-                       (match (atomic/ensure-dir! a (.state-dir call) 448)
-                         (Err [e] (return-from :outside (failed-result a (kit-cat a ["could not create " (.state-dir call)]))))
-                         (Ok [_] (match (real-path a (.state-dir call)) (Some [p] p) (None [] (.state-dir call))))))
-               agent-file (path-join a dir "agent.md")
-               input-file (path-join a dir "input.txt")
-               results-file (path-join a dir "results.jsonl")
-               error-file (path-join a dir "tools-error.txt")
-               result (block :prepared
-                             (match (write-state! a agent-file (.source spec))
-                               (Some [message] (return-from :prepared (failed-result a message)))
-                               (None [] 0))
-                             (match (write-state! a input-file (.input call))
-                               (Some [message] (return-from :prepared (failed-result a message)))
-                               (None [] 0))
-                             ;; A fresh call starts with no reports and no error.
-                             (atomic/unlink-path a results-file)
-                             (atomic/unlink-path a error-file)
-                             (let [program (if (> (len (.server-program call)) 0) (.server-program call) (self-executable a))
-                                   (mut server) (al-new [(slice u8)] a)
-                                   sink (box! a Collected (collected-new a))
-                                   counting (box! a Counting (counting-new a observer))
-                                   (mut request) (base-request spec call harness-name)]
-                               (set! (.run-dir request) dir)
-                               (for word (iter [program "_mcp-agent" "--agent" agent-file "--input" input-file "--results" results-file
-                                                "--error" error-file "--workdir" (.workdir call) "--home" (.home call)
-                                                "--isolation" (.isolation config)])
-                                 (push! (mut server) word))
-                               (set! (.agent-server request) (al-slice server))
-                               (match (station-agent a config (load request) counting control)
-                                 (AgentUnavailable [message] (failed-result a message))
-                                 (AgentReady [ready]
-                                             (let [system (agent-system-prompt a spec (.workdir call) (.tools-note ready) (.tool-prefix ready))
-                                                   (mut result) (converse! a (.harness ready) spec (.input call) system sink gate results-file)]
-                                               (finish-result (mut result) ready counting)
-                                               ;; When the tools could not be served, the server said why.
-                                               (when (not (.ok result))
-                                                 (match (atomic/read-file-if-exists a error-file)
-                                                   (Ok [found] (match found
-                                                                 (Some [text] (when (> (len (str-trim text)) 0)
-                                                                                (set! (.failure result) (kit-cat a [(str-trim text) " (" (.failure result) ")"]))
-                                                                                0))
-                                                                 (None [] 0)))
-                                                   (Err [e] 0))
-                                                 0)
-                                               (load result))))))]
-           (when temporary (atomic/remove-tree! a dir) 0)
-           result)))
+  (block
+    :outside
+      (let [temporary (= (len (.state-dir call)) 0)
+            dir
+              (if temporary
+                  (match (make-temp-dir a (.name spec))
+                    (Err [message]
+                         (return-from :outside (failed-result a message)))
+                    (Ok [made] made))
+                  (match (atomic/ensure-dir! a (.state-dir call) 448)
+                    (Err [e]
+                         (return-from
+                           :outside
+                             (failed-result a
+                                            (kit-cat a
+                                                     ["could not create "
+                                                      (.state-dir call)]))))
+                    (Ok [_]
+                        (match (real-path a (.state-dir call))
+                          (Some [p] p)
+                          (None [] (.state-dir call))))))
+            agent-file (path-join a dir "agent.md")
+            input-file (path-join a dir "input.txt")
+            results-file (path-join a dir "results.jsonl")
+            error-file (path-join a dir "tools-error.txt")
+            result
+              (block :prepared
+                (match (write-state! a agent-file (.source spec))
+                  (Some [message]
+                        (return-from :prepared (failed-result a message)))
+                  (None [] 0))
+                (match (write-state! a input-file (.input call))
+                  (Some [message]
+                        (return-from :prepared (failed-result a message)))
+                  (None [] 0))
+                ;; A fresh call starts with no reports and no error.
+                (atomic/unlink-path a results-file)
+                (atomic/unlink-path a error-file)
+                (let [program
+                        (if (> (len (.server-program call)) 0)
+                            (.server-program call)
+                            (self-executable a))
+                      (mut server) (ArrayList::new [(slice u8)] a)
+                      sink (box! a Collected (collected-new a))
+                      counting (box! a Counting (counting-new a observer))
+                      (mut request) (base-request spec call harness-name)]
+                  (set! (.run-dir request) dir)
+                  (for word (iter [program
+                                   "_mcp-agent"
+                                   "--agent"
+                                   agent-file
+                                   "--input"
+                                   input-file
+                                   "--results"
+                                   results-file
+                                   "--error"
+                                   error-file
+                                   "--workdir"
+                                   (.workdir call)
+                                   "--home"
+                                   (.home call)
+                                   "--isolation"
+                                   (.isolation config)])
+                    (push! (mut server) word))
+                  (set! (.agent-server request) (slice server))
+                  (match (station-agent a
+                                        config
+                                        (load request)
+                                        counting
+                                        control)
+                    (AgentUnavailable [message] (failed-result a message))
+                    (AgentReady [ready]
+                                (let [system
+                                        (agent-system-prompt a
+                                                             spec
+                                                             (.workdir call)
+                                                             (.tools-note ready)
+                                                             (.tool-prefix ready))
+                                      (mut result)
+                                        (converse! a
+                                                   (.harness ready)
+                                                   spec
+                                                   (.input call)
+                                                   system
+                                                   sink
+                                                   gate
+                                                   results-file)]
+                                  (finish-result (mut result) ready counting)
+                                  ;; When the tools could not be served, the server said why.
+                                  (when (not (.ok result))
+                                    (match (atomic/read-file-if-exists a
+                                                                       error-file)
+                                      (Ok [found]
+                                          (match found
+                                            (Some [text]
+                                                  (when (> (len (trim text)) 0)
+                                                    (set! (.failure result)
+                                                          (kit-cat a
+                                                                   [(trim text)
+                                                                    " ("
+                                                                    (.failure result)
+                                                                    ")"]))
+                                                    0))
+                                            (None [] 0)))
+                                      (Err [e] 0))
+                                    0)
+                                  (load result))))))]
+        (when temporary (atomic/remove-tree! a dir) 0)
+        result)))
 
 ;;; The result as JSON: what `factory agent run` prints.
 ;;;
@@ -456,7 +733,9 @@
 ;;;      "model": "…", "usage": {"input_tokens": N, "output_tokens": N}}
 ;;;
 ;;; with `"failure": "…"` when `ok` is false.
-(defn agent-result-json [(a (dyn Allocator)) (name (slice u8)) (result (ptr AgentResult))] (-> JVal)
+(defn agent-result-json [(a (dyn Allocator))
+                         (name (slice u8))
+                         (result (ptr AgentResult))] (-> JVal)
   (let [out (jv-object a)
         usage (jv-object a)]
     (jv-put! out "agent" (JStr name))
@@ -466,8 +745,11 @@
     (jv-put! out "reports" (reports-json a (.reports result)))
     (jv-put! out "model" (JStr (.label result)))
     (jv-put! usage "input_tokens" (JInt (.input-tokens result)))
+    (jv-put! usage "cached_input_tokens" (JInt (.cached-input-tokens result)))
     (jv-put! usage "output_tokens" (JInt (.output-tokens result)))
-    (when (> (len (.usage-unknown result)) 0) (jv-put! usage "incomplete" (JStr (.usage-unknown result))) 0)
+    (when (> (len (.usage-unknown result)) 0)
+      (jv-put! usage "incomplete" (JStr (.usage-unknown result)))
+      0)
     (jv-put! out "usage" usage)
     out))
 
@@ -475,11 +757,26 @@
 ;; Serving an agent's tools to an outside harness
 
 (defstruct ServerArgs
-  [(agent (slice u8)) (input (slice u8)) (results (slice u8)) (error (slice u8))
-   (workdir (slice u8)) (home (slice u8)) (isolation (slice u8)) (ready (slice u8))])
+  [(agent (slice u8))
+   (input (slice u8))
+   (results (slice u8))
+   (error (slice u8))
+   (workdir (slice u8))
+   (home (slice u8))
+   (isolation (slice u8))
+   (ready (slice u8))])
 
 (defn server-args [(args (slice (slice u8)))] (-> ServerArgs)
-  (let [(mut out) (ServerArgs :agent "" :input "" :results "" :error "" :workdir "" :home "" :isolation "none" :ready "")
+  (let [(mut out)
+          (ServerArgs
+            :agent ""
+            :input ""
+            :results ""
+            :error ""
+            :workdir ""
+            :home ""
+            :isolation "none"
+            :ready "")
         (mut i) 0]
     (loop (if (>= (+ (load i) 1) (len args))
               (break)
@@ -497,9 +794,13 @@
                 (set! i (+ (load i) 2)))))
     (load out)))
 
-(defn server-fail [(a (dyn Allocator)) (args ServerArgs) (message (slice u8))] (-> i64)
-  (do (when (> (len (.error args)) 0) (atomic/write-file-atomic! a (.error args) message 384) 0)
-      1))
+(defn server-fail [(a (dyn Allocator)) (args ServerArgs) (message (slice u8))]
+  (-> i64)
+  (do
+    (when (> (len (.error args)) 0)
+      (atomic/write-file-atomic! a (.error args) message 384)
+      0)
+    1))
 
 ;;; `_mcp-agent --agent FILE --input FILE --results FILE --error FILE
 ;;; --workdir DIR --home DIR --isolation MODE [--ready FILE]`: serve the
@@ -510,40 +811,97 @@
 ;;; this from its main.
 (defn agent-server-main [(a (dyn Allocator)) (argv (slice (slice u8)))] (-> i64)
   (let [args (server-args argv)]
-    (block :serve
-    (match (atomic/read-file-if-exists a (.agent args))
-      (Err [e] (server-fail a args (kit-cat a ["cannot read " (.agent args)])))
-      (Ok [agent-text]
-          (match agent-text
-            (None [] (server-fail a args (kit-cat a ["no agent file at " (.agent args)])))
-            (Some [text]
-                  (match (parse-agent a text)
-                    (AgentSpecBad [problems] (server-fail a args "the agent file has problems; `factory agent check` shows them"))
-                    (AgentSpecOk [parsed]
-                                 (let [(mut spec) parsed
-                                       input (match (atomic/read-file-if-exists a (.input args))
-                                               (Ok [found] (match found (Some [t] t) (None [] "")))
+    (block
+      :serve
+        (match (atomic/read-file-if-exists a (.agent args))
+          (Err [e]
+               (server-fail a args (kit-cat a ["cannot read " (.agent args)])))
+          (Ok [agent-text]
+              (match agent-text
+                (None []
+                      (server-fail a
+                                   args
+                                   (kit-cat a
+                                            ["no agent file at " (.agent args)])))
+                (Some [text]
+                      (match (parse-agent a text)
+                        (AgentSpecBad [problems]
+                                      (server-fail a
+                                                   args
+                                                   "the agent file has problems; `factory agent check` shows them"))
+                        (AgentSpecOk [parsed]
+                                     (let [(mut spec) parsed
+                                           input
+                                             (match (atomic/read-file-if-exists a
+                                                                                (.input args))
+                                               (Ok [found]
+                                                   (match found
+                                                     (Some [t] t)
+                                                     (None [] "")))
                                                (Err [e] ""))
-                                       ;; Started again (Codex does on each resume), it
-                                       ;; goes on from the reports already made.
-                                       sink (match (collected-resume! a (.results args))
-                                              (Err [message] (return-from :serve (server-fail a args message)))
-                                              (Ok [resumed] (box! a Collected resumed)))
-                                       place (AgentPlace :home (.home args) :workdir (.workdir args) :isolation (.isolation args))
-                                       context (box! a NeverCancelled (NeverCancelled :unused 0))]
-                                   (match (agent-tool-list a (mut spec) input place sink context)
-                                     (Err [message] (server-fail a args message))
-                                     (Ok [made]
-                                         (let [(mut tools) made
-                                               (mut registry) (registry-new a)
-                                               hooks (box! a ReadyFile (ReadyFile :allocator a :path (.ready args)))
-                                               (mut problem) ""]
-                                           (for tool (iter (.tools tools))
-                                             (when (not (registry-add! (mut registry) tool))
-                                               (set! problem (kit-cat a ["two of the agent's tools are named \"" (.name (tool-spec tool)) "\""]))
-                                               0))
-                                           (let [status (if (> (len (load problem)) 0)
-                                                            (server-fail a args (load problem))
-                                                            (mcp/serve-stdio a (mut registry) (mcp/ServerInfo :name "factory" :version "0.1.0") hooks))]
-                                             (agent-tools-close! (mut tools))
-                                             status))))))))))))))
+                                           ;; Started again (Codex does on each resume), it
+                                           ;; goes on from the reports already made.
+                                           sink
+                                             (match (collected-resume! a
+                                                                       (.results args))
+                                               (Err [message]
+                                                    (return-from
+                                                      :serve
+                                                        (server-fail a
+                                                                     args
+                                                                     message)))
+                                               (Ok [resumed]
+                                                   (box! a Collected resumed)))
+                                           place
+                                             (AgentPlace
+                                               :home (.home args)
+                                               :workdir (.workdir args)
+                                               :isolation (.isolation args))
+                                           context
+                                             (box! a
+                                                   NeverCancelled
+                                                   (NeverCancelled :unused 0))]
+                                       (match (agent-tool-list a
+                                                               (mut spec)
+                                                               input
+                                                               place
+                                                               sink
+                                                               context)
+                                         (Err [message]
+                                              (server-fail a args message))
+                                         (Ok [made]
+                                             (let [(mut tools) made
+                                                   (mut registry)
+                                                     (registry-new a)
+                                                   hooks
+                                                     (box! a
+                                                           ReadyFile
+                                                           (ReadyFile
+                                                             :allocator a
+                                                             :path (.ready args)))
+                                                   (mut problem) ""]
+                                               (for tool (iter (.tools tools))
+                                                 (when (not (registry-add! (mut registry)
+                                                                           tool))
+                                                   (set! problem
+                                                         (kit-cat a
+                                                                  ["two of the agent's tools are named \""
+                                                                   (.name (tool-spec tool))
+                                                                   "\""]))
+                                                   0))
+                                               (let [status
+                                                       (if (> (len (load problem))
+                                                              0)
+                                                           (server-fail a
+                                                                        args
+                                                                        (load problem))
+                                                           (mcp/serve-stdio a
+                                                                            (mut registry)
+                                                                            (mcp/ServerInfo
+                                                                              :name
+                                                                                "factory"
+                                                                              :version
+                                                                                "0.1.0")
+                                                                            hooks))]
+                                                 (agent-tools-close! (mut tools))
+                                                 status))))))))))))))

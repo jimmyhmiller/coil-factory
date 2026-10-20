@@ -1,7 +1,6 @@
 (module factory.runspec)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -46,8 +45,10 @@
 (defstruct StationReview [(station (slice u8)) (names (ArrayList (slice u8)))])
 
 ;;; The reviewers `station` needs, by name; empty when it needs none.
-(defn station-review-names [(a (dyn Allocator)) (spec (ptr RunSpec)) (station (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)]
+(defn station-review-names [(a (dyn Allocator))
+                            (spec (ptr RunSpec))
+                            (station (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
     (for entry (iter (.station-reviews spec))
       (when (= (.station entry) station)
         (for name (iter (.names entry)) (push! (mut out) name))
@@ -58,7 +59,8 @@
   (RunSpecOk [(spec RunSpec)])
   (RunSpecBad [(message (slice u8))]))
 
-(defn copies-json [(a (dyn Allocator)) (copies (ArrayList ReviewerCopy))] (-> JVal)
+(defn copies-json [(a (dyn Allocator)) (copies (ArrayList ReviewerCopy))]
+  (-> JVal)
   (let [out (jv-array a)]
     (for copy (iter copies)
       (let [entry (jv-object a)]
@@ -67,31 +69,40 @@
         (jv-push! out entry)))
     out))
 
-(defn copies-from [(a (dyn Allocator)) (copies JVal)] (-> (ArrayList ReviewerCopy))
-  (let [(mut out) (al-new [ReviewerCopy] a)
+(defn copies-from [(a (dyn Allocator)) (copies JVal)]
+  (-> (ArrayList ReviewerCopy))
+  (let [(mut out) (ArrayList::new [ReviewerCopy] a)
         (mut i) 0]
     (loop (if (>= (load i) (jv-count copies))
               (break)
               (let [entry (jv-nth copies (load i))]
-                (push! (mut out) (ReviewerCopy :name (jv-string-or (jv-get entry "name") "")
-                                               :text (jv-string-or (jv-get entry "text") "")))
+                (push! (mut out)
+                       (ReviewerCopy
+                         :name (jv-string-or (jv-get entry "name") "")
+                         :text (jv-string-or (jv-get entry "text") "")))
                 (set! i (+ (load i) 1)))))
     (load out)))
 
-(defn reviews-from [(a (dyn Allocator)) (reviews JVal)] (-> (ArrayList StationReview))
-  (let [(mut out) (al-new [StationReview] a)
+(defn reviews-from [(a (dyn Allocator)) (reviews JVal)]
+  (-> (ArrayList StationReview))
+  (let [(mut out) (ArrayList::new [StationReview] a)
         (mut i) 0]
     (loop (if (>= (load i) (jv-count reviews))
               (break)
               (let [item (jv-nth reviews (load i))
                     list (jv-get item "names")
-                    (mut names) (al-new [(slice u8)] a)
+                    (mut names) (ArrayList::new [(slice u8)] a)
                     (mut k) 0]
                 (loop (if (>= (load k) (jv-count list))
                           (break)
-                          (do (push! (mut names) (jv-string-or (jv-nth list (load k)) ""))
-                              (set! k (+ (load k) 1)))))
-                (push! (mut out) (StationReview :station (jv-string-or (jv-get item "station") "") :names (load names)))
+                          (do
+                            (push! (mut names)
+                                   (jv-string-or (jv-nth list (load k)) ""))
+                            (set! k (+ (load k) 1)))))
+                (push! (mut out)
+                       (StationReview
+                         :station (jv-string-or (jv-get item "station") "")
+                         :names (load names)))
                 (set! i (+ (load i) 1)))))
     (load out)))
 
@@ -126,13 +137,18 @@
     (jv-put! out "created" (JInt (.created spec)))
     out))
 
-(defn save-run-spec! [(a (dyn Allocator)) (home (slice u8)) (spec (ptr RunSpec))] (-> bool)
-  (match (atomic/write-file-atomic! a (run-file a home (.id spec) "run.json")
-                                    (jv-encode a (run-spec-json a spec)) 384)
+(defn save-run-spec! [(a (dyn Allocator))
+                      (home (slice u8))
+                      (spec (ptr RunSpec))] (-> bool)
+  (match (atomic/write-file-atomic! a
+                                    (run-file a home (.id spec) "run.json")
+                                    (jv-encode a (run-spec-json a spec))
+                                    384)
     (Ok [written] true)
     (Err [failure] false)))
 
-(defn load-run-spec [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> RunSpecResult)
+(defn load-run-spec [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))]
+  (-> RunSpecResult)
   (match (atomic/read-file-if-exists a (run-file a home run-id "run.json"))
     (Err [failure] (RunSpecBad "run.json could not be read"))
     (Ok [found]
@@ -142,23 +158,48 @@
                 (match (jv-parse a text)
                   (None [] (RunSpecBad "run.json is not valid JSON"))
                   (Some [root]
-                        (let [(mut spec) (primitive/zeroed RunSpec)]
+                        (let [(mut spec) (zeroed RunSpec)]
                           (set! (.id spec) (jv-string-or (jv-get root "id") ""))
-                          (set! (.factory-name spec) (jv-string-or (jv-get root "factory") ""))
-                          (set! (.factory-text spec) (jv-string-or (jv-get root "factory_text") ""))
-                          (set! (.brief spec) (jv-string-or (jv-get root "brief") ""))
-                          (set! (.project spec) (jv-string-or (jv-get root "project") ""))
-                          (set! (.base spec) (jv-string-or (jv-get root "base") ""))
-                          (set! (.branch spec) (jv-string-or (jv-get root "branch") ""))
-                          (set! (.model spec) (jv-string-or (jv-get root "model") ""))
-                          (set! (.harness spec) (jv-string-or (jv-get root "harness") ""))
-                          (set! (.reviewers spec) (copies-from a (jv-get root "reviewers")))
-                          (set! (.station-reviewers spec) (copies-from a (jv-get root "station_reviewers")))
-                          (set! (.station-reviews spec) (reviews-from a (jv-get root "station_reviews")))
-                          (set! (.summarizer spec) (ReviewerCopy :name (jv-string-or (jv-get (jv-get root "summarizer") "name") "")
-                                                                 :text (jv-string-or (jv-get (jv-get root "summarizer") "text") "")))
-                          (set! (.site spec) (jv-string-or (jv-get root "site") ""))
-                          (set! (.created spec) (jv-int (jv-get root "created")))
-                          (if (or (not (= (.id spec) run-id)) (= (len (.factory-text spec)) 0))
+                          (set! (.factory-name spec)
+                                (jv-string-or (jv-get root "factory") ""))
+                          (set! (.factory-text spec)
+                                (jv-string-or (jv-get root "factory_text") ""))
+                          (set! (.brief spec)
+                                (jv-string-or (jv-get root "brief") ""))
+                          (set! (.project spec)
+                                (jv-string-or (jv-get root "project") ""))
+                          (set! (.base spec)
+                                (jv-string-or (jv-get root "base") ""))
+                          (set! (.branch spec)
+                                (jv-string-or (jv-get root "branch") ""))
+                          (set! (.model spec)
+                                (jv-string-or (jv-get root "model") ""))
+                          (set! (.harness spec)
+                                (jv-string-or (jv-get root "harness") ""))
+                          (set! (.reviewers spec)
+                                (copies-from a (jv-get root "reviewers")))
+                          (set! (.station-reviewers spec)
+                                (copies-from a
+                                             (jv-get root "station_reviewers")))
+                          (set! (.station-reviews spec)
+                                (reviews-from a (jv-get root "station_reviews")))
+                          (set! (.summarizer spec)
+                                (ReviewerCopy
+                                  :name
+                                    (jv-string-or (jv-get (jv-get root
+                                                                  "summarizer")
+                                                          "name")
+                                                  "")
+                                  :text
+                                    (jv-string-or (jv-get (jv-get root
+                                                                  "summarizer")
+                                                          "text")
+                                                  "")))
+                          (set! (.site spec)
+                                (jv-string-or (jv-get root "site") ""))
+                          (set! (.created spec)
+                                (jv-int (jv-get root "created")))
+                          (if (or (not (= (.id spec) run-id))
+                                  (= (len (.factory-text spec)) 0))
                               (RunSpecBad "run.json does not describe this run")
                               (RunSpecOk (load spec)))))))))))

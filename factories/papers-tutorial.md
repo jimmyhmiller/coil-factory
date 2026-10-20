@@ -3,7 +3,7 @@ name: papers-tutorial
 description: Rewrite an accepted paper's index.html as an explanatory article, keeping its paper, implementation and mechanism tests.
 input: The accepted paper workspace as the project, plus notes on what the previous article got wrong.
 harness: codex
-model: gpt-5.5
+model: gpt-6.1-sol
 tools: files, shell
 attempts: 2
 reviewers: none
@@ -122,7 +122,7 @@ coding sandbox. Do not disable the coding sandbox.
 
 ## Station: judge
 harness: codex
-model: gpt-5.5
+model: gpt-6.1-sol
 attempts: 1
 gate: sh scripts/verify.sh && python3 -c 'import json; v=json.load(open("JUDGMENT.json")); assert v["verdict"] == "approved" and v["checks_run"] and v["evidence"] and v["interest_review"]["verdict"] == "pass" and v["interest_review"]["distinctiveness_evidence"] and v["interest_review"]["experiment_evidence"] and v["explanation_review"]["verdict"] == "pass" and all(v["explanation_review"]["cold_read"].get(k) for k in ("problem", "background", "prior_work", "insight", "mechanism", "costs", "legacy")) and v["explanation_review"]["evidence"]' && test -s CONTEXT.md
 

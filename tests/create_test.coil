@@ -1,7 +1,6 @@
 (module factory.create-test)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "durable.atomic" :as atomic)
@@ -12,49 +11,72 @@
 
 ;;; Tests declare a keyless provider, `local/…`, so they never depend on the
 ;;; API keys of the machine running them.
-(const LOCAL "\"providers\": [{\"name\": \"local\", \"base_url\": \"http://127.0.0.1:1/v1/chat/completions\", \"key_env\": \"\"}]")
+(const LOCAL
+       "\"providers\": [{\"name\": \"local\", \"base_url\": \"http://127.0.0.1:1/v1/chat/completions\", \"key_env\": \"\"}]")
 
-(defn site [(a (dyn Allocator)) (label (slice u8)) (settings (slice u8))] (-> SiteConfig)
-  (site-from-json a label (let [(mut b) (sb-new a)]
-                       (sb-push-str! (mut b) "{")
-                       (sb-push-str! (mut b) LOCAL)
-                       (when (> (len settings) 0) (sb-push-str! (mut b) ", ") (sb-push-str! (mut b) settings) 0)
-                       (sb-push-str! (mut b) "}")
-                       (sb-finish! (mut b)))))
+(defn site [(a (dyn Allocator)) (label (slice u8)) (settings (slice u8))]
+  (-> SiteConfig)
+  (site-from-json a
+                  label
+                  (let [(mut b) (StrBuf::new a)]
+                    (push-str! (mut b) "{")
+                    (push-str! (mut b) LOCAL)
+                    (when (> (len settings) 0)
+                      (push-str! (mut b) ", ")
+                      (push-str! (mut b) settings)
+                      0)
+                    (push-str! (mut b) "}")
+                    (finish! (mut b)))))
 
-(defn site-from-json [(a (dyn Allocator)) (label (slice u8)) (site-json (slice u8))] (-> SiteConfig)
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/factory-create-test-")
-    (sb-push-i64! (mut path) (pid))
-    (sb-push-str! (mut path) "-")
-    (sb-push-str! (mut path) label)
-    (let [home (sb-finish! (mut path))]
+(defn site-from-json [(a (dyn Allocator))
+                      (label (slice u8))
+                      (site-json (slice u8))] (-> SiteConfig)
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-create-test-")
+    (push-i64! (mut path) (pid))
+    (push-str! (mut path) "-")
+    (push-str! (mut path) label)
+    (let [home (finish! (mut path))]
       (capture a "rm" ["-rf" home] "" 10000)
       (atomic/ensure-dir! a home 448)
       (atomic/write-file-atomic! a (path-join a home "site.json") site-json 420)
       (match (load-site-config a home)
         (SiteConfigOk [config] config)
-        (SiteConfigBad [message] (do (println "{s}" message) (assert false) (site-from-json a label site-json)))))))
+        (SiteConfigBad [message]
+                       (do
+                         (println "{s}" message)
+                         (assert false)
+                         (site-from-json a label site-json)))))))
 
-(const TWO-STATIONS "---\nname: pair\n---\n\n## Station: write\n\nWrite.\n\n## Station: check\nmodel: local/checker\n\nCheck.\n")
+(const TWO-STATIONS
+       "---\nname: pair\n---\n\n## Station: write\n\nWrite.\n\n## Station: check\nmodel: local/checker\n\nCheck.\n")
 
-(defn request [(model (slice u8)) (harness (slice u8)) (reviewers (slice u8))] (-> NewRun)
-  (NewRun :factory "" :factory-text TWO-STATIONS :brief "b" :project "" :base ""
-          :model model :harness harness :reviewers reviewers))
+(defn request [(model (slice u8)) (harness (slice u8)) (reviewers (slice u8))]
+  (-> NewRun)
+  (NewRun
+    :factory ""
+    :factory-text TWO-STATIONS
+    :brief "b"
+    :project ""
+    :base ""
+    :model model
+    :harness harness
+    :reviewers reviewers))
 
-(defn outcome [(a (dyn Allocator)) (config SiteConfig) (req NewRun)] (-> (slice u8))
+(defn outcome [(a (dyn Allocator)) (config SiteConfig) (req NewRun)]
+  (-> (slice u8))
   (let [(mut c) config]
     (match (create-run! a (mut c) req)
       (CreatedRun [id] "created")
       (CreateRejected [code message]
-                      (let [(mut out) (sb-new a)]
-                        (sb-push-str! (mut out) code)
-                        (sb-push-str! (mut out) ": ")
-                        (sb-push-str! (mut out) message)
-                        (sb-finish! (mut out)))))))
+                      (let [(mut out) (StrBuf::new a)]
+                        (push-str! (mut out) code)
+                        (push-str! (mut out) ": ")
+                        (push-str! (mut out) message)
+                        (finish! (mut out)))))))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (deftest a-station-without-a-model-is-refused
   (let [a (malloc-allocator)
@@ -66,44 +88,85 @@
 
 (deftest any-level-can-choose-the-model
   (let [a (malloc-allocator)]
-    (assert (= (outcome a (site a "run" "") (request "local/runner" "" "")) "created"))
-    (assert (= (outcome a (site a "site" "\"default_model\": \"local/x\"") (request "" "" "")) "created"))
-    (assert (contains? (outcome a (site a "oc" "\"default_model\": \"local/x\"") (request "" "opencode" ""))
+    (assert (= (outcome a (site a "run" "") (request "local/runner" "" ""))
+               "created"))
+    (assert (= (outcome a
+                        (site a "site" "\"default_model\": \"local/x\"")
+                        (request "" "" ""))
+               "created"))
+    (assert (contains? (outcome a
+                                (site a "oc" "\"default_model\": \"local/x\"")
+                                (request "" "opencode" ""))
                        "\"opencode_model\" in site.json"))
-    (assert (= (outcome a (site a "oc2" "\"opencode_model\": \"opencode/big-pickle\"") (request "" "opencode" "")) "created"))))
+    (assert (= (outcome a
+                        (site a
+                              "oc2"
+                              "\"opencode_model\": \"opencode/big-pickle\"")
+                        (request "" "opencode" ""))
+               "created"))))
 
 (deftest a-reviewer-without-a-model-is-refused
   (let [a (malloc-allocator)]
-    (assert (contains? (outcome a (site a "rev" "") (request "local/x" "" "judge"))
+    (assert (contains? (outcome a
+                                (site a "rev" "")
+                                (request "local/x" "" "judge"))
                        "reviewer judge names no model and this site has no default for the builtin harness"))
-    (assert (= (outcome a (site a "rev2" "\"default_model\": \"local/x\"") (request "" "" "judge")) "created"))))
+    (assert (= (outcome a
+                        (site a "rev2" "\"default_model\": \"local/x\"")
+                        (request "" "" "judge"))
+               "created"))))
 
 (deftest a-builtin-model-must-resolve-when-the-run-is-made
   (let [a (malloc-allocator)]
     ;; opencode/… is an OpenCode name; the builtin harness has no such provider.
-    (assert (contains? (outcome a (site a "bad" "") (request "opencode/big-pickle" "" ""))
+    (assert (contains? (outcome a
+                                (site a "bad" "")
+                                (request "opencode/big-pickle" "" ""))
                        "bad_model: station write: unknown model provider \"opencode\""))))
 
-(const REVIEWED "---\nname: reviewed\nreview: judge\n---\n\n## Station: write\n\nWrite.\n\n## Station: check\nreview: none\n\nCheck.\n")
+(const REVIEWED
+       "---\nname: reviewed\nreview: judge\n---\n\n## Station: write\n\nWrite.\n\n## Station: check\nreview: none\n\nCheck.\n")
 
-(defn created-spec [(a (dyn Allocator)) (config SiteConfig) (text (slice u8))] (-> RunSpec)
+(defn created-spec [(a (dyn Allocator)) (config SiteConfig) (text (slice u8))]
+  (-> RunSpec)
   (let [(mut c) config]
-    (match (create-run! a (mut c) (NewRun :factory "" :factory-text text :brief "b" :project "" :base ""
-                                          :model "local/x" :harness "" :reviewers "none"))
-      (CreateRejected [code message] (do (println "{s}: {s}" code message) (assert false) (primitive/zeroed RunSpec)))
+    (match (create-run! a
+                        (mut c)
+                        (NewRun
+                          :factory ""
+                          :factory-text text
+                          :brief "b"
+                          :project ""
+                          :base ""
+                          :model "local/x"
+                          :harness ""
+                          :reviewers "none"))
+      (CreateRejected [code message]
+                      (do
+                        (println "{s}: {s}" code message)
+                        (assert false)
+                        (zeroed RunSpec)))
       (CreatedRun [id]
                   (match (load-run-spec a (.home c) id)
                     (RunSpecOk [spec] spec)
-                    (RunSpecBad [message] (do (println "{s}" message) (assert false) (primitive/zeroed RunSpec))))))))
+                    (RunSpecBad [message]
+                                (do
+                                  (println "{s}" message)
+                                  (assert false)
+                                  (zeroed RunSpec))))))))
 
 (deftest station-reviewers-are-resolved-and-kept-with-the-run
   (let [a (malloc-allocator)
-        (mut spec) (created-spec a (site a "stationrev" "\"default_model\": \"local/x\"") REVIEWED)]
+        (mut spec)
+          (created-spec a
+                        (site a "stationrev" "\"default_model\": \"local/x\"")
+                        REVIEWED)]
     ;; `--reviewers none` turns off the overseer's reviewers, not the stations'.
     (assert-eq (len (.reviewers spec)) 0)
     (assert-eq (len (.station-reviewers spec)) 1)
     (assert (= (.name (get (.station-reviewers spec) 0)) "judge"))
-    (assert (contains? (.text (get (.station-reviewers spec) 0)) "verdicts: on_track"))
+    (assert (contains? (.text (get (.station-reviewers spec) 0))
+                       "verdicts: on_track"))
     (let [write (station-review-names a (mut spec) "write")
           check (station-review-names a (mut spec) "check")]
       (assert-eq (len write) 1)
@@ -113,19 +176,41 @@
 
 (deftest station-reviewers-are-checked-when-the-run-is-made
   (let [a (malloc-allocator)
-        unknown "---\nname: r\n---\n\n## Station: write\nreview: nobody-by-this-name\n\nWrite.\n"]
+        unknown
+          "---\nname: r\n---\n\n## Station: write\nreview: nobody-by-this-name\n\nWrite.\n"]
     (let [(mut c) (site a "stationrev-unknown" "\"default_model\": \"local/x\"")]
-      (match (create-run! a (mut c) (NewRun :factory "" :factory-text unknown :brief "b" :project "" :base ""
-                                            :model "local/x" :harness "" :reviewers ""))
+      (match (create-run! a
+                          (mut c)
+                          (NewRun
+                            :factory ""
+                            :factory-text unknown
+                            :brief "b"
+                            :project ""
+                            :base ""
+                            :model "local/x"
+                            :harness ""
+                            :reviewers ""))
         (CreatedRun [id] (assert false))
         (CreateRejected [code message]
-                        (do (assert (= code "invalid_reviewer"))
-                            (assert (contains? message "station write review:"))))))
+                        (do
+                          (assert (= code "invalid_reviewer"))
+                          (assert (contains? message "station write review:"))))))
     ;; A station reviewer needs a model like any other reviewer.
     (let [(mut c) (site a "stationrev-model" "")]
-      (match (create-run! a (mut c) (NewRun :factory "" :factory-text REVIEWED :brief "b" :project "" :base ""
-                                            :model "local/x" :harness "" :reviewers "none"))
+      (match (create-run! a
+                          (mut c)
+                          (NewRun
+                            :factory ""
+                            :factory-text REVIEWED
+                            :brief "b"
+                            :project ""
+                            :base ""
+                            :model "local/x"
+                            :harness ""
+                            :reviewers "none"))
         (CreatedRun [id] (assert false))
         (CreateRejected [code message]
-                        (do (assert (= code "no_model"))
-                            (assert (contains? message "reviewer judge names no model"))))))))
+                        (do
+                          (assert (= code "no_model"))
+                          (assert (contains? message
+                                             "reviewer judge names no model"))))))))

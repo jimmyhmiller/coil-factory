@@ -1,7 +1,6 @@
 (module factory.cli.ctx)
 (import "coil.alloc" :use *)
 (import "coil.io" :as io)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -32,12 +31,13 @@
       (SiteConfigBad [message] (CtxBad message))
       (SiteConfigOk [loaded]
                     (let [(mut config) loaded]
-                      (CtxOk (Ctx :allocator a
-                                  :home home
-                                  :config (load config)
-                                  :hub (client/hub-for a (mut config))
-                                  :out (style/term-stdout)
-                                  :err (style/term-stderr))))))))
+                      (CtxOk (Ctx
+                               :allocator a
+                               :home home
+                               :config (load config)
+                               :hub (client/hub-for a (mut config))
+                               :out (style/term-stdout)
+                               :err (style/term-stderr))))))))
 
 (defn write-err [(text (slice u8))] (-> i64)
   (do (io/print-str (io/stderr) text) 0))
@@ -57,26 +57,30 @@
   (client/reply-ok? (client/hub-get (.allocator ctx) (.hub ctx) "/v1/site")))
 
 (defn hub-down-message [(ctx (ptr Ctx))] (-> i64)
-  (do (fail-with ctx "the factory hub is not running on this machine")
-      (hint ctx "  start it with `factory up`")
-      1))
+  (do
+    (fail-with ctx "the factory hub is not running on this machine")
+    (hint ctx "  start it with `factory up`")
+    1))
 
 (defsum Fetched
   (FetchedOk [(body JVal)])
   (FetchedFailed [(code i64)]))
 
 ;;; A request whose failure has already been reported to the person.
-(defn fetch [(ctx (ptr Ctx)) (method (slice u8)) (path (slice u8)) (body JVal)] (-> Fetched)
+(defn fetch [(ctx (ptr Ctx)) (method (slice u8)) (path (slice u8)) (body JVal)]
+  (-> Fetched)
   (let [a (.allocator ctx)
-        reply (if (= method "GET")
-                  (client/hub-get a (.hub ctx) path)
-                  (client/hub-post a (.hub ctx) path body))]
+        reply
+          (if (= method "GET")
+              (client/hub-get a (.hub ctx) path)
+              (client/hub-post a (.hub ctx) path body))]
     (match reply
       (client/ReplyFailed [message] (FetchedFailed (hub-down-message ctx)))
       (client/ReplyOk [status value text]
                       (if (and (>= status 200) (< status 300))
                           (FetchedOk value)
-                          (FetchedFailed (fail-with ctx (client/reply-error a reply))))))))
+                          (FetchedFailed (fail-with ctx
+                                                    (client/reply-error a reply))))))))
 
 (defn get-json [(ctx (ptr Ctx)) (path (slice u8))] (-> Fetched)
   (fetch ctx "GET" path (JNull)))
@@ -91,6 +95,9 @@
 (defstruct AgentRef [(run (slice u8)) (agent (slice u8))])
 
 (defn agent-ref [(text (slice u8))] (-> AgentRef)
-  (match (str-find text "/")
-    (Some [at] (AgentRef :run (subslice [u8] text 0 at) :agent (subslice [u8] text (+ at 1) (len text))))
+  (match (find text "/")
+    (Some [at]
+          (AgentRef
+            :run (subslice [u8] text 0 at)
+            :agent (subslice [u8] text (+ at 1) (len text))))
     (None [] (AgentRef :run text :agent ""))))

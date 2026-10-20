@@ -1,10 +1,8 @@
 (module factory.ui.dashboard)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator free])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-trim])
-(import "coil.scratch" :as scratch)
+(import "coil.str" :use [trim])
 (import "coil.serde.value" :use *)
 (import "coil.time" :as time)
 (import "agent.json" :use [copy-bytes jv-object jv-put! jv-encode])
@@ -15,14 +13,7 @@
 (import "tui.term" :use [TermError NotATerminal])
 (import "factory.client"
         :use
-        [Hub
-         Reply
-         ReplyOk
-         ReplyFailed
-         hub-call
-         reply-ok?
-         reply-body
-         reply-error])
+        [Hub Reply ReplyOk ReplyFailed hub-call reply-ok? reply-body reply-error])
 (import "factory.ui.fmt" :use *)
 (import "factory.ui.store" :use *)
 (import "factory.ui.feed" :use *)
@@ -43,8 +34,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Requests
 (defn io-allocator [(d (ptr Dash))] (-> (dyn Allocator))
-  (scratch/scratch-recycle! (field d io))
-  (scratch/scratch-allocator (field d io)))
+  (recycle! (field d io))
+  (allocator (field d io)))
 
 ;;; One request to the hub, recording whether the hub answered at all.
 (defn request! [(d (ptr Dash))
@@ -71,7 +62,8 @@
     (ReplyOk [status value text] (toast! d (reply-error a reply) (ToneError)))
     (ReplyFailed [message] 0)))
 
-(defn run-path [(a (dyn Allocator)) (run (slice u8)) (suffix (slice u8))] (-> (slice u8))
+(defn run-path [(a (dyn Allocator)) (run (slice u8)) (suffix (slice u8))]
+  (-> (slice u8))
   (concat a ["/v1/runs/" run suffix]))
 
 (defn fetch-overview! [(d (ptr Dash))] (-> i64)
@@ -324,7 +316,7 @@
 
 (defn send! [(d (ptr Dash))] (-> i64)
   (let [chat (field d chat)
-        text (str-trim (input-text (field chat input)))]
+        text (trim (input-text (field chat input)))]
     (if (= (len text) 0)
         0
         (let [a (io-allocator d)
@@ -497,23 +489,23 @@
 ;; The app
 (impl App Dash
   (app-draw [(self (ptr Dash)) (frame (ptr Frame))]
-            (-> i64)
-            (set! (.tick self) (.tick frame))
-            (match (.view self)
-              (ViewOverview [] (draw-overview! self frame))
-              (ViewRun [] (draw-run-view! self frame))
-              (ViewChat [] (draw-chat-view! self frame)))
-            (when (.help self) (draw-help! self (.canvas frame)))
-            (when (.confirm-stop self)
-              (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
-            0)
+    (-> i64)
+    (set! (.tick self) (.tick frame))
+    (match (.view self)
+      (ViewOverview [] (draw-overview! self frame))
+      (ViewRun [] (draw-run-view! self frame))
+      (ViewChat [] (draw-chat-view! self frame)))
+    (when (.help self) (draw-help! self (.canvas frame)))
+    (when (.confirm-stop self)
+      (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
+    0)
   (app-event [(self (ptr Dash)) (event Event)]
-             (-> AppFlow)
-             (set! (.now self) (wall-now))
-             (match event
-               (TickEvent [n] (do (poll! self) (Continue)))
-               (ResizeEvent [w h] (Continue))
-               (KeyEvent [key] (dashboard-key! self key)))))
+    (-> AppFlow)
+    (set! (.now self) (wall-now))
+    (match event
+      (TickEvent [n] (do (poll! self) (Continue)))
+      (ResizeEvent [w h] (Continue))
+      (KeyEvent [key] (dashboard-key! self key)))))
 
 ;;; The dashboard, full screen, until the person quits. With `initial-agent`
 ;;; (and `initial-run`) it opens that agent's chat; with only `initial-run`
@@ -523,14 +515,14 @@
                      (hub Hub)
                      (initial-run (slice u8))
                      (initial-agent (slice u8))] (-> i64)
-  (let [d (primitive/alloc-stack Dash)]
-    (dash-init! d a hub)
+  (let [(mut d) (zeroed Dash)]
+    (dash-init! (mut d) a hub)
     (set! (.now d) (wall-now))
     (cond (and (> (len initial-run) 0) (> (len initial-agent) 0))
-            (open-chat! d initial-run initial-agent false)
-          (> (len initial-run) 0) (open-run! d initial-run)
-          :else (fetch-overview! d))
-    (match (app-run d (app-options-default) a)
+            (open-chat! (mut d) initial-run initial-agent false)
+          (> (len initial-run) 0) (open-run! (mut d) initial-run)
+          :else (fetch-overview! (mut d)))
+    (match (app-run (mut d) (app-options-default) a)
       (Ok [_] 0)
       (Err [e]
            (match e

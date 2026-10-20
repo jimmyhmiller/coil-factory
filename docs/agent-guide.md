@@ -89,7 +89,7 @@ only: check_style
 | `name` | required; lowercase letters, digits, and dashes | |
 | `description` | one line, shown by `factory agents` | |
 | `input` | what the input is; the model is told this | |
-| `model` | `provider/model` (`deepseek/…`, `openrouter/…`, `openai/…`, `vercel/…`, `zen/…`); for opencode or codex, the model as that program names it | the site's `default_model` (`opencode_model`, `codex_model`) |
+| `model` | `provider/model` (`deepseek/…`, `openrouter/…`, `openai/…`, `vercel/…`, `zen/…`, `chatgpt/…`); for opencode or codex, the model as that program names it | the site's `default_model` (`opencode_model`, `codex_model`) |
 | `harness` | `builtin`, `opencode`, or `codex` | the site's `default_harness`, else `builtin` |
 | `tools` | `none`, or standard groups: `files` (read and edit files), `read` (read only), `shell` | `none` |
 | `gate` | a command that checks the results when the agent calls `done` (see below) | none |
@@ -224,7 +224,12 @@ From Coil, `factory.agentkit`'s `run-agent!` does the same as a library call
 ## Harnesses
 
 - **`builtin`** calls the model's API directly. Use it unless you need a model
-  that only OpenCode or Codex can reach.
+  that only OpenCode can reach.
+- **A ChatGPT subscription** is a builtin model too: `chatgpt/gpt-6-luna` and
+  the other models of your plan, with the login `codex login` made. The agent
+  gets only its own prompt and tools. That is much cheaper than running it
+  under the codex harness, and the model reads the instructions it was given
+  and no others.
 - **`opencode`** and **`codex`** run the agent in that program, and the
   agent's tools reach it over MCP. OpenCode puts `factory_` in front of the
   tool names, and the instructions the runner adds say so.

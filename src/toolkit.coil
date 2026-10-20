@@ -1,7 +1,6 @@
 (module factory.toolkit)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "agent.json" :use *)
@@ -24,7 +23,9 @@
 
 ;;; `isolation` is the site setting: "none" or "sandbox". A site that asks for
 ;;; a sandbox on a machine without one is refused, never run unconfined.
-(defn policy-for [(a (dyn Allocator)) (workspace ws/Workspace) (isolation (slice u8))] (-> PolicyResult)
+(defn policy-for [(a (dyn Allocator))
+                  (workspace ws/Workspace)
+                  (isolation (slice u8))] (-> PolicyResult)
   (if (= isolation "none")
       (PolicyOk (sandbox/NoSandbox))
       (match (sandbox/workspace-sandbox-options a workspace true)
@@ -32,13 +33,15 @@
         (Ok [options]
             (let [policy (sandbox/sandbox-detect a options)]
               (match policy
-                (sandbox/NoSandbox [] (PolicyBad "this site's isolation is \"sandbox\" but this machine has neither sandbox-exec nor bwrap"))
+                (sandbox/NoSandbox []
+                                   (PolicyBad "this site's isolation is \"sandbox\" but this machine has neither sandbox-exec nor bwrap"))
                 (_ (PolicyOk policy))))))))
 
-(defn split-groups [(a (dyn Allocator)) (tools (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)]
-    (for raw (iter (str-split a tools ","))
-      (let [name (str-trim raw)]
+(defn split-groups [(a (dyn Allocator)) (tools (slice u8))]
+  (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
+    (for raw (iter (split a tools ","))
+      (let [name (trim raw)]
         (when (> (len name) 0) (push! [(slice u8)] (mut out) name) 0)))
     (load out)))
 
@@ -56,7 +59,10 @@
           (PolicyBad [message] (Some message))
           (PolicyOk [policy]
                     (let [groups (split-groups a tools)]
-                      (match (bundle/standard-tools a workspace policy (al-slice [(slice u8)] groups))
+                      (match (bundle/standard-tools a
+                                                    workspace
+                                                    policy
+                                                    (slice groups))
                         (Err [message] (Some message))
                         (Ok [made]
                             ;; The standard tools live as long as the process.
@@ -65,8 +71,12 @@
                                   (mut i) 0]
                               (loop (if (>= (load i) n)
                                         (break)
-                                        (do (registry-add! registry (registry-at (field owned registry) (load i)))
-                                            (set! i (+ (load i) 1)))))
+                                        (do
+                                          (registry-add! registry
+                                                         (registry-at (field owned
+                                                                             registry)
+                                                                      (load i)))
+                                          (set! i (+ (load i) 1)))))
                               (None))))))))))
 
 (defstruct GateRun [(ok bool) (exit i64) (output (slice u8)) (cancelled bool)])
@@ -78,25 +88,55 @@
                 (isolation (slice u8))
                 (control (dyn AgentControl))] (-> GateRun)
   (match (ws/workspace-open a workspace-path)
-    (Err [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+    (Err [message]
+         (GateRun
+           :ok false
+           :exit -1
+           :output message
+           :cancelled false))
     (Ok [workspace]
         (match (policy-for a workspace isolation)
-          (PolicyBad [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+          (PolicyBad [message]
+                     (GateRun
+                       :ok false
+                       :exit -1
+                       :output message
+                       :cancelled false))
           (PolicyOk [policy]
-                    (let [context (box! a ControlledContext (ControlledContext :control control))]
-                      (match (shell/run-command a workspace policy gate GATE-TIMEOUT-MS context)
-                        (Err [message] (GateRun :ok false :exit -1 :output message :cancelled false))
+                    (let [context
+                            (box! a
+                                  ControlledContext
+                                  (ControlledContext :control control))]
+                      (match (shell/run-command a
+                                                workspace
+                                                policy
+                                                gate
+                                                GATE-TIMEOUT-MS
+                                                context)
+                        (Err [message]
+                             (GateRun
+                               :ok false
+                               :exit -1
+                               :output message
+                               :cancelled false))
                         (Ok [ran]
                             (let [result ran
                                   timed-out (.timed-out result)]
-                              (GateRun :ok (and (= (.exit-code result) 0) (not timed-out) (not (.cancelled result)))
-                                       :exit (.exit-code result)
-                                       :output (if timed-out
-                                                   (join a ["(timed out after 30 minutes)\n" (.output result)])
-                                                   (.output result))
-                                       :cancelled (.cancelled result)))))))))))
+                              (GateRun
+                                :ok
+                                  (and (= (.exit-code result) 0)
+                                       (not timed-out)
+                                       (not (.cancelled result)))
+                                :exit (.exit-code result)
+                                :output
+                                  (if timed-out
+                                      (join a
+                                            ["(timed out after 30 minutes)\n"
+                                             (.output result)])
+                                      (.output result))
+                                :cancelled (.cancelled result)))))))))))
 
 (defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))

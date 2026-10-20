@@ -1,7 +1,6 @@
 (module factory.spec)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "agent.json" :use *)
@@ -51,10 +50,11 @@
 
 (defstruct SpecProblem [(line i64) (message (slice u8))])
 
-(defn station-count [(spec (ptr FactorySpec))] (-> i64) (len (.stations spec)))
+(defn station-count [(spec (ptr FactorySpec))] (-> i64)
+  (len (.stations spec)))
 
 (defn station-spec [(spec (ptr FactorySpec)) (index i64)] (-> (ptr StationSpec))
-  (al-elem [StationSpec] (field spec stations) index))
+  (elem (field spec stations) index))
 
 (defn find-station [(spec (ptr FactorySpec)) (name (slice u8))] (-> i64)
   (let [(mut i) 0
@@ -68,7 +68,8 @@
     (load found)))
 
 ;;; The station's tools, falling back to the factory's, then to both groups.
-(defn station-tools [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> (slice u8))
+(defn station-tools [(spec (ptr FactorySpec)) (station (ptr StationSpec))]
+  (-> (slice u8))
   (cond (> (len (.tools station)) 0) (.tools station)
         (> (len (.tools spec)) 0) (.tools spec)
         :else "files, shell"))
@@ -76,23 +77,29 @@
 ;;; The reviewers a station's finished work must satisfy, as comma-separated
 ;;; names or paths: the station's own `review`, else the factory's. "" (or
 ;;; "none") means the station passes on its gate alone.
-(defn station-review [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> (slice u8))
+(defn station-review [(spec (ptr FactorySpec)) (station (ptr StationSpec))]
+  (-> (slice u8))
   (review-choice (.review spec) (.review station)))
 
 ;;; The station's own review choice, else the factory's; "none" is "".
-(defn review-choice [(factory-review (slice u8)) (station-review (slice u8))] (-> (slice u8))
-  (let [chosen (if (> (len (str-trim station-review)) 0) station-review factory-review)]
-    (if (= (str-trim chosen) "none") "" chosen)))
+(defn review-choice [(factory-review (slice u8)) (station-review (slice u8))]
+  (-> (slice u8))
+  (let [chosen
+          (if (> (len (trim station-review)) 0) station-review factory-review)]
+    (if (= (trim chosen) "none") "" chosen)))
 
 ;;; Whether a person must approve this station's work: its own `approve`, else
 ;;; the factory's, else no.
-(defn station-approves? [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> bool)
+(defn station-approves? [(spec (ptr FactorySpec)) (station (ptr StationSpec))]
+  (-> bool)
   (approve-choice (.approve spec) (.approve station)))
 
-(defn approve-choice [(factory-approve (slice u8)) (station-approve (slice u8))] (-> bool)
+(defn approve-choice [(factory-approve (slice u8)) (station-approve (slice u8))]
+  (-> bool)
   (= (if (> (len station-approve) 0) station-approve factory-approve) "yes"))
 
-(defn station-attempts [(spec (ptr FactorySpec)) (station (ptr StationSpec))] (-> i64)
+(defn station-attempts [(spec (ptr FactorySpec)) (station (ptr StationSpec))]
+  (-> i64)
   (cond (> (.attempts station) 0) (.attempts station)
         (> (.attempts spec) 0) (.attempts spec)
         :else 3))
@@ -114,20 +121,25 @@
 (defn harness-problem [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
   (if (harness-known? name)
       ""
-      (let [(mut out) (sb-new a)]
-        (sb-push-str! (mut out) "unknown harness \"")
-        (sb-push-str! (mut out) name)
-        (sb-push-str! (mut out) "\"; the harnesses are builtin, opencode, and codex")
-        (sb-finish! (mut out)))))
+      (let [(mut out) (StrBuf::new a)]
+        (push-str! (mut out) "unknown harness \"")
+        (push-str! (mut out) name)
+        (push-str! (mut out)
+                   "\"; the harnesses are builtin, opencode, and codex")
+        (finish! (mut out)))))
 
 ;;; The harness a station uses: its own, the factory's, then `fallback`.
-(defn station-harness [(spec (ptr FactorySpec)) (station (ptr StationSpec)) (fallback (slice u8))] (-> (slice u8))
+(defn station-harness [(spec (ptr FactorySpec))
+                       (station (ptr StationSpec))
+                       (fallback (slice u8))] (-> (slice u8))
   (cond (> (len (.harness station)) 0) (.harness station)
         (> (len (.harness spec)) 0) (.harness spec)
         :else fallback))
 
 ;;; The model a station uses: its own, the factory's, then `fallback`.
-(defn station-model [(spec (ptr FactorySpec)) (station (ptr StationSpec)) (fallback (slice u8))] (-> (slice u8))
+(defn station-model [(spec (ptr FactorySpec))
+                     (station (ptr StationSpec))
+                     (fallback (slice u8))] (-> (slice u8))
   (cond (> (len (.model station)) 0) (.model station)
         (> (len (.model spec)) 0) (.model spec)
         :else fallback))
@@ -141,7 +153,9 @@
               (let [c (cast i64 (get name (load i)))]
                 (when (not (or (and (>= c 97) (<= c 122))
                                (and (>= c 48) (<= c 57))
-                               (and (= c 45) (> (load i) 0) (< (load i) (- n 1)))))
+                               (and (= c 45)
+                                    (> (load i) 0)
+                                    (< (load i) (- n 1)))))
                   (set! ok false)
                   0)
                 (set! i (+ (load i) 1)))))
@@ -150,15 +164,15 @@
 ;;; Every name in a comma-separated tool list is `files` or `shell`.
 (defn tool-list-problem [(a (dyn Allocator)) (tools (slice u8))] (-> (slice u8))
   (let [(mut problem) ""]
-    (for raw (iter (str-split a tools ","))
-      (let [name (str-trim raw)]
+    (for raw (iter (split a tools ","))
+      (let [name (trim raw)]
         (when (and (= (len (load problem)) 0)
                    (not (or (= name "files") (= name "shell"))))
-          (let [(mut out) (sb-new a)]
-            (sb-push-str! (mut out) "unknown tool group \"")
-            (sb-push-str! (mut out) name)
-            (sb-push-str! (mut out) "\"; the groups are files and shell")
-            (set! problem (sb-finish! (mut out)))
+          (let [(mut out) (StrBuf::new a)]
+            (push-str! (mut out) "unknown tool group \"")
+            (push-str! (mut out) name)
+            (push-str! (mut out) "\"; the groups are files and shell")
+            (set! problem (finish! (mut out)))
             0)
           0)))
     (load problem)))

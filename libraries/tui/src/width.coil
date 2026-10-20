@@ -1,9 +1,8 @@
 (module tui.width)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [string-view-unchecked])
+(import "coil.str" :use [StringView])
 (import "coil.unicode.grapheme" :use [grapheme-next-offset])
 (import "tui.fatal" :use [fatal])
 (import "tui.width.tables" :use [ZERO-WIDTH-RANGES WIDE-RANGES])
@@ -28,7 +27,7 @@
 
 (defn utf8--cont? [(bytes (slice u8)) (at i64)] (-> bool)
   (and (< at (len bytes))
-       (= (primitive/iand (cast i64 (get bytes at)) 0xC0) 0x80)))
+       (= (& (cast i64 (get bytes at)) 0xC0) 0x80)))
 
 (defn utf8--invalid [] (-> Utf8Decoded)
   (Utf8Decoded
@@ -53,26 +52,23 @@
           (= n 2)
             (Utf8Decoded
               :rune
-                (primitive/ior (primitive/ishl (primitive/iand lead 0x1F) 6)
-                               (primitive/iand (cast i64 (get bytes (+ at 1)))
-                                               0x3F))
+                (| (<< (& lead 0x1F) 6)
+                   (& (cast i64 (get bytes (+ at 1))) 0x3F))
               :len 2
               :valid true)
           (not (utf8--cont? bytes (+ at 2))) (utf8--invalid)
           (= n 3)
             (let [rune
-                    (primitive/ior (primitive/ior (primitive/ishl (primitive/iand lead
-                                                                                  0x0F)
-                                                                  12)
-                                                  (primitive/ishl (primitive/iand (cast i64
-                                                                                        (get bytes
-                                                                                             (+ at
-                                                                                                1)))
-                                                                                  0x3F)
-                                                                  6))
-                                   (primitive/iand (cast i64
-                                                         (get bytes (+ at 2)))
-                                                   0x3F))]
+                    (| (<< (& lead 0x0F) 12)
+                       (<< (& (cast i64
+                                    (get bytes
+                                         (+ at
+                                            1)))
+                              0x3F)
+                           6)
+                       (& (cast i64
+                                (get bytes (+ at 2)))
+                          0x3F))]
               (if (or (< rune 0x800) (and (>= rune 0xD800) (<= rune 0xDFFF)))
                   (utf8--invalid)
                   (Utf8Decoded
@@ -82,26 +78,24 @@
           (not (utf8--cont? bytes (+ at 3))) (utf8--invalid)
           :else
             (let [rune
-                    (primitive/ior (primitive/ior (primitive/ishl (primitive/iand lead
-                                                                                  0x07)
-                                                                  18)
-                                                  (primitive/ishl (primitive/iand (cast i64
-                                                                                        (get bytes
-                                                                                             (+ at
-                                                                                                1)))
-                                                                                  0x3F)
-                                                                  12))
-                                   (primitive/ior (primitive/ishl (primitive/iand (cast i64
-                                                                                        (get bytes
-                                                                                             (+ at
-                                                                                                2)))
-                                                                                  0x3F)
-                                                                  6)
-                                                  (primitive/iand (cast i64
-                                                                        (get bytes
-                                                                             (+ at
-                                                                                3)))
-                                                                  0x3F)))]
+                    (| (<< (& lead 0x07) 18)
+                       (<< (& (cast i64
+                                    (get bytes
+                                         (+ at
+                                            1)))
+                              0x3F)
+                           12)
+                       (<< (& (cast i64
+                                    (get bytes
+                                         (+ at
+                                            2)))
+                              0x3F)
+                           6)
+                       (& (cast i64
+                                (get bytes
+                                     (+ at
+                                        3)))
+                          0x3F))]
               (if (or (< rune 0x10000) (> rune 0x10FFFF))
                   (utf8--invalid)
                   (Utf8Decoded
@@ -128,44 +122,38 @@
 ;;; bytes) and return the byte count. Aborts on a non-scalar.
 (defn utf8-encode-into [(out (ptr u8)) (rune i64)] (-> i64)
   (let [n (utf8-encoded-len rune)]
-    (case n 1
-          (set! out (cast u8 rune)) 2
-          (do
-            (set! out (cast u8 (primitive/ior 0xC0 (primitive/ishr rune 6))))
-            (set! (index out 1)
-                  (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F)))))
-            3
-          (do
-            (set! out (cast u8 (primitive/ior 0xE0 (primitive/ishr rune 12))))
-            (set! (index out 1)
-                  (cast u8
-                        (primitive/ior 0x80
-                                       (primitive/iand (primitive/ishr rune 6)
-                                                       0x3F))))
-            (set! (index out 2)
-                  (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F)))))
-            (do
-              (set! out (cast u8 (primitive/ior 0xF0 (primitive/ishr rune 18))))
-              (set! (index out 1)
-                    (cast u8
-                          (primitive/ior 0x80
-                                         (primitive/iand (primitive/ishr rune
-                                                                         12)
-                                                         0x3F))))
-              (set! (index out 2)
-                    (cast u8
-                          (primitive/ior 0x80
-                                         (primitive/iand (primitive/ishr rune 6)
-                                                         0x3F))))
-              (set! (index out 3)
-                    (cast u8 (primitive/ior 0x80 (primitive/iand rune 0x3F))))))
+    (case n
+      1 (set! out (cast u8 rune))
+      2
+        (do
+          (set! out (cast u8 (| 0xC0 (>> rune 6))))
+          (set! (index out 1)
+                (cast u8 (| 0x80 (& rune 0x3F)))))
+      3
+        (do
+          (set! out (cast u8 (| 0xE0 (>> rune 12))))
+          (set! (index out 1)
+                (cast u8
+                      (| 0x80 (& (>> rune 6) 0x3F))))
+          (set! (index out 2)
+                (cast u8 (| 0x80 (& rune 0x3F)))))
+      (do
+        (set! out (cast u8 (| 0xF0 (>> rune 18))))
+        (set! (index out 1)
+              (cast u8
+                    (| 0x80 (& (>> rune 12) 0x3F))))
+        (set! (index out 2)
+              (cast u8
+                    (| 0x80 (& (>> rune 6) 0x3F))))
+        (set! (index out 3)
+              (cast u8 (| 0x80 (& rune 0x3F))))))
     n))
 
 ;;; Append the UTF-8 encoding of `rune` to `out`. Aborts on a non-scalar.
 (defn utf8-encode! [(out (mut (ArrayList u8))) (rune i64)] (-> i64)
   (let [(mut buf) (zeroed (array u8 4))
         n (utf8-encode-into (index buf 0) rune)]
-    (al-extend! (mut out) (index buf 0) n)
+    (extend! (mut out) (index buf 0) n)
     n))
 
 ;;; End offset of the longest well-formed UTF-8 run starting at `at`.
@@ -186,7 +174,7 @@
 (defn width--in-ranges? [(table (slice (array i64 2))) (rune i64)] (-> bool)
   ;; Read the pairs through a flat i64 view: `get` on a slice of arrays currently
   ;; miscompiles (see README, "Known compiler issues").
-  (let [flat (cast (ptr i64) (slice-data table))
+  (let [flat (cast (ptr i64) (data table))
         (mut lo) 0
         (mut hi) (- (len table) 1)
         (mut found) false]
@@ -235,7 +223,8 @@
 
 ;;; Width of a multi-scalar cluster: that of its base, widened to 2 by an emoji
 ;;; presentation selector (U+FE0F) or a regional-indicator pair (a flag).
-(defn width--cluster-width [(text (slice u8)) (start i64) (end i64) (base i64)] (-> i64)
+(defn width--cluster-width [(text (slice u8)) (start i64) (end i64) (base i64)]
+  (-> i64)
   (let [base-width (rune-width base)]
     (if (or (= base-width 2) (rune-control? base))
         base-width
@@ -287,7 +276,7 @@
                                   :rune REPLACEMENT-RUNE
                                   :single true)))
                         (let [view
-                                (string-view-unchecked (subslice text
+                                (StringView::unchecked (subslice text
                                                                  0
                                                                  (.valid-end it)))
                               end (grapheme-next-offset view start)
@@ -351,36 +340,38 @@
             (let [keep (prefix-within-width text limit)]
               (subslice text 0 (.bytes keep)))
             (let [keep (prefix-within-width text (- limit 1))
-                  (mut out) (al-new [u8] a)]
-              (al-extend! (mut out) (slice-data text) (.bytes keep))
-              (al-extend! (mut out) (slice-data ELLIPSIS) (len ELLIPSIS))
-              (al-into-slice (mut out)))))))
+                  (mut out) (ArrayList::new [u8] a)]
+              (extend! (mut out) (data text) (.bytes keep))
+              (extend! (mut out) (data ELLIPSIS) (len ELLIPSIS))
+              (into-slice (mut out)))))))
 
 ;;; `text` truncated (with "…") and then right-padded with spaces to exactly
 ;;; `width` cells. Allocated from `a` whenever padding or an ellipsis is needed.
-(defn pad-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+(defn pad-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)]
+  (-> (slice u8))
   (let [cut (truncate-to-width a text width true)
         w (text-width cut)]
     (if (>= w width)
         cut
-        (let [(mut out) (al-new [u8] a)
+        (let [(mut out) (ArrayList::new [u8] a)
               (mut i) w]
-          (al-extend! (mut out) (slice-data cut) (len cut))
+          (extend! (mut out) (data cut) (len cut))
           (loop (if (>= (load i) width)
                     (break)
                     (do (push! (mut out) (cast u8 32)) (set! i (+ (load i) 1)))))
-          (al-into-slice (mut out))))))
+          (into-slice (mut out))))))
 
 ;;; Like `pad-to-width`, but pads on the left (right-aligned text).
-(defn pad-left-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (slice u8))
+(defn pad-left-to-width [(a (dyn Allocator)) (text (slice u8)) (width i64)]
+  (-> (slice u8))
   (let [cut (truncate-to-width a text width true)
         w (text-width cut)]
     (if (>= w width)
         cut
-        (let [(mut out) (al-new [u8] a)
+        (let [(mut out) (ArrayList::new [u8] a)
               (mut i) w]
           (loop (if (>= (load i) width)
                     (break)
                     (do (push! (mut out) (cast u8 32)) (set! i (+ (load i) 1)))))
-          (al-extend! (mut out) (slice-data cut) (len cut))
-          (al-into-slice (mut out))))))
+          (extend! (mut out) (data cut) (len cut))
+          (into-slice (mut out))))))

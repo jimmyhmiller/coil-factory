@@ -1,0 +1,348 @@
+(module ai-responses-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.http.client" :as http)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ai.chat" :use *)
+(import "ai.openai" :as openai)
+(import "ai.responses" :use *)
+
+(defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find text needle) (Some [_] true) (None [] false)))
+
+(defn parse [(a (dyn Allocator)) (text (slice u8))] (-> JVal)
+  (try (let [v (try-or! (from-json [JVal] a text) (do (assert false) (JNull)))]
+         v)))
+
+;;; Replays one canned stream per call, and remembers what it was sent.
+(defstruct FakeStream
+  [(allocator (dyn Allocator))
+   (replies (slice (slice u8)))
+   (statuses (slice i64))
+   (calls i64)
+   (bodies (ArrayList (slice u8)))
+   (headers (ArrayList (slice u8)))])
+
+(impl ResponsesTransport FakeStream
+  (post-stream [(self (ptr FakeStream))
+                (a (dyn Allocator))
+                (url (slice u8))
+                (headers (slice http/Header))
+                (body (slice u8))
+                (timeout-ms i64)
+                (bytes (dyn ResponseBytes))]
+    (-> openai/HttpReply)
+    (let [n (.calls self)
+          (mut seen) (StrBuf::new (.allocator self))
+          (mut reply) (zeroed openai/HttpReply)]
+      (for h (iter headers)
+        (push-str! (mut seen) (.name h))
+        (push-str! (mut seen) ": ")
+        (push-str! (mut seen) (.value h))
+        (push-str! (mut seen) "\n"))
+      (push! (mut (.headers self)) (finish! (mut seen)))
+      (push! (mut (.bodies self))
+             (match (concat (.allocator self) "" body)
+               (Some [kept] kept)
+               (None [] "")))
+      (set! (.calls self) (+ n 1))
+      (on-response-bytes bytes (get (.replies self) n))
+      (set! (.status reply) (get (.statuses self) n))
+      (load reply))))
+
+;;; Hands out `first`; renewing gives `second`, or fails when it is "".
+(defstruct FakeLogin [(first (slice u8)) (second (slice u8)) (renewals i64)])
+
+(impl ResponsesLogin FakeLogin
+  (login-current [(self (ptr FakeLogin)) (a (dyn Allocator))]
+    (-> CredentialResult)
+    (CredentialsOk (ResponsesCredentials :token (.first self) :account "acct-1")))
+  (login-renew [(self (ptr FakeLogin))
+                (a (dyn Allocator))
+                (rejected ResponsesCredentials)] (-> CredentialResult)
+    (do
+      (set! (.renewals self) (+ (.renewals self) 1))
+      (if (= (len (.second self)) 0)
+          (CredentialsBad "no refresh token")
+          (CredentialsOk (ResponsesCredentials
+                           :token (.second self)
+                           :account "acct-1"))))))
+
+(const TOOL-CALLS-STREAM
+       "event: response.created
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}
+
+event: response.output_item.done
+data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Two errors.\"}],\"encrypted_content\":\"SECRET\"}}
+
+event: response.output_item.done
+data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"report_error\",\"arguments\":\"{\\\"original\\\":\\\"Their\\\"}\"}}
+
+event: response.output_item.done
+data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_2\",\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"report_error\",\"arguments\":\"{\\\"original\\\":\\\"eror\\\"}\"}}
+
+event: response.completed
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":2600,\"input_tokens_details\":{\"cached_tokens\":1536},\"output_tokens\":40}}}
+
+")
+
+(const TEXT-STREAM
+       "event: response.output_item.done
+data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"All done.\"}]}}
+
+event: response.completed
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}
+
+")
+
+(defn tools-json [] (-> (slice u8))
+  "[{\"type\":\"function\",\"function\":{\"name\":\"report_error\",\"description\":\"Report one error.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"original\":{\"type\":\"string\"}}}}}]")
+
+(defn transcript [(a (dyn Allocator))] (-> JVal)
+  (parse a
+         "[{\"role\":\"system\",\"content\":\"You are a proofreader.\"},{\"role\":\"system\",\"content\":\"Call done at the end.\"},{\"role\":\"user\",\"content\":\"<input>Their is a eror.</input>\"}]"))
+
+(defn fake [(a (dyn Allocator))
+            (replies (slice (slice u8)))
+            (statuses (slice i64))] (-> (ptr FakeStream))
+  (box! a
+        FakeStream
+        (FakeStream
+          :allocator a
+          :replies replies
+          :statuses statuses
+          :calls 0
+          :bodies (ArrayList::new [(slice u8)] a)
+          :headers (ArrayList::new [(slice u8)] a))))
+
+(defn provider [(a (dyn Allocator))
+                (transport (ptr FakeStream))
+                (login (ptr FakeLogin))] (-> (ptr ResponsesChat))
+  (box! a
+        ResponsesChat
+        (ResponsesChat
+          :url "https://example.test/responses"
+          :login login
+          :transport transport)))
+
+(defn request [(a (dyn Allocator)) (messages JVal)] (-> ChatRequest)
+  (ChatRequest
+    :model "gpt-test"
+    :messages messages
+    :tools (parse a (tools-json))
+    :timeout-ms 5000))
+
+(deftest tool-calls-reasoning-and-usage-come-back-in-the-chat-shape
+  (let [a (malloc-allocator)
+        transport (fake a [TOOL-CALLS-STREAM] [200])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "tok-1"
+                  :second ""
+                  :renewals 0))]
+    (match (chat (provider a transport login) a (request a (transcript a)))
+      (ChatFailed [e] (do (println "failed: {s}" (.message e)) (assert false)))
+      (ChatOk [r]
+              (let [response r
+                    calls (.tool-calls response)
+                    message
+                      (jv-get (jv-nth (jv-get (.raw response) "choices") 0)
+                              "message")]
+                (assert-eq (jv-len calls) 2)
+                (assert (= (jv-str (jv-get (jv-nth calls 0) "id")) "call_a"))
+                (assert (= (jv-str (jv-get (jv-get (jv-nth calls 1) "function")
+                                           "name"))
+                           "report_error"))
+                (assert (= (jv-str (jv-get (jv-get (jv-nth calls 1) "function")
+                                           "arguments"))
+                           "{\"original\":\"eror\"}"))
+                (assert (= (.finish-reason response) "tool_calls"))
+                (assert-eq (.input-tokens response) 2600)
+                (assert-eq (.cached-input-tokens response) 1536)
+                (assert-eq (.output-tokens response) 40)
+                ;; The reasoning summary is shown; the items, encrypted
+                ;; reasoning included, are kept to send back.
+                (assert (= (jv-str (jv-get message "reasoning_content"))
+                           "Two errors."))
+                (assert-eq (jv-len (jv-get message "response_items")) 3)
+                (assert (= (jv-str (jv-get (jv-nth (jv-get message
+                                                           "response_items")
+                                                   0)
+                                           "encrypted_content"))
+                           "SECRET")))))
+    ;; What was sent.
+    (let [body (parse a (get (.bodies transport) 0))
+          headers (get (.headers transport) 0)
+          tool (jv-nth (jv-get body "tools") 0)]
+      (assert (= (jv-str (jv-get body "instructions"))
+                 "You are a proofreader.\n\nCall done at the end."))
+      (assert-eq (jv-len (jv-get body "input")) 1)
+      (assert (= (jv-str (jv-get (jv-nth (jv-get (jv-nth (jv-get body "input")
+                                                         0)
+                                                 "content")
+                                         0)
+                                 "text"))
+                 "<input>Their is a eror.</input>"))
+      (assert (= (jv-str (jv-get tool "name")) "report_error"))
+      (assert (= (jv-str (jv-get (jv-get tool "parameters") "type")) "object"))
+      (assert (match (jv-get body "store") (JBool [b] (not b)) (_ false)))
+      (assert (match (jv-get body "stream") (JBool [b] b) (_ false)))
+      (assert (contains? headers "Authorization: Bearer tok-1\n"))
+      (assert (contains? headers "chatgpt-account-id: acct-1\n"))
+      ;; The conversation is named in the body and the header, the same way.
+      (assert (contains? headers
+                         (cat a
+                              ["session_id: "
+                               (jv-str (jv-get body "prompt_cache_key"))
+                               "\n"])))
+      (assert (starts-with (jv-str (jv-get body "prompt_cache_key")) "factory-")))))
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
+
+(deftest a-later-request-starts-exactly-as-the-earlier-one-so-it-can-be-cached
+  (let [a (malloc-allocator)
+        transport (fake a [TOOL-CALLS-STREAM TEXT-STREAM] [200 200])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "tok-1"
+                  :second ""
+                  :renewals 0))
+        chat-provider (provider a transport login)
+        (mut messages) (transcript a)]
+    (match (chat chat-provider a (request a (load messages)))
+      (ChatFailed [e] (assert false))
+      (ChatOk [r]
+              (let [response r
+                    kept
+                      (jv-get (jv-nth (jv-get (.raw response) "choices") 0)
+                              "message")]
+                ;; The loop keeps the provider's message, then the tool results.
+                (array-push! (mut messages) kept)
+                (array-push! (mut messages)
+                             (parse a
+                                    "{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"Recorded as #1.\"}"))
+                (array-push! (mut messages)
+                             (parse a
+                                    "{\"role\":\"tool\",\"tool_call_id\":\"call_b\",\"content\":\"Recorded as #2.\"}"))
+                0)))
+    (match (chat chat-provider a (request a (load messages)))
+      (ChatFailed [e] (assert false))
+      (ChatOk [r] (assert (= (.text r) "All done."))))
+    (let [first (parse a (get (.bodies transport) 0))
+          second (parse a (get (.bodies transport) 1))
+          input (jv-get second "input")]
+      (assert (= (jv-str (jv-get first "instructions"))
+                 (jv-str (jv-get second "instructions"))))
+      (assert (= (jv-str (jv-get first "prompt_cache_key"))
+                 (jv-str (jv-get second "prompt_cache_key"))))
+      ;; user, then the model's three items as they came, then the outputs.
+      (assert-eq (jv-len input) 6)
+      (assert (= (jv-str (jv-get (jv-nth input 1) "encrypted_content"))
+                 "SECRET"))
+      (assert (= (jv-str (jv-get (jv-nth input 2) "id")) "fc_1"))
+      (assert (= (jv-str (jv-get (jv-nth input 4) "type"))
+                 "function_call_output"))
+      (assert (= (jv-str (jv-get (jv-nth input 4) "call_id")) "call_a"))
+      (assert (= (jv-str (jv-get (jv-nth input 5) "output")) "Recorded as #2.")))))
+
+(deftest an-assistant-message-from-elsewhere-is-rebuilt-as-items
+  (let [a (malloc-allocator)
+        transport (fake a [TEXT-STREAM] [200])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "tok-1"
+                  :second ""
+                  :renewals 0))
+        messages
+          (parse a
+                 "[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"Looking.\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"done\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"ok\"}]")]
+    (match (chat (provider a transport login) a (request a messages))
+      (ChatFailed [e] (assert false))
+      (ChatOk [r] (assert (= (.finish-reason r) "stop"))))
+    (let [input (jv-get (parse a (get (.bodies transport) 0)) "input")]
+      (assert-eq (jv-len input) 4)
+      (assert (= (jv-str (jv-get (jv-nth (jv-get (jv-nth input 1) "content") 0)
+                                 "type"))
+                 "output_text"))
+      (assert (= (jv-str (jv-get (jv-nth input 2) "type")) "function_call"))
+      (assert (= (jv-str (jv-get (jv-nth input 2) "call_id")) "c1")))))
+
+(deftest a-refused-login-is-renewed-once-and-the-request-made-again
+  (let [a (malloc-allocator)
+        transport
+          (fake a ["{\"detail\":\"token expired\"}" TEXT-STREAM] [401 200])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "old"
+                  :second "new"
+                  :renewals 0))]
+    (match (chat (provider a transport login) a (request a (transcript a)))
+      (ChatFailed [e] (do (println "failed: {s}" (.message e)) (assert false)))
+      (ChatOk [r] (assert (= (.text r) "All done."))))
+    (assert-eq (.renewals login) 1)
+    (assert (contains? (get (.headers transport) 1)
+                       "Authorization: Bearer new\n"))))
+
+(deftest a-login-that-cannot-be-renewed-is-an-authentication-failure
+  (let [a (malloc-allocator)
+        transport (fake a ["{\"detail\":\"token expired\"}"] [401])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "old"
+                  :second ""
+                  :renewals 0))]
+    (match (chat (provider a transport login) a (request a (transcript a)))
+      (ChatOk [r] (assert false))
+      (ChatFailed [e]
+                  (do
+                    (assert (= (.kind e) "authentication"))
+                    (assert (contains? (.message e) "token expired"))
+                    (assert (contains? (.message e) "no refresh token")))))))
+
+(deftest a-refusal-body-and-a-failed-response-are-shown
+  (let [a (malloc-allocator)
+        transport
+          (fake a
+                ["{\"detail\":\"Unsupported parameter: x\"}"
+                 "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n"
+                 "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n"]
+                [400 200 200])
+        login
+          (box! a
+                FakeLogin
+                (FakeLogin
+                  :first "tok"
+                  :second ""
+                  :renewals 0))
+        chat-provider (provider a transport login)]
+    (match (chat chat-provider a (request a (transcript a)))
+      (ChatOk [r] (assert false))
+      (ChatFailed [e]
+                  (do
+                    (assert-eq (.status e) 400)
+                    (assert (contains? (.message e) "Unsupported parameter: x")))))
+    (match (chat chat-provider a (request a (transcript a)))
+      (ChatOk [r] (assert false))
+      (ChatFailed [e] (assert (= (.message e) "boom (server_error)"))))
+    ;; A stream that stops before the response completes is not a reply.
+    (match (chat chat-provider a (request a (transcript a)))
+      (ChatOk [r] (assert false))
+      (ChatFailed [e]
+                  (assert (contains? (.message e)
+                                     "ended before the response completed"))))))

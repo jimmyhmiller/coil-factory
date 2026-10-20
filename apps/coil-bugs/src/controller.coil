@@ -59,19 +59,25 @@
 (defn save [(ctl (ptr Ctl))] (-> (Result i64 (slice u8)))
   (write-json-file (.a ctl) (ctl-state-path ctl) (.state ctl) 384))
 
-(defn seconds [(n i64)] (-> i64) (* n 1000))
+(defn seconds [(n i64)] (-> i64)
+  (* n 1000))
 
-(defn event! [(ctl (ptr Ctl)) (events (ptr (ArrayList Event))) (subject (slice u8)) (message (slice u8))] (-> (Result i64 (slice u8)))
-  (do (push! events (Event :time (utc-stamp (.a ctl) (.now ctl)) :message message))
-      (println "coil-bugs: {s}: {s}" subject message)
-      0)
+(defn event! [(ctl (ptr Ctl))
+              (events (ptr (ArrayList Event)))
+              (subject (slice u8))
+              (message (slice u8))] (-> (Result i64 (slice u8)))
+  (do
+    (push! events
+           (Event :time (utc-stamp (.a ctl) (.now ctl)) :message message))
+    (println "coil-bugs: {s}: {s}" subject message)
+    0)
   (save ctl))
 
 (defn bugs-of [(ctl (ptr Ctl))] (-> (ptr (ArrayList Bug)))
   (field (field ctl state) bugs))
 
 (defn bug-at [(ctl (ptr Ctl)) (i i64)] (-> (ptr Bug))
-  (al-elem [Bug] (bugs-of ctl) i))
+  (elem (bugs-of ctl) i))
 
 (defn find-bug [(ctl (ptr Ctl)) (id (slice u8))] (-> i64)
   (let [(mut found) -1
@@ -81,26 +87,40 @@
       (set! i (+ (load i) 1)))
     (load found)))
 
-(defn bug-event! [(ctl (ptr Ctl)) (bug (ptr Bug)) (message (slice u8))] (-> (Result i64 (slice u8)))
+(defn bug-event! [(ctl (ptr Ctl)) (bug (ptr Bug)) (message (slice u8))]
+  (-> (Result i64 (slice u8)))
   (event! ctl (field bug events) (.id bug) message))
 
-(defn triage-event! [(ctl (ptr Ctl)) (message (slice u8))] (-> (Result i64 (slice u8)))
+(defn triage-event! [(ctl (ptr Ctl)) (message (slice u8))]
+  (-> (Result i64 (slice u8)))
   (event! ctl (field (field (field ctl state) triage) events) "triage" message))
 
 (defn status-name [(status BugStatus)] (-> (slice u8))
   (match status
-    (Queued [] "queued") (Preparing [] "preparing") (Running [] "running")
-    (Publishing [] "publishing") (Done [] "done") (Skipped [] "skipped")
+    (Queued [] "queued")
+    (Preparing [] "preparing")
+    (Running [] "running")
+    (Publishing [] "publishing")
+    (Done [] "done")
+    (Skipped [] "skipped")
     (ScopeReview [] "awaiting Jimmy's scope decision")))
 
 (defn outcome-name [(outcome Outcome)] (-> (slice u8))
   (match outcome
-    (Pending [] "pending") (PullRequest [] "pull request") (DoesNotReproduce [] "does not reproduce")
-    (CannotVerify [] "cannot verify") (Failed [] "did not finish") (Noted [] "noted in the pad")
+    (Pending [] "pending")
+    (PullRequest [] "pull request")
+    (DoesNotReproduce [] "does not reproduce")
+    (CannotVerify [] "cannot verify")
+    (Failed [] "did not finish")
+    (Noted [] "noted in the pad")
     (OutOfScope [] "out of scope")))
 
 (defn active? [(bug Bug)] (-> bool)
-  (match (.status bug) (Preparing [] true) (Running [] true) (Publishing [] true) (_ false)))
+  (match (.status bug)
+    (Preparing [] true)
+    (Running [] true)
+    (Publishing [] true)
+    (_ false)))
 
 (defn queued? [(bug Bug)] (-> bool)
   (match (.status bug) (Queued [] true) (_ false)))
@@ -108,47 +128,88 @@
 (defn halted? [(ctl (ptr Ctl))] (-> bool)
   (> (len (.reason (field (field ctl state) halted))) 0))
 
-(defn new-bug [(a (dyn Allocator)) (id (slice u8)) (title (slice u8)) (cells (ArrayList (slice u8))) (reason (slice u8))
-               (snapshot (slice u8)) (status BugStatus) (outcome Outcome)] (-> Bug)
-  (Bug :id id :title title :cells cells :reason reason :snapshot snapshot :status status :outcome outcome
-       :failure "" :infrastructure-failures 0 :watch (idle-watch) :base-build (BaseBuild :commit "" :started 0)
-       :base "" :compiler "" :repro (empty-repro a) :head "" :fix "" :pr-branch "" :pr-commit "" :pr-url ""
-       :other-bugs "" :scope-rule "" :scope-reason "" :scope-quote "" :scope-request "" :scope-url ""
-       :scope-polled 0 :scope-comment "" :events (al-new [Event] a)))
+(defn new-bug [(a (dyn Allocator))
+               (id (slice u8))
+               (title (slice u8))
+               (cells (ArrayList (slice u8)))
+               (reason (slice u8))
+               (snapshot (slice u8))
+               (status BugStatus)
+               (outcome Outcome)] (-> Bug)
+  (Bug
+    :id id
+    :title title
+    :cells cells
+    :reason reason
+    :snapshot snapshot
+    :status status
+    :outcome outcome
+    :failure ""
+    :infrastructure-failures 0
+    :watch (idle-watch)
+    :base-build (BaseBuild :commit "" :started 0)
+    :base ""
+    :compiler ""
+    :repro (empty-repro a)
+    :head ""
+    :fix ""
+    :pr-branch ""
+    :pr-commit ""
+    :pr-url ""
+    :other-bugs ""
+    :scope-rule ""
+    :scope-reason ""
+    :scope-quote ""
+    :scope-request ""
+    :scope-url ""
+    :scope-polled 0
+    :scope-comment ""
+    :events (ArrayList::new [Event] a)))
 
 (defn halt! [(ctl (ptr Ctl)) (reason (slice u8))] (-> (Result i64 (slice u8)))
-  (do (set! (.halted (field ctl state)) (Halt :reason reason :time (utc-stamp (.a ctl) (.now ctl))))
-      (println "coil-bugs: halted: {s}" reason)
-      0)
+  (do
+    (set! (.halted (field ctl state))
+          (Halt :reason reason :time (utc-stamp (.a ctl) (.now ctl))))
+    (println "coil-bugs: halted: {s}" reason)
+    0)
   (save ctl))
 
 ;; ---------------------------------------------------------------------------
 ;; The heartbeat
 
 (defn tick [(ctl (ptr Ctl))] (-> (Result i64 (slice u8)))
-  (try (try! (native-check (.native ctl) (.a ctl)))
-       (try! (ingest-snapshot ctl))
-       (try! (advance-scope-reviews ctl))
-       (let [triage (field (field ctl state) triage)
-             active (active-bug ctl)
-             snapshot (field (field ctl state) snapshot)]
-         (try! (cond (match (.phase triage) (TriageRunning [] true) (_ false)) (advance-triage ctl)
-                     (>= active 0) (advance-bug ctl (bug-at ctl active))
-                     (or (not (.enabled (field ctl config))) (halted? ctl)) (Ok [i64 (slice u8)] 0)
-                     (and (> (len (.id snapshot)) 0)
-                          (!= (.digest snapshot) (.triaged-digest (field ctl state)))
-                          (not (and (match (.phase triage) (TriageFailed [] true) (_ false))
-                                    (= (.snapshot triage) (.id snapshot)))))
-                       (start-triage ctl)
-                     :else (start-next-bug ctl)))
-         (write-status ctl))))
+  (try
+    (try! (native-check (.native ctl) (.a ctl)))
+    (try! (ingest-snapshot ctl))
+    (try! (advance-scope-reviews ctl))
+    (let [triage (field (field ctl state) triage)
+          active (active-bug ctl)
+          snapshot (field (field ctl state) snapshot)]
+      (try! (cond (match (.phase triage) (TriageRunning [] true) (_ false))
+                    (advance-triage ctl)
+                  (>= active 0) (advance-bug ctl (bug-at ctl active))
+                  (or (not (.enabled (field ctl config))) (halted? ctl))
+                    (Ok [i64 (slice u8)] 0)
+                  (and (> (len (.id snapshot)) 0)
+                       (!= (.digest snapshot)
+                           (.triaged-digest (field ctl state)))
+                       (not (and (match (.phase triage)
+                                   (TriageFailed [] true)
+                                   (_ false))
+                                 (= (.snapshot triage) (.id snapshot)))))
+                    (start-triage ctl)
+                  :else (start-next-bug ctl)))
+      (write-status ctl))))
 
 (defn active-bug [(ctl (ptr Ctl))] (-> i64)
   (let [(mut found) -1
         (mut count) 0
         (mut i) 0]
     (for bug (iter (load (bugs-of ctl)))
-      (when (active? bug) (set! found (load i)) (set! count (+ (load count) 1)) 0)
+      (when (active? bug)
+        (set! found (load i))
+        (set! count (+ (load count) 1))
+        0)
       (set! i (+ (load i) 1)))
     (when (> (load count) 1)
       (println "coil-bugs: more than one bug is active; the factory works one at a time")
@@ -159,60 +220,95 @@
 ;; Snapshots
 
 (defn snapshot-path [(ctl (ptr Ctl)) (id (slice u8))] (-> (slice u8))
-  (path-join (.a ctl) (.snapshot-dir (field ctl config)) (join (.a ctl) [id ".json"])))
+  (path-join (.a ctl)
+             (.snapshot-dir (field ctl config))
+             (join (.a ctl) [id ".json"])))
 
-(defn note-cell? [(id (slice u8))] (-> bool) (outcome-note? id))
+(defn note-cell? [(id (slice u8))] (-> bool)
+  (outcome-note? id))
 
 ;;; What triage depends on: the cells people wrote, not the factory's notes.
-(defn cells-digest [(a (dyn Allocator)) (cells (ArrayList Cell))] (-> (slice u8))
-  (let [(mut text) (sb-new a)]
+(defn cells-digest [(a (dyn Allocator)) (cells (ArrayList Cell))]
+  (-> (slice u8))
+  (let [(mut text) (StrBuf::new a)]
     (for cell (iter cells)
       (when (not (note-cell? (.id cell)))
-        (sb-push-str! (mut text) (.id cell))
-        (sb-push-str! (mut text) "\x00;")
-        (sb-push-str! (mut text) (.source cell))
-        (sb-push-str! (mut text) "\x00;")
+        (push-str! (mut text) (.id cell))
+        (push-str! (mut text) "\x00;")
+        (push-str! (mut text) (.source cell))
+        (push-str! (mut text) "\x00;")
         0))
-    (let [all (sb-finish! (mut text))]
-      (join a [(hex64 a (str-hash all)) "-" (int-text a (len all))]))))
+    (let [all (finish! (mut text))]
+      (join a [(hex64 a (hash all)) "-" (int-text a (len all))]))))
 
-(defn read-snapshot [(ctl (ptr Ctl)) (id (slice u8))] (-> (Result Snapshot (slice u8)))
+(defn read-snapshot [(ctl (ptr Ctl)) (id (slice u8))]
+  (-> (Result Snapshot (slice u8)))
   (match (read-json-file [Snapshot] (.a ctl) (snapshot-path ctl id))
     (Err [why] (Err why))
-    (Ok [snapshot] (if (or (!= (.id snapshot) id) (!= (.notebook snapshot) (.notebook (field ctl config))))
-                       (Err (join (.a ctl) ["snapshot " id " is not a " (.notebook (field ctl config)) " snapshot"]))
-                       (Ok snapshot)))))
+    (Ok [snapshot]
+        (if (or (!= (.id snapshot) id)
+                (!= (.notebook snapshot) (.notebook (field ctl config))))
+            (Err (join (.a ctl)
+                       ["snapshot "
+                        id
+                        " is not a "
+                        (.notebook (field ctl config))
+                        " snapshot"]))
+            (Ok snapshot)))))
 
 (defn ingest-snapshot [(ctl (ptr Ctl))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
              names (try! (list-names a (.snapshot-dir (field ctl config))))
              (mut newest) ""]
          (for name (iter names)
-           (when (and (ends-with? name ".json") (not (starts-with name "."))) (set! newest (subslice name 0 (- (len name) 5))) 0))
-         (if (or (= (len (load newest)) 0) (= (load newest) (.id (field (field ctl state) snapshot))))
+           (when (and (ends-with? name ".json") (not (starts-with name ".")))
+             (set! newest (subslice name 0 (- (len name) 5)))
+             0))
+         (if (or (= (len (load newest)) 0)
+                 (= (load newest) (.id (field (field ctl state) snapshot))))
              (Ok 0)
              (let [snapshot (try! (read-snapshot ctl (load newest)))]
                (set! (.snapshot (field ctl state))
-                     (SnapshotSeen :id (load newest) :received (.received snapshot) :cells (len (.cells snapshot))
-                                   :seen (utc-stamp a (.now ctl)) :digest (cells-digest a (.cells snapshot))))
+                     (SnapshotSeen
+                       :id (load newest)
+                       :received (.received snapshot)
+                       :cells (len (.cells snapshot))
+                       :seen (utc-stamp a (.now ctl))
+                       :digest (cells-digest a (.cells snapshot))))
                ;; The pad itself records which bugs the factory has attempted:
                ;; each note cell is named for its bug. Count those too, so lost
                ;; controller state can never make the factory attempt a bug twice.
                (for cell (iter (.cells snapshot))
-                 (when (and (note-cell? (.id cell)) (!= (.id cell) (join a [NOTE-CELL-PREFIX "status"])))
-                   (let [bug-id (subslice (.id cell) (len NOTE-CELL-PREFIX) (len (.id cell)))
+                 (when (and (note-cell? (.id cell))
+                            (!= (.id cell) (join a [NOTE-CELL-PREFIX "status"])))
+                   (let [bug-id
+                           (subslice (.id cell)
+                                     (len NOTE-CELL-PREFIX)
+                                     (len (.id cell)))
                          at (find-bug ctl bug-id)]
                      (if (< at 0)
-                         (let [(mut cells) (al-new [(slice u8)] a)]
+                         (let [(mut cells) (ArrayList::new [(slice u8)] a)]
                            (push! (mut cells) bug-id)
                            (push! (bugs-of ctl)
-                                  (new-bug a bug-id "(recorded in the pad)" (load cells) "" (load newest) (Done) (Noted)))
+                                  (new-bug a
+                                           bug-id
+                                           "(recorded in the pad)"
+                                           (load cells)
+                                           ""
+                                           (load newest)
+                                           (Done)
+                                           (Noted)))
                            0)
                          (let [bug (bug-at ctl at)]
-                           (when (queued? (load bug)) (set! (.status bug) (Done)) (set! (.outcome bug) (Noted)) 0)
+                           (when (queued? (load bug))
+                             (set! (.status bug) (Done))
+                             (set! (.outcome bug) (Noted))
+                             0)
                            0)))
                    0))
-               (println "coil-bugs: snapshot {s}: {} cells" (load newest) (len (.cells snapshot)))
+               (println "coil-bugs: snapshot {s}: {} cells"
+                        (load newest)
+                        (len (.cells snapshot)))
                (save ctl))))))
 
 ;; ---------------------------------------------------------------------------
@@ -221,50 +317,82 @@
 (defstruct Value [(key (slice u8)) (value (slice u8))])
 
 ;;; `text` with every `{{KEY}}` replaced; a key with no value is an error.
-(defn fill [(a (dyn Allocator)) (text (slice u8)) (values (slice Value))] (-> (Result (slice u8) (slice u8)))
-  (block :fill
-         (let [(mut out) (sb-new a)
-               (mut at) 0]
-           (loop (match (str-find-from text "{{" (load at))
-                   (None [] (do (sb-push-str! (mut out) (subslice text (load at) (len text))) (break)))
-                   (Some [open]
-                         (match (str-find-from text "}}" open)
-                           (None [] (do (sb-push-str! (mut out) (subslice text (load at) (len text))) (break)))
-                           (Some [close]
-                                 (let [key (subslice text (+ open 2) close)
-                                       (mut found) false]
-                                   (sb-push-str! (mut out) (subslice text (load at) open))
-                                   (for v (iter values)
-                                     (when (and (not (load found)) (= (.key v) key))
-                                       (sb-push-str! (mut out) (.value v))
-                                       (set! found true)
-                                       0))
-                                   (when (not (load found))
-                                     (return-from :fill (Err (join a ["no value for {{" key "}}"]))))
-                                   (set! at (+ close 2))))))))
-           (Ok (sb-finish! (mut out))))))
+(defn fill [(a (dyn Allocator)) (text (slice u8)) (values (slice Value))]
+  (-> (Result (slice u8) (slice u8)))
+  (block
+    :fill
+      (let [(mut out) (StrBuf::new a)
+            (mut at) 0]
+        (loop (match (find-from text "{{" (load at))
+                (None []
+                      (do
+                        (push-str! (mut out)
+                                   (subslice text (load at) (len text)))
+                        (break)))
+                (Some [open]
+                      (match (find-from text "}}" open)
+                        (None []
+                              (do
+                                (push-str! (mut out)
+                                           (subslice text (load at) (len text)))
+                                (break)))
+                        (Some [close]
+                              (let [key (subslice text (+ open 2) close)
+                                    (mut found) false]
+                                (push-str! (mut out)
+                                           (subslice text (load at) open))
+                                (for v (iter values)
+                                  (when (and (not (load found))
+                                             (= (.key v) key))
+                                    (push-str! (mut out) (.value v))
+                                    (set! found true)
+                                    0))
+                                (when (not (load found))
+                                  (return-from
+                                    :fill
+                                      (Err (join a ["no value for {{" key "}}"]))))
+                                (set! at (+ close 2))))))))
+        (Ok (finish! (mut out))))))
 
 ;;; A recipe from `recipes`, filled, with the configured model added to its
 ;;; front matter. The reviewers it names are filled into the state directory.
-(defn render [(ctl (ptr Ctl)) (name (slice u8)) (extra (slice Value))] (-> (Result (slice u8) (slice u8)))
+(defn render [(ctl (ptr Ctl)) (name (slice u8)) (extra (slice Value))]
+  (-> (Result (slice u8) (slice u8)))
   (try (let [a (.a ctl)
              config (field ctl config)
-             rendered (path-join a (path-join a (.state-dir config) "rendered") "reviewers")
-             (mut values) (al-new [Value] a)]
+             rendered
+               (path-join a
+                          (path-join a (.state-dir config) "rendered")
+                          "reviewers")
+             (mut values) (ArrayList::new [Value] a)]
          (push! (mut values) (Value :key "PROGRAM" :value (.program config)))
          (push! (mut values) (Value :key "REVIEWERS" :value rendered))
-         (push! (mut values) (Value :key "REVIEW_MODEL" :value (.review-model config)))
+         (push! (mut values)
+                (Value :key "REVIEW_MODEL" :value (.review-model config)))
          (push! (mut values) (Value :key "SCOPE" :value (.scope-file config)))
          (for v (iter extra) (push! (mut values) v))
          (let [reviewers (path-join a (.recipes config) "reviewers")]
            (for file (iter (try! (list-names a reviewers)))
              (when (ends-with? file ".md")
-               (try! (write-text a (path-join a rendered file)
-                                 (try! (fill a (try! (read-required a (path-join a reviewers file))) (al-slice values))) 420))
+               (try! (write-text a
+                                 (path-join a rendered file)
+                                 (try! (fill a
+                                             (try! (read-required a
+                                                                  (path-join a
+                                                                             reviewers
+                                                                             file)))
+                                             (slice values)))
+                                 420))
                0)))
-         (let [text (try! (fill a (try! (read-required a (path-join a (.recipes config) name))) (al-slice values)))
-               lines (str-split a text "\n")
-               (mut out) (sb-new a)
+         (let [text
+                 (try! (fill a
+                             (try! (read-required a
+                                                  (path-join a
+                                                             (.recipes config)
+                                                             name)))
+                             (slice values)))
+               lines (split a text "\n")
+               (mut out) (StrBuf::new a)
                (mut fence) 0
                (mut inserted) false
                (mut names-model) false]
@@ -272,15 +400,20 @@
              (when (= line "---")
                (set! fence (+ (load fence) 1))
                (when (and (= (load fence) 2) (not (load inserted)))
-                 (sb-push-str! (mut out) (join a ["model: " (.model config) "\n"]))
+                 (push-str! (mut out) (join a ["model: " (.model config) "\n"]))
                  (set! inserted true)
                  0)
                0)
-             (when (and (= (load fence) 1) (starts-with line "model:")) (set! names-model true) 0)
-             (sb-push-str! (mut out) line)
-             (sb-push-str! (mut out) "\n"))
-           (cond (load names-model) (Err (join a [name " must not name a model; config.json chooses it"]))
-                 (load inserted) (Ok (sb-finish! (mut out)))
+             (when (and (= (load fence) 1) (starts-with line "model:"))
+               (set! names-model true)
+               0)
+             (push-str! (mut out) line)
+             (push-str! (mut out) "\n"))
+           (cond (load names-model)
+                   (Err (join a
+                              [name
+                               " must not name a model; config.json chooses it"]))
+                 (load inserted) (Ok (finish! (mut out)))
                  :else (Err (join a [name " has no front matter"])))))))
 
 ;; ---------------------------------------------------------------------------
@@ -289,76 +422,114 @@
 (defsum Watched (Going) (Over [(run RunView)]))
 
 (defn terminal? [(status (slice u8))] (-> bool)
-  (or (= status "succeeded") (= status "failed") (= status "cancelled") (= status "blocked") (= status "lost")))
+  (or (= status "succeeded")
+      (= status "failed")
+      (= status "cancelled")
+      (= status "blocked")
+      (= status "lost")))
 
 (defn progress-kind? [(kind (slice u8))] (-> bool)
-  (or (= kind "agent.text") (= kind "agent.thought") (= kind "tool.started") (= kind "tool.finished")
-      (= kind "station.started") (= kind "station.finished") (= kind "gate.started") (= kind "gate.finished")
-      (= kind "review.started") (= kind "review.verdict")))
+  (or (= kind "agent.text")
+      (= kind "agent.streaming")
+      (= kind "agent.thought")
+      (= kind "tool.started")
+      (= kind "tool.finished")
+      (= kind "station.started")
+      (= kind "station.finished")
+      (= kind "gate.started")
+      (= kind "gate.finished")
+      (= kind "review.started")
+      (= kind "review.verdict")))
 
 ;;; Read the run's journal from where the last heartbeat stopped: any agent,
 ;;; tool, gate, review or station record is progress.
-(defn progress! [(ctl (ptr Ctl)) (watch (ptr RunWatch))] (-> (Result i64 (slice u8)))
+(defn progress! [(ctl (ptr Ctl)) (watch (ptr RunWatch))]
+  (-> (Result i64 (slice u8)))
   (let [a (.a ctl)
         path (run-journal a (.native ctl) (.run-id watch))]
-    (match (jsonl/journal-read a path (.journal-offset watch) 5000 16777216)
-      (Err [_] (Err (join a ["cannot read the journal " path " from byte " (int-text a (.journal-offset watch))])))
-      (Ok [batch]
-          (let [(mut b) batch]
-            (for record (iter (jsonl/batch-records (load b)))
-              (match (jv-parse a (.line record))
-                (Some [r] (when (progress-kind? (jv-string-or (jv-get r "kind") ""))
-                            (match (jv-get r "t")
-                              (JInt [t] (when (> t (.last-progress watch)) (set! (.last-progress watch) t) 0))
-                              (_ 0))
-                            0))
-                (None [] 0)))
-            (set! (.journal-offset watch) (jsonl/batch-next-offset (load b)))
-            (jsonl/journal-batch-free! (mut b))
-            (Ok 0))))))
+    (try (let [(mut b)
+                 (try-or! (jsonl/journal-read a
+                                              path
+                                              (.journal-offset watch)
+                                              5000
+                                              16777216)
+                          (Err (join a
+                                     ["cannot read the journal "
+                                      path
+                                      " from byte "
+                                      (int-text a (.journal-offset watch))])))]
+           (for record (iter (jsonl/batch-records (load b)))
+             (match (jv-parse a (.line record))
+               (Some [r]
+                     (when (progress-kind? (jv-string-or (jv-get r "kind") ""))
+                       (match (jv-get r "t")
+                         (JInt [t]
+                               (when (> t (.last-progress watch))
+                                 (set! (.last-progress watch) t)
+                                 0))
+                         (_ 0))
+                       0))
+               (None [] 0)))
+           (set! (.journal-offset watch) (jsonl/batch-next-offset (load b)))
+           (jsonl/journal-batch-free! (mut b))
+           (Ok 0)))))
 
 ;;; Create the run (or find the one an earlier, interrupted heartbeat
 ;;; created). A refused run is not this record's fault: it goes back to
 ;;; waiting and the factory stops for a person.
-(defn submit! [(ctl (ptr Ctl)) (watch (ptr RunWatch))] (-> (Result bool (slice u8)))
+(defn submit! [(ctl (ptr Ctl)) (watch (ptr RunWatch))]
+  (-> (Result bool (slice u8)))
   (try (let [a (.a ctl)
              found (try! (native-reconcile (.native ctl) a (.tag watch)))
-             created (if (> (len found) 0)
-                         (match (native-run (.native ctl) a found)
-                           (Ok [run] (Created run))
-                           (Err [why] (Unknown why)))
-                         (match (jv-parse a (.request watch))
-                           (Some [request] (native-create (.native ctl) a request))
-                           (None [] (Refused "the stored run request is not JSON"))))]
+             created
+               (if (> (len found) 0)
+                   (match (native-run (.native ctl) a found)
+                     (Ok [run] (Created run))
+                     (Err [why] (Unknown why)))
+                   (match (jv-parse a (.request watch))
+                     (Some [request] (native-create (.native ctl) a request))
+                     (None [] (Refused "the stored run request is not JSON"))))]
          (match created
            (Created [run]
-                    (do (set! (.run-id watch) (.id run))
-                        (set! (.phase watch) (Watching))
-                        (set! (.request watch) "")
-                        (set! (.started watch) (.now ctl))
-                        (set! (.last-progress watch) (.now ctl))
-                        (set! (.journal-offset watch) 0)
-                        (println "coil-bugs: started native run {s}" (.id run))
-                        (try! (save ctl))
-                        (Ok true)))
-           (Refused [message] (do (try! (halt! ctl (join a ["The factory refused a run: " message]))) (Ok false)))
+                    (do
+                      (set! (.run-id watch) (.id run))
+                      (set! (.phase watch) (Watching))
+                      (set! (.request watch) "")
+                      (set! (.started watch) (.now ctl))
+                      (set! (.last-progress watch) (.now ctl))
+                      (set! (.journal-offset watch) 0)
+                      (println "coil-bugs: started native run {s}" (.id run))
+                      (try! (save ctl))
+                      (Ok true)))
+           (Refused [message]
+                    (do
+                      (try! (halt! ctl
+                                   (join a
+                                         ["The factory refused a run: " message])))
+                      (Ok false)))
            ;; Unknown outcome: the tag finds the run on the next heartbeat.
            (Unknown [message] (Err message))))))
 
-(defn cancel! [(ctl (ptr Ctl)) (watch (ptr RunWatch))] (-> (Result i64 (slice u8)))
+(defn cancel! [(ctl (ptr Ctl)) (watch (ptr RunWatch))]
+  (-> (Result i64 (slice u8)))
   (native-cancel (.native ctl) (.a ctl) (.run-id watch)))
 
-(defn stop! [(ctl (ptr Ctl)) (watch (ptr RunWatch)) (failure (slice u8))] (-> (Result i64 (slice u8)))
-  (try (set! (.phase watch) (Stopping))
-       (set! (.failure watch) failure)
-       (set! (.stop-started watch) (.now ctl))
-       (println "coil-bugs: {s}" failure)
-       (try! (save ctl))
-       (cancel! ctl watch)))
+(defn stop! [(ctl (ptr Ctl)) (watch (ptr RunWatch)) (failure (slice u8))]
+  (-> (Result i64 (slice u8)))
+  (try
+    (set! (.phase watch) (Stopping))
+    (set! (.failure watch) failure)
+    (set! (.stop-started watch) (.now ctl))
+    (println "coil-bugs: {s}" failure)
+    (try! (save ctl))
+    (cancel! ctl watch)))
 
 ;;; One step of watching a run: `Over` with the run once it has ended and its
 ;;; worker is gone, else `Going`.
-(defn watch-run [(ctl (ptr Ctl)) (watch (ptr RunWatch)) (idle-ms i64) (max-ms i64)] (-> (Result Watched (slice u8)))
+(defn watch-run [(ctl (ptr Ctl))
+                 (watch (ptr RunWatch))
+                 (idle-ms i64)
+                 (max-ms i64)] (-> (Result Watched (slice u8)))
   (try (let [a (.a ctl)
              config (field ctl config)]
          (match (.phase watch)
@@ -371,29 +542,62 @@
                 (cond stopping
                         (if (and (terminal? (.status run)) (not (.alive run)))
                             (Ok (Over run))
-                            (do (when (not (terminal? (.status run))) (try! (cancel! ctl watch)) 0)
-                                (try! (save ctl))
-                                (Ok (Going))))
+                            (do
+                              (when (not (terminal? (.status run)))
+                                (try! (cancel! ctl watch))
+                                0)
+                              (try! (save ctl))
+                              (Ok (Going))))
                       ;; Nobody answers here: an agent that stops to ask ends
                       ;; its attempt, and its question goes into the pad note.
                       (= (.status run) "blocked")
-                        (do (try! (stop! ctl watch (join a ["The agent stopped to ask: "
-                                                             (if (> (len (.reason run)) 0) (.reason run) "no reason given")])))
-                            (Ok (Going)))
+                        (do
+                          (try! (stop! ctl
+                                       watch
+                                       (join a
+                                             ["The agent stopped to ask: "
+                                              (if (> (len (.reason run)) 0)
+                                                  (.reason run)
+                                                  "no reason given")])))
+                          (Ok (Going)))
                       (terminal? (.status run))
-                        (if (.alive run) (do (try! (save ctl)) (Ok (Going))) (Ok (Over run)))
+                        (if (.alive run)
+                            (do (try! (save ctl)) (Ok (Going)))
+                            (Ok (Over run)))
                       (= (.status run) "paused")
-                        (do (set! (.last-progress watch) (.now ctl)) (try! (save ctl)) (Ok (Going)))
+                        (do
+                          (set! (.last-progress watch) (.now ctl))
+                          (try! (save ctl))
+                          (Ok (Going)))
                       :else
-                        (let [gate (let [(mut g) false]
-                                     (for s (iter (.stations run)) (when (= (.status s) "gate") (set! g true) 0))
-                                     (load g))
-                              limit (if gate (seconds (.gate-idle-seconds config)) idle-ms)]
+                        (let [gate
+                                (let [(mut g) false]
+                                  (for s (iter (.stations run))
+                                    (when (= (.status s) "gate")
+                                      (set! g true)
+                                      0))
+                                  (load g))
+                              limit
+                                (if gate
+                                    (seconds (.gate-idle-seconds config))
+                                    idle-ms)]
                           (cond (> (- (.now ctl) (.last-progress watch)) limit)
-                                  (try! (stop! ctl watch (join a ["Stopped: no agent, tool, gate or station progress for "
-                                                                   (int-text a (/ limit 60000)) " minutes"])))
+                                  (try! (stop! ctl
+                                               watch
+                                               (join a
+                                                     ["Stopped: no agent, tool, gate or station progress for "
+                                                      (int-text a
+                                                                (/ limit 60000))
+                                                      " minutes"])))
                                 (> (- (.now ctl) (.started watch)) max-ms)
-                                  (try! (stop! ctl watch (join a ["Stopped: ran past its " (int-text a (/ max-ms 3600000)) " hour limit"])))
+                                  (try! (stop! ctl
+                                               watch
+                                               (join a
+                                                     ["Stopped: ran past its "
+                                                      (int-text a
+                                                                (/ max-ms
+                                                                   3600000))
+                                                      " hour limit"])))
                                 :else (try! (save ctl)))
                           (Ok (Going))))))))))
 
@@ -401,24 +605,37 @@
 ;;; provider, the harness, the worker) rather than the agent's work.
 (defstruct Ending [(failure (slice u8)) (infrastructure bool)])
 
-(defn ending [(a (dyn Allocator)) (watch (ptr RunWatch)) (run RunView)] (-> Ending)
+(defn ending [(a (dyn Allocator)) (watch (ptr RunWatch)) (run RunView)]
+  (-> Ending)
   (if (> (len (.failure watch)) 0)
       (Ending :failure (.failure watch) :infrastructure false)
-      (Ending :failure (join a ["The native run ended " (.status run) ": " (if (> (len (.reason run)) 0) (.reason run) "no reason given")])
-              :infrastructure (or (= (.status run) "failed") (= (.status run) "lost")))))
+      (Ending
+        :failure
+          (join a
+                ["The native run ended "
+                 (.status run)
+                 ": "
+                 (if (> (len (.reason run)) 0) (.reason run) "no reason given")])
+        :infrastructure (or (= (.status run) "failed") (= (.status run) "lost")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Triage
 
 (defn cell-file [(a (dyn Allocator)) (n i64)] (-> (slice u8))
   (let [digits (int-text a n)]
-    (join a ["cells/" (subslice "0000" 0 (if (< (len digits) 4) (- 4 (len digits)) 0)) digits ".md"])))
+    (join a
+          ["cells/"
+           (subslice "0000" 0 (if (< (len digits) 4) (- 4 (len digits)) 0))
+           digits
+           ".md"])))
 
-(defn git-run [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> (Result i64 (slice u8)))
+(defn git-run [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))]
+  (-> (Result i64 (slice u8)))
   (match (git a dir args) (Ok [_] (Ok 0)) (Err [why] (Err why))))
 
 ;;; The snapshot as a small git repository, the triage run's project.
-(defn triage-project [(ctl (ptr Ctl)) (snapshot Snapshot)] (-> (Result (slice u8) (slice u8)))
+(defn triage-project [(ctl (ptr Ctl)) (snapshot Snapshot)]
+  (-> (Result (slice u8) (slice u8)))
   (try (let [a (.a ctl)
              parent (path-join a (.state-dir (field ctl config)) "triage")
              project (path-join a parent (.id snapshot))
@@ -427,29 +644,53 @@
              (Ok project)
              (let [listing (jv-array a)
                    (mut n) 0]
-               (when (dir-exists? a temporary) (atomic/remove-tree! a temporary) 0)
+               (when (dir-exists? a temporary)
+                 (atomic/remove-tree! a temporary)
+                 0)
                (for cell (iter (.cells snapshot))
                  (let [file (cell-file a (load n))
                        entry (jv-object a)]
-                   (try! (write-text a (path-join a temporary file) (.source cell) 420))
+                   (try! (write-text a
+                                     (path-join a temporary file)
+                                     (.source cell)
+                                     420))
                    (jv-put! entry "id" (JStr (.id cell)))
                    (jv-put! entry "ts" (JInt (.ts cell)))
                    (jv-put! entry "file" (JStr file))
                    (jv-push! listing entry)
                    (set! n (+ (load n) 1))))
-               (try! (write-text a (path-join a temporary "CELLS.json") (join a [(jv-encode a listing) "\n"]) 420))
+               (try! (write-text a
+                                 (path-join a temporary "CELLS.json")
+                                 (join a [(jv-encode a listing) "\n"])
+                                 420))
                (try! (git-run a temporary ["init" "-q" "-b" "main"]))
                (try! (git-run a temporary ["add" "-A"]))
-               (try! (git-run a temporary ["-c" "user.name=coil-bugs factory" "-c" "user.email=coil-bugs@localhost"
-                                           "commit" "-q" "-m" (join a ["coil-bugs snapshot " (.id snapshot)])]))
+               (try! (git-run a
+                              temporary
+                              ["-c"
+                               "user.name=coil-bugs factory"
+                               "-c"
+                               "user.email=coil-bugs@localhost"
+                               "commit"
+                               "-q"
+                               "-m"
+                               (join a ["coil-bugs snapshot " (.id snapshot)])]))
                (match (atomic/rename-path a temporary project)
                  (Ok [_] (Ok project))
-                 (Err [e] (Err (durable-message a "cannot move into place" project e)))))))))
+                 (Err [e]
+                      (Err (durable-message a
+                                            "cannot move into place"
+                                            project
+                                            e)))))))))
 
 (defn random-tag [(a (dyn Allocator))] (-> (slice u8))
-  (match (ids/random-hex a 16)
-    (Ok [hex] hex)
-    (Err [_] (do (println "coil-bugs: no randomness for a run tag") (abort) ""))))
+  (try (let [hex
+               (try-or! (ids/random-hex a 16)
+                        (do
+                          (println "coil-bugs: no randomness for a run tag")
+                          (abort)
+                          ""))]
+         hex)))
 
 (defn start-triage [(ctl (ptr Ctl))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
@@ -457,11 +698,16 @@
              snapshot (try! (read-snapshot ctl (.id seen)))
              project (try! (triage-project ctl snapshot))
              tag (join a ["coil-bugs/triage/" (.id seen) "/" (random-tag a)])
-             text (try! (render ctl "triage.md" (al-slice (al-new [Value] a))))
+             text
+               (try! (render ctl "triage.md" (slice (ArrayList::new [Value] a))))
              request (jv-object a)
              triage (field (field ctl state) triage)]
          (jv-put! request "factory_text" (JStr text))
-         (jv-put! request "brief" (JStr (join a [tag "\nTriage the coil-bugs pad snapshot in this workspace."])))
+         (jv-put! request
+                  "brief"
+                  (JStr (join a
+                              [tag
+                               "\nTriage the coil-bugs pad snapshot in this workspace."])))
          (jv-put! request "project" (JStr project))
          (jv-put! request "reviewers" (JStr "none"))
          (set! (.snapshot triage) (.id seen))
@@ -471,85 +717,144 @@
          (set! (.failure triage) "")
          (try! (triage-event! ctl (join a ["Triaging snapshot " (.id seen)])))
          (if (try! (submit! ctl (field triage watch)))
-           (Ok 0)
-           (do (set! (.phase triage) (TriageFailed))
-                     (set! (.failure triage) "the factory refused the triage run")
-                     (save ctl))))))
+             (Ok 0)
+             (do
+               (set! (.phase triage) (TriageFailed))
+               (set! (.failure triage) "the factory refused the triage run")
+               (save ctl))))))
 
-(defn triage-failed! [(ctl (ptr Ctl)) (failure (slice u8))] (-> (Result i64 (slice u8)))
+(defn triage-failed! [(ctl (ptr Ctl)) (failure (slice u8))]
+  (-> (Result i64 (slice u8)))
   (let [triage (field (field ctl state) triage)]
     (set! (.phase triage) (TriageFailed))
     (set! (.failure triage) failure)
     (set! (.watch triage) (idle-watch))
-    (triage-event! ctl (join (.a ctl) [failure "; the next snapshot is triaged afresh"]))))
+    (triage-event! ctl
+                   (join (.a ctl)
+                         [failure "; the next snapshot is triaged afresh"]))))
 
 (defn advance-triage [(ctl (ptr Ctl))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
              config (field ctl config)
              triage (field (field ctl state) triage)]
-         (match (try! (watch-run ctl (field triage watch) (seconds (.triage-idle-seconds config)) (seconds (.triage-max-seconds config))))
+         (match (try! (watch-run ctl
+                                 (field triage watch)
+                                 (seconds (.triage-idle-seconds config))
+                                 (seconds (.triage-max-seconds config))))
            (Going [] (Ok 0))
            (Over [run]
                  (if (!= (.status run) "succeeded")
                      (let [end (ending a (field triage watch) run)]
                        (try! (triage-failed! ctl (.failure end)))
                        (if (.infrastructure end)
-                           (halt! ctl (join a ["Native run " (.id run) " " (.status run) ": " (.reason run)]))
+                           (halt! ctl
+                                  (join a
+                                        ["Native run "
+                                         (.id run)
+                                         " "
+                                         (.status run)
+                                         ": "
+                                         (.reason run)]))
                            (Ok 0)))
                      (let [workspace (run-workspace a (.native ctl) (.id run))
-                           problems (triage-problems a workspace (scope-rules a (try! (read-required a (.scope-file (field ctl config))))))]
+                           problems
+                             (triage-problems a
+                                              workspace
+                                              (scope-rules a
+                                                           (try! (read-required a
+                                                                                (.scope-file (field ctl
+                                                                                                    config))))))]
                        (if (> (len problems) 0)
-                           (triage-failed! ctl (join a ["TRIAGE.json fails its own gate: " (get problems 0)]))
+                           (triage-failed! ctl
+                                           (join a
+                                                 ["TRIAGE.json fails its own gate: "
+                                                  (get problems 0)]))
                            (let [entries (try! (triage-entries a workspace))
                                  (mut queued) 0
-                                 (mut open) 0 (mut fixed) 0 (mut other) 0]
+                                 (mut open) 0
+                                 (mut fixed) 0
+                                 (mut other) 0]
                              (for entry (iter entries)
                                (let [known (find-bug ctl (.id entry))]
-                                 (cond (= (.status entry) "open") (set! open (+ (load open) 1))
-                                       (= (.status entry) "fixed") (set! fixed (+ (load fixed) 1))
+                                 (cond (= (.status entry) "open")
+                                         (set! open (+ (load open) 1))
+                                       (= (.status entry) "fixed")
+                                         (set! fixed (+ (load fixed) 1))
                                        :else (set! other (+ (load other) 1)))
-                                 (cond
-                                   ;; Attempted, or being attempted: once is the rule.
-                                   (and (>= known 0) (not (queued? (load (bug-at ctl known))))) 0
-                                   (= (.status entry) "open")
-                                     (let [at (if (< known 0)
-                                                  (do (push! (bugs-of ctl)
-                                                             (new-bug a (.id entry) (.title entry) (.cells entry) (.reason entry)
-                                                                      (.snapshot triage) (Queued) (Pending)))
-                                                      (set! queued (+ (load queued) 1))
-                                                      (- (len (load (bugs-of ctl))) 1))
-                                                  known)
-                                           bug (bug-at ctl at)]
-                                       (set! (.title bug) (.title entry))
-                                       (set! (.cells bug) (.cells entry))
-                                       (set! (.reason bug) (.reason entry))
-                                       (set! (.snapshot bug) (.snapshot triage))
-                                       ;; Out of scope: nothing happens until Jimmy has decided.
-                                       (when (= (.scope entry) "out")
-                                         (set! (.status bug) (ScopeReview))
-                                         (set! (.scope-rule bug) (.rule entry))
-                                         (set! (.scope-reason bug) (.scope-reason entry))
-                                         (set! (.scope-quote bug) (.scope-quote entry))
-                                         (when (< known 0) (set! queued (- (load queued) 1)) 0)
-                                         0)
-                                       0)
-                                   ;; A queued bug a later snapshot shows fixed, or not a bug.
-                                   (>= known 0)
-                                     (let [bug (bug-at ctl known)]
-                                       (set! (.status bug) (Skipped))
-                                       (set! (.reason bug) (join a [(.status entry) ": " (.reason entry)]))
-                                       0)
-                                   :else 0)))
+                                 (cond ;; Attempted, or being attempted: once is the rule.
+                                       (and (>= known 0)
+                                            (not (queued? (load (bug-at ctl
+                                                                        known)))))
+                                         0
+                                       (= (.status entry) "open")
+                                         (let [at
+                                                 (if (< known 0)
+                                                     (do
+                                                       (push! (bugs-of ctl)
+                                                              (new-bug a
+                                                                       (.id entry)
+                                                                       (.title entry)
+                                                                       (.cells entry)
+                                                                       (.reason entry)
+                                                                       (.snapshot triage)
+                                                                       (Queued)
+                                                                       (Pending)))
+                                                       (set! queued
+                                                             (+ (load queued) 1))
+                                                       (- (len (load (bugs-of ctl)))
+                                                          1))
+                                                     known)
+                                               bug (bug-at ctl at)]
+                                           (set! (.title bug) (.title entry))
+                                           (set! (.cells bug) (.cells entry))
+                                           (set! (.reason bug) (.reason entry))
+                                           (set! (.snapshot bug)
+                                                 (.snapshot triage))
+                                           ;; Out of scope: nothing happens until Jimmy has decided.
+                                           (when (= (.scope entry) "out")
+                                             (set! (.status bug) (ScopeReview))
+                                             (set! (.scope-rule bug)
+                                                   (.rule entry))
+                                             (set! (.scope-reason bug)
+                                                   (.scope-reason entry))
+                                             (set! (.scope-quote bug)
+                                                   (.scope-quote entry))
+                                             (when (< known 0)
+                                               (set! queued (- (load queued) 1))
+                                               0)
+                                             0)
+                                           0)
+                                       ;; A queued bug a later snapshot shows fixed, or not a bug.
+                                       (>= known 0)
+                                         (let [bug (bug-at ctl known)]
+                                           (set! (.status bug) (Skipped))
+                                           (set! (.reason bug)
+                                                 (join a
+                                                       [(.status entry)
+                                                        ": "
+                                                        (.reason entry)]))
+                                           0)
+                                       :else 0)))
                              (set! (.open triage) (load open))
                              (set! (.fixed triage) (load fixed))
                              (set! (.not-a-bug triage) (load other))
                              (set! (.phase triage) (TriageDone))
                              (set! (.watch triage) (idle-watch))
-                             (set! (.triaged-digest (field ctl state)) (.digest triage))
-                             (triage-event! ctl (join a ["Triaged " (int-text a (len entries)) " entries ("
-                                                         (int-text a (load open)) " open, " (int-text a (load fixed)) " fixed, "
-                                                         (int-text a (load other)) " not a bug); "
-                                                         (int-text a (load queued)) " newly queued"])))))))))))
+                             (set! (.triaged-digest (field ctl state))
+                                   (.digest triage))
+                             (triage-event! ctl
+                                            (join a
+                                                  ["Triaged "
+                                                   (int-text a (len entries))
+                                                   " entries ("
+                                                   (int-text a (load open))
+                                                   " open, "
+                                                   (int-text a (load fixed))
+                                                   " fixed, "
+                                                   (int-text a (load other))
+                                                   " not a bug); "
+                                                   (int-text a (load queued))
+                                                   " newly queued"])))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bugs
@@ -564,57 +869,98 @@
         (Ok 0)
         (let [bug (bug-at ctl (load next))]
           (set! (.status bug) (Preparing))
-          (match (bug-event! ctl bug "Preparing: fetching main and its base compiler")
+          (match (bug-event! ctl
+                             bug
+                             "Preparing: fetching main and its base compiler")
             (Err [why] (Err why))
             (Ok [_] (advance-bug ctl bug)))))))
 
-(defsum BaseChoice (BaseReady [(commit (slice u8)) (compiler (slice u8))]) (BaseWaiting))
+(defsum BaseChoice
+  (BaseReady [(commit (slice u8)) (compiler (slice u8))])
+  (BaseWaiting))
 
 ;;; The base this bug runs on: main's head when a compiler built from it
 ;;; exists, building one first if not. A main that does not build falls back
 ;;; to the last base that did.
-(defn ensure-base [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result BaseChoice (slice u8)))
+(defn ensure-base [(ctl (ptr Ctl)) (bug (ptr Bug))]
+  (-> (Result BaseChoice (slice u8)))
   (try (let [a (.a ctl)
              base (field (field ctl state) base)
              build (field bug base-build)
              have-base (> (len (.commit base)) 0)]
          (if (= (len (.commit build)) 0)
              (let [head (try! (remote-head (.remote ctl) a))]
-               (cond (= (.commit base) head) (Ok (BaseReady (.commit base) (.compiler base)))
+               (cond (= (.commit base) head)
+                       (Ok (BaseReady (.commit base) (.compiler base)))
                      (= (.broken-main (field ctl state)) head)
                        (if have-base
                            (Ok (BaseReady (.commit base) (.compiler base)))
-                           (do (set! (.status bug) (Queued)) (try! (save ctl)) (Ok (BaseWaiting))))
+                           (do
+                             (set! (.status bug) (Queued))
+                             (try! (save ctl))
+                             (Ok (BaseWaiting))))
                      :else
-                       (do (set! (.commit build) head)
-                           (set! (.started build) (.now ctl))
-                           (try! (bug-event! ctl bug (join a ["Building a base compiler from " (subslice head 0 12)])))
-                           (try! (build-start (.builder ctl) a head))
-                           (Ok (BaseWaiting)))))
+                       (do
+                         (set! (.commit build) head)
+                         (set! (.started build) (.now ctl))
+                         (try! (bug-event! ctl
+                                           bug
+                                           (join a
+                                                 ["Building a base compiler from "
+                                                  (subslice head 0 12)])))
+                         (try! (build-start (.builder ctl) a head))
+                         (Ok (BaseWaiting)))))
              (let [commit (.commit build)
-                   polled (match (build-poll (.builder ctl) a commit)
-                            (Building [] (if (> (- (.now ctl) (.started build)) (seconds (.base-build-max-seconds (field ctl config))))
-                                             (BuildFailed "the base build ran too long")
-                                             (Building)))
-                            (Built [] (Built))
-                            (BuildFailed [why] (BuildFailed why)))]
+                   polled
+                     (match (build-poll (.builder ctl) a commit)
+                       (Building []
+                                 (if (> (- (.now ctl) (.started build))
+                                        (seconds (.base-build-max-seconds (field ctl
+                                                                                 config))))
+                                     (BuildFailed "the base build ran too long")
+                                     (Building)))
+                       (Built [] (Built))
+                       (BuildFailed [why] (BuildFailed why)))]
                (match polled
                  (Building [] (Ok (BaseWaiting)))
                  (Built []
-                        (do (set! (.commit build) "")
-                            (set! (.base (field ctl state))
-                                  (Base :commit commit :compiler (build-compiler (.builder ctl) a commit) :built (utc-stamp a (.now ctl))))
-                            (try! (bug-event! ctl bug (join a ["Base compiler ready at " (subslice commit 0 12)])))
-                            (Ok (BaseReady commit (.compiler (field (field ctl state) base))))))
+                        (do
+                          (set! (.commit build) "")
+                          (set! (.base (field ctl state))
+                                (Base
+                                  :commit commit
+                                  :compiler
+                                    (build-compiler (.builder ctl) a commit)
+                                  :built (utc-stamp a (.now ctl))))
+                          (try! (bug-event! ctl
+                                            bug
+                                            (join a
+                                                  ["Base compiler ready at "
+                                                   (subslice commit 0 12)])))
+                          (Ok (BaseReady commit
+                                         (.compiler (field (field ctl state)
+                                                           base))))))
                  (BuildFailed [why]
-                              (do (set! (.commit build) "")
-                                  (set! (.broken-main (field ctl state)) commit)
-                                  (try! (bug-event! ctl bug (join a ["Main at " (subslice commit 0 12) " does not build (" why ")"])))
-                                  (if have-base
-                                      (Ok (BaseReady (.commit base) (.compiler base)))
-                                      (do (set! (.status bug) (Queued))
-                                          (try! (bug-event! ctl bug "No base compiler has ever built; waiting for main to move"))
-                                          (Ok (BaseWaiting))))))))))))
+                              (do
+                                (set! (.commit build) "")
+                                (set! (.broken-main (field ctl state)) commit)
+                                (try! (bug-event! ctl
+                                                  bug
+                                                  (join a
+                                                        ["Main at "
+                                                         (subslice commit 0 12)
+                                                         " does not build ("
+                                                         why
+                                                         ")"])))
+                                (if have-base
+                                    (Ok (BaseReady (.commit base)
+                                                   (.compiler base)))
+                                    (do
+                                      (set! (.status bug) (Queued))
+                                      (try! (bug-event! ctl
+                                                        bug
+                                                        "No base compiler has ever built; waiting for main to move"))
+                                      (Ok (BaseWaiting))))))))))))
 
 (defn advance-bug [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
@@ -624,45 +970,87 @@
                       (match (try! (ensure-base ctl bug))
                         (BaseWaiting [] (save ctl))
                         (BaseReady [commit compiler]
-                                   (do (set! (.status bug) (Running))
-                                       (set! (.base bug) commit)
-                                       (set! (.compiler bug) compiler)
-                                       (submit-bug ctl bug)))))
+                                   (do
+                                     (set! (.status bug) (Running))
+                                     (set! (.base bug) commit)
+                                     (set! (.compiler bug) compiler)
+                                     (submit-bug ctl bug)))))
            (Publishing [] (publish ctl bug))
            (Running []
-                    (match (try! (watch-run ctl (field bug watch) (seconds (.idle-seconds config)) (seconds (.max-seconds config))))
+                    (match (try! (watch-run ctl
+                                            (field bug watch)
+                                            (seconds (.idle-seconds config))
+                                            (seconds (.max-seconds config))))
                       (Going [] (Ok 0))
                       (Over [run]
                             (if (!= (.status run) "succeeded")
                                 (let [end (ending a (field bug watch) run)]
                                   (if (.infrastructure end)
                                       ;; Keep the bug: one outage must not mark the whole queue failed.
-                                      (do (set! (.status bug) (Queued))
-                                          (set! (.infrastructure-failures bug) (+ (.infrastructure-failures bug) 1))
-                                          (set! (.watch bug) (idle-watch))
-                                          (halt! ctl (join a ["Native run " (.id run) " " (.status run) ": "
-                                                              (if (> (len (.reason run)) 0) (.reason run) "no reason given")])))
+                                      (do
+                                        (set! (.status bug) (Queued))
+                                        (set! (.infrastructure-failures bug)
+                                              (+ (.infrastructure-failures bug)
+                                                 1))
+                                        (set! (.watch bug) (idle-watch))
+                                        (halt! ctl
+                                               (join a
+                                                     ["Native run "
+                                                      (.id run)
+                                                      " "
+                                                      (.status run)
+                                                      ": "
+                                                      (if (> (len (.reason run))
+                                                             0)
+                                                          (.reason run)
+                                                          "no reason given")])))
                                       (conclude ctl bug (Failed) (.failure end))))
                                 (match (accept ctl bug run)
                                   (Ok [_] (Ok 0))
-                                  (Err [why] (conclude ctl bug (Failed) (join a ["The run succeeded but its result does not hold up: " why]))))))))
+                                  (Err [why]
+                                       (conclude ctl
+                                                 bug
+                                                 (Failed)
+                                                 (join a
+                                                       ["The run succeeded but its result does not hold up: "
+                                                        why]))))))))
            (_ (Ok 0))))))
 
 (defn submit-bug [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
              config (field ctl config)
-             tag (join a ["coil-bugs/bug/" (slug a (.id bug)) "/" (random-tag a)])
+             tag
+               (join a ["coil-bugs/bug/" (slug a (.id bug)) "/" (random-tag a)])
              report (try! (report-text ctl bug))]
-         (let [text (try! (render ctl "fix.md" [(Value :key "BUG_ID" :value (.id bug))
-                                                (Value :key "BASE_COMMIT" :value (.base bug))
-                                                (Value :key "BASE_COMPILER" :value (.compiler bug))
-                                                (Value :key "BASE_BIN" :value (dir-name (.compiler bug)))]))
-               brief (join a [tag "\nBug id: " (.id bug) "\nTitle: " (.title bug) "\nBase commit: " (.base bug)
-                              "\nBase compiler: " (.compiler bug)
-                              (if (> (len (.scope-comment bug)) 0)
-                                  (join a ["\n\nTriage judged this bug out of Coil's scope; Jimmy ruled it in scope: " (.scope-comment bug)])
-                                  "")
-                              "\n\nEvery coil-bugs pad cell about this bug, verbatim:\n\n" report])
+         (let [text
+                 (try! (render ctl
+                               "fix.md"
+                               [(Value :key "BUG_ID" :value (.id bug))
+                                (Value :key "BASE_COMMIT" :value (.base bug))
+                                (Value
+                                  :key "BASE_COMPILER"
+                                  :value (.compiler bug))
+                                (Value
+                                  :key "BASE_BIN"
+                                  :value (dir-name (.compiler bug)))]))
+               brief
+                 (join a
+                       [tag
+                        "\nBug id: "
+                        (.id bug)
+                        "\nTitle: "
+                        (.title bug)
+                        "\nBase commit: "
+                        (.base bug)
+                        "\nBase compiler: "
+                        (.compiler bug)
+                        (if (> (len (.scope-comment bug)) 0)
+                            (join a
+                                  ["\n\nTriage judged this bug out of Coil's scope; Jimmy ruled it in scope: "
+                                   (.scope-comment bug)])
+                            "")
+                        "\n\nEvery coil-bugs pad cell about this bug, verbatim:\n\n"
+                        report])
                request (jv-object a)]
            (jv-put! request "factory_text" (JStr text))
            (jv-put! request "brief" (JStr brief))
@@ -670,145 +1058,359 @@
            (jv-put! request "base" (JStr (.base bug)))
            (jv-put! request "reviewers" (JStr "none"))
            (set! (.watch bug) (new-watch tag (jv-encode a request) (.now ctl)))
-           (try! (bug-event! ctl bug (join a ["Starting on coil " (subslice (.base bug) 0 12)])))
+           (try! (bug-event! ctl
+                             bug
+                             (join a
+                                   ["Starting on coil "
+                                    (subslice (.base bug) 0 12)])))
            (if (try! (submit! ctl (field bug watch)))
-             (Ok 0)
-             (do (set! (.status bug) (Queued))
-                       (set! (.watch bug) (idle-watch))
-                       (save ctl)))))))
+               (Ok 0)
+               (do
+                 (set! (.status bug) (Queued))
+                 (set! (.watch bug) (idle-watch))
+                 (save ctl)))))))
 
-(defn git-in [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> (Result (slice u8) (slice u8)))
+(defn git-in [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))]
+  (-> (Result (slice u8) (slice u8)))
   (git a dir args))
 
 ;;; A run that succeeded: what its reproduce station recorded, and for a fix,
 ;;; the fix's own checks repeated from outside the run.
-(defn accept [(ctl (ptr Ctl)) (bug (ptr Bug)) (run RunView)] (-> (Result i64 (slice u8)))
-  (block :accept-stations
-  (try (let [a (.a ctl)
-             workspace (run-workspace a (.native ctl) (.id run))]
-         (for station (iter (.stations run))
-           (when (!= (.status station) "passed")
-             (return-from :accept-stations (Err (join a ["station " (.name station) " is " (.status station) ", not passed"]))))
-           0)
-         (when (= (len (.stations run)) 0) (return-from :accept-stations (Err "the run has no stations")))
-         (let [repro (try! (read-repro a (try! (read-required a (path-join a workspace ".coil-bug/REPRO.json"))) (.id bug)))]
-           (set! (.repro bug) repro)
-           (match (try! (read-text a (path-join a workspace ".coil-bug/OTHER-BUGS.md")))
-             (Some [text] (do (set! (.other-bugs bug) (str-trim text)) 0))
-             (None [] 0))
-           (cond (= (.verdict repro) "does_not_reproduce") (conclude ctl bug (DoesNotReproduce) "")
-                 (= (.verdict repro) "cannot_verify") (conclude ctl bug (CannotVerify) "")
-                 :else
-                   (let [head (try! (git-in a workspace ["rev-parse" "HEAD"]))
-                         fix (str-trim (try! (read-required a (path-join a workspace ".coil-bug/FIX.md"))))
-                         reproduced-at (try! (reproduce-commit a workspace (.base bug) head))
-                         (mut args) (al-new [(slice u8)] a)]
-                     (when (< (len fix) 200) (return-from :accept-stations (Err "FIX.md is missing or too short")))
-                     ;; The fix gate checked this against the reproduce commit;
-                     ;; check again from outside, against the branch as committed.
-                     (for x (iter ["diff" "--name-only" reproduced-at head "--"]) (push! (mut args) x))
-                     (for t (iter (.tests repro)) (push! (mut args) t))
-                     (let [changed (try! (git-in a workspace (al-slice args)))]
-                       (when (> (len changed) 0)
-                         (return-from :accept-stations (Err (join a ["the regression tests changed after the reproduce station: " changed])))))
-                     (set! (.status bug) (Publishing))
-                     (set! (.head bug) head)
-                     (set! (.fix bug) fix)
-                     (bug-event! ctl bug "Fixed and verified; opening a pull request on the next heartbeat"))))))))
+(defn accept [(ctl (ptr Ctl)) (bug (ptr Bug)) (run RunView)]
+  (-> (Result i64 (slice u8)))
+  (block
+    :accept-stations
+      (try (let [a (.a ctl)
+                 workspace (run-workspace a (.native ctl) (.id run))]
+             (for station (iter (.stations run))
+               (when (!= (.status station) "passed")
+                 (return-from
+                   :accept-stations
+                     (Err (join a
+                                ["station "
+                                 (.name station)
+                                 " is "
+                                 (.status station)
+                                 ", not passed"]))))
+               0)
+             (when (= (len (.stations run)) 0)
+               (return-from :accept-stations (Err "the run has no stations")))
+             (let [repro
+                     (try! (read-repro a
+                                       (try! (read-required a
+                                                            (path-join a
+                                                                       workspace
+                                                                       ".coil-bug/REPRO.json")))
+                                       (.id bug)))]
+               (set! (.repro bug) repro)
+               (match (try! (read-text a
+                                       (path-join a
+                                                  workspace
+                                                  ".coil-bug/OTHER-BUGS.md")))
+                 (Some [text] (do (set! (.other-bugs bug) (trim text)) 0))
+                 (None [] 0))
+               (cond (= (.verdict repro) "does_not_reproduce")
+                       (conclude ctl bug (DoesNotReproduce) "")
+                     (= (.verdict repro) "cannot_verify")
+                       (conclude ctl bug (CannotVerify) "")
+                     :else
+                       (let [head
+                               (try! (git-in a workspace ["rev-parse" "HEAD"]))
+                             fix
+                               (trim (try! (read-required a
+                                                          (path-join a
+                                                                     workspace
+                                                                     ".coil-bug/FIX.md"))))
+                             reproduced-at
+                               (try! (reproduce-commit a
+                                                       workspace
+                                                       (.base bug)
+                                                       head))
+                             (mut args) (ArrayList::new [(slice u8)] a)]
+                         (when (< (len fix) 200)
+                           (return-from
+                             :accept-stations
+                               (Err "FIX.md is missing or too short")))
+                         ;; The fix gate checked this against the reproduce commit;
+                         ;; check again from outside, against the branch as committed.
+                         (for x (iter ["diff"
+                                       "--name-only"
+                                       reproduced-at
+                                       head
+                                       "--"])
+                           (push! (mut args) x))
+                         (for t (iter (.tests repro)) (push! (mut args) t))
+                         (let [changed (try! (git-in a workspace (slice args)))]
+                           (when (> (len changed) 0)
+                             (return-from
+                               :accept-stations
+                                 (Err (join a
+                                            ["the regression tests changed after the reproduce station: "
+                                             changed])))))
+                         (set! (.status bug) (Publishing))
+                         (set! (.head bug) head)
+                         (set! (.fix bug) fix)
+                         (bug-event! ctl
+                                     bug
+                                     "Fixed and verified; opening a pull request on the next heartbeat"))))))))
 
 (defn publish [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
-             title (let [t (str-trim (.title bug))] (if (ends-with? t ".") (subslice t 0 (- (len t) 1)) t))
+             title
+               (let [t (trim (.title bug))]
+                 (if (ends-with? t ".") (subslice t 0 (- (len t) 1)) t))
              repro (field bug repro)]
          (when (= (len (.pr-commit bug)) 0)
-           (let [message (join a [title "\n\n" (.fix bug) "\n\nReported in the coil-bugs pad (cell " (.id bug)
-                                  "); reproduced and fixed by the coil-bugs factory, run " (.run-id (field bug watch)) ".\n"])]
+           (let [message
+                   (join a
+                         [title
+                          "\n\n"
+                          (.fix bug)
+                          "\n\nReported in the coil-bugs pad (cell "
+                          (.id bug)
+                          "); reproduced and fixed by the coil-bugs factory, run "
+                          (.run-id (field bug watch))
+                          ".\n"])]
              (set! (.pr-branch bug) (join a ["coil-bugs/" (slug a (.id bug))]))
-             (set! (.pr-commit bug) (try! (publish-squash (.publisher ctl) a (.head bug) (.base bug) message)))
+             (set! (.pr-commit bug)
+                   (try! (publish-squash (.publisher ctl)
+                                         a
+                                         (.head bug)
+                                         (.base bug)
+                                         message)))
              (try! (save ctl))
              0))
-         (let [(mut tests) (sb-new a)]
+         (let [(mut tests) (StrBuf::new a)]
            (for t (iter (.tests repro))
-             (when (> (len (sb-str (load tests))) 0) (sb-push-str! (mut tests) ", ") 0)
-             (sb-push-str! (mut tests) (join a ["`" t "`"])))
-           (let [body (join a [(.fix bug) "\n\n## Reproduction\n\n" (.summary repro)
-                               "\n\nCheck (fails before, passes after):\n\n```sh\n" (.check repro) "\n```\n\nRegression tests: "
-                               (sb-finish! (mut tests))
-                               "\n\n## Origin\n\nReported in the `coil-bugs` pad, cell `" (.id bug) "`. Reproduced against `"
-                               (subslice (.base bug) 0 12) "` and fixed by the coil-bugs factory (native run `" (.run-id (field bug watch))
-                               "` on computer.jimmyhmiller.com); the gates built a candidate compiler, ran the reproduction and "
-                               "`dev.py test modernize-fast`, and a reviewer approved each station.\n"])]
-             (set! (.pr-url bug) (try! (publish-open (.publisher ctl) a (.pr-branch bug) (.pr-commit bug) title body)))
+             (when (> (len (str (load tests))) 0)
+               (push-str! (mut tests) ", ")
+               0)
+             (push-str! (mut tests) (join a ["`" t "`"])))
+           (let [body
+                   (join a
+                         [(.fix bug)
+                          "\n\n## Reproduction\n\n"
+                          (.summary repro)
+                          "\n\nCheck (fails before, passes after):\n\n```sh\n"
+                          (.check repro)
+                          "\n```\n\nRegression tests: "
+                          (finish! (mut tests))
+                          "\n\n## Origin\n\nReported in the `coil-bugs` pad, cell `"
+                          (.id bug)
+                          "`. Reproduced against `"
+                          (subslice (.base bug) 0 12)
+                          "` and fixed by the coil-bugs factory (native run `"
+                          (.run-id (field bug watch))
+                          "` on computer.jimmyhmiller.com); the gates built a candidate compiler, ran the reproduction and "
+                          "`dev.py test modernize-fast`, and a reviewer approved each station.\n"])]
+             (set! (.pr-url bug)
+                   (try! (publish-open (.publisher ctl)
+                                       a
+                                       (.pr-branch bug)
+                                       (.pr-commit bug)
+                                       title
+                                       body)))
              (conclude ctl bug (PullRequest) ""))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Outcomes and notes
 
-(defn conclude [(ctl (ptr Ctl)) (bug (ptr Bug)) (outcome Outcome) (failure (slice u8))] (-> (Result i64 (slice u8)))
+(defn conclude [(ctl (ptr Ctl))
+                (bug (ptr Bug))
+                (outcome Outcome)
+                (failure (slice u8))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)]
          (set! (.status bug) (Done))
          (set! (.outcome bug) outcome)
          (when (> (len failure) 0) (set! (.failure bug) failure) 0)
-         (try! (bug-event! ctl bug (join a ["Outcome: " (outcome-name outcome) (if (> (len failure) 0) (join a [" (" failure ")"]) "")])))
-         (try! (note! ctl (.notebook (field ctl config)) (join a [NOTE-CELL-PREFIX (.id bug)]) (bug-note ctl bug)))
+         (try! (bug-event! ctl
+                           bug
+                           (join a
+                                 ["Outcome: "
+                                  (outcome-name outcome)
+                                  (if (> (len failure) 0)
+                                      (join a [" (" failure ")"])
+                                      "")])))
+         (try! (note! ctl
+                      (.notebook (field ctl config))
+                      (join a [NOTE-CELL-PREFIX (.id bug)])
+                      (bug-note ctl bug)))
          ;; What the agent found on the way is filed as a report of its own, so
          ;; the factory reproduces it rather than taking the agent's word for it.
          (if (> (len (.other-bugs bug)) 0)
-             (note! ctl (.notebook (field ctl config)) (join a [FOUND-CELL-PREFIX (.id bug)])
-                    (join a ["### Found while working on [" (.title bug) "](pad://" (.notebook (field ctl config)) "#" (.id bug) ")
+             (note! ctl
+                    (.notebook (field ctl config))
+                    (join a [FOUND-CELL-PREFIX (.id bug)])
+                    (join a
+                          ["### Found while working on ["
+                           (.title bug)
+                           "](pad://"
+                           (.notebook (field ctl config))
+                           "#"
+                           (.id bug)
+                           ")
 
 "
-                             "Reported by the coil-bugs factory's agent (native run `" (.run-id (field bug watch)) "`, coil `"
-                             (if (> (len (.base bug)) 12) (subslice (.base bug) 0 12) (.base bug)) "`), not yet reproduced.
+                           "Reported by the coil-bugs factory's agent (native run `"
+                           (.run-id (field bug watch))
+                           "`, coil `"
+                           (if (> (len (.base bug)) 12)
+                               (subslice (.base bug) 0 12)
+                               (.base bug))
+                           "`), not yet reproduced.
 
 "
-                             (.other-bugs bug) "
+                           (.other-bugs bug)
+                           "
 "]))
              (Ok 0)))))
 
-(defn note! [(ctl (ptr Ctl)) (notebook (slice u8)) (cell-id (slice u8)) (markdown (slice u8))] (-> (Result i64 (slice u8)))
+(defn note! [(ctl (ptr Ctl))
+             (notebook (slice u8))
+             (cell-id (slice u8))
+             (markdown (slice u8))] (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)
              number (+ (.notes (field ctl state)) 1)
              digits (int-text a number)
-             id (join a [(subslice "000000" 0 (if (< (len digits) 6) (- 6 (len digits)) 0)) digits "-"
-                         (slug a (subslice cell-id (len NOTE-CELL-PREFIX) (len cell-id)))])]
+             id
+               (join a
+                     [(subslice "000000"
+                                0
+                                (if (< (len digits) 6) (- 6 (len digits)) 0))
+                      digits
+                      "-"
+                      (slug a
+                            (subslice cell-id
+                                      (len NOTE-CELL-PREFIX)
+                                      (len cell-id)))])]
          (set! (.notes (field ctl state)) number)
          (try! (save ctl))
-         (try! (write-json-file a (path-join a (.notes-dir (field ctl config)) (join a [id ".json"]))
-                                (Note :id id :created (.now ctl) :notebook notebook :cell-id cell-id :markdown markdown) 420))
+         (try! (write-json-file a
+                                (path-join a
+                                           (.notes-dir (field ctl config))
+                                           (join a [id ".json"]))
+                                (Note
+                                  :id id
+                                  :created (.now ctl)
+                                  :notebook notebook
+                                  :cell-id cell-id
+                                  :markdown markdown)
+                                420))
          (println "coil-bugs: note {s} for {s}" id cell-id)
          (Ok 0))))
 
 (defn bug-note [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (slice u8))
   (let [a (.a ctl)
         day (utc-date a (.now ctl))
-        link (join a ["[" (.title bug) "](pad://" (.notebook (field ctl config)) "#" (.id bug) ")"])
-        base (if (> (len (.base bug)) 0) (join a ["`" (subslice (.base bug) 0 12) "`"]) "an unbuilt base")
-        run (if (> (len (.run-id (field bug watch))) 0) (join a ["native run `" (.run-id (field bug watch)) "`"]) "no native run")
+        link
+          (join a
+                ["["
+                 (.title bug)
+                 "](pad://"
+                 (.notebook (field ctl config))
+                 "#"
+                 (.id bug)
+                 ")"])
+        base
+          (if (> (len (.base bug)) 0)
+              (join a ["`" (subslice (.base bug) 0 12) "`"])
+              "an unbuilt base")
+        run
+          (if (> (len (.run-id (field bug watch))) 0)
+              (join a ["native run `" (.run-id (field bug watch)) "`"])
+              "no native run")
         repro (field bug repro)
         head-and-body
           (match (.outcome bug)
-            (PullRequest [] (join a ["### Factory: pull request opened for " link "\n\n**Pull request:** " (.pr-url bug)
-                                     "\n\nReproduced against coil " base ", fixed, and verified (" run ").\n\n" (.summary repro)]))
-            (DoesNotReproduce [] (join a ["### Factory: unable to reproduce " link "\n\nNot reproduced against coil " base " on " day
-                                          " (" run "). The pad cells are unchanged; Jimmy decides whether to remove them.\n\n"
-                                          (.summary repro) "\n\nCheck, which passes with that compiler:\n\n```sh\n" (.check repro) "\n```"]))
-            (OutOfScope [] (join a ["### Factory: out of Coil's scope: " link "\n\nRule " (.scope-rule bug)
-                                    " of the factory's SCOPE.md: " (.scope-reason bug)
-                                    "\n\nJimmy confirmed it on " day (if (> (len (.scope-comment bug)) 0) (join a [": " (.scope-comment bug)]) "")
-                                    ". The factory will not work on it; the report stays in the pad."]))
-            (CannotVerify [] (join a ["### Factory: could not verify " link " on the server\n\nTried on " day " against coil " base
-                                      " (" run ").\n\n**Missing:** " (.needs repro) "\n\n" (.summary repro)]))
-            (_ (join a ["### Factory: fix attempt did not finish for " link "\n\n"
-                        (if (> (len (.failure bug)) 0) (.failure bug) "unknown failure")
-                        "\n\nAttempted on " day " against coil " base " (" run "). Not retried automatically."])))
-        (mut tried) (sb-new a)]
+            (PullRequest []
+                         (join a
+                               ["### Factory: pull request opened for "
+                                link
+                                "\n\n**Pull request:** "
+                                (.pr-url bug)
+                                "\n\nReproduced against coil "
+                                base
+                                ", fixed, and verified ("
+                                run
+                                ").\n\n"
+                                (.summary repro)]))
+            (DoesNotReproduce []
+                              (join a
+                                    ["### Factory: unable to reproduce "
+                                     link
+                                     "\n\nNot reproduced against coil "
+                                     base
+                                     " on "
+                                     day
+                                     " ("
+                                     run
+                                     "). The pad cells are unchanged; Jimmy decides whether to remove them.\n\n"
+                                     (.summary repro)
+                                     "\n\nCheck, which passes with that compiler:\n\n```sh\n"
+                                     (.check repro)
+                                     "\n```"]))
+            (OutOfScope []
+                        (join a
+                              ["### Factory: out of Coil's scope: "
+                               link
+                               "\n\nRule "
+                               (.scope-rule bug)
+                               " of the factory's SCOPE.md: "
+                               (.scope-reason bug)
+                               "\n\nJimmy confirmed it on "
+                               day
+                               (if (> (len (.scope-comment bug)) 0)
+                                   (join a [": " (.scope-comment bug)])
+                                   "")
+                               ". The factory will not work on it; the report stays in the pad."]))
+            (CannotVerify []
+                          (join a
+                                ["### Factory: could not verify "
+                                 link
+                                 " on the server\n\nTried on "
+                                 day
+                                 " against coil "
+                                 base
+                                 " ("
+                                 run
+                                 ").\n\n**Missing:** "
+                                 (.needs repro)
+                                 "\n\n"
+                                 (.summary repro)]))
+            (_ (join a
+                     ["### Factory: fix attempt did not finish for "
+                      link
+                      "\n\n"
+                      (if (> (len (.failure bug)) 0)
+                          (.failure bug)
+                          "unknown failure")
+                      "\n\nAttempted on "
+                      day
+                      " against coil "
+                      base
+                      " ("
+                      run
+                      "). Not retried automatically."])))
+        (mut tried) (StrBuf::new a)]
     (for attempt (iter (.attempts repro))
-      (sb-push-str! (mut tried) (join a ["\n- **" (.what attempt) "** — `" (.command attempt) "` → " (.result attempt)])))
-    (let [details (sb-finish! (mut tried))]
-      (join a [head-and-body
-               (if (> (len details) 0) (join a ["\n\n<details>\n<summary>What was tried</summary>\n" details "\n\n</details>"]) "")
-               "\n"]))))
+      (push-str! (mut tried)
+                 (join a
+                       ["\n- **"
+                        (.what attempt)
+                        "** — `"
+                        (.command attempt)
+                        "` → "
+                        (.result attempt)])))
+    (let [details (finish! (mut tried))]
+      (join a
+            [head-and-body
+             (if (> (len details) 0)
+                 (join a
+                       ["\n\n<details>\n<summary>What was tried</summary>\n"
+                        details
+                        "\n\n</details>"])
+                 "")
+             "\n"]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Status
@@ -817,36 +1419,79 @@
   (try (let [a (.a ctl)
              state (field ctl state)
              config (field ctl config)
-             (mut counts) (sb-new a)
-             (mut queue) (sb-new a)
+             (mut counts) (StrBuf::new a)
+             (mut queue) (StrBuf::new a)
              (mut queued) 0
              active (active-bug ctl)
-             triage-phase (match (.phase (field state triage))
-                            (TriageNone [] "none") (TriageRunning [] "running") (TriageDone [] "done") (TriageFailed [] "failed"))]
-         (for name (iter ["queued" "preparing" "running" "publishing" "skipped" "pull request" "does not reproduce"
-                          "cannot verify" "did not finish" "noted in the pad"])
+             triage-phase
+               (match (.phase (field state triage))
+                 (TriageNone [] "none")
+                 (TriageRunning [] "running")
+                 (TriageDone [] "done")
+                 (TriageFailed [] "failed"))]
+         (for name (iter ["queued"
+                          "preparing"
+                          "running"
+                          "publishing"
+                          "skipped"
+                          "pull request"
+                          "does not reproduce"
+                          "cannot verify"
+                          "did not finish"
+                          "noted in the pad"])
            (let [(mut n) 0]
              (for bug (iter (.bugs state))
-               (when (= (match (.status bug) (Done [] (outcome-name (.outcome bug))) (_ (status-name (.status bug)))) name)
+               (when (= (match (.status bug)
+                          (Done [] (outcome-name (.outcome bug)))
+                          (_ (status-name (.status bug))))
+                        name)
                  (set! n (+ (load n) 1))
                  0))
              (when (> (load n) 0)
-               (when (> (len (sb-str (load counts))) 0) (sb-push-str! (mut counts) ", ") 0)
-               (sb-push-str! (mut counts) (join a [(int-text a (load n)) " " name]))
+               (when (> (len (str (load counts))) 0)
+                 (push-str! (mut counts) ", ")
+                 0)
+               (push-str! (mut counts)
+                          (join a [(int-text a (load n)) " " name]))
                0)))
          (for bug (iter (.bugs state))
            (when (and (queued? bug) (< (load queued) 10))
              (set! queued (+ (load queued) 1))
-             (sb-push-str! (mut queue) (join a ["\n" (int-text a (load queued)) ". " (.title bug)]))
+             (push-str! (mut queue)
+                        (join a
+                              ["\n"
+                               (int-text a (load queued))
+                               ". "
+                               (.title bug)]))
              0))
-         (let [counts-text (sb-finish! (mut counts))
-               active-text (if (>= active 0)
-                               (let [bug (bug-at ctl active)]
-                                 (join a ["**" (.title bug) "** (" (status-name (.status bug)) ", run `" (.run-id (field bug watch))
-                                          "`, station " (.station (field bug watch)) ")"]))
-                               "")
-               summary (join a [counts-text "|" (.commit (field state base)) "|" (if (>= active 0) (.id (bug-at ctl active)) "") "|"
-                                triage-phase "|" (.reason (field state halted)) "|" (if (.enabled config) "on" "off")])
+         (let [counts-text (finish! (mut counts))
+               active-text
+                 (if (>= active 0)
+                     (let [bug (bug-at ctl active)]
+                       (join a
+                             ["**"
+                              (.title bug)
+                              "** ("
+                              (status-name (.status bug))
+                              ", run `"
+                              (.run-id (field bug watch))
+                              "`, station "
+                              (.station (field bug watch))
+                              ")"]))
+                     "")
+               summary
+                 (join a
+                       [counts-text
+                        "|"
+                        (.commit (field state base))
+                        "|"
+                        (if (>= active 0) (.id (bug-at ctl active)) "")
+                        "|"
+                        triage-phase
+                        "|"
+                        (.reason (field state halted))
+                        "|"
+                        (if (.enabled config) "on" "off")])
                status (jv-object a)]
            (jv-put! status "checked" (JStr (utc-stamp a (.now ctl))))
            (jv-put! status "enabled" (JBool (.enabled config)))
@@ -856,117 +1501,260 @@
            (jv-put! status "base" (JStr (.commit (field state base))))
            (jv-put! status "counts" (JStr counts-text))
            (jv-put! status "active" (JStr active-text))
-           (try! (write-text a (path-join a (.state-dir config) "status.json") (join a [(jv-encode a status) "\n"]) 420))
+           (try! (write-text a
+                             (path-join a (.state-dir config) "status.json")
+                             (join a [(jv-encode a status) "\n"])
+                             420))
            (if (= summary (.status-summary state))
                (Ok 0)
-               (do (set! (.status-summary state) summary)
-                   (try! (note! ctl (.status-notebook config) (join a [NOTE-CELL-PREFIX "status"])
-                                (join a ["## coil-bugs factory status\n\nAs of " (utc-stamp a (.now ctl))
-                                         " on computer.jimmyhmiller.com. One bug at a time, each attempted once; outcomes are notes in the coil-bugs pad.\n"
-                                         (if (> (len (.reason (field state halted))) 0)
-                                             (join a ["\n**Halted** since " (.time (field state halted)) ": " (.reason (field state halted))
-                                                      ". Fix the cause, then `coil-bugs controller --config ... --resume`.\n"])
-                                             "")
-                                         (if (.enabled config) "" "\n**Disabled** in config.json.\n")
-                                         (if (> (len (.id (field state snapshot))) 0)
-                                             (join a ["\n- Last snapshot: `" (.id (field state snapshot)) "` (" (int-text a (.cells (field state snapshot))) " cells)"])
-                                             "\n- No snapshot from the Mac yet")
-                                         "\n- Triage: " triage-phase
-                                         (if (match (.phase (field state triage)) (TriageNone [] false) (_ true))
-                                             (join a [" (" (int-text a (.open (field state triage))) " open, " (int-text a (.fixed (field state triage)))
-                                                      " fixed, " (int-text a (.not-a-bug (field state triage))) " not a bug)"])
-                                             "")
-                                         (if (> (len (.commit (field state base))) 0)
-                                             (join a ["\n- Base compiler: coil `" (subslice (.commit (field state base)) 0 12) "`"])
-                                             "")
-                                         "\n- Bugs: " (if (> (len counts-text) 0) counts-text "none yet")
-                                         (if (> (len active-text) 0) (join a ["\n- Working on: " active-text]) "")
-                                         (if (contains? counts-text "scope decision")
-                                             (join a ["\n- **Out of scope?** Decide at " (.approvals-url config)])
-                                             "")
-                                         (if (> (load queued) 0) (join a ["\n\n**Next up:**" (sb-finish! (mut queue))]) "")
-                                         "\n"])))
-                   (save ctl)))))))
+               (do
+                 (set! (.status-summary state) summary)
+                 (try! (note! ctl
+                              (.status-notebook config)
+                              (join a [NOTE-CELL-PREFIX "status"])
+                              (join a
+                                    ["## coil-bugs factory status\n\nAs of "
+                                     (utc-stamp a (.now ctl))
+                                     " on computer.jimmyhmiller.com. One bug at a time, each attempted once; outcomes are notes in the coil-bugs pad.\n"
+                                     (if (> (len (.reason (field state halted)))
+                                            0)
+                                         (join a
+                                               ["\n**Halted** since "
+                                                (.time (field state halted))
+                                                ": "
+                                                (.reason (field state halted))
+                                                ". Fix the cause, then `coil-bugs controller --config ... --resume`.\n"])
+                                         "")
+                                     (if (.enabled config)
+                                         ""
+                                         "\n**Disabled** in config.json.\n")
+                                     (if (> (len (.id (field state snapshot)))
+                                            0)
+                                         (join a
+                                               ["\n- Last snapshot: `"
+                                                (.id (field state snapshot))
+                                                "` ("
+                                                (int-text a
+                                                          (.cells (field state
+                                                                         snapshot)))
+                                                " cells)"])
+                                         "\n- No snapshot from the Mac yet")
+                                     "\n- Triage: "
+                                     triage-phase
+                                     (if (match (.phase (field state triage))
+                                           (TriageNone [] false)
+                                           (_ true))
+                                         (join a
+                                               [" ("
+                                                (int-text a
+                                                          (.open (field state
+                                                                        triage)))
+                                                " open, "
+                                                (int-text a
+                                                          (.fixed (field state
+                                                                         triage)))
+                                                " fixed, "
+                                                (int-text a
+                                                          (.not-a-bug (field state
+                                                                             triage)))
+                                                " not a bug)"])
+                                         "")
+                                     (if (> (len (.commit (field state base)))
+                                            0)
+                                         (join a
+                                               ["\n- Base compiler: coil `"
+                                                (subslice (.commit (field state
+                                                                          base))
+                                                          0
+                                                          12)
+                                                "`"])
+                                         "")
+                                     "\n- Bugs: "
+                                     (if (> (len counts-text) 0)
+                                         counts-text
+                                         "none yet")
+                                     (if (> (len active-text) 0)
+                                         (join a
+                                               ["\n- Working on: " active-text])
+                                         "")
+                                     (if (contains? counts-text
+                                                    "scope decision")
+                                         (join a
+                                               ["\n- **Out of scope?** Decide at "
+                                                (.approvals-url config)])
+                                         "")
+                                     (if (> (load queued) 0)
+                                         (join a
+                                               ["\n\n**Next up:**"
+                                                (finish! (mut queue))])
+                                         "")
+                                     "\n"])))
+                 (save ctl)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Scope: Jimmy decides every bug triage judges out of Coil's scope
 
 ;;; Every pad cell about `bug`, verbatim, from the newest snapshot.
-(defn report-text [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result (slice u8) (slice u8)))
+(defn report-text [(ctl (ptr Ctl)) (bug (ptr Bug))]
+  (-> (Result (slice u8) (slice u8)))
   (try (let [a (.a ctl)
-             snapshot (try! (read-snapshot ctl (.id (field (field ctl state) snapshot))))
-             (mut report) (sb-new a)]
+             snapshot
+               (try! (read-snapshot ctl
+                                    (.id (field (field ctl state) snapshot))))
+             (mut report) (StrBuf::new a)]
          (for id (iter (.cells bug))
            (for cell (iter (.cells snapshot))
              (when (= (.id cell) id)
-               (sb-push-str! (mut report) (join a ["--- pad cell " id " ---\n" (.source cell) "\n\n"]))
+               (push-str! (mut report)
+                          (join a
+                                ["--- pad cell "
+                                 id
+                                 " ---\n"
+                                 (.source cell)
+                                 "\n\n"]))
                0)))
-         (Ok (sb-finish! (mut report))))))
+         (Ok (finish! (mut report))))))
 
 ;;; The text of SCOPE.md rule `id`: its heading and everything up to the next.
-(defn rule-text [(a (dyn Allocator)) (scope (slice u8)) (id (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+(defn rule-text [(a (dyn Allocator)) (scope (slice u8)) (id (slice u8))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
         (mut inside) false]
-    (for line (iter (str-split a scope "\n"))
-      (when (starts-with line "## ") (set! inside (starts-with line (join a ["## " id "."]))) 0)
-      (when (load inside) (sb-push-str! (mut out) line) (sb-push-str! (mut out) "\n") 0))
-    (str-trim (sb-finish! (mut out)))))
+    (for line (iter (split a scope "\n"))
+      (when (starts-with line "## ")
+        (set! inside (starts-with line (join a ["## " id "."])))
+        0)
+      (when (load inside)
+        (push-str! (mut out) line)
+        (push-str! (mut out) "\n")
+        0))
+    (trim (finish! (mut out)))))
 
 ;;; The request asking Jimmy to confirm that `bug` is out of scope: one
 ;;; proposal that stands alone on a phone, with the report and the rule
 ;;; attached as evidence the summary cannot alter.
-(defn scope-request-json [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result (slice u8) (slice u8)))
+(defn scope-request-json [(ctl (ptr Ctl)) (bug (ptr Bug))]
+  (-> (Result (slice u8) (slice u8)))
   (try (let [a (.a ctl)
              scope (try! (read-required a (.scope-file (field ctl config))))
              rule (rule-text a scope (.scope-rule bug))
              report (try! (report-text ctl bug))
-             (mut proposals) (al-new [approval/Proposal] a)
-             (mut evidence) (al-new [approval/Evidence] a)]
+             (mut proposals) (ArrayList::new [approval/Proposal] a)
+             (mut evidence) (ArrayList::new [approval/Evidence] a)]
          (push! (mut proposals)
                 (approval/Proposal
-                  :title (join a ["\"" (.title bug) "\" is outside Coil's scope (rule " (.scope-rule bug) ")"])
-                  :what (join a ["Triage judged that fixing this coil-bugs report would need Coil to do what rule "
-                                 (.scope-rule bug) " of your SCOPE.md rules out, so the factory has not worked on it.\n\n"
-                                 "**What the report asks for:**\n\n> " (.scope-quote bug) "\n\n"
-                                 "**Why triage says it is out of scope:** " (.scope-reason bug) "\n\n" rule])
-                  :why "Your rules (factories/coil-bugs/SCOPE.md) say Coil will not do this. The factory never works on an out-of-scope bug without your word, either way."
-                  :if-approved (join a ["The factory never works on this bug. A note in the coil-bugs pad marks it out of scope under rule "
-                                        (.scope-rule bug) "; the report itself stays in the pad."])
-                  :if-rejected "The bug goes back into the queue and is reproduced and fixed like any other. Your comment is shown to the agent that works on it."
+                  :title
+                    (join a
+                          ["\""
+                           (.title bug)
+                           "\" is outside Coil's scope (rule "
+                           (.scope-rule bug)
+                           ")"])
+                  :what
+                    (join a
+                          ["Triage judged that fixing this coil-bugs report would need Coil to do what rule "
+                           (.scope-rule bug)
+                           " of your SCOPE.md rules out, so the factory has not worked on it.\n\n"
+                           "**What the report asks for:**\n\n> "
+                           (.scope-quote bug)
+                           "\n\n"
+                           "**Why triage says it is out of scope:** "
+                           (.scope-reason bug)
+                           "\n\n"
+                           rule])
+                  :why
+                    "Your rules (factories/coil-bugs/SCOPE.md) say Coil will not do this. The factory never works on an out-of-scope bug without your word, either way."
+                  :if-approved
+                    (join a
+                          ["The factory never works on this bug. A note in the coil-bugs pad marks it out of scope under rule "
+                           (.scope-rule bug)
+                           "; the report itself stays in the pad."])
+                  :if-rejected
+                    "The bug goes back into the queue and is reproduced and fixed like any other. Your comment is shown to the agent that works on it."
                   :evidence (join a ["> " (.scope-quote bug)])))
-         (push! (mut evidence) (approval/Evidence :name "The report, every coil-bugs pad cell about it" :content report :format "markdown"))
-         (push! (mut evidence) (approval/Evidence :name "SCOPE.md" :content scope :format "markdown"))
+         (push! (mut evidence)
+                (approval/Evidence
+                  :name "The report, every coil-bugs pad cell about it"
+                  :content report
+                  :format "markdown"))
+         (push! (mut evidence)
+                (approval/Evidence
+                  :name "SCOPE.md"
+                  :content scope
+                  :format "markdown"))
          (Ok (approval/request-json a
-                                    (approval/RequestSource :site "coil-bugs" :run "" :station "triage" :kind "scope" :round 0)
-                                    (approval/Summary :title (join a ["Out of scope? " (.title bug)])
-                                                      :summary (.scope-reason bug)
-                                                      :proposals (load proposals)
-                                                      :questions (al-new [approval/Question] a))
+                                    (approval/RequestSource
+                                      :site "coil-bugs"
+                                      :run ""
+                                      :station "triage"
+                                      :kind "scope"
+                                      :round 0)
+                                    (approval/Summary
+                                      :title
+                                        (join a ["Out of scope? " (.title bug)])
+                                      :summary (.scope-reason bug)
+                                      :proposals (load proposals)
+                                      :questions
+                                        (ArrayList::new [approval/Question] a))
                                     (load evidence))))))
 
-(defn scope-review-step [(ctl (ptr Ctl)) (bug (ptr Bug))] (-> (Result i64 (slice u8)))
+(defn scope-review-step [(ctl (ptr Ctl)) (bug (ptr Bug))]
+  (-> (Result i64 (slice u8)))
   (try (let [a (.a ctl)]
          (cond (= (len (.scope-request bug)) 0)
-                 (match (approver-submit (.approver ctl) a (try! (scope-request-json ctl bug)))
-                   (Ok [ticket] (do (set! (.scope-request bug) (.id ticket))
-                                    (set! (.scope-url bug) (.page ticket))
-                                    (set! (.scope-polled bug) (.now ctl))
-                                    (bug-event! ctl bug (join a ["Asked Jimmy whether it is out of scope: " (.page ticket)]))))
+                 (match (approver-submit (.approver ctl)
+                                         a
+                                         (try! (scope-request-json ctl bug)))
+                   (Ok [ticket]
+                       (do
+                         (set! (.scope-request bug) (.id ticket))
+                         (set! (.scope-url bug) (.page ticket))
+                         (set! (.scope-polled bug) (.now ctl))
+                         (bug-event! ctl
+                                     bug
+                                     (join a
+                                           ["Asked Jimmy whether it is out of scope: "
+                                            (.page ticket)]))))
                    ;; The page is down or refuses: ask again on a later heartbeat.
-                   (Err [why] (do (println "coil-bugs: {s}: cannot ask about its scope yet: {s}" (.id bug) why) (Ok 0))))
+                   (Err [why]
+                        (do
+                          (println "coil-bugs: {s}: cannot ask about its scope yet: {s}"
+                                   (.id bug)
+                                   why)
+                          (Ok 0))))
                (< (- (.now ctl) (.scope-polled bug)) 60000) (Ok 0)
                :else
-                 (do (set! (.scope-polled bug) (.now ctl))
-                     (match (approver-fetch (.approver ctl) a (.scope-request bug))
-                       (ScopeWaiting [] (save ctl))
-                       (ScopeUnreachable [message] (do (println "coil-bugs: {s}: {s}" (.id bug) message) (save ctl)))
-                       (ScopeWithdrawn [] (do (set! (.scope-request bug) "")
-                                              (bug-event! ctl bug "The scope question was withdrawn; asking again")))
-                       (ScopeConfirmed [comment] (do (set! (.scope-comment bug) comment)
-                                                     (conclude ctl bug (OutOfScope) "")))
-                       (ScopeOverruled [comment] (do (set! (.scope-comment bug) comment)
-                                                     (set! (.status bug) (Queued))
-                                                     (bug-event! ctl bug (join a ["Jimmy ruled it in scope: " comment]))))))))))
+                 (do
+                   (set! (.scope-polled bug) (.now ctl))
+                   (match (approver-fetch (.approver ctl)
+                                          a
+                                          (.scope-request bug))
+                     (ScopeWaiting [] (save ctl))
+                     (ScopeUnreachable [message]
+                                       (do
+                                         (println "coil-bugs: {s}: {s}"
+                                                  (.id bug)
+                                                  message)
+                                         (save ctl)))
+                     (ScopeWithdrawn []
+                                     (do
+                                       (set! (.scope-request bug) "")
+                                       (bug-event! ctl
+                                                   bug
+                                                   "The scope question was withdrawn; asking again")))
+                     (ScopeConfirmed [comment]
+                                     (do
+                                       (set! (.scope-comment bug) comment)
+                                       (conclude ctl bug (OutOfScope) "")))
+                     (ScopeOverruled [comment]
+                                     (do
+                                       (set! (.scope-comment bug) comment)
+                                       (set! (.status bug) (Queued))
+                                       (bug-event! ctl
+                                                   bug
+                                                   (join a
+                                                         ["Jimmy ruled it in scope: "
+                                                          comment]))))))))))
 
 ;;; Ask about, or read Jimmy's answer for, every bug awaiting a scope decision.
 ;;; These go on beside the one bug being worked on.

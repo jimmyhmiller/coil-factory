@@ -34,7 +34,7 @@
                       (cast i64
                             (write (cast i32 2)
                                    (cast (ptr i8)
-                                         (index (slice-data text) (load at)))
+                                         (index (data text) (load at)))
                                    (cast isize (- n (load at)))))]
                 (if (<= written 0)
                     (break)

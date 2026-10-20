@@ -1,7 +1,6 @@
 (module factory.worker)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -25,7 +24,10 @@
 (import "factory.prompts" :use *)
 (import "factory.review" :use *)
 (import "factory.approval" :as approval)
-(import "factory.reviewer" :use [ReviewerSpec parse-reviewer ReviewerOk ReviewerBad reviewer-problems-text])
+(import "factory.reviewer"
+        :use
+        [ReviewerSpec parse-reviewer ReviewerOk ReviewerBad
+         reviewer-problems-text])
 (import "factory.runspec" :use *)
 (import "factory.runstate" :use *)
 (import "factory.spec" :use *)
@@ -59,21 +61,25 @@
                            (path (slice u8))
                            (agent (slice u8))
                            (st (ptr RunState))] (-> (ptr JournalControl))
-  (let [control (box! a JournalControl (primitive/zeroed JournalControl))]
+  (let [control (box! a JournalControl (zeroed JournalControl))]
     (set! (.allocator control) a)
     (set! (.path control) path)
     (set! (.agent control) agent)
     (set! (.cursor control) (.cursor st))
     (set! (.paused control) (= (.status st) "paused"))
     (set! (.cancelled control) false)
-    (set! (.inbox control) (al-new [Inbound] a))
+    (set! (.inbox control) (ArrayList::new [Inbound] a))
     (set! (.last-poll control) 0)
     ;; Messages sent before this process started are still owed to the agent.
     (for pending (iter (.pending st))
       (let [m pending]
         (when (= (.agent m) agent)
-          (push! [Inbound] (mut (.inbox control))
-                 (Inbound :from (.from m) :text (.text m) :ref (.ref m)))
+          (push! [Inbound]
+                 (mut (.inbox control))
+                 (Inbound
+                   :from (.from m)
+                   :text (.text m)
+                   :ref (.ref m)))
           0)))
     control))
 
@@ -83,7 +89,11 @@
         0
         (let [a (.allocator control)]
           (set! (.last-poll control) now)
-          (match (jsonl/journal-read a (.path control) (.cursor control) 256 1048576)
+          (match (jsonl/journal-read a
+                                     (.path control)
+                                     (.cursor control)
+                                     256
+                                     1048576)
             (Err [failure] 0)
             (Ok [read]
                 (let [(mut batch) read]
@@ -94,18 +104,47 @@
                         (Some [value]
                               (let [kind (jv-string-or (jv-get value "kind") "")]
                                 (cond (= kind "control")
-                                        (let [action (jv-string-or (jv-get value "action") "")]
-                                          (cond (= action "pause") (do (set! (.paused control) true) 0)
-                                                (= action "resume") (do (set! (.paused control) false) 0)
-                                                (= action "cancel") (do (set! (.cancelled control) true) 0)
+                                        (let [action
+                                                (jv-string-or (jv-get value
+                                                                      "action")
+                                                              "")]
+                                          (cond (= action "pause")
+                                                  (do
+                                                    (set! (.paused control)
+                                                          true)
+                                                    0)
+                                                (= action "resume")
+                                                  (do
+                                                    (set! (.paused control)
+                                                          false)
+                                                    0)
+                                                (= action "cancel")
+                                                  (do
+                                                    (set! (.cancelled control)
+                                                          true)
+                                                    0)
                                                 :else 0))
                                       (and (= kind "message.sent")
-                                           (= (jv-string-or (jv-get value "agent") "") (.agent control)))
-                                        (do (push! [Inbound] (mut (.inbox control))
-                                                   (Inbound :from (copy-bytes a (jv-string-or (jv-get value "from") "operator"))
-                                                            :text (copy-bytes a (jv-string-or (jv-get value "text") ""))
-                                                            :ref (.offset r)))
-                                            0)
+                                           (= (jv-string-or (jv-get value
+                                                                    "agent")
+                                                            "")
+                                              (.agent control)))
+                                        (do
+                                          (push! [Inbound]
+                                                 (mut (.inbox control))
+                                                 (Inbound
+                                                   :from
+                                                     (copy-bytes a
+                                                                 (jv-string-or (jv-get value
+                                                                                       "from")
+                                                                               "operator"))
+                                                   :text
+                                                     (copy-bytes a
+                                                                 (jv-string-or (jv-get value
+                                                                                       "text")
+                                                                               ""))
+                                                   :ref (.offset r)))
+                                          0)
                                       :else 0))))))
                   (set! (.cursor control) (jsonl/batch-next-offset batch))
                   (jsonl/journal-batch-free! (mut batch))
@@ -113,19 +152,23 @@
 
 (impl AgentControl JournalControl
   (control-check [(self (ptr JournalControl))] (-> Control)
-                 (do (journal-control-poll! self)
-                     (cond (.cancelled self) (Cancel)
-                           (.paused self) (Pause)
-                           :else (Proceed))))
-  (control-inbox [(self (ptr JournalControl)) (a (dyn Allocator))] (-> (ArrayList Inbound))
-                 (do (set! (.last-poll self) 0)
-                     (journal-control-poll! self)
-                     (let [(mut out) (al-new [Inbound] a)]
-                       (for message (iter (.inbox self))
-                         (push! [Inbound] (mut out) message))
-                       (al-clear! [Inbound] (mut (.inbox self)))
-                       (load out))))
-  (control-idle [(self (ptr JournalControl))] (-> i64) (sleep-ms 250)))
+    (do
+      (journal-control-poll! self)
+      (cond (.cancelled self) (Cancel)
+            (.paused self) (Pause)
+            :else (Proceed))))
+  (control-inbox [(self (ptr JournalControl)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (do
+      (set! (.last-poll self) 0)
+      (journal-control-poll! self)
+      (let [(mut out) (ArrayList::new [Inbound] a)]
+        (for message (iter (.inbox self))
+          (push! [Inbound] (mut out) message))
+        (clear! (mut (.inbox self)))
+        (load out))))
+  (control-idle [(self (ptr JournalControl))] (-> i64)
+    (sleep-ms 250)))
 
 ;; ---------------------------------------------------------------------------
 ;; Everything the agent does, into the journal
@@ -136,81 +179,190 @@
    (agent-name (slice u8))
    ;;; The agent whose checkpoint this saves; None until it is made.
    (harness (Option (dyn Harness)))
-   (checkpoint (slice u8))])
+   (checkpoint (slice u8))
+   ;;; `Streaming` reports are journaled at most every STREAMING_RECORD_MS;
+   ;;; when the last record went out, and the characters reported since.
+   (streamed-ms i64)
+   (streamed-chars i64)])
+
+;;; A model streaming for minutes would otherwise write a record a second.
+(const STREAMING_RECORD_MS 10000)
 
 (defn save-checkpoint! [(observer (ptr JournalObserver))] (-> i64)
   (let [a (.allocator observer)]
     (match (.harness observer)
       (None [] 0)
       (Some [harness]
-        (match (atomic/write-file-atomic! a (.checkpoint observer) (harness-checkpoint harness a) 384)
-          (Ok [written]
-              ;; Which part of the journal this checkpoint already reflects, so
-              ;; a reader can merge the transcript with later records exactly.
-              (match (jsonl/journal-size a (.path observer))
-                (Ok [size] (let [(mut text) (sb-new a)]
-                             (sb-push-i64! (mut text) size)
-                             (atomic/write-file-atomic! a (text-join a [(.checkpoint observer) ".cursor"]) (sb-finish! (mut text)) 384)
-                             0))
-                (Err [failure] 0)))
-          (Err [failure] (do (println "factory: could not save the transcript checkpoint") 0)))))))
+            (match (atomic/write-file-atomic! a
+                                              (.checkpoint observer)
+                                              (harness-checkpoint harness a)
+                                              384)
+              (Ok [written]
+                  ;; Which part of the journal this checkpoint already reflects, so
+                  ;; a reader can merge the transcript with later records exactly.
+                  (match (jsonl/journal-size a (.path observer))
+                    (Ok [size]
+                        (let [(mut text) (StrBuf::new a)]
+                          (push-i64! (mut text) size)
+                          (atomic/write-file-atomic! a
+                                                     (text-join a
+                                                                [(.checkpoint observer)
+                                                                 ".cursor"])
+                                                     (finish! (mut text))
+                                                     384)
+                          0))
+                    (Err [failure] 0)))
+              (Err [failure]
+                   (do
+                     (println "factory: could not save the transcript checkpoint")
+                     0)))))))
 
 (defn observe-record! [(observer (ptr JournalObserver)) (record JVal)] (-> i64)
   (match (append-record! (.allocator observer) (.path observer) record)
     (AppendedAt [offset] 0)
     (AppendFailed [message]
-                  (fail [i64] "factory: cannot append to the run journal; stopping rather than working unobserved"))))
+                  (fail [i64]
+                        "factory: cannot append to the run journal; stopping rather than working unobserved"))))
 
 (impl AgentObserver JournalObserver
   (observe [(self (ptr JournalObserver)) (event AgentEvent)] (-> i64)
-           (let [a (.allocator self)
-                 name (.agent-name self)]
-             (match event
-               (TurnStarted [turn]
-                            (do (save-checkpoint! self)
-                                (observe-record! self (ev-int! (ev-agent a "agent.turn" name) "turn" turn))))
-               (MessageDelivered [delivered]
-                                 (let [m delivered]
-                                   (observe-record! self
-                                                    (ev-text! a (ev-str! (ev-int! (ev-agent a "message.received" name) "ref" (.ref m))
-                                                                         "from" (.from m))
-                                                              "text" (.text m) 2000))))
-               (Thought [text]
-                        (observe-record! self (ev-text! a (ev-agent a "agent.thought" name) "text" text 1500)))
-               (Said [text]
-                     (observe-record! self (ev-text! a (ev-agent a "agent.text" name) "text" text 4000)))
-               (UsageReported [input output]
-                              (observe-record! self (ev-int! (ev-int! (ev-agent a "agent.usage" name) "input" input)
-                                                             "output" output)))
-               (UsageUnknown [reason]
-                             (observe-record! self (ev-text! a (ev-agent a "agent.usage-unknown" name) "reason" reason 1000)))
-               (ToolStarted [started summary]
-                            (let [call started]
-                              (observe-record! self
-                                               (ev-text! a (ev-text! a (ev-str! (ev-str! (ev-agent a "tool.started" name)
-                                                                                         "call" (.id call))
-                                                                                "tool" (.name call))
-                                                                     "summary" summary 200)
-                                                         "args" (.arguments-json call) 600))))
-               (ToolEnded [ended summary ok output elapsed]
-                          (let [call ended]
+    (let [a (.allocator self)
+          name (.agent-name self)]
+      (match event
+        (TurnStarted [turn]
+                     (do
+                       (save-checkpoint! self)
+                       (observe-record! self
+                                        (ev-int! (ev-agent a "agent.turn" name)
+                                                 "turn"
+                                                 turn))))
+        (MessageDelivered [delivered]
+                          (let [m delivered]
                             (observe-record! self
-                                             (ev-text! a (ev-int! (ev-bool! (ev-text! a (ev-str! (ev-str! (ev-agent a "tool.finished" name)
-                                                                                                          "call" (.id call))
-                                                                                                 "tool" (.name call))
-                                                                                      "summary" summary 200)
-                                                                            "ok" ok)
-                                                                  "ms" elapsed)
-                                                       "output" output 1500))))
-               (ModelRetrying [attempt failure delay]
-                              (let [error failure]
-                                (observe-record! self
-                                                 (ev-text! a (ev-int! (ev-int! (ev-agent a "agent.retry" name) "attempt" attempt)
-                                                                      "status" (.status error))
-                                                           "message" (.message error) 400))))
-               (PausedEvent [] (observe-record! self (ev-agent a "agent.paused" name)))
-               (ResumedEvent [] (observe-record! self (ev-agent a "agent.resumed" name)))
-               (Compacted [n bytes] (observe-record! self (ev-int! (ev-int! (ev-agent a "agent.compacted" name) "messages" n) "bytes" bytes)))))))
+                                             (ev-text! a
+                                                       (ev-str! (ev-int! (ev-agent a
+                                                                                   "message.received"
+                                                                                   name)
+                                                                         "ref"
+                                                                         (.ref m))
+                                                                "from"
+                                                                (.from m))
+                                                       "text"
+                                                       (.text m)
+                                                       2000))))
+        (Thought [text]
+                 (observe-record! self
+                                  (ev-text! a
+                                            (ev-agent a "agent.thought" name)
+                                            "text"
+                                            text
+                                            1500)))
+        (Streaming [part chars]
+                   (let [now (now-ms)
+                         total (+ (.streamed-chars self) chars)]
+                     (if (< (- now (.streamed-ms self)) STREAMING_RECORD_MS)
+                         (do (set! (.streamed-chars self) total) 0)
+                         (do (set! (.streamed-ms self) now)
+                             (set! (.streamed-chars self) 0)
+                             (observe-record! self
+                                              (ev-int! (ev-str! (ev-agent a "agent.streaming" name)
+                                                                "part"
+                                                                part)
+                                                       "chars"
+                                                       total))))))
+        (Said [text]
+              (observe-record! self
+                               (ev-text! a
+                                         (ev-agent a "agent.text" name)
+                                         "text"
+                                         text
+                                         4000)))
+        (UsageReported [input cached output]
+                       (observe-record! self
+                                        (ev-int! (ev-int! (ev-int! (ev-agent a
+                                                                             "agent.usage"
+                                                                             name)
+                                                                   "input"
+                                                                   input)
+                                                          "cached"
+                                                          cached)
+                                                 "output"
+                                                 output)))
+        (UsageUnknown [reason]
+                      (observe-record! self
+                                       (ev-text! a
+                                                 (ev-agent a
+                                                           "agent.usage-unknown"
+                                                           name)
+                                                 "reason"
+                                                 reason
+                                                 1000)))
+        (ToolStarted [started summary]
+                     (let [call started]
+                       (observe-record! self
+                                        (ev-text! a
+                                                  (ev-text! a
+                                                            (ev-str! (ev-str! (ev-agent a
+                                                                                        "tool.started"
+                                                                                        name)
+                                                                              "call"
+                                                                              (.id call))
+                                                                     "tool"
+                                                                     (.name call))
+                                                            "summary"
+                                                            summary
+                                                            200)
+                                                  "args"
+                                                  (.arguments-json call)
+                                                  600))))
+        (ToolEnded [ended summary ok output elapsed]
+                   (let [call ended]
+                     (observe-record! self
+                                      (ev-text! a
+                                                (ev-int! (ev-bool! (ev-text! a
+                                                                             (ev-str! (ev-str! (ev-agent a
+                                                                                                         "tool.finished"
+                                                                                                         name)
+                                                                                               "call"
+                                                                                               (.id call))
+                                                                                      "tool"
+                                                                                      (.name call))
+                                                                             "summary"
+                                                                             summary
+                                                                             200)
+                                                                   "ok"
+                                                                   ok)
+                                                         "ms"
+                                                         elapsed)
+                                                "output"
+                                                output
+                                                1500))))
+        (ModelRetrying [attempt failure delay]
+                       (let [error failure]
+                         (observe-record! self
+                                          (ev-text! a
+                                                    (ev-int! (ev-int! (ev-agent a
+                                                                                "agent.retry"
+                                                                                name)
+                                                                      "attempt"
+                                                                      attempt)
+                                                             "status"
+                                                             (.status error))
+                                                    "message"
+                                                    (.message error)
+                                                    400))))
+        (PausedEvent [] (observe-record! self (ev-agent a "agent.paused" name)))
+        (ResumedEvent []
+                      (observe-record! self (ev-agent a "agent.resumed" name)))
+        (Compacted [n bytes]
+                   (observe-record! self
+                                    (ev-int! (ev-int! (ev-agent a
+                                                                "agent.compacted"
+                                                                name)
+                                                      "messages"
+                                                      n)
+                                             "bytes"
+                                             bytes)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A run
@@ -236,16 +388,24 @@
   (match (append-record! (.allocator worker) (.events worker) record)
     (AppendedAt [offset] 0)
     (AppendFailed [message]
-                  (fail [i64] "factory: cannot append to the run journal; stopping rather than working unobserved"))))
+                  (fail [i64]
+                        "factory: cannot append to the run journal; stopping rather than working unobserved"))))
 
-(defn finish-run! [(worker (ptr Worker)) (status (slice u8)) (reason (slice u8))] (-> i64)
+(defn finish-run! [(worker (ptr Worker))
+                   (status (slice u8))
+                   (reason (slice u8))] (-> i64)
   (let [a (.allocator worker)]
-    (emit! worker (ev-text! a (ev-str! (ev a "run.finished") "status" status) "reason" reason 2000))))
+    (emit! worker
+           (ev-text! a
+                     (ev-str! (ev a "run.finished") "status" status)
+                     "reason"
+                     reason
+                     2000))))
 
 (defn text-join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 ;;; Make the run's worktree if it does not exist yet. Returns "" on success or
 ;;; the reason it could not be made.
@@ -262,30 +422,45 @@
                     (Err [failure] "could not create the workspace directory")
                     (Ok [made]
                         (let [init (git-init-scratch a workspace)
-                              branched (if (git-ok? init)
-                                           (git a workspace ["checkout" "-q" "-b" (.branch run)])
-                                           (load init))]
+                              branched
+                                (if (git-ok? init)
+                                    (git a
+                                         workspace
+                                         ["checkout" "-q" "-b" (.branch run)])
+                                    (load init))]
                           (if (not (git-ok? branched))
                               (git-message branched)
                               (match (git-head a workspace)
                                 (Some [head] (do (set! (.base worker) head) ""))
                                 (None [] "the new repository has no commit"))))))
-                  (let [base (if (> (len (.base run)) 0)
-                                 (.base run)
-                                 (match (git-head a (.project run))
-                                   (Some [head] head)
-                                   (None [] "")))]
+                  (let [base
+                          (if (> (len (.base run)) 0)
+                              (.base run)
+                              (match (git-head a (.project run))
+                                (Some [head] head)
+                                (None [] "")))]
                     (if (= (len base) 0)
-                        (text-join a ["project " (.project run) " is not a git repository with a commit"])
-                        (let [made (git-worktree-add a (.project run) workspace (.branch run) base)]
+                        (text-join a
+                                   ["project "
+                                    (.project run)
+                                    " is not a git repository with a commit"])
+                        (let [made
+                                (git-worktree-add a
+                                                  (.project run)
+                                                  workspace
+                                                  (.branch run)
+                                                  base)]
                           (if (git-ok? made)
                               (do (set! (.base worker) base) "")
-                              (text-join a ["could not create the worktree: " (git-message made)]))))))))
+                              (text-join a
+                                         ["could not create the worktree: "
+                                          (git-message made)]))))))))
       (Err [failure] "could not inspect the workspace directory"))))
 
-(defn handoffs-before [(worker (ptr Worker)) (index i64)] (-> (ArrayList Handoff))
+(defn handoffs-before [(worker (ptr Worker)) (index i64)]
+  (-> (ArrayList Handoff))
   (let [a (.allocator worker)
-        (mut out) (al-new [Handoff] a)
+        (mut out) (ArrayList::new [Handoff] a)
         spec (field worker factory)
         st (field worker state)
         (mut i) 0]
@@ -294,12 +469,18 @@
               (let [station (station-spec spec (load i))
                     known (station-at st (.name station))]
                 (when (= (.status known) "passed")
-                  (push! [Handoff] (mut out) (Handoff :station (.name station) :summary (.summary known)))
+                  (push! [Handoff]
+                         (mut out)
+                         (Handoff
+                           :station (.name station)
+                           :summary (.summary known)))
                   0)
                 (set! i (+ (load i) 1)))))
     (load out)))
 
-(defn short-summary [(a (dyn Allocator)) (station (slice u8)) (summary (slice u8))] (-> (slice u8))
+(defn short-summary [(a (dyn Allocator))
+                     (station (slice u8))
+                     (summary (slice u8))] (-> (slice u8))
   (text-join a [station ": " (first-line a summary 72)]))
 
 ;;; Run one station to an outcome.
@@ -312,206 +493,494 @@
         known (station-at st name)
         gate (.gate station)
         attempts (station-attempts spec station)
-        checkpoint (transcript-path a (.home worker) (.id (field worker run)) name)
+        checkpoint
+          (transcript-path a (.home worker) (.id (field worker run)) name)
         review-names (station-review-names a (field worker run) name)
         ;; What this station changed is everything since the commit it
         ;; started from (the last station's, or the run's base).
-        station-start (match (git-head a (.workspace worker)) (Some [head] head) (None [] (.base worker)))
+        station-start
+          (match (git-head a (.workspace worker))
+            (Some [head] head)
+            (None [] (.base worker)))
         approves (station-approves? spec station)]
-    (block :station
-           (let [control (journal-control-new a (.events worker) name st)
-                 observer (journal-observer a worker name checkpoint)
-                 made (match (station-agent a (field worker config) (agent-request worker station gate) observer control)
-                        (AgentReady [ready] ready)
-                        (AgentUnavailable [message] (return-from :station (StationFailed message))))
-                 agent (.harness made)
-                 finish-tool (.finish-tool made)
-                 (mut gate-failures) (.gate-failures known)
-                 (mut review-rejections) (.review-rejections known)
-                 (mut gate-output) ""
-                 (mut review-notes) ""
-                 ;; Approval rounds so far, and what Jimmy decided in each (the
-                 ;; exact words the agent was given), for the next request.
-                 (mut approval-round) (.approval-rounds known)
-                 (mut approval-history) (.approval-history known)
-                 (mut quiet-replies) 0
-                 reviewers (match (station-reviewer-specs a worker review-names)
-                             (Ok [specs] specs)
-                             (Err [message] (return-from :station (StationFailed message))))]
-             (set! (.harness observer) (Some agent))
-             (let [resumed (match (atomic/read-file-if-exists a checkpoint)
-                             (Ok [found] (match found
-                                           (Some [text] (harness-restore! agent text))
-                                           (None [] false)))
-                             (Err [failure] false))]
-               (if resumed
-                   (harness-add-user! agent "[factory] This station was interrupted and has resumed. The workspace may hold changes from the interrupted turn; check its state before continuing.")
-                   (let [handoffs (handoffs-before worker index)]
-                     (harness-add-system! agent
-                                          (station-system-prompt a
-                                                                 (StationBrief :factory (.name spec)
-                                                                               :station name
-                                                                               :station-number (+ index 1)
-                                                                               :station-count (station-count spec)
-                                                                               :workspace (.workspace worker)
-                                                                               :branch (.branch (field worker run))
-                                                                               :base (.base worker)
-                                                                               :gate gate
-                                                                               :attempts attempts
-                                                                               :reviewers (names-text a review-names)
-                                                                               :approval approves
-                                                                               :tools (.tools-note made)
-                                                                               :workspace-note (.workspace-note made)
-                                                                               :finish-tool finish-tool
-                                                                               :context (.context spec)
-                                                                               :instructions (.instructions station)
-                                                                               :brief (.brief (field worker run))
-                                                                               :handoffs (al-slice [Handoff] handoffs))))
-                     (harness-add-user! agent (station-kickoff a name))))
-               (emit! worker (ev-bool! (ev-str! (ev-str! (ev-agent a "station.started" name) "model" (.label made))
-                                                "harness" (harness-for worker station))
-                                       "resumed" resumed)))
-             ;; A worker that stopped while waiting on a person goes back to
-             ;; waiting on the same request; it never asks twice.
-             (when (> (len (.approval-id known)) 0)
-               (match (await-approval! worker name (.approval-id known) (.approval-kind known) (.approval-rounds known) control)
-                 (ApprovalAccepted [message] (return-from :station (commit-station! worker name (.approval-summary known))))
-                 (ApprovalAnswered [message] (do (set! approval-history (with-decision a (load approval-history) (.approval-rounds known) message))
-                                                 (harness-add-user! agent message) 0))
-                 (ApprovalStopped [why] (return-from :station (block-station! worker name why)))
-                 (ApprovalCancelled [] (return-from :station (StationCancelled))))
-               0)
-             (loop
-               (let [stop (harness-run! agent)]
-                 (save-checkpoint! observer)
-                 (match stop
-                   (Cancelled [] (return-from :station (StationCancelled)))
-                   (Failed [failure]
-                           (let [error failure]
-                             (return-from :station
-                                            (StationFailed (text-join a ["the model failed (" (.kind error) "): "
-                                                                         (first-line a (.message error) 300)])))))
-                   (Replied [text]
-                            (do (set! quiet-replies (+ (load quiet-replies) 1))
-                                (if (>= (load quiet-replies) 2)
-                                    (if approves
-                                        (do (set! quiet-replies 0)
-                                            (set! approval-round (+ (load approval-round) 1))
-                                            (match (approve! worker station "question" text "" "" "" station-start
-                                                             (load approval-round) (load approval-history) control)
-                                              (ApprovalAnswered [message]
-                                                                (do (set! approval-history (with-decision a (load approval-history) (load approval-round) message))
-                                                                    (harness-add-user! agent message) 0))
-                                              (ApprovalAccepted [message] (fail [i64] "factory: a question cannot be accepted, only answered"))
-                                              (ApprovalStopped [why] (return-from :station (block-station! worker name why)))
-                                              (ApprovalCancelled [] (return-from :station (StationCancelled)))))
-                                        (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
-                                                                    "summary" text 4000))
-                                            (return-from :station (StationBlocked text))))
-                                    (harness-add-user! agent (no-tool-nudge a finish-tool)))
-                                0))
-                   (Finished [called result]
-                             (let [call called
-                                   outcome (call-string call "outcome")
-                                   summary (call-string call "summary")]
-                               (set! quiet-replies 0)
-                               (when (= outcome "blocked")
-                                 (when (not approves)
-                                   (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
-                                                           "summary" summary 4000))
-                                   (return-from :station (StationBlocked summary)))
-                                 ;; Its claims and questions go to Jimmy; his
-                                 ;; decisions and answers are its next instruction.
-                                 (set! approval-round (+ (load approval-round) 1))
-                                 (match (approve! worker station "question" summary "" "" "" station-start
-                                                  (load approval-round) (load approval-history) control)
-                                   (ApprovalAnswered [message]
-                                                     (do (set! approval-history (with-decision a (load approval-history) (load approval-round) message))
-                                                         (harness-add-user! agent message) 0))
-                                   (ApprovalAccepted [message] (fail [i64] "factory: a question cannot be accepted, only answered"))
-                                   (ApprovalStopped [why] (return-from :station (block-station! worker name why)))
-                                   (ApprovalCancelled [] (return-from :station (StationCancelled))))
-                                 (continue))
-                               (when (> (len gate) 0)
-                                 (emit! worker (ev-str! (ev-agent a "gate.started" name) "command" gate))
-                                 (let [gate-run (run-gate a (.workspace worker) gate
-                                                          (.isolation (field worker config)) control)]
-                                   (set! gate-output (tail-text (.output gate-run) 3000))
-                                   (emit! worker (ev-text! a (ev-int! (ev-bool! (ev-str! (ev-agent a "gate.finished" name) "command" gate)
-                                                                                "ok" (.ok gate-run))
-                                                                      "exit" (.exit gate-run))
-                                                           "output" (.output gate-run) 3000))
-                                   (when (.cancelled gate-run)
-                                     (return-from :station (StationCancelled)))
-                                   (when (not (.ok gate-run))
-                                     (set! gate-failures (+ (load gate-failures) 1))
-                                     (when (>= (load gate-failures) attempts)
-                                       (let [why (text-join a ["The gate `" gate "` failed " (int-text a (load gate-failures))
-                                                               " times. Last output:\n" (tail-text (.output gate-run) 1500)])]
-                                         (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
-                                                                 "summary" why 4000))
-                                         (return-from :station (StationBlocked why))))
-                                     (harness-add-user! agent
-                                                        (gate-failure-message a finish-tool gate (.exit gate-run)
-                                                                              (tail-text (.output gate-run) 6000)
-                                                                              (- attempts (load gate-failures))))
-                                     (continue))
-                                   0)
-                                 0)
-                               (when (> (len reviewers) 0)
-                                 (match (review-station! worker station reviewers summary gate (load gate-output) station-start
-                                                         (+ (load review-rejections) 1) control)
-                                   (ReviewApproved [notes] (do (set! review-notes notes) 0))
-                                   (ReviewCancelled [] (return-from :station (StationCancelled)))
-                                   (ReviewNoVerdict [message]
-                                                    (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
-                                                                                "summary" message 4000))
-                                                        (return-from :station (StationBlocked message))))
-                                   (ReviewRejected [reasons]
-                                                   (do (set! review-rejections (+ (load review-rejections) 1))
-                                                       (when (>= (load review-rejections) attempts)
-                                                         (let [why (text-join a ["The reviewers sent the work back " (int-text a (load review-rejections))
-                                                                                 " times. The last time:\n" reasons])]
-                                                           (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked")
-                                                                                   "summary" why 4000))
-                                                           (return-from :station (StationBlocked why))))
-                                                       (harness-add-user! agent (review-rejection-message a finish-tool reasons
-                                                                                                          (- attempts (load review-rejections))))
-                                                       (continue))))
-                                 0)
-                               (when approves
-                                 (set! approval-round (+ (load approval-round) 1))
-                                 (match (approve! worker station "station" summary gate (load gate-output) (load review-notes)
-                                                  station-start (load approval-round) (load approval-history) control)
-                                   (ApprovalAccepted [message] 0)
-                                   (ApprovalAnswered [message]
-                                                     (do (set! approval-history (with-decision a (load approval-history) (load approval-round) message))
-                                                         (harness-add-user! agent message)
-                                                         (continue)))
-                                   (ApprovalStopped [why] (return-from :station (block-station! worker name why)))
-                                   (ApprovalCancelled [] (return-from :station (StationCancelled))))
-                                 0)
-                               (return-from :station (commit-station! worker name summary)))))))
-             (StationCancelled)))))
+    (block
+      :station
+        (let [control (journal-control-new a (.events worker) name st)
+              observer (journal-observer a worker name checkpoint)
+              made
+                (match (station-agent a
+                                      (field worker config)
+                                      (agent-request worker station gate)
+                                      observer
+                                      control)
+                  (AgentReady [ready] ready)
+                  (AgentUnavailable [message]
+                                    (return-from
+                                      :station (StationFailed message))))
+              agent (.harness made)
+              finish-tool (.finish-tool made)
+              (mut gate-failures) (.gate-failures known)
+              (mut review-rejections) (.review-rejections known)
+              (mut gate-output) ""
+              (mut review-notes) ""
+              ;; Approval rounds so far, and what Jimmy decided in each (the
+              ;; exact words the agent was given), for the next request.
+              (mut approval-round) (.approval-rounds known)
+              (mut approval-history) (.approval-history known)
+              (mut quiet-replies) 0
+              reviewers
+                (match (station-reviewer-specs a worker review-names)
+                  (Ok [specs] specs)
+                  (Err [message] (return-from :station (StationFailed message))))]
+          (set! (.harness observer) (Some agent))
+          (let [resumed
+                  (match (atomic/read-file-if-exists a checkpoint)
+                    (Ok [found]
+                        (match found
+                          (Some [text] (harness-restore! agent text))
+                          (None [] false)))
+                    (Err [failure] false))]
+            (if resumed
+                (harness-add-user! agent
+                                   "[factory] This station was interrupted and has resumed. The workspace may hold changes from the interrupted turn; check its state before continuing.")
+                (let [handoffs (handoffs-before worker index)]
+                  (harness-add-system! agent
+                                       (station-system-prompt a
+                                                              (StationBrief
+                                                                :factory
+                                                                  (.name spec)
+                                                                :station name
+                                                                :station-number
+                                                                  (+ index 1)
+                                                                :station-count
+                                                                  (station-count spec)
+                                                                :workspace
+                                                                  (.workspace worker)
+                                                                :branch
+                                                                  (.branch (field worker
+                                                                                  run))
+                                                                :base
+                                                                  (.base worker)
+                                                                :gate gate
+                                                                :attempts
+                                                                  attempts
+                                                                :reviewers
+                                                                  (names-text a
+                                                                              review-names)
+                                                                :approval
+                                                                  approves
+                                                                :tools
+                                                                  (.tools-note made)
+                                                                :workspace-note
+                                                                  (.workspace-note made)
+                                                                :finish-tool
+                                                                  finish-tool
+                                                                :context
+                                                                  (.context spec)
+                                                                :instructions
+                                                                  (.instructions station)
+                                                                :brief
+                                                                  (.brief (field worker
+                                                                                 run))
+                                                                :handoffs
+                                                                  (slice handoffs))))
+                  (harness-add-user! agent (station-kickoff a name))))
+            (emit! worker
+                   (ev-bool! (ev-str! (ev-str! (ev-agent a
+                                                         "station.started"
+                                                         name)
+                                               "model"
+                                               (.label made))
+                                      "harness"
+                                      (harness-for worker station))
+                             "resumed"
+                             resumed)))
+          ;; A worker that stopped while waiting on a person goes back to
+          ;; waiting on the same request; it never asks twice.
+          (when (> (len (.approval-id known)) 0)
+            (match (await-approval! worker
+                                    name
+                                    (.approval-id known)
+                                    (.approval-kind known)
+                                    (.approval-rounds known)
+                                    control)
+              (ApprovalAccepted [message]
+                                (return-from
+                                  :station
+                                    (commit-station! worker
+                                                     name
+                                                     (.approval-summary known))))
+              (ApprovalAnswered [message]
+                                (do
+                                  (set! approval-history
+                                        (with-decision a
+                                                       (load approval-history)
+                                                       (.approval-rounds known)
+                                                       message))
+                                  (harness-add-user! agent message)
+                                  0))
+              (ApprovalStopped [why]
+                               (return-from
+                                 :station (block-station! worker name why)))
+              (ApprovalCancelled [] (return-from :station (StationCancelled))))
+            0)
+          (loop (let [stop (harness-run! agent)]
+                  (save-checkpoint! observer)
+                  (match stop
+                    (Cancelled [] (return-from :station (StationCancelled)))
+                    (Failed [failure]
+                            (let [error failure]
+                              (return-from
+                                :station
+                                  (StationFailed (text-join a
+                                                            ["the model failed ("
+                                                             (.kind error)
+                                                             "): "
+                                                             (first-line a
+                                                                         (.message error)
+                                                                         300)])))))
+                    (Replied [text]
+                             (do
+                               (set! quiet-replies (+ (load quiet-replies) 1))
+                               (if (>= (load quiet-replies) 2)
+                                   (if approves
+                                       (do
+                                         (set! quiet-replies 0)
+                                         (set! approval-round
+                                               (+ (load approval-round) 1))
+                                         (match (approve! worker
+                                                          station
+                                                          "question"
+                                                          text
+                                                          ""
+                                                          ""
+                                                          ""
+                                                          station-start
+                                                          (load approval-round)
+                                                          (load approval-history)
+                                                          control)
+                                           (ApprovalAnswered [message]
+                                                             (do
+                                                               (set! approval-history
+                                                                     (with-decision a
+                                                                                    (load approval-history)
+                                                                                    (load approval-round)
+                                                                                    message))
+                                                               (harness-add-user! agent
+                                                                                  message)
+                                                               0))
+                                           (ApprovalAccepted [message]
+                                                             (fail [i64]
+                                                                   "factory: a question cannot be accepted, only answered"))
+                                           (ApprovalStopped [why]
+                                                            (return-from
+                                                              :station
+                                                                (block-station! worker
+                                                                                name
+                                                                                why)))
+                                           (ApprovalCancelled []
+                                                              (return-from
+                                                                :station
+                                                                  (StationCancelled)))))
+                                       (do
+                                         (emit! worker
+                                                (ev-text! a
+                                                          (ev-str! (ev-agent a
+                                                                             "station.finished"
+                                                                             name)
+                                                                   "outcome"
+                                                                   "blocked")
+                                                          "summary"
+                                                          text
+                                                          4000))
+                                         (return-from
+                                           :station (StationBlocked text))))
+                                   (harness-add-user! agent
+                                                      (no-tool-nudge a
+                                                                     finish-tool)))
+                               0))
+                    (Finished [called result]
+                              (let [call called
+                                    outcome (call-string call "outcome")
+                                    summary (call-string call "summary")]
+                                (set! quiet-replies 0)
+                                (when (= outcome "blocked")
+                                  (when (not approves)
+                                    (emit! worker
+                                           (ev-text! a
+                                                     (ev-str! (ev-agent a
+                                                                        "station.finished"
+                                                                        name)
+                                                              "outcome"
+                                                              "blocked")
+                                                     "summary"
+                                                     summary
+                                                     4000))
+                                    (return-from
+                                      :station (StationBlocked summary)))
+                                  ;; Its claims and questions go to Jimmy; his
+                                  ;; decisions and answers are its next instruction.
+                                  (set! approval-round
+                                        (+ (load approval-round) 1))
+                                  (match (approve! worker
+                                                   station
+                                                   "question"
+                                                   summary
+                                                   ""
+                                                   ""
+                                                   ""
+                                                   station-start
+                                                   (load approval-round)
+                                                   (load approval-history)
+                                                   control)
+                                    (ApprovalAnswered [message]
+                                                      (do
+                                                        (set! approval-history
+                                                              (with-decision a
+                                                                             (load approval-history)
+                                                                             (load approval-round)
+                                                                             message))
+                                                        (harness-add-user! agent
+                                                                           message)
+                                                        0))
+                                    (ApprovalAccepted [message]
+                                                      (fail [i64]
+                                                            "factory: a question cannot be accepted, only answered"))
+                                    (ApprovalStopped [why]
+                                                     (return-from
+                                                       :station
+                                                         (block-station! worker
+                                                                         name
+                                                                         why)))
+                                    (ApprovalCancelled []
+                                                       (return-from
+                                                         :station
+                                                           (StationCancelled))))
+                                  (continue))
+                                (when (> (len gate) 0)
+                                  (emit! worker
+                                         (ev-str! (ev-agent a
+                                                            "gate.started"
+                                                            name)
+                                                  "command"
+                                                  gate))
+                                  (let [gate-run
+                                          (run-gate a
+                                                    (.workspace worker)
+                                                    gate
+                                                    (.isolation (field worker
+                                                                       config))
+                                                    control)]
+                                    (set! gate-output
+                                          (tail-text (.output gate-run) 3000))
+                                    (emit! worker
+                                           (ev-text! a
+                                                     (ev-int! (ev-bool! (ev-str! (ev-agent a
+                                                                                           "gate.finished"
+                                                                                           name)
+                                                                                 "command"
+                                                                                 gate)
+                                                                        "ok"
+                                                                        (.ok gate-run))
+                                                              "exit"
+                                                              (.exit gate-run))
+                                                     "output"
+                                                     (.output gate-run)
+                                                     3000))
+                                    (when (.cancelled gate-run)
+                                      (return-from :station (StationCancelled)))
+                                    (when (not (.ok gate-run))
+                                      (set! gate-failures
+                                            (+ (load gate-failures) 1))
+                                      (when (>= (load gate-failures) attempts)
+                                        (let [why
+                                                (text-join a
+                                                           ["The gate `"
+                                                            gate
+                                                            "` failed "
+                                                            (int-text a
+                                                                      (load gate-failures))
+                                                            " times. Last output:\n"
+                                                            (tail-text (.output gate-run)
+                                                                       1500)])]
+                                          (emit! worker
+                                                 (ev-text! a
+                                                           (ev-str! (ev-agent a
+                                                                              "station.finished"
+                                                                              name)
+                                                                    "outcome"
+                                                                    "blocked")
+                                                           "summary"
+                                                           why
+                                                           4000))
+                                          (return-from
+                                            :station (StationBlocked why))))
+                                      (harness-add-user! agent
+                                                         (gate-failure-message a
+                                                                               finish-tool
+                                                                               gate
+                                                                               (.exit gate-run)
+                                                                               (tail-text (.output gate-run)
+                                                                                          6000)
+                                                                               (- attempts
+                                                                                  (load gate-failures))))
+                                      (continue))
+                                    0)
+                                  0)
+                                (when (> (len reviewers) 0)
+                                  (match (review-station! worker
+                                                          station
+                                                          reviewers
+                                                          summary
+                                                          gate
+                                                          (load gate-output)
+                                                          station-start
+                                                          (+ (load review-rejections)
+                                                             1)
+                                                          control)
+                                    (ReviewApproved [notes]
+                                                    (do
+                                                      (set! review-notes notes)
+                                                      0))
+                                    (ReviewCancelled []
+                                                     (return-from
+                                                       :station
+                                                         (StationCancelled)))
+                                    (ReviewNoVerdict [message]
+                                                     (do
+                                                       (emit! worker
+                                                              (ev-text! a
+                                                                        (ev-str! (ev-agent a
+                                                                                           "station.finished"
+                                                                                           name)
+                                                                                 "outcome"
+                                                                                 "blocked")
+                                                                        "summary"
+                                                                        message
+                                                                        4000))
+                                                       (return-from
+                                                         :station
+                                                           (StationBlocked message))))
+                                    (ReviewRejected [reasons]
+                                                    (do
+                                                      (set! review-rejections
+                                                            (+ (load review-rejections)
+                                                               1))
+                                                      (when (>= (load review-rejections)
+                                                                attempts)
+                                                        (let [why
+                                                                (text-join a
+                                                                           ["The reviewers sent the work back "
+                                                                            (int-text a
+                                                                                      (load review-rejections))
+                                                                            " times. The last time:\n"
+                                                                            reasons])]
+                                                          (emit! worker
+                                                                 (ev-text! a
+                                                                           (ev-str! (ev-agent a
+                                                                                              "station.finished"
+                                                                                              name)
+                                                                                    "outcome"
+                                                                                    "blocked")
+                                                                           "summary"
+                                                                           why
+                                                                           4000))
+                                                          (return-from
+                                                            :station
+                                                              (StationBlocked why))))
+                                                      (harness-add-user! agent
+                                                                         (review-rejection-message a
+                                                                                                   finish-tool
+                                                                                                   reasons
+                                                                                                   (- attempts
+                                                                                                      (load review-rejections))))
+                                                      (continue))))
+                                  0)
+                                (when approves
+                                  (set! approval-round
+                                        (+ (load approval-round) 1))
+                                  (match (approve! worker
+                                                   station
+                                                   "station"
+                                                   summary
+                                                   gate
+                                                   (load gate-output)
+                                                   (load review-notes)
+                                                   station-start
+                                                   (load approval-round)
+                                                   (load approval-history)
+                                                   control)
+                                    (ApprovalAccepted [message] 0)
+                                    (ApprovalAnswered [message]
+                                                      (do
+                                                        (set! approval-history
+                                                              (with-decision a
+                                                                             (load approval-history)
+                                                                             (load approval-round)
+                                                                             message))
+                                                        (harness-add-user! agent
+                                                                           message)
+                                                        (continue)))
+                                    (ApprovalStopped [why]
+                                                     (return-from
+                                                       :station
+                                                         (block-station! worker
+                                                                         name
+                                                                         why)))
+                                    (ApprovalCancelled []
+                                                       (return-from
+                                                         :station
+                                                           (StationCancelled))))
+                                  0)
+                                (return-from
+                                  :station (commit-station! worker name summary)))))))
+          (StationCancelled)))))
 
 ;;; Commit the station's work on the run branch, and record that it passed.
 ;;; `history` with Jimmy's decision in `round` added.
-(defn with-decision [(a (dyn Allocator)) (history (slice u8)) (round i64) (message (slice u8))] (-> (slice u8))
-  (text-join a [history (if (> (len history) 0) "\n\n" "") "Round " (int-text a round) ":\n" message]))
+(defn with-decision [(a (dyn Allocator))
+                     (history (slice u8))
+                     (round i64)
+                     (message (slice u8))] (-> (slice u8))
+  (text-join a
+             [history
+              (if (> (len history) 0) "\n\n" "")
+              "Round "
+              (int-text a round)
+              ":\n"
+              message]))
 
-(defn commit-station! [(worker (ptr Worker)) (name (slice u8)) (summary (slice u8))] (-> StationResult)
+(defn commit-station! [(worker (ptr Worker))
+                       (name (slice u8))
+                       (summary (slice u8))] (-> StationResult)
   (let [a (.allocator worker)
-        commit (git-commit-all a (.workspace worker) (short-summary a name summary))
+        commit
+          (git-commit-all a (.workspace worker) (short-summary a name summary))
         head (match (git-head a (.workspace worker)) (Some [h] h) (None [] ""))]
-    (emit! worker (ev-text! a (ev-str! (ev-str! (ev-agent a "station.finished" name) "outcome" "passed")
-                                       "commit" head)
-                            "summary" summary 4000))
+    (emit! worker
+           (ev-text! a
+                     (ev-str! (ev-str! (ev-agent a "station.finished" name)
+                                       "outcome"
+                                       "passed")
+                              "commit"
+                              head)
+                     "summary"
+                     summary
+                     4000))
     (StationPassed summary)))
 
 ;;; Stop the station for a person at the terminal (`factory say`).
-(defn block-station! [(worker (ptr Worker)) (name (slice u8)) (why (slice u8))] (-> StationResult)
+(defn block-station! [(worker (ptr Worker)) (name (slice u8)) (why (slice u8))]
+  (-> StationResult)
   (let [a (.allocator worker)]
-    (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" name) "outcome" "blocked") "summary" why 4000))
+    (emit! worker
+           (ev-text! a
+                     (ev-str! (ev-agent a "station.finished" name)
+                              "outcome"
+                              "blocked")
+                     "summary"
+                     why
+                     4000))
     (StationBlocked why)))
 
 ;; ---------------------------------------------------------------------------
@@ -542,136 +1011,323 @@
                 (round i64)
                 (history (slice u8))
                 (control (dyn AgentControl))] (-> ApprovalEnd)
-  (block :approve
-         (let [a (.allocator worker)
-               name (.name station)
-               config (field worker config)
-               spec (match (approval/parse-summarizer a (.text (field (field worker run) summarizer)))
-                      (approval/SummarizerOk [s] (box! a approval/SummarizerSpec s))
-                      (approval/SummarizerBad [problems]
-                                              (return-from :approve
-                                                             (ApprovalStopped (text-join a ["run.json's summarizer does not parse:\n"
-                                                                                            (problems-text a problems)])))))
-               diff (git-work-diff a (.workspace worker) station-start 200000)
-               (mut evidence) (al-new [approval/Evidence] a)
-               (mut material) (sb-new a)]
-           (push! (mut evidence) (approval/Evidence :name "The agent's own words" :content agent-words :format "text"))
-           (when (> (len gate) 0)
-             (push! (mut evidence) (approval/Evidence :name (text-join a ["Gate `" gate "` (passed): end of its output"])
-                                                      :content gate-output :format "text"))
-             (sb-push-str! (mut material) (text-join a ["## Gate `" gate "` passed; its output ended:\n```\n" gate-output "\n```\n\n"]))
-             0)
-           (when (> (len review-notes) 0)
-             (push! (mut evidence) (approval/Evidence :name "Reviewers' verdicts" :content review-notes :format "markdown"))
-             (sb-push-str! (mut material) (text-join a ["## Reviewers' verdicts\n" review-notes "\n\n"]))
-             0)
-           (push! (mut evidence) (approval/Evidence :name (text-join a ["What the station changed (against " (git-short a (.workspace worker) station-start) ")"])
-                                                    :content (if (> (len (str-trim diff)) 0) diff "(no changes)") :format "diff"))
-           (push! (mut evidence) (approval/Evidence :name "The brief" :content (.brief (field worker run)) :format "markdown"))
-           (when (> (len history) 0)
-             (push! (mut evidence) (approval/Evidence :name "Jimmy's earlier decisions at this station" :content history :format "text"))
-             (sb-push-str! (mut material) (text-join a ["## Jimmy's earlier decisions at this station (the agent was given exactly these words; "
-                                                        "work that follows them is what he asked for)\n" history "\n\n"]))
-             0)
-           (sb-push-str! (mut material) (text-join a ["## What the station changed (against `" station-start "`; untracked files shown as new)\n```diff\n"
-                                                      (if (> (len (str-trim diff)) 0) diff "(no changes)") "\n```"]))
-           (let [system (approval/summarizer-system-prompt a spec)
-                 context (approval/summarizer-context a kind (.brief (field worker run)) (.context (field worker factory)) name
-                                                      (.instructions station) agent-words (sb-finish! (mut material)) (.workspace worker))
-                 run-dir (run-dir a (.home worker) (.id (field worker run)))
-                 (mut summary) (None [approval/Summary])
-                 (mut last-problem) ""
-                 (mut tries) 0]
-             (emit! worker (ev-str! (ev-int! (ev-agent a "approval.summarizing" name) "round" round) "approval_kind" kind))
-             ;; The summarizer gets a second chance with its mistake named,
-             ;; then the station stops: nothing goes to Jimmy unchecked.
-             (loop (if (or (>= (load tries) 2) (match (load summary) (Some [_] true) (None [] false)))
-                       (break)
-                       (let [ctx (if (= (load tries) 0)
-                                     context
-                                     (text-join a [context "\n\n## Your previous reply was refused\n" (load last-problem)
-                                                   "\nReply again with only the JSON object."]))]
-                         (match (ask-agents! a config [(approval/summarizer-role spec)] [system] [ctx]
-                                             (.workspace worker) run-dir name control)
-                           (AgentsCancelled [] (return-from :approve (ApprovalCancelled)))
-                           (AgentsAnswered [answers]
-                                           (let [answer (get answers 0)]
-                                             (if (> (len (.failure answer)) 0)
-                                                 (set! last-problem (text-join a ["the summarizer could not run: " (.failure answer)]))
-                                                 (match (approval/parse-summary a kind (.reply answer))
-                                                   (Ok [s] (set! summary (Some s)))
-                                                   (Err [problem] (set! last-problem problem)))))))
-                         (set! tries (+ (load tries) 1)))))
-             (match (load summary)
-               (None [] (return-from :approve
-                                     (ApprovalStopped (text-join a ["The summary for Jimmy's approval could not be made, so nothing was sent: "
-                                                                    (load last-problem)]))))
-               (Some [made]
-                     (let [body (approval/request-json a (approval/RequestSource :site (.name config) :run (.id (field worker run))
-                                                                                 :station name :kind kind :round round)
-                                                       made (load evidence))]
-                       (match (approval/approval-submit! a config body)
-                         (Err [why] (return-from :approve
-                                                 (ApprovalStopped (text-join a ["The approval request could not be submitted: " why]))))
-                         (Ok [submitted]
-                             (do (emit! worker (ev-text! a (ev-int! (ev-str! (ev-str! (ev-str! (ev-str! (ev-str! (ev-agent a "approval.requested" name)
-                                                                                                                 "id" (.id submitted))
-                                                                                                        "url" (.url submitted))
-                                                                                               "page" (.page submitted))
-                                                                                      "approval_kind" kind)
-                                                                             "title" (.title made))
-                                                                    "round" round)
-                                                         "summary" (if (= kind "station") agent-words "") 8000))
-                                 (await-approval! worker name (.id submitted) kind round control)))))))))))
+  (block
+    :approve
+      (let [a (.allocator worker)
+            name (.name station)
+            config (field worker config)
+            spec
+              (match (approval/parse-summarizer a
+                                                (.text (field (field worker run)
+                                                              summarizer)))
+                (approval/SummarizerOk [s] (box! a approval/SummarizerSpec s))
+                (approval/SummarizerBad [problems]
+                                        (return-from
+                                          :approve
+                                            (ApprovalStopped (text-join a
+                                                                        ["run.json's summarizer does not parse:\n"
+                                                                         (problems-text a
+                                                                                        problems)])))))
+            diff (git-work-diff a (.workspace worker) station-start 200000)
+            (mut evidence) (ArrayList::new [approval/Evidence] a)
+            (mut material) (StrBuf::new a)]
+        (push! (mut evidence)
+               (approval/Evidence
+                 :name "The agent's own words"
+                 :content agent-words
+                 :format "text"))
+        (when (> (len gate) 0)
+          (push! (mut evidence)
+                 (approval/Evidence
+                   :name
+                     (text-join a
+                                ["Gate `" gate "` (passed): end of its output"])
+                   :content gate-output
+                   :format "text"))
+          (push-str! (mut material)
+                     (text-join a
+                                ["## Gate `"
+                                 gate
+                                 "` passed; its output ended:\n```\n"
+                                 gate-output
+                                 "\n```\n\n"]))
+          0)
+        (when (> (len review-notes) 0)
+          (push! (mut evidence)
+                 (approval/Evidence
+                   :name "Reviewers' verdicts"
+                   :content review-notes
+                   :format "markdown"))
+          (push-str! (mut material)
+                     (text-join a
+                                ["## Reviewers' verdicts\n" review-notes "\n\n"]))
+          0)
+        (push! (mut evidence)
+               (approval/Evidence
+                 :name
+                   (text-join a
+                              ["What the station changed (against "
+                               (git-short a (.workspace worker) station-start)
+                               ")"])
+                 :content (if (> (len (trim diff)) 0) diff "(no changes)")
+                 :format "diff"))
+        (push! (mut evidence)
+               (approval/Evidence
+                 :name "The brief"
+                 :content (.brief (field worker run))
+                 :format "markdown"))
+        (when (> (len history) 0)
+          (push! (mut evidence)
+                 (approval/Evidence
+                   :name "Jimmy's earlier decisions at this station"
+                   :content history
+                   :format "text"))
+          (push-str! (mut material)
+                     (text-join a
+                                ["## Jimmy's earlier decisions at this station (the agent was given exactly these words; "
+                                 "work that follows them is what he asked for)\n"
+                                 history
+                                 "\n\n"]))
+          0)
+        (push-str! (mut material)
+                   (text-join a
+                              ["## What the station changed (against `"
+                               station-start
+                               "`; untracked files shown as new)\n```diff\n"
+                               (if (> (len (trim diff)) 0) diff "(no changes)")
+                               "\n```"]))
+        (let [system (approval/summarizer-system-prompt a spec)
+              context
+                (approval/summarizer-context a
+                                             kind
+                                             (.brief (field worker run))
+                                             (.context (field worker factory))
+                                             name
+                                             (.instructions station)
+                                             agent-words
+                                             (finish! (mut material))
+                                             (.workspace worker))
+              run-dir (run-dir a (.home worker) (.id (field worker run)))
+              (mut summary) (None [approval/Summary])
+              (mut last-problem) ""
+              (mut tries) 0]
+          (emit! worker
+                 (ev-str! (ev-int! (ev-agent a "approval.summarizing" name)
+                                   "round"
+                                   round)
+                          "approval_kind"
+                          kind))
+          ;; The summarizer gets a second chance with its mistake named,
+          ;; then the station stops: nothing goes to Jimmy unchecked.
+          (loop (if (or (>= (load tries) 2)
+                        (match (load summary) (Some [_] true) (None [] false)))
+                    (break)
+                    (let [ctx
+                            (if (= (load tries) 0)
+                                context
+                                (text-join a
+                                           [context
+                                            "\n\n## Your previous reply was refused\n"
+                                            (load last-problem)
+                                            "\nReply again with only the JSON object."]))]
+                      (match (ask-agents! a
+                                          config
+                                          [(approval/summarizer-role spec)]
+                                          [system]
+                                          [ctx]
+                                          (.workspace worker)
+                                          run-dir
+                                          name
+                                          control)
+                        (AgentsCancelled []
+                                         (return-from
+                                           :approve (ApprovalCancelled)))
+                        (AgentsAnswered [answers]
+                                        (let [answer (get answers 0)]
+                                          (if (> (len (.failure answer)) 0)
+                                              (set! last-problem
+                                                    (text-join a
+                                                               ["the summarizer could not run: "
+                                                                (.failure answer)]))
+                                              (match (approval/parse-summary a
+                                                                             kind
+                                                                             (.reply answer))
+                                                (Ok [s] (set! summary (Some s)))
+                                                (Err [problem]
+                                                     (set! last-problem problem)))))))
+                      (set! tries (+ (load tries) 1)))))
+          (match (load summary)
+            (None []
+                  (return-from
+                    :approve
+                      (ApprovalStopped (text-join a
+                                                  ["The summary for Jimmy's approval could not be made, so nothing was sent: "
+                                                   (load last-problem)]))))
+            (Some [made]
+                  (let [body
+                          (approval/request-json a
+                                                 (approval/RequestSource
+                                                   :site (.name config)
+                                                   :run (.id (field worker run))
+                                                   :station name
+                                                   :kind kind
+                                                   :round round)
+                                                 made
+                                                 (load evidence))]
+                    (match (approval/approval-submit! a config body)
+                      (Err [why]
+                           (return-from
+                             :approve
+                               (ApprovalStopped (text-join a
+                                                           ["The approval request could not be submitted: "
+                                                            why]))))
+                      (Ok [submitted]
+                          (do
+                            (emit! worker
+                                   (ev-text! a
+                                             (ev-int! (ev-str! (ev-str! (ev-str! (ev-str! (ev-str! (ev-agent a
+                                                                                                             "approval.requested"
+                                                                                                             name)
+                                                                                                   "id"
+                                                                                                   (.id submitted))
+                                                                                          "url"
+                                                                                          (.url submitted))
+                                                                                 "page"
+                                                                                 (.page submitted))
+                                                                        "approval_kind"
+                                                                        kind)
+                                                               "title"
+                                                               (.title made))
+                                                      "round"
+                                                      round)
+                                             "summary"
+                                             (if (= kind "station")
+                                                 agent-words
+                                                 "")
+                                             8000))
+                            (await-approval! worker
+                                             name
+                                             (.id submitted)
+                                             kind
+                                             round
+                                             control)))))))))))
 
 ;;; Wait for the decision on request `id`, polling the service, until Jimmy
 ;;; decides or the run is cancelled (which withdraws the request).
-(defn await-approval! [(worker (ptr Worker)) (name (slice u8)) (id (slice u8)) (kind (slice u8)) (round i64) (control (dyn AgentControl))] (-> ApprovalEnd)
+(defn await-approval! [(worker (ptr Worker))
+                       (name (slice u8))
+                       (id (slice u8))
+                       (kind (slice u8))
+                       (round i64)
+                       (control (dyn AgentControl))] (-> ApprovalEnd)
   (let [a (.allocator worker)
         config (field worker config)
         (mut last-unreachable) 0]
     (block :await
-           (loop
-             (match (approval/approval-fetch a config id)
-               (approval/Decided [approved-all message decision]
-                                 (do (emit! worker (ev-text! a (ev-int! (ev-str! (ev-put! (ev-bool! (ev-str! (ev-agent a "approval.decided" name) "id" id)
-                                                                                                    "approved_all" approved-all)
-                                                                                          "decision" decision)
-                                                                                 "approval_kind" kind)
-                                                                        "round" round)
-                                                             "message" message 8000))
-                                     (return-from :await (if (and (= kind "station") approved-all)
-                                                             (ApprovalAccepted message)
-                                                             (ApprovalAnswered message)))))
-               (approval/Withdrawn [reason]
-                                   (do (emit! worker (ev-str! (ev-str! (ev-agent a "approval.withdrawn" name) "id" id) "reason" reason))
-                                       (return-from :await (ApprovalStopped (text-join a ["The approval request was withdrawn"
-                                                                                           (if (> (len reason) 0) (text-join a [": " reason]) "")])))))
-               (approval/Unreachable [message]
-                                     (let [now (now-wall)]
-                                       ;; Waiting goes on; a person sees the trouble once every ten minutes.
-                                       (when (>= (- now (load last-unreachable)) 600000)
-                                         (set! last-unreachable now)
-                                         (emit! worker (ev-text! a (ev-str! (ev-agent a "approval.unreachable" name) "id" id) "message" message 1000))
-                                         0)
-                                       0))
-               (approval/Waiting [] 0))
-             ;; Ask again in fifteen seconds, watching for cancellation.
-             (let [(mut waited) 0]
-               (loop (if (>= (load waited) 15000)
-                         (break)
-                         (do (match (control-check control)
-                               (Cancel []
-                                       (do (match (approval/approval-withdraw! a config id "the run was cancelled")
-                                             (Ok [_] (emit! worker (ev-str! (ev-str! (ev-agent a "approval.withdrawn" name) "id" id)
-                                                                            "reason" "the run was cancelled")))
-                                             (Err [why] (emit! worker (ev-text! a (ev-str! (ev-agent a "approval.unreachable" name) "id" id)
-                                                                                "message" (text-join a ["could not withdraw: " why]) 1000))))
-                                           (return-from :await (ApprovalCancelled))))
-                               (_ 0))
-                             (sleep-ms 500)
-                             (set! waited (+ (load waited) 500)))))))
-           (ApprovalCancelled))))
+      (loop (match (approval/approval-fetch a config id)
+              (approval/Decided [approved-all message decision]
+                                (do
+                                  (emit! worker
+                                         (ev-text! a
+                                                   (ev-int! (ev-str! (ev-put! (ev-bool! (ev-str! (ev-agent a
+                                                                                                           "approval.decided"
+                                                                                                           name)
+                                                                                                 "id"
+                                                                                                 id)
+                                                                                        "approved_all"
+                                                                                        approved-all)
+                                                                              "decision"
+                                                                              decision)
+                                                                     "approval_kind"
+                                                                     kind)
+                                                            "round"
+                                                            round)
+                                                   "message"
+                                                   message
+                                                   8000))
+                                  (return-from
+                                    :await
+                                      (if (and (= kind "station") approved-all)
+                                          (ApprovalAccepted message)
+                                          (ApprovalAnswered message)))))
+              (approval/Withdrawn [reason]
+                                  (do
+                                    (emit! worker
+                                           (ev-str! (ev-str! (ev-agent a
+                                                                       "approval.withdrawn"
+                                                                       name)
+                                                             "id"
+                                                             id)
+                                                    "reason"
+                                                    reason))
+                                    (return-from
+                                      :await
+                                        (ApprovalStopped (text-join a
+                                                                    ["The approval request was withdrawn"
+                                                                     (if (> (len reason)
+                                                                            0)
+                                                                         (text-join a
+                                                                                    [": "
+                                                                                     reason])
+                                                                         "")])))))
+              (approval/Unreachable [message]
+                                    (let [now (now-wall)]
+                                      ;; Waiting goes on; a person sees the trouble once every ten minutes.
+                                      (when (>= (- now (load last-unreachable))
+                                                600000)
+                                        (set! last-unreachable now)
+                                        (emit! worker
+                                               (ev-text! a
+                                                         (ev-str! (ev-agent a
+                                                                            "approval.unreachable"
+                                                                            name)
+                                                                  "id"
+                                                                  id)
+                                                         "message"
+                                                         message
+                                                         1000))
+                                        0)
+                                      0))
+              (approval/Waiting [] 0))
+        ;; Ask again in fifteen seconds, watching for cancellation.
+        (let [(mut waited) 0]
+          (loop (if (>= (load waited) 15000)
+                    (break)
+                    (do
+                      (match (control-check control)
+                        (Cancel []
+                                (do
+                                  (match (approval/approval-withdraw! a
+                                                                      config
+                                                                      id
+                                                                      "the run was cancelled")
+                                    (Ok [_]
+                                        (emit! worker
+                                               (ev-str! (ev-str! (ev-agent a
+                                                                           "approval.withdrawn"
+                                                                           name)
+                                                                 "id"
+                                                                 id)
+                                                        "reason"
+                                                        "the run was cancelled")))
+                                    (Err [why]
+                                         (emit! worker
+                                                (ev-text! a
+                                                          (ev-str! (ev-agent a
+                                                                             "approval.unreachable"
+                                                                             name)
+                                                                   "id"
+                                                                   id)
+                                                          "message"
+                                                          (text-join a
+                                                                     ["could not withdraw: "
+                                                                      why])
+                                                          1000))))
+                                  (return-from :await (ApprovalCancelled))))
+                        (_ 0))
+                      (sleep-ms 500)
+                      (set! waited (+ (load waited) 500)))))))
+      (ApprovalCancelled))))
 
 (defsum ReviewDecision
   ;;; Every reviewer's verdict, as Markdown, for the record.
@@ -682,33 +1338,49 @@
   (ReviewNoVerdict [(message (slice u8))])
   (ReviewCancelled))
 
-(defn names-text [(a (dyn Allocator)) (names (ArrayList (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+(defn names-text [(a (dyn Allocator)) (names (ArrayList (slice u8)))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
         (mut first) true]
     (for name (iter names)
-      (when (not (load first)) (sb-push-str! (mut out) ", ") 0)
-      (sb-push-str! (mut out) name)
+      (when (not (load first)) (push-str! (mut out) ", ") 0)
+      (push-str! (mut out) name)
       (set! first false))
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; The reviewers a station needs, read from the copies in run.json. Every
 ;;; one was checked when the run was made, so a missing or unreadable copy
 ;;; means run.json is damaged; that fails the station rather than skip a review.
-(defn station-reviewer-specs [(a (dyn Allocator)) (worker (ptr Worker)) (names (ArrayList (slice u8)))] (-> (Result (ArrayList (ptr ReviewerSpec)) (slice u8)))
-  (block :specs
-         (let [(mut out) (al-new [(ptr ReviewerSpec)] a)]
-           (for name (iter names)
-             (let [(mut found) false]
-               (for copy (iter (.station-reviewers (field worker run)))
-                 (when (and (not (load found)) (= (.name copy) name))
-                   (set! found true)
-                   (match (parse-reviewer a (.text copy))
-                     (ReviewerBad [problems] (return-from :specs (Err (reviewer-problems-text a name problems))))
-                     (ReviewerOk [spec] (do (push! (mut out) (box! a ReviewerSpec spec)) 0)))
-                   0))
-               (when (not (load found))
-                 (return-from :specs (Err (text-join a ["run.json has no copy of the reviewer \"" name "\" this station needs"]))))))
-           (Ok (load out)))))
+(defn station-reviewer-specs [(a (dyn Allocator))
+                              (worker (ptr Worker))
+                              (names (ArrayList (slice u8)))]
+  (-> (Result (ArrayList (ptr ReviewerSpec)) (slice u8)))
+  (block
+    :specs
+      (let [(mut out) (ArrayList::new [(ptr ReviewerSpec)] a)]
+        (for name (iter names)
+          (let [(mut found) false]
+            (for copy (iter (.station-reviewers (field worker run)))
+              (when (and (not (load found)) (= (.name copy) name))
+                (set! found true)
+                (match (parse-reviewer a (.text copy))
+                  (ReviewerBad [problems]
+                               (return-from
+                                 :specs
+                                   (Err (reviewer-problems-text a name problems))))
+                  (ReviewerOk [spec]
+                              (do
+                                (push! (mut out) (box! a ReviewerSpec spec))
+                                0)))
+                0))
+            (when (not (load found))
+              (return-from
+                :specs
+                  (Err (text-join a
+                                  ["run.json has no copy of the reviewer \""
+                                   name
+                                   "\" this station needs"]))))))
+        (Ok (load out)))))
 
 ;;; Have the station's reviewers judge its finished work, all at once, and
 ;;; record every verdict. Approved only when every reviewer gives an ok
@@ -724,86 +1396,181 @@
                        (control (dyn AgentControl))] (-> ReviewDecision)
   (let [a (.allocator worker)
         name (.name station)
-        (mut names) (al-new [(slice u8)] a)
-        (mut systems) (al-new [(slice u8)] a)
-        (mut contexts) (al-new [(slice u8)] a)
+        (mut names) (ArrayList::new [(slice u8)] a)
+        (mut systems) (ArrayList::new [(slice u8)] a)
+        (mut contexts) (ArrayList::new [(slice u8)] a)
         diff (git-work-diff a (.workspace worker) station-start 200000)]
     (for spec (iter specs)
       (push! (mut names) (.name spec))
       (push! (mut systems) (station-review-system-prompt a spec))
-      (push! (mut contexts) (station-review-context a spec (.brief (field worker run)) (.context (field worker factory))
-                                                    name (.instructions station) summary gate gate-output
-                                                    station-start diff (.workspace worker) round)))
-    (emit! worker (ev-int! (ev-str! (ev-agent a "review.started" name) "reviewers" (names-text a (load names))) "round" round))
-    (match (run-reviews! a (field worker config) (al-slice specs) (al-slice systems) (al-slice contexts)
-                         (.workspace worker) (run-dir a (.home worker) (.id (field worker run))) name control)
+      (push! (mut contexts)
+             (station-review-context a
+                                     spec
+                                     (.brief (field worker run))
+                                     (.context (field worker factory))
+                                     name
+                                     (.instructions station)
+                                     summary
+                                     gate
+                                     gate-output
+                                     station-start
+                                     diff
+                                     (.workspace worker)
+                                     round)))
+    (emit! worker
+           (ev-int! (ev-str! (ev-agent a "review.started" name)
+                             "reviewers"
+                             (names-text a (load names)))
+                    "round"
+                    round))
+    (match (run-reviews! a
+                         (field worker config)
+                         (slice specs)
+                         (slice systems)
+                         (slice contexts)
+                         (.workspace worker)
+                         (run-dir a (.home worker) (.id (field worker run)))
+                         name
+                         control)
       (ReviewsCancelled [] (ReviewCancelled))
       (ReviewsDone [outcomes]
-                   (let [(mut reasons) (sb-new a)
-                         (mut notes) (sb-new a)
+                   (let [(mut reasons) (StrBuf::new a)
+                         (mut notes) (StrBuf::new a)
                          (mut rejected) false
-                         (mut failures) (sb-new a)]
+                         (mut failures) (StrBuf::new a)]
                      (for outcome (iter outcomes)
-                       (emit! worker (ev-int! (ev-int! (ev-put! (ev-str! (ev-str! (ev-str! (ev-str! (ev-text! a (ev-text! a (ev-text! a (ev-agent a "review.verdict" name)
-                                                                                                                                   "reason" (.reason outcome) 2000)
-                                                                                                                         "advice" (.advice outcome) 2000)
-                                                                                                               "failure" (.failure outcome) 2000)
-                                                                                                     "reviewer" (.reviewer outcome))
-                                                                                            "model" (.label outcome))
-                                                                                   "verdict" (.verdict outcome))
-                                                                          "level" (.level outcome))
-                                                                 "confidence" (JFloat (.confidence outcome)))
-                                                        "input" (.input-tokens outcome))
-                                               "output" (.output-tokens outcome)))
-                       (sb-push-str! (mut notes) (text-join a ["- **" (.reviewer outcome) "**: "
-                                                               (if (> (len (.failure outcome)) 0)
-                                                                   (text-join a ["no verdict (" (.failure outcome) ")"])
-                                                                   (text-join a [(.verdict outcome) " — " (.reason outcome)]))
-                                                               "\n"]))
+                       (emit! worker
+                              (ev-int! (ev-int! (ev-put! (ev-str! (ev-str! (ev-str! (ev-str! (ev-text! a
+                                                                                                       (ev-text! a
+                                                                                                                 (ev-text! a
+                                                                                                                           (ev-agent a
+                                                                                                                                     "review.verdict"
+                                                                                                                                     name)
+                                                                                                                           "reason"
+                                                                                                                           (.reason outcome)
+                                                                                                                           2000)
+                                                                                                                 "advice"
+                                                                                                                 (.advice outcome)
+                                                                                                                 2000)
+                                                                                                       "failure"
+                                                                                                       (.failure outcome)
+                                                                                                       2000)
+                                                                                             "reviewer"
+                                                                                             (.reviewer outcome))
+                                                                                    "model"
+                                                                                    (.label outcome))
+                                                                           "verdict"
+                                                                           (.verdict outcome))
+                                                                  "level"
+                                                                  (.level outcome))
+                                                         "confidence"
+                                                         (JFloat (.confidence outcome)))
+                                                "input"
+                                                (.input-tokens outcome))
+                                       "output"
+                                       (.output-tokens outcome)))
+                       (push-str! (mut notes)
+                                  (text-join a
+                                             ["- **"
+                                              (.reviewer outcome)
+                                              "**: "
+                                              (if (> (len (.failure outcome)) 0)
+                                                  (text-join a
+                                                             ["no verdict ("
+                                                              (.failure outcome)
+                                                              ")"])
+                                                  (text-join a
+                                                             [(.verdict outcome)
+                                                              " — "
+                                                              (.reason outcome)]))
+                                              "\n"]))
                        (cond (> (len (.failure outcome)) 0)
-                               (do (sb-push-str! (mut failures) (text-join a ["reviewer " (.reviewer outcome) " gave no verdict: " (.failure outcome) "\n"])) 0)
+                               (do
+                                 (push-str! (mut failures)
+                                            (text-join a
+                                                       ["reviewer "
+                                                        (.reviewer outcome)
+                                                        " gave no verdict: "
+                                                        (.failure outcome)
+                                                        "\n"]))
+                                 0)
                              (not (= (.level outcome) "ok"))
-                               (do (set! rejected true)
-                                   (sb-push-str! (mut reasons) (text-join a ["- " (.reviewer outcome) " (" (.verdict outcome) "): " (.reason outcome) "\n"
-                                                                             (if (> (len (str-trim (.advice outcome))) 0)
-                                                                                 (text-join a ["  What to change: " (.advice outcome) "\n"])
-                                                                                 "")]))
-                                   0)
+                               (do
+                                 (set! rejected true)
+                                 (push-str! (mut reasons)
+                                            (text-join a
+                                                       ["- "
+                                                        (.reviewer outcome)
+                                                        " ("
+                                                        (.verdict outcome)
+                                                        "): "
+                                                        (.reason outcome)
+                                                        "\n"
+                                                        (if (> (len (trim (.advice outcome)))
+                                                               0)
+                                                            (text-join a
+                                                                       ["  What to change: "
+                                                                        (.advice outcome)
+                                                                        "\n"])
+                                                            "")]))
+                                 0)
                              :else 0))
-                     (let [failed (sb-finish! (mut failures))]
-                       (emit! worker (ev-bool! (ev-int! (ev-agent a "review.round" name) "round" round)
-                                               "approved" (and (= (len failed) 0) (not (load rejected)))))
+                     (let [failed (finish! (mut failures))]
+                       (emit! worker
+                              (ev-bool! (ev-int! (ev-agent a
+                                                           "review.round"
+                                                           name)
+                                                 "round"
+                                                 round)
+                                        "approved"
+                                        (and (= (len failed) 0)
+                                             (not (load rejected)))))
                        (cond (> (len failed) 0)
-                               (ReviewNoVerdict (text-join a ["The station's work could not be reviewed, so it was not accepted:\n" failed]))
-                             (load rejected) (ReviewRejected (sb-finish! (mut reasons)))
-                             :else (ReviewApproved (sb-finish! (mut notes))))))))))
+                               (ReviewNoVerdict (text-join a
+                                                           ["The station's work could not be reviewed, so it was not accepted:\n"
+                                                            failed]))
+                             (load rejected)
+                               (ReviewRejected (finish! (mut reasons)))
+                             :else (ReviewApproved (finish! (mut notes))))))))))
 
-(defn journal-observer [(a (dyn Allocator)) (worker (ptr Worker)) (name (slice u8)) (checkpoint (slice u8))] (-> (ptr JournalObserver))
-  (box! a JournalObserver (JournalObserver :allocator a
-                                           :path (.events worker)
-                                           :agent-name name
-                                           :harness (None)
-                                           :checkpoint checkpoint)))
+(defn journal-observer [(a (dyn Allocator))
+                        (worker (ptr Worker))
+                        (name (slice u8))
+                        (checkpoint (slice u8))] (-> (ptr JournalObserver))
+  (box! a
+        JournalObserver
+        (JournalObserver
+          :allocator a
+          :path (.events worker)
+          :agent-name name
+          :harness (None)
+          :checkpoint checkpoint
+          :streamed-ms 0
+          :streamed-chars 0)))
 
 ;;; What `station-agent` needs to make a station's agent.
-(defn agent-request [(worker (ptr Worker)) (station (ptr StationSpec)) (gate (slice u8))] (-> AgentRequest)
-  (AgentRequest :harness (harness-for worker station)
-                :model (model-for worker station)
-                :tools (station-tools (field worker factory) station)
-                :finish true
-                :gate gate
-                :workspace (.workspace worker)
-                :run-dir (run-dir (.allocator worker) (.home worker) (.id (field worker run)))
-                :station (.name station)
-                :state-key ""
-                :extra-tools (no-extra-tools)
-                :agent-server (no-agent-server)
-                :stop-tool ""))
+(defn agent-request [(worker (ptr Worker))
+                     (station (ptr StationSpec))
+                     (gate (slice u8))] (-> AgentRequest)
+  (AgentRequest
+    :harness (harness-for worker station)
+    :model (model-for worker station)
+    :tools (station-tools (field worker factory) station)
+    :finish true
+    :gate gate
+    :workspace (.workspace worker)
+    :run-dir
+      (run-dir (.allocator worker) (.home worker) (.id (field worker run)))
+    :station (.name station)
+    :state-key ""
+    :extra-tools (no-extra-tools)
+    :agent-server (no-agent-server)
+    :stop-tool ""))
 
 (defn int-text [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) n)
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) n)
+    (finish! (mut out))))
 
 ;;; The last `limit` bytes of `text`, starting at a line boundary when possible.
 (defn tail-text [(text (slice u8)) (limit i64)] (-> (slice u8))
@@ -822,7 +1589,10 @@
         n (station-count spec)
         (mut i) 0]
     (loop (if (or (>= (load i) n)
-                  (not (= (.status (station-at st (.name (station-spec spec (load i))))) "passed")))
+                  (not (= (.status (station-at st
+                                               (.name (station-spec spec
+                                                                    (load i)))))
+                          "passed")))
               (break)
               (set! i (+ (load i) 1))))
     (load i)))
@@ -839,16 +1609,48 @@
                 (match (run-station! worker (load i))
                   (StationPassed [summary] (set! i (+ (load i) 1)))
                   (StationBlocked [summary]
-                                  (do (finish-run! worker "blocked"
-                                                   (text-join a [(.name (station-spec (field worker factory) (load i)))
-                                                                 " is waiting for you: " (first-line a summary 300)]))
+                                  (do
+                                    (finish-run! worker
+                                                 "blocked"
+                                                 (text-join a
+                                                            [(.name (station-spec (field worker
+                                                                                         factory)
+                                                                                  (load i)))
+                                                             " is waiting for you: "
+                                                             (first-line a
+                                                                         summary
+                                                                         300)]))
+                                    (set! done true)))
+                  (StationCancelled []
+                                    (do
+                                      (emit! worker
+                                             (ev-str! (ev-agent a
+                                                                "station.finished"
+                                                                (.name (station-spec (field worker
+                                                                                            factory)
+                                                                                     (load i))))
+                                                      "outcome"
+                                                      "cancelled"))
+                                      (finish-run! worker
+                                                   "cancelled"
+                                                   "stopped by an operator")
                                       (set! done true)))
-                  (StationCancelled [] (do (emit! worker (ev-str! (ev-agent a "station.finished" (.name (station-spec (field worker factory) (load i)))) "outcome" "cancelled"))
-                                           (finish-run! worker "cancelled" "stopped by an operator")
-                                           (set! done true)))
-                  (StationFailed [reason] (do (emit! worker (ev-text! a (ev-str! (ev-agent a "station.finished" (.name (station-spec (field worker factory) (load i)))) "outcome" "failed") "summary" reason 2000))
-                                              (finish-run! worker "failed" reason)
-                                              (set! done true))))
+                  (StationFailed [reason]
+                                 (do
+                                   (emit! worker
+                                          (ev-text! a
+                                                    (ev-str! (ev-agent a
+                                                                       "station.finished"
+                                                                       (.name (station-spec (field worker
+                                                                                                   factory)
+                                                                                            (load i))))
+                                                             "outcome"
+                                                             "failed")
+                                                    "summary"
+                                                    reason
+                                                    2000))
+                                   (finish-run! worker "failed" reason)
+                                   (set! done true))))
                 0)))
     (when (not (load done))
       (git-commit-all a (.workspace worker) "factory: remaining changes")
@@ -862,106 +1664,159 @@
         spec (field worker factory)
         index (find-station spec name)]
     (block :converse
-           (when (< index 0)
-             (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply"
-                                     "There is no station by that name in this factory." 400))
-             (return-from :converse 0))
-           (let [station (station-spec spec index)
-                 checkpoint (transcript-path a (.home worker) (.id (field worker run)) name)
-                 control (journal-control-new a (.events worker) name (field worker state))
-                 observer (journal-observer a worker name checkpoint)
-                 agent (match (station-agent a (field worker config) (agent-request worker station "") observer control)
-                         (AgentReady [ready] (.harness ready))
-                         (AgentUnavailable [message]
-                                           (do (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply" message 400))
-                                               (return-from :converse 0))))]
-             (set! (.harness observer) (Some agent))
-             (match (atomic/read-file-if-exists a checkpoint)
-               (Ok [found] (match found
-                             (Some [text] (do (harness-restore! agent text) 0))
-                             (None [] 0)))
-               (Err [failure] 0))
-             (harness-add-user! agent (conversation-note))
-             (emit! worker (ev-agent a "conversation.started" name))
-             (let [stop (harness-run! agent)
-                   reply (match stop
-                           (Replied [text] text)
-                           (Finished [call result] (call-string call "summary"))
-                           (Cancelled [] "(cancelled)")
-                           (Failed [failure] (let [e failure] (.message e))))]
-               (save-checkpoint! observer)
-               (git-commit-all a (.workspace worker) (text-join a [name ": follow-up"]))
-               (emit! worker (ev-text! a (ev-agent a "conversation.finished" name) "reply" reply 4000))
-               0)))))
+      (when (< index 0)
+        (emit! worker
+               (ev-text! a
+                         (ev-agent a "conversation.finished" name)
+                         "reply"
+                         "There is no station by that name in this factory."
+                         400))
+        (return-from :converse 0))
+      (let [station (station-spec spec index)
+            checkpoint
+              (transcript-path a (.home worker) (.id (field worker run)) name)
+            control
+              (journal-control-new a (.events worker) name (field worker state))
+            observer (journal-observer a worker name checkpoint)
+            agent
+              (match (station-agent a
+                                    (field worker config)
+                                    (agent-request worker station "")
+                                    observer
+                                    control)
+                (AgentReady [ready] (.harness ready))
+                (AgentUnavailable [message]
+                                  (do
+                                    (emit! worker
+                                           (ev-text! a
+                                                     (ev-agent a
+                                                               "conversation.finished"
+                                                               name)
+                                                     "reply"
+                                                     message
+                                                     400))
+                                    (return-from :converse 0))))]
+        (set! (.harness observer) (Some agent))
+        (match (atomic/read-file-if-exists a checkpoint)
+          (Ok [found]
+              (match found
+                (Some [text] (do (harness-restore! agent text) 0))
+                (None [] 0)))
+          (Err [failure] 0))
+        (harness-add-user! agent (conversation-note))
+        (emit! worker (ev-agent a "conversation.started" name))
+        (let [stop (harness-run! agent)
+              reply
+                (match stop
+                  (Replied [text] text)
+                  (Finished [call result] (call-string call "summary"))
+                  (Cancelled [] "(cancelled)")
+                  (Failed [failure] (let [e failure] (.message e))))]
+          (save-checkpoint! observer)
+          (git-commit-all a
+                          (.workspace worker)
+                          (text-join a [name ": follow-up"]))
+          (emit! worker
+                 (ev-text! a
+                           (ev-agent a "conversation.finished" name)
+                           "reply"
+                           reply
+                           4000))
+          0)))))
 
-(defn now-wall [] (-> i64) (wall-ms))
+(defn now-wall [] (-> i64)
+  (wall-ms))
 
 ;;; `factory _run RUN-ID`. Returns the process exit code.
-(defn worker-main [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))] (-> i64)
+(defn worker-main [(a (dyn Allocator)) (home (slice u8)) (run-id (slice u8))]
+  (-> i64)
   (let [dir (run-dir a home run-id)
         lock-path (path-join a dir "lock")]
-    (block :main
-           (let [(mut run-lock) (match (lock/lock-open! a lock-path)
-                                  (Ok [l] l)
-                                  (Err [failure] (return-from :main 70)))]
-             (match (lock/lock-try! (mut run-lock))
-               (Ok [held] (when (not held)
-                            (println "factory: another process is already running {s}" run-id)
-                            (return-from :main 0)))
-               (Err [failure] (return-from :main 70)))
-             (lock/pid-write! a (path-join a dir "pid") (pid))
-             (let [worker (box! a Worker (primitive/zeroed Worker))
-                   events (events-path a home run-id)]
-               (set! (.allocator worker) a)
-               (set! (.home worker) home)
-               (set! (.events worker) events)
-               (set! (.workspace worker) (workspace-path a home run-id))
-               (set! (.state worker) (load-run-state a home run-id))
-               (let [run (match (load-run-spec a home run-id)
-                           (RunSpecOk [spec] spec)
-                           (RunSpecBad [message]
-                                       (do (finish-run! worker "failed" message)
-                                           (return-from :main 1))))]
-                 (set! (.run worker) run))
-               (match (load-site-config a home)
-                 (SiteConfigOk [config] (set! (.config worker) config))
-                 (SiteConfigBad [message] (do (finish-run! worker "failed" message)
-                                              (return-from :main 1))))
-               (match (parse-factory a (.factory-text (field worker run)))
-                 (SpecOk [spec] (set! (.factory worker) spec))
-                 (SpecBad [problems]
-                          (do (finish-run! worker "failed" (problems-text a problems))
-                              (return-from :main 1))))
-               (let [st (field worker state)
-                     status (.status st)
-                     all-passed (>= (first-unpassed worker) (station-count (field worker factory)))
-                     conversation (or all-passed (= status "cancelled"))]
-                 (if conversation
-                     ;; Answer every agent that has been spoken to.
-                     (let [(mut names) (al-new [(slice u8)] a)]
-                       (for pending (iter (.pending st))
-                         (let [m pending
-                               (mut seen) false]
-                           (for n (iter names) (when (= n (.agent m)) (set! seen true) 0))
-                           (when (not (load seen)) (push! [(slice u8)] (mut names) (.agent m)) 0)))
-                       (for n (iter names) (converse! worker n))
-                       0)
-                     (let [problem (prepare-workspace! worker)]
-                       (if (> (len problem) 0)
-                           (finish-run! worker "failed" problem)
-                           (do (emit! worker (ev-str! (ev-str! (ev-str! (ev a "run.started") "base" (.base worker))
-                                                               "workspace" (.workspace worker))
-                                                      "pid" (int-text a (pid))))
-                               (set! (.state worker) (load-run-state a home run-id))
-                               (run-stations! worker)))
-                       0)))
-               (atomic/unlink-path a (path-join a dir "pid"))
-               (lock/unlock! (mut run-lock))
-               0)))))
+    (block
+      :main
+        (let [(mut run-lock)
+                (match (lock/lock-open! a lock-path)
+                  (Ok [l] l)
+                  (Err [failure] (return-from :main 70)))]
+          (match (lock/lock-try! (mut run-lock))
+            (Ok [held]
+                (when (not held)
+                  (println "factory: another process is already running {s}"
+                           run-id)
+                  (return-from :main 0)))
+            (Err [failure] (return-from :main 70)))
+          (lock/pid-write! a (path-join a dir "pid") (pid))
+          (let [worker (box! a Worker (zeroed Worker))
+                events (events-path a home run-id)]
+            (set! (.allocator worker) a)
+            (set! (.home worker) home)
+            (set! (.events worker) events)
+            (set! (.workspace worker) (workspace-path a home run-id))
+            (set! (.state worker) (load-run-state a home run-id))
+            (let [run
+                    (match (load-run-spec a home run-id)
+                      (RunSpecOk [spec] spec)
+                      (RunSpecBad [message]
+                                  (do
+                                    (finish-run! worker "failed" message)
+                                    (return-from :main 1))))]
+              (set! (.run worker) run))
+            (match (load-site-config a home)
+              (SiteConfigOk [config] (set! (.config worker) config))
+              (SiteConfigBad [message]
+                             (do
+                               (finish-run! worker "failed" message)
+                               (return-from :main 1))))
+            (match (parse-factory a (.factory-text (field worker run)))
+              (SpecOk [spec] (set! (.factory worker) spec))
+              (SpecBad [problems]
+                       (do
+                         (finish-run! worker
+                                      "failed"
+                                      (problems-text a problems))
+                         (return-from :main 1))))
+            (let [st (field worker state)
+                  status (.status st)
+                  all-passed
+                    (>= (first-unpassed worker)
+                        (station-count (field worker factory)))
+                  conversation (or all-passed (= status "cancelled"))]
+              (if conversation
+                  ;; Answer every agent that has been spoken to.
+                  (let [(mut names) (ArrayList::new [(slice u8)] a)]
+                    (for pending (iter (.pending st))
+                      (let [m pending
+                            (mut seen) false]
+                        (for n (iter names)
+                          (when (= n (.agent m)) (set! seen true) 0))
+                        (when (not (load seen))
+                          (push! [(slice u8)] (mut names) (.agent m))
+                          0)))
+                    (for n (iter names) (converse! worker n))
+                    0)
+                  (let [problem (prepare-workspace! worker)]
+                    (if (> (len problem) 0)
+                        (finish-run! worker "failed" problem)
+                        (do
+                          (emit! worker
+                                 (ev-str! (ev-str! (ev-str! (ev a "run.started")
+                                                            "base"
+                                                            (.base worker))
+                                                   "workspace"
+                                                   (.workspace worker))
+                                          "pid"
+                                          (int-text a (pid))))
+                          (set! (.state worker) (load-run-state a home run-id))
+                          (run-stations! worker)))
+                    0)))
+            (atomic/unlink-path a (path-join a dir "pid"))
+            (lock/unlock! (mut run-lock))
+            0)))))
 
 ;;; The model for a station: the run's explicit choice, then the station's,
 ;;; then the factory's; "" leaves it to the harness's default on this site.
-(defn model-for [(worker (ptr Worker)) (station (ptr StationSpec))] (-> (slice u8))
+(defn model-for [(worker (ptr Worker)) (station (ptr StationSpec))]
+  (-> (slice u8))
   (let [chosen (.model (field worker run))]
     (if (> (len chosen) 0)
         chosen
@@ -969,8 +1824,11 @@
 
 ;;; The harness for a station: the run's explicit choice, then the station's,
 ;;; then the factory's, then the site default.
-(defn harness-for [(worker (ptr Worker)) (station (ptr StationSpec))] (-> (slice u8))
+(defn harness-for [(worker (ptr Worker)) (station (ptr StationSpec))]
+  (-> (slice u8))
   (let [chosen (.harness (field worker run))]
     (if (> (len chosen) 0)
         chosen
-        (station-harness (field worker factory) station (.default-harness (field worker config))))))
+        (station-harness (field worker factory)
+                         station
+                         (.default-harness (field worker config))))))

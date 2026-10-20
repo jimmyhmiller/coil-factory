@@ -45,7 +45,7 @@ from . import probe_tasks
 from .controller import TERMINAL, APIError, NativeAPI, atomic_json, read_json
 
 LOG = logging.getLogger("paper-models")
-PROGRESS_KINDS = {"agent.turn", "agent.text", "agent.thought", "tool.started", "tool.finished",
+PROGRESS_KINDS = {"agent.turn", "agent.streaming", "agent.text", "agent.thought", "tool.started", "tool.finished",
                   "station.started", "station.finished", "gate.started", "gate.finished"}
 
 

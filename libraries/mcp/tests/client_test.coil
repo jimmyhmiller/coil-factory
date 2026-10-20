@@ -12,7 +12,7 @@
 (import "mcp.client" :use *)
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 ;; A server written in sh: it answers initialize, lists its tools in two
 ;; pages (one with keywords json-schema cannot check), pings the client before
@@ -47,11 +47,11 @@ done
 ")
 
 (defn server-file [(a (dyn Allocator))] (-> (slice u8))
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/mcp-client-test-")
-    (sb-push-i64! (mut path) (primitive/cast i64 (os/getpid)))
-    (sb-push-str! (mut path) ".sh")
-    (let [file (sb-finish! (mut path))]
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/mcp-client-test-")
+    (push-i64! (mut path) (primitive/cast i64 (os/getpid)))
+    (push-str! (mut path) ".sh")
+    (let [file (finish! (mut path))]
       (match (fs/write-file a file FAKE-SERVER)
         (Ok [n] file)
         (Err [e] (do (assert false) file))))))

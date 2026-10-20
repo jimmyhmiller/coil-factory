@@ -1,8 +1,7 @@
 (module factory.ui-views-test)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator malloc-allocator box!])
 (import "coil.slice" :use *)
-(import "coil.str" :use [sb-new sb-push-byte! sb-finish! str-find])
+(import "coil.str" :use [StrBuf])
 (import "coil.arraylist" :use *)
 (import "tui.keys" :use *)
 (import "tui.app" :use [Quit Continue])
@@ -22,15 +21,15 @@
 
 ;; Fixtures are written with ' for " to stay readable.
 (defn q [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+  (let [(mut out) (StrBuf::new a)
         (mut i) 0]
     (loop (if (>= (load i) (len text))
               (break)
               (let [b (get text (load i))]
-                (sb-push-byte! (mut out)
-                               (if (= (cast i64 b) #\') (cast u8 #\") b))
+                (push! (mut out)
+                       (if (= (cast i64 b) #\') (cast u8 #\") b))
                 (set! i (+ (load i) 1)))))
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 (defn doc [(a (dyn Allocator)) (text (slice u8))] (-> JVal)
   (match (jv-parse a (q a text))
@@ -78,14 +77,14 @@
     d))
 
 (deftest overview-shows-sites-runs-and-the-overseer
-         (let [a (malloc-allocator)
-               d (dash-for-test a)]
-           (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
-           (sync-selection! d)
-           (let [screen (app-snapshot d 120 16 0 a)]
-             (assert (= screen
+  (let [a (malloc-allocator)
+        d (dash-for-test a)]
+    (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
+    (sync-selection! d)
+    (let [screen (app-snapshot d 120 16 0 a)]
+      (assert (= screen
 
-                        " ◆ factory  ·  1 site  ·  1 running  ·   1 NEEDS YOU                                                              02:35
+                 " ◆ factory  ·  1 site  ·  1 running  ·   1 NEEDS YOU                                                              02:35
  ● ui local 1/4 running
 ╭─ Runs ───────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │  STATUS       RUN               FACTORY   SITE      STATION         ACTIVITY                            TOKENS   AGE │
@@ -102,7 +101,7 @@
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────── 2 notices ─╯
  ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
 "))))
-         0)
+  0)
 
 (const EVENTS
        "{'cursor': 9000, 'records': [
@@ -132,13 +131,13 @@
     0))
 
 (deftest run-view-shows-pipeline-agents-and-feed
-         (let [a (malloc-allocator)
-               d (dash-for-test a)]
-           (load-run! d a)
-           (set! (.view d) (ViewRun))
-           (let [screen (app-snapshot d 110 30 0 a)]
-             (assert (= screen
-                        " ◆ factory › haiku › haiku-4695   running                                                               02:35
+  (let [a (malloc-allocator)
+        d (dash-for-test a)]
+    (load-run! d a)
+    (set! (.view d) (ViewRun))
+    (let [screen (app-snapshot d 110 30 0 a)]
+      (assert (= screen
+                 " ◆ factory › haiku › haiku-4695   running                                                               02:35
    50s  ·  deepseek/deepseek-v4-flash  ·  20.7k tokens (↑18.0k ↓2.7k)  ·  factory/haiku-4695  ·  on ui
    brief  autumn rain on a tin roof
    reviewers  ◉ judge: on_track  fine
@@ -169,7 +168,7 @@
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────── ● live ─╯
  ↑↓ agent · enter chat · tab feed · pgup/pgdn scroll · p pause/resume · x stop · esc back
 "))))
-         0)
+  0)
 
 (const AGENT
        "{'run': 'haiku-4695', 'name': 'critique', 'transcript': [
@@ -197,22 +196,22 @@
     'agents': [{'name': 'critique', 'phase': 'tool', 'activity': '$ coil test', 'turns': 6, 'input_tokens': 10030, 'output_tokens': 1883}]}")
 
 (deftest chat-view-merges-transcript-journal-and-pending
-         (let [a (malloc-allocator)
-               d (dash-for-test a)
-               chat (field d chat)]
-           (own! d (field d run-id) "haiku-4695")
-           (assert (snap-load-text! (field d run) (q a PENDING-RUN) NOW))
-           (chat-open! chat "haiku-4695" "critique")
-           (chat-start-from-tail! chat (doc a CHAT-TAIL))
-           (assert (snap-load-text! (field chat transcript) (q a AGENT) NOW))
-           (set! (.needs-transcript chat) false)
-           (chat-bump! chat)
-           (chat-sync-pending! chat (.value (field d run)))
-           (chat-add-local! chat 9700 "and the rhythm" NOW)
-           (set! (.view d) (ViewChat))
-           (let [screen (app-snapshot d 90 34 0 a)]
-             (assert (= screen
-                        " ◆ factory › haiku-4695 › critique   running                                        02:35
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        chat (field d chat)]
+    (own! d (field d run-id) "haiku-4695")
+    (assert (snap-load-text! (field d run) (q a PENDING-RUN) NOW))
+    (chat-open! chat "haiku-4695" "critique")
+    (chat-start-from-tail! chat (doc a CHAT-TAIL))
+    (assert (snap-load-text! (field chat transcript) (q a AGENT) NOW))
+    (set! (.needs-transcript chat) false)
+    (chat-bump! chat)
+    (chat-sync-pending! chat (.value (field d run)))
+    (chat-add-local! chat 9700 "and the rhythm" NOW)
+    (set! (.view d) (ViewChat))
+    (let [screen (app-snapshot d 90 34 0 a)]
+      (assert (= screen
+                 " ◆ factory › haiku-4695 › critique   running                                        02:35
 ╭─ critique · conversation ──────────────────────────────────────────────────────────────╮
 │ factory                                                                                │
 │ │ Begin the critique station.                                                          │
@@ -247,10 +246,10 @@
 ╰─────────────────────────────────────────────────────────────── 6 turns · 11.9k tokens ─╯
  enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
 ")))
-           (set! (.details chat) true)
-           (let [screen (app-snapshot d 90 40 0 a)]
-             (assert (= screen
-                        " ◆ factory › haiku-4695 › critique   running                                        02:35
+    (set! (.details chat) true)
+    (let [screen (app-snapshot d 90 40 0 a)]
+      (assert (= screen
+                 " ◆ factory › haiku-4695 › critique   running                                        02:35
 ╭─ critique · conversation ──────────────────────────────────────────────────────────────╮
 │ factory                                                                                │
 │ │ Begin the critique station.                                                          │
@@ -291,63 +290,63 @@
 ╰────────────────────────────────────────────────── 6 turns · 11.9k tokens · details on ─╯
  enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
 "))))
-         0)
+  0)
 
 (deftest keys-drive-selection-overlays-and-actions-without-a-hub
-         (let [a (malloc-allocator)
-               d (dash-for-test a)]
-           (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
-           (sync-selection! d)
-           (dashboard-key! d (Char #\?))
-           (assert (.help d))
-           (assert (str-contains? (app-snapshot d 100 24 0 a)
-                                  "show tool output and full reasoning"))
-           (dashboard-key! d (Escape))
-           (assert (not (.help d)))
-           (dashboard-key! d (Char #\x))
-           (assert (.confirm-stop d))
-           (assert (str-contains? (app-snapshot d 100 24 0 a)
-                                  "Stop haiku-4695? Its agents are cancelled."))
-           (dashboard-key! d (Char #\n))
-           (assert (not (.confirm-stop d)))
-           (dashboard-key! d (Down))
-           (assert (= (.selected-id d) "blocker-73c0"))
-           (dashboard-key! d (Char #\p))
-           (assert (str-contains? (.toast d) "is blocked"))
-           ;; Nothing listens on port 1: opening the run reports the hub as down.
-           (dashboard-key! d (Enter))
-           (assert (match (.view d) (ViewRun [] true) (_ false)))
-           (assert (hub-down? d))
-           (assert (str-contains? (app-snapshot d 100 24 0 a) "HUB DOWN"))
-           (dashboard-key! d (Escape))
-           (assert (match (.view d) (ViewOverview [] true) (_ false)))
-           (assert (match (dashboard-key! d (Char #\q))
-                     (Quit [] true)
-                     (_ false))))
-         0)
+  (let [a (malloc-allocator)
+        d (dash-for-test a)]
+    (assert (snap-load-text! (field d overview) (q a OVERVIEW) NOW))
+    (sync-selection! d)
+    (dashboard-key! d (Char #\?))
+    (assert (.help d))
+    (assert (str-contains? (app-snapshot d 100 24 0 a)
+                           "show tool output and full reasoning"))
+    (dashboard-key! d (Escape))
+    (assert (not (.help d)))
+    (dashboard-key! d (Char #\x))
+    (assert (.confirm-stop d))
+    (assert (str-contains? (app-snapshot d 100 24 0 a)
+                           "Stop haiku-4695? Its agents are cancelled."))
+    (dashboard-key! d (Char #\n))
+    (assert (not (.confirm-stop d)))
+    (dashboard-key! d (Down))
+    (assert (= (.selected-id d) "blocker-73c0"))
+    (dashboard-key! d (Char #\p))
+    (assert (str-contains? (.toast d) "is blocked"))
+    ;; Nothing listens on port 1: opening the run reports the hub as down.
+    (dashboard-key! d (Enter))
+    (assert (match (.view d) (ViewRun [] true) (_ false)))
+    (assert (hub-down? d))
+    (assert (str-contains? (app-snapshot d 100 24 0 a) "HUB DOWN"))
+    (dashboard-key! d (Escape))
+    (assert (match (.view d) (ViewOverview [] true) (_ false)))
+    (assert (match (dashboard-key! d (Char #\q))
+              (Quit [] true)
+              (_ false))))
+  0)
 
 (deftest chat-refetches-at-checkpoints
-         (let [a (malloc-allocator)
-               d (dash-for-test a)
-               chat (field d chat)]
-           (chat-open! chat "haiku-4695" "critique")
-           (chat-start-from-tail! chat (doc a CHAT-TAIL))
-           (assert-eq (len (.overlay chat)) 2)
-           (assert-eq (.cursor chat) 9500)
-           (set! (.needs-transcript chat) false)
-           (chat-ingest-page! chat
-                              (doc a
-                                   "{'cursor': 9900, 'records': [
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        chat (field d chat)]
+    (chat-open! chat "haiku-4695" "critique")
+    (chat-start-from-tail! chat (doc a CHAT-TAIL))
+    (assert-eq (len (.overlay chat)) 2)
+    (assert-eq (.cursor chat) 9500)
+    (set! (.needs-transcript chat) false)
+    (chat-ingest-page! chat
+                       (doc a
+                            "{'cursor': 9900, 'records': [
       {'t': 1, 'kind': 'agent.text', 'agent': 'critique', 'text': 'done counting'},
       {'t': 2, 'kind': 'agent.turn', 'agent': 'critique', 'turn': 7},
       {'t': 3, 'kind': 'agent.thought', 'agent': 'critique', 'text': 'next'}]}"))
-           (assert-eq (len (.overlay chat)) 1)
-           (assert (.needs-transcript chat))
-           (assert-eq (.cursor chat) 9900))
-         0)
+    (assert-eq (len (.overlay chat)) 1)
+    (assert (.needs-transcript chat))
+    (assert-eq (.cursor chat) 9900))
+  0)
 
 (defn str-contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [i] true) (None [] false)))
+  (match (find hay needle) (Some [i] true) (None [] false)))
 
 (defn agent-doc-at [(a (dyn Allocator)) (cursor i64)] (-> JVal)
   (let [v (doc a AGENT)]
@@ -355,43 +354,43 @@
     v))
 
 (deftest chat-merges-exactly-at-the-transcript-cursor
-         (let [a (malloc-allocator)
-               d (dash-for-test a)
-               chat (field d chat)]
-           (chat-open! chat "haiku-4695" "critique")
-           ;; A transcript with its cursor: the overlay is read from exactly there.
-           (assert (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW))
-           (assert (.exact chat))
-           (assert (.loaded chat))
-           (assert-eq (.cursor chat) 9000)
-           (chat-ingest-page! chat
-                              (doc a
-                                   "{'cursor': 9900, 'records': [
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        chat (field d chat)]
+    (chat-open! chat "haiku-4695" "critique")
+    ;; A transcript with its cursor: the overlay is read from exactly there.
+    (assert (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW))
+    (assert (.exact chat))
+    (assert (.loaded chat))
+    (assert-eq (.cursor chat) 9000)
+    (chat-ingest-page! chat
+                       (doc a
+                            "{'cursor': 9900, 'records': [
       {'t': 1, 'kind': 'agent.text', 'agent': 'critique', 'text': 'done counting'},
       {'t': 2, 'kind': 'agent.turn', 'agent': 'critique', 'turn': 7},
       {'t': 3, 'kind': 'agent.thought', 'agent': 'critique', 'text': 'next'}]}"))
-           ;; A checkpoint record keeps the overlay and asks for a newer transcript.
-           (assert-eq (len (.overlay chat)) 2)
-           (assert (.needs-transcript chat))
-           (assert-eq (.cursor chat) 9900)
-           ;; No newer checkpoint yet: nothing changes.
-           (assert (not (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW)))
-           (assert (not (.needs-transcript chat)))
-           (assert-eq (len (.overlay chat)) 2)
-           ;; A newer one replaces the overlay; events are reread from its cursor.
-           (assert (chat-adopt-transcript! chat (agent-doc-at a 9800) NOW))
-           (assert-eq (len (.overlay chat)) 0)
-           (assert-eq (.cursor chat) 9800)
-           (assert-eq (.transcript-cursor chat) 9800))
-         0)
+    ;; A checkpoint record keeps the overlay and asks for a newer transcript.
+    (assert-eq (len (.overlay chat)) 2)
+    (assert (.needs-transcript chat))
+    (assert-eq (.cursor chat) 9900)
+    ;; No newer checkpoint yet: nothing changes.
+    (assert (not (chat-adopt-transcript! chat (agent-doc-at a 9000) NOW)))
+    (assert (not (.needs-transcript chat)))
+    (assert-eq (len (.overlay chat)) 2)
+    ;; A newer one replaces the overlay; events are reread from its cursor.
+    (assert (chat-adopt-transcript! chat (agent-doc-at a 9800) NOW))
+    (assert-eq (len (.overlay chat)) 0)
+    (assert-eq (.cursor chat) 9800)
+    (assert-eq (.transcript-cursor chat) 9800))
+  0)
 
 (deftest chat-falls-back-to-checkpoint-records-without-a-cursor
-         (let [a (malloc-allocator)
-               d (dash-for-test a)
-               chat (field d chat)]
-           (chat-open! chat "haiku-4695" "critique")
-           (assert (not (chat-adopt-transcript! chat (doc a AGENT) NOW)))
-           (assert (not (.exact chat)))
-           (assert (not (.loaded chat)))
-           (assert (.has (field chat transcript))))
-         0)
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        chat (field d chat)]
+    (chat-open! chat "haiku-4695" "critique")
+    (assert (not (chat-adopt-transcript! chat (doc a AGENT) NOW)))
+    (assert (not (.exact chat)))
+    (assert (not (.loaded chat)))
+    (assert (.has (field chat transcript))))
+  0)

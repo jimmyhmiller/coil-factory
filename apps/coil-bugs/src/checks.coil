@@ -31,7 +31,7 @@
   (match value (JStr [s] s) (_ "")))
 
 (defn non-empty-string? [(value JVal)] (-> bool)
-  (match value (JStr [s] (> (len (str-trim s)) 0)) (_ false)))
+  (match value (JStr [s] (> (len (trim s)) 0)) (_ false)))
 
 (defstruct CellText [(id (slice u8)) (text (slice u8))])
 
@@ -52,10 +52,10 @@
 
 ;;; The rule numbers of SCOPE.md: its `## N.` headings.
 (defn scope-rules [(a (dyn Allocator)) (text (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut ids) (al-new [(slice u8)] a)]
-    (for line (iter (str-split a text "\n"))
+  (let [(mut ids) (ArrayList::new [(slice u8)] a)]
+    (for line (iter (split a text "\n"))
       (when (starts-with line "## ")
-        (match (str-find line ".")
+        (match (find line ".")
           (Some [dot] (let [id (subslice line 3 dot)] (when (digits? id) (push! (mut ids) id) 0)))
           (None [] 0))
         0))
@@ -75,8 +75,8 @@
 
 (defn triage-problems [(a (dyn Allocator)) (workspace (slice u8)) (rules (ArrayList (slice u8)))] (-> (ArrayList (slice u8)))
   (block :check
-         (let [(mut found) (al-new [(slice u8)] a)
-               (mut cells) (al-new [CellText] a)]
+         (let [(mut found) (ArrayList::new [(slice u8)] a)
+               (mut cells) (ArrayList::new [CellText] a)]
            (let [listing (match (read-required a (path-join a workspace "CELLS.json"))
                            (Ok [text] (match (jv-parse a text)
                                         (Some [v] v)
@@ -99,7 +99,7 @@
                                                        (Some [v] v)
                                                        (None [] (do (push! (mut found) "TRIAGE.json is not JSON") (return-from :check (load found)))))))))
                  bugs (jv-get triage "bugs")
-                 (mut placed) (al-new [i64] a)]
+                 (mut placed) (ArrayList::new [i64] a)]
              (when (= (jv-len bugs) 0)
                (push! (mut found) "TRIAGE.json must be {\"bugs\": [...]} with at least one entry")
                (return-from :check (load found)))
@@ -163,20 +163,20 @@
                                                  :else 0))
                                        :else 0)))
                            (set! n (+ (load n) 1))))))
-             (let [(mut missing) (sb-new a)
+             (let [(mut missing) (StrBuf::new a)
                    (mut count) 0
                    (mut i) 0]
                (for cell (iter cells)
                  (when (and (< (get placed (load i)) 0) (not (outcome-note? (.id cell))))
                    (when (< (load count) 20)
-                     (when (> (load count) 0) (sb-push-str! (mut missing) ", ") 0)
-                     (sb-push-str! (mut missing) (.id cell))
+                     (when (> (load count) 0) (push-str! (mut missing) ", ") 0)
+                     (push-str! (mut missing) (.id cell))
                      0)
                    (set! count (+ (load count) 1))
                    0)
                  (set! i (+ (load i) 1)))
                (when (> (load count) 0)
-                 (push! (mut found) (join a [(int-text a (load count)) " cells are in no entry: " (sb-finish! (mut missing))]))
+                 (push! (mut found) (join a [(int-text a (load count)) " cells are in no entry: " (finish! (mut missing))]))
                  0)))
            (load found))))
 
@@ -201,13 +201,13 @@
           (None [] (Err "TRIAGE.json is not JSON"))
           (Some [triage]
                 (let [bugs (jv-get triage "bugs")
-                      (mut out) (al-new [TriageEntry] a)
+                      (mut out) (ArrayList::new [TriageEntry] a)
                       (mut i) 0]
                   (loop (if (>= (load i) (jv-len bugs))
                             (break)
                             (let [bug (jv-nth bugs (load i))
                                   members (jv-get bug "cells")
-                                  (mut cells) (al-new [(slice u8)] a)
+                                  (mut cells) (ArrayList::new [(slice u8)] a)
                                   (mut m) 0]
                               (loop (if (>= (load m) (jv-len members))
                                         (break)
@@ -215,13 +215,13 @@
                                             (set! m (+ (load m) 1)))))
                               (push! (mut out) (TriageEntry :id (copy-bytes a (json-text (jv-get bug "id")))
                                                             :cells (load cells)
-                                                            :title (copy-bytes a (str-trim (json-text (jv-get bug "title"))))
+                                                            :title (copy-bytes a (trim (json-text (jv-get bug "title"))))
                                                             :status (copy-bytes a (json-text (jv-get bug "status")))
                                                             :reason (copy-bytes a (json-text (jv-get bug "reason")))
                                                             :scope (copy-bytes a (json-text (jv-get bug "scope")))
                                                             :rule (copy-bytes a (json-text (jv-get bug "rule")))
-                                                            :scope-reason (copy-bytes a (str-trim (json-text (jv-get bug "scope_reason"))))
-                                                            :scope-quote (copy-bytes a (str-trim (json-text (jv-get bug "scope_quote"))))))
+                                                            :scope-reason (copy-bytes a (trim (json-text (jv-get bug "scope_reason"))))
+                                                            :scope-quote (copy-bytes a (trim (json-text (jv-get bug "scope_quote"))))))
                               (set! i (+ (load i) 1)))))
                   (Ok (load out))))))))
 
@@ -230,13 +230,13 @@
 
 (defn string-list [(a (dyn Allocator)) (value JVal)] (-> (Option (ArrayList (slice u8))))
   (match value
-    (JArr [_] (let [(mut out) (al-new [(slice u8)] a)
+    (JArr [_] (let [(mut out) (ArrayList::new [(slice u8)] a)
                     (mut ok) true
                     (mut i) 0]
                 (loop (if (>= (load i) (jv-len value))
                           (break)
                           (do (match (jv-nth value (load i))
-                                (JStr [s] (if (> (len (str-trim s)) 0) (push! (mut out) (copy-bytes a s)) (set! ok false)))
+                                (JStr [s] (if (> (len (trim s)) 0) (push! (mut out) (copy-bytes a s)) (set! ok false)))
                                 (_ (set! ok false)))
                               (set! i (+ (load i) 1)))))
                 (if (load ok) (Some (load out)) (None))))
@@ -251,7 +251,7 @@
                        (None [] (return-from :read (Err ".coil-bug/REPRO.json is not JSON"))))
                verdict (json-text (jv-get repro "verdict"))
                attempts (jv-get repro "attempts")
-               (mut tried) (al-new [Attempt] a)
+               (mut tried) (ArrayList::new [Attempt] a)
                (mut i) 0]
            (when (!= (json-text (jv-get repro "bug")) bug)
              (return-from :read (Err (join a [".coil-bug/REPRO.json is about bug \"" (json-text (jv-get repro "bug")) "\", not \"" bug "\""]))))
@@ -279,7 +279,7 @@
                                               (return-from :read (Err "reproduces needs the regression test files in tests"))
                                               list))
                              (None [] (return-from :read (Err "reproduces needs the regression test files in tests"))))
-                           (al-new [(slice u8)] a))]
+                           (ArrayList::new [(slice u8)] a))]
              (for test (iter tests)
                (when (or (starts-with test "/") (contains? test "..") (starts-with test ".coil-bug/") (starts-with test "build/"))
                  (return-from :read (Err (join a ["test \"" test "\" must be a repository path outside .coil-bug/ and build/"]))))
@@ -287,10 +287,10 @@
              (when (and (= verdict "cannot_verify") (not (non-empty-string? (jv-get repro "needs"))))
                (return-from :read (Err "cannot_verify must say in needs exactly what is missing")))
              (Ok (Repro :bug (copy-bytes a bug) :verdict (copy-bytes a verdict)
-                        :summary (copy-bytes a (str-trim (json-text (jv-get repro "summary"))))
-                        :check (copy-bytes a (str-trim (json-text (jv-get repro "check"))))
+                        :summary (copy-bytes a (trim (json-text (jv-get repro "summary"))))
+                        :check (copy-bytes a (trim (json-text (jv-get repro "check"))))
                         :tests tests :attempts (load tried)
-                        :needs (copy-bytes a (str-trim (json-text (jv-get repro "needs"))))))))))
+                        :needs (copy-bytes a (trim (json-text (jv-get repro "needs"))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Running things in the workspace
@@ -298,10 +298,10 @@
 (defn git-lines [(a (dyn Allocator)) (dir (slice u8)) (args (slice (slice u8)))] (-> (Result (ArrayList (slice u8)) (slice u8)))
   (let [result (capture a "git" args dir 300000)]
     (if (not (.ok result))
-        (Err (join a ["git " (get args 0) " failed: " (str-trim (.error result))]))
-        (let [(mut out) (al-new [(slice u8)] a)]
-          (for part (iter (str-split a (.output result) "\x00;"))
-            (let [line (str-trim part)]
+        (Err (join a ["git " (get args 0) " failed: " (trim (.error result))]))
+        (let [(mut out) (ArrayList::new [(slice u8)] a)]
+          (for part (iter (split a (.output result) "\x00;"))
+            (let [line (trim part)]
               (when (> (len line) 0) (push! (mut out) line) 0)))
           (Ok (load out))))))
 
@@ -336,7 +336,7 @@
                                         dir CHECK-TIMEOUT-MS 16777216)]
             (println "--- {s}: COIL={s} sh -c '{s}'" label coil command)
             (println "{s}" (tail (.output result) 6000))
-            (when (> (len (str-trim (.error result))) 0) (println "{s}" (tail (.error result) 3000)) 0)
+            (when (> (len (trim (.error result))) 0) (println "{s}" (tail (.error result) 3000)) 0)
             (cond (and (!= (.exit result) 0) (= (.error result) "timed out"))
                     (Err (join a [label ": the check ran past " (int-text a (/ CHECK-TIMEOUT-MS 60000)) " minutes"]))
                   (< (.exit result) 0) (Err (join a [label ": the check could not be started"]))
@@ -353,10 +353,10 @@
 (defn gate-triage-with [(a (dyn Allocator)) (workspace (slice u8)) (rules (ArrayList (slice u8)))] (-> (Result (slice u8) (slice u8)))
   (let [problems (triage-problems a workspace rules)]
     (if (> (len problems) 0)
-        (let [(mut out) (sb-new a)]
-          (sb-push-str! (mut out) "triage:")
-          (for problem (iter problems) (sb-push-str! (mut out) "\n  ") (sb-push-str! (mut out) problem))
-          (Err (sb-finish! (mut out))))
+        (let [(mut out) (StrBuf::new a)]
+          (push-str! (mut out) "triage:")
+          (for problem (iter problems) (push-str! (mut out) "\n  ") (push-str! (mut out) problem))
+          (Err (finish! (mut out))))
         (match (triage-entries a workspace)
           (Err [why] (Err why))
           (Ok [entries]
@@ -394,14 +394,14 @@
                      (Ok [code] (if (= code 0)
                                     (Err "the check passes with the base compiler, so it does not reproduce the bug")
                                     (Ok (join a ["reproduces: the check fails with the base compiler (exit " (int-text a code) ")"]))))))
-               (let [(mut stray) (sb-new a)]
+               (let [(mut stray) (StrBuf::new a)]
                  (for path (iter changed)
                    (when (not (starts-with path ".coil-bug/"))
-                     (sb-push-str! (mut stray) " ")
-                     (sb-push-str! (mut stray) path)
+                     (push-str! (mut stray) " ")
+                     (push-str! (mut stray) path)
                      0))
-                 (when (> (len (sb-str (load stray))) 0)
-                   (return-from :gate (Err (join a [verdict " must leave the repository as it was; changed:" (sb-finish! (mut stray))]))))
+                 (when (> (len (str (load stray))) 0)
+                   (return-from :gate (Err (join a [verdict " must leave the repository as it was; changed:" (finish! (mut stray))]))))
                  (if (= verdict "does_not_reproduce")
                      (match (run-check a workspace (.check repro) compiler "check against the base compiler")
                        (Err [why] (Err why))
@@ -415,7 +415,7 @@
   (match (git-lines a dir ["log" "-z" "--format=%H %s" (join a [base ".." head])])
     (Err [why] (Err why))
     (Ok [lines]
-        (let [(mut found) (al-new [(slice u8)] a)]
+        (let [(mut found) (ArrayList::new [(slice u8)] a)]
           (for line (iter lines)
             (when (and (> (len line) 41) (starts-with (subslice line 41 (len line)) "reproduce:"))
               (push! (mut found) (subslice line 0 40))
@@ -426,7 +426,7 @@
 
 (defn git-show [(a (dyn Allocator)) (dir (slice u8)) (spec (slice u8))] (-> (Result (slice u8) (slice u8)))
   (let [result (capture a "git" ["show" spec] dir 60000)]
-    (if (.ok result) (Ok (.output result)) (Err (join a ["git show " spec " failed: " (str-trim (.error result))])))))
+    (if (.ok result) (Ok (.output result)) (Err (join a ["git show " spec " failed: " (trim (.error result))])))))
 
 (const BUILD-TIMEOUT-MS 3600000)
 (const SUITE-TIMEOUT-MS 5400000)
@@ -435,7 +435,7 @@
   (let [result (capture-limited a "env" argv dir timeout-ms 16777216)]
     (println "--- {s}" label)
     (println "{s}" (tail (.output result) 8000))
-    (when (> (len (str-trim (.error result))) 0) (println "{s}" (tail (.error result) 4000)) 0)
+    (when (> (len (trim (.error result))) 0) (println "{s}" (tail (.error result) 4000)) 0)
     (cond (and (!= (.exit result) 0) (= (.error result) "timed out"))
             (Err (join a [label " ran past " (int-text a (/ timeout-ms 60000)) " minutes"]))
           (!= (.exit result) 0) (Err (join a [label " exited " (int-text a (.exit result))]))
@@ -477,7 +477,7 @@
              (when (not (load fixed-something))
                (return-from :gate (Err "nothing outside the tests and .coil-bug/ changed, so nothing was fixed"))))
            (let [fix (match (read-text a (path-join a workspace ".coil-bug/FIX.md"))
-                       (Ok [maybe] (match maybe (Some [text] (str-trim text)) (None [] "")))
+                       (Ok [maybe] (match maybe (Some [text] (trim text)) (None [] "")))
                        (Err [why] (return-from :gate (Err why))))]
              (when (< (len fix) 200)
                (return-from :gate (Err ".coil-bug/FIX.md must explain the root cause, the change, and how it was verified"))))

@@ -38,9 +38,10 @@ payoff that the proof of concept can actually demonstrate. If none qualifies,
 finish blocked with the shortlist and reasons instead of lowering the bar.
 
 The unattended brief starts with a controller request tag, then a JSON object.
-Its `selection` object is the authoritative record to write as SELECTION.json;
-preserve its date, roll, mode, archive_url and prior_papers exactly. History entries
-are paper metadata objects: compare titles and source URLs to avoid repeats.
+Its `selection` object is the authoritative record. The controller has already
+written it to SELECTION.json in the workspace; read it from there and never edit,
+rewrite or regenerate that file. History entries (`prior_papers`) are paper
+metadata objects: compare titles and source URLs to avoid repeats.
 If `locked_paper` is present, implement that same paper; never replace it on a
 retry. The controller owns scheduling, escalation and history. Do not edit them.
 Use the existing coil-factory-papers pad for notes; do not create new run pads.
@@ -165,16 +166,16 @@ INTEREST.md exist and are nonempty, the extra interest metadata is well typed an
 nonempty, and closest_related_work has at least three entries with required fields.
 These structural checks do not prove interest; the independent judge must assess
 its substance. It must exit nonzero on
-invalid input. Run it before finishing. Check prior-paper history from the brief.
+invalid input. Run it before finishing. Check prior-paper history from SELECTION.json.
 
 On a paid repair, `recovery_snapshot` may name a read-only snapshot of the previous
-attempt. First copy its files into this new workspace, excluding .git, caches and
-dependencies. Preserve previous-review/ as rejection evidence; a new judge must
-write fresh JUDGMENT files. If PAPER.json and sources already form a valid selection,
+attempt. First copy its files into this new workspace, excluding .git, caches,
+dependencies and SELECTION.json (the workspace already has the controller's).
+Preserve previous-review/ as rejection evidence; a new judge must write fresh
+JUDGMENT files. If PAPER.json and sources already form a valid selection,
 retain that paper, sources and plan, and repair only their actual defects. Read the
 brief's previous_findings and previous-review/ to address rejected work. If there
-is no valid selection, complete selection under the same persisted roll. Always
-write the brief's selection object to SELECTION.json and verify it before finish.
+is no valid selection, complete selection under the same persisted roll.
 Never copy factory operational state or modify the snapshot.
 
 ## Station: build
@@ -221,7 +222,7 @@ Do not retry the known forbidden launch or disable the coding sandbox.
 
 ## Station: judge
 harness: codex
-model: gpt-5.5
+model: gpt-6.1-sol
 gate: sh scripts/verify.sh && python3 -c 'import json; v=json.load(open("JUDGMENT.json")); assert v["verdict"] == "approved" and v["checks_run"] and v["evidence"] and v["interest_review"]["verdict"] == "pass" and v["interest_review"]["distinctiveness_evidence"] and v["interest_review"]["experiment_evidence"] and v["explanation_review"]["verdict"] == "pass" and all(v["explanation_review"]["cold_read"].get(k) for k in ("problem", "background", "prior_work", "insight", "mechanism", "costs", "legacy")) and v["explanation_review"]["evidence"]' && test -s CONTEXT.md
 attempts: 1
 

@@ -1,5 +1,4 @@
 (module factory.ui.overview)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -15,7 +14,8 @@
 
 ;;; The overview: every site and run at a glance, and what the overseer has
 ;;; noticed. Blocked runs ("needs you") are the loudest thing on screen.
-(defn plural [(a (dyn Allocator)) (n i64) (one (slice u8)) (many (slice u8))] (-> (slice u8))
+(defn plural [(a (dyn Allocator)) (n i64) (one (slice u8)) (many (slice u8))]
+  (-> (slice u8))
   (concat a [(int-text a n) " " (if (= n 1) one many)]))
 
 (defn draw-overview-header! [(d (ptr Dash))
@@ -59,7 +59,8 @@
           (put-text! c r (load x) (.y r) "nothing needs you" (.subtle theme))))
     0))
 
-(defn draw-sites! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)] (-> i64)
+(defn draw-sites! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator)) (r Rect)]
+  (-> i64)
   (let [theme (.theme d)
         sites (overview-sites d)
         (mut x) (+ (.x r) 1)
@@ -106,9 +107,10 @@
                  (.subtle theme)))
     0))
 
-(defn run-cells [(d (ptr Dash)) (a (dyn Allocator)) (runs JVal) (tick i64)] (-> (slice TableCell))
+(defn run-cells [(d (ptr Dash)) (a (dyn Allocator)) (runs JVal) (tick i64)]
+  (-> (slice TableCell))
   (let [theme (.theme d)
-        (mut cells) (al-new [TableCell] a)
+        (mut cells) (ArrayList::new [TableCell] a)
         (mut i) 0]
     (loop (if (>= (load i) (jv-len runs))
               (break)
@@ -150,7 +152,7 @@
                        (table-cell (fmt-age a (- (.now d) (ji run "created")))
                                    (.subtle theme)))
                 (set! i (+ (load i) 1)))))
-    (al-slice cells)))
+    (slice cells)))
 
 (const RUN-COLUMNS
        [(Column
@@ -228,7 +230,7 @@
 
 (defn notices [(d (ptr Dash)) (a (dyn Allocator))] (-> (ArrayList Notice))
   (let [runs (overview-runs d)
-        (mut out) (al-new [Notice] a)
+        (mut out) (ArrayList::new [Notice] a)
         (mut i) 0]
     (loop (if (>= (load i) (jv-len runs))
               (break)
@@ -267,26 +269,48 @@
                                          :suffix-tone (ToneSubtle))))
                             (set! k (+ (load k) 1)))))
                 (let [(mut k) 0]
-                  (loop (if (or (>= (load k) (jv-len reviewers)) (finished-status? (js run "status")))
+                  (loop (if (or (>= (load k) (jv-len reviewers))
+                                (finished-status? (js run "status")))
                             (break)
                             (let [rv (jv-nth reviewers (load k))
                                   standing (reviewer-standing rv)
                                   failed (= standing "failed")]
-                              (when (or failed (= standing "warn") (= standing "alert"))
-                                (let [t (if failed (ji rv "failure_t") (ji rv "t"))]
+                              (when (or failed
+                                        (= standing "warn")
+                                        (= standing "alert"))
+                                (let [t
+                                        (if failed
+                                            (ji rv "failure_t")
+                                            (ji rv "t"))]
                                   (push! (mut out)
                                          (Notice
                                            :t t
                                            :line
                                              (Line
-                                               :gutter (concat a [(if failed "✗ " "◉ ") (fmt-clock a t false) " "])
-                                               :gutter-tone (standing-tone standing)
+                                               :gutter
+                                                 (concat a
+                                                         [(if failed
+                                                              "✗ "
+                                                              "◉ ")
+                                                          (fmt-clock a t false)
+                                                          " "])
+                                               :gutter-tone
+                                                 (standing-tone standing)
                                                :text
                                                  (concat a
-                                                         [id "  " (js rv "name") ": "
-                                                          (if failed "failed" (js rv "verdict"))
+                                                         [id
+                                                          "  "
+                                                          (js rv "name")
+                                                          ": "
+                                                          (if failed
+                                                              "failed"
+                                                              (js rv "verdict"))
                                                           " — "
-                                                          (first-line (if failed (js rv "failure") (js rv "reason")))])
+                                                          (first-line (if failed
+                                                                          (js rv
+                                                                              "failure")
+                                                                          (js rv
+                                                                              "reason")))])
                                                :tone (TonePlain)
                                                :suffix ""
                                                :suffix-tone (ToneSubtle))))
@@ -332,16 +356,16 @@
                          "✓ nothing to report — every run looks on track"
                          (.success theme))
             :else
-              (let [(mut lines) (al-new [Line] a)
+              (let [(mut lines) (ArrayList::new [Line] a)
                     (mut i) 0]
                 (loop (if (>= (load i) n)
                           (break)
                           (do
-                            (push! (mut lines) (.line (al-elem items (load i))))
+                            (push! (mut lines) (.line (elem items (load i))))
                             (set! i (+ (load i) 1)))))
                 (let [(mut sv) (scroll-view-new)]
                   (set! (.stick-bottom sv) false)
-                  (draw-lines! c inner (mut sv) (al-slice lines) theme))))
+                  (draw-lines! c inner (mut sv) (slice lines) theme))))
       0)))
 
 (const OVERVIEW-HINTS

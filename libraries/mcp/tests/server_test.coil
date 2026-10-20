@@ -1,6 +1,5 @@
 (module mcp.server-test)
 (import "coil.alloc" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -12,27 +11,47 @@
 
 (impl Tool Shout
   (tool-spec [(self (ptr Shout))] (-> ToolSpec)
-    (ToolSpec :name "shout"
-              :description "Say it louder"
-              :parameters "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"
-              :self-checked false))
-  (tool-summary [(self (ptr Shout)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8)) "shout")
-  (tool-run [(self (ptr Shout)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
-    (do (set! (.calls self) (+ (.calls self) 1))
-        (if (= (call-string call "text") "")
-            (ToolFailed "nothing to shout")
-            (let [(mut out) (sb-new a)]
-              (sb-push-str! (mut out) (call-string call "text"))
-              (sb-push-str! (mut out) "!")
-              (ToolOk (sb-finish! (mut out))))))))
+    (ToolSpec
+      :name "shout"
+      :description "Say it louder"
+      :parameters
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}"
+      :self-checked false))
+  (tool-summary [(self (ptr Shout)) (a (dyn Allocator)) (call ToolCall)]
+    (-> (slice u8))
+    "shout")
+  (tool-run [(self (ptr Shout))
+             (a (dyn Allocator))
+             (call ToolCall)
+             (context (dyn ToolContext))] (-> ToolOutcome)
+    (do
+      (set! (.calls self) (+ (.calls self) 1))
+      (if (= (call-string call "text") "")
+          (ToolFailed "nothing to shout")
+          (let [(mut out) (StrBuf::new a)]
+            (push-str! (mut out) (call-string call "text"))
+            (push-str! (mut out) "!")
+            (ToolOk (finish! (mut out))))))))
 
-(defn info [] (-> ServerInfo) (ServerInfo :name "test" :version "1"))
+(defn info [] (-> ServerInfo)
+  (ServerInfo :name "test" :version "1"))
 
-(defn reply [(a (dyn Allocator)) (registry (ptr ToolRegistry)) (line (slice u8))] (-> JVal)
-  (match (handle-message a registry (info) (box! a NoHooks (NoHooks :unused 0)) line)
-    (Some [text] (match (jv-parse a text)
-                   (Some [v] v)
-                   (None [] (do (println "reply is not JSON: {}" text) (assert false) (JNull)))))
+(defn reply [(a (dyn Allocator))
+             (registry (ptr ToolRegistry))
+             (line (slice u8))] (-> JVal)
+  (match (handle-message a
+                         registry
+                         (info)
+                         (box! a NoHooks (NoHooks :unused 0))
+                         line)
+    (Some [text]
+          (match (jv-parse a text)
+            (Some [v] v)
+            (None []
+                  (do
+                    (println "reply is not JSON: {}" text)
+                    (assert false)
+                    (JNull)))))
     (None [] (do (println "no reply to {}" line) (assert false) (JNull)))))
 
 (defn setup [(a (dyn Allocator))] (-> (ptr ToolRegistry))
@@ -44,70 +63,123 @@
 (deftest initialize-echoes-a-supported-version
   (let [a (malloc-allocator)
         registry (setup a)
-        r (reply a registry "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"c\",\"version\":\"1\"}}}")
+        r
+          (reply a
+                 registry
+                 "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"c\",\"version\":\"1\"}}}")
         result (jv-get r "result")]
     (assert-eq (jv-int (jv-get r "id")) 0)
     (assert (= (jv-string-or (jv-get result "protocolVersion") "") "2025-03-26"))
-    (assert (= (jv-string-or (jv-get (jv-get result "serverInfo") "name") "") "test"))
+    (assert (= (jv-string-or (jv-get (jv-get result "serverInfo") "name") "")
+               "test"))
     (assert (not (jv-null? (jv-get (jv-get result "capabilities") "tools"))))))
 
 (deftest initialize-offers-the-newest-for-an-unknown-version
   (let [a (malloc-allocator)
-        r (reply a (setup a) "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}")]
+        r
+          (reply a
+                 (setup a)
+                 "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}")]
     (assert (= (jv-string-or (jv-get r "id") "") "x"))
-    (assert (= (jv-string-or (jv-get (jv-get r "result") "protocolVersion") "") "2025-11-25"))))
+    (assert (= (jv-string-or (jv-get (jv-get r "result") "protocolVersion") "")
+               "2025-11-25"))))
 
 (deftest notifications-get-no-reply
   (let [a (malloc-allocator)]
-    (match (handle-message a (setup a) (info) (box! a NoHooks (NoHooks :unused 0)) "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+    (match (handle-message a
+                           (setup a)
+                           (info)
+                           (box! a NoHooks (NoHooks :unused 0))
+                           "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
       (Some [text] (do (println "unexpected reply {}" text) (assert false)))
       (None [] 0))))
 
 (deftest lists-tools-with-their-schemas
   (let [a (malloc-allocator)
-        r (reply a (setup a) "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
+        r
+          (reply a
+                 (setup a)
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
         tool (jv-nth (jv-get (jv-get r "result") "tools") 0)]
     (assert (= (jv-string-or (jv-get tool "name") "") "shout"))
-    (assert (= (jv-string-or (jv-get (jv-get tool "inputSchema") "type") "") "object"))))
+    (assert (= (jv-string-or (jv-get (jv-get tool "inputSchema") "type") "")
+               "object"))))
 
 (deftest calls-a-tool
   (let [a (malloc-allocator)
-        r (reply a (setup a) "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"text\":\"hi\"}}}")
+        r
+          (reply a
+                 (setup a)
+                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"text\":\"hi\"}}}")
         result (jv-get r "result")]
-    (assert (= (jv-string-or (jv-get (jv-nth (jv-get result "content") 0) "text") "") "hi!"))
+    (assert (= (jv-string-or (jv-get (jv-nth (jv-get result "content") 0)
+                                     "text")
+                             "")
+               "hi!"))
     (assert (match (jv-get result "isError") (JBool [b] (not b)) (_ false)))))
 
 (deftest invalid-arguments-and-tool-failures-are-error-results
   (let [a (malloc-allocator)
         registry (setup a)
-        bad (jv-get (reply a registry "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"loud\":true}}}") "result")
-        failed (jv-get (reply a registry "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"text\":\"\"}}}") "result")]
+        bad
+          (jv-get (reply a
+                         registry
+                         "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"loud\":true}}}")
+                  "result")
+        failed
+          (jv-get (reply a
+                         registry
+                         "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"shout\",\"arguments\":{\"text\":\"\"}}}")
+                  "result")]
     (assert (match (jv-get bad "isError") (JBool [b] b) (_ false)))
     (assert (match (jv-get failed "isError") (JBool [b] b) (_ false)))
-    (assert (= (jv-string-or (jv-get (jv-nth (jv-get failed "content") 0) "text") "") "nothing to shout"))))
+    (assert (= (jv-string-or (jv-get (jv-nth (jv-get failed "content") 0)
+                                     "text")
+                             "")
+               "nothing to shout"))))
 
 (deftest unknown-tools-methods-and-garbage-are-protocol-errors
   (let [a (malloc-allocator)
         registry (setup a)]
-    (assert-eq (jv-int (jv-get (jv-get (reply a registry "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}") "error") "code")) -32602)
-    (assert-eq (jv-int (jv-get (jv-get (reply a registry "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/list\"}") "error") "code")) -32601)
-    (assert-eq (jv-int (jv-get (jv-get (reply a registry "{not json") "error") "code")) -32700)))
+    (assert-eq (jv-int (jv-get (jv-get (reply a
+                                              registry
+                                              "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}")
+                                       "error")
+                               "code"))
+               -32602)
+    (assert-eq (jv-int (jv-get (jv-get (reply a
+                                              registry
+                                              "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/list\"}")
+                                       "error")
+                               "code"))
+               -32601)
+    (assert-eq (jv-int (jv-get (jv-get (reply a registry "{not json") "error")
+                               "code"))
+               -32700)))
 
 (deftest batches-answer-each-request
   (let [a (malloc-allocator)
-        r (reply a (setup a) "[{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}]")]
+        r
+          (reply a
+                 (setup a)
+                 "[{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}]")]
     (assert-eq (jv-count r) 1)
     (assert-eq (jv-int (jv-get (jv-nth r 0) "id")) 7)))
 
 (defstruct Seen [(client (slice u8)) (version (slice u8))])
 
 (impl ServerHooks Seen
-  (on-initialize [(self (ptr Seen)) (client (slice u8)) (version (slice u8))] (-> i64)
+  (on-initialize [(self (ptr Seen)) (client (slice u8)) (version (slice u8))]
+    (-> i64)
     (do (set! (.client self) client) (set! (.version self) version) 0)))
 
 (deftest initialize-is-reported-to-the-hooks
   (let [a (malloc-allocator)
         seen (box! a Seen (Seen :client "" :version ""))]
-    (handle-message a (setup a) (info) seen "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"clientInfo\":{\"name\":\"opencode\",\"version\":\"1\"}}}")
+    (handle-message a
+                    (setup a)
+                    (info)
+                    seen
+                    "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"clientInfo\":{\"name\":\"opencode\",\"version\":\"1\"}}}")
     (assert (= (.client seen) "opencode"))
     (assert (= (.version seen) "2025-11-25"))))

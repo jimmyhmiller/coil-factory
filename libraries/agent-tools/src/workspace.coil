@@ -71,7 +71,7 @@
 ;;; Split a relative path into components, dropping empty and "." parts and
 ;;; applying "..". None when ".." would climb above the root.
 (defn normalize-components [(a (dyn Allocator)) (path (slice u8))] (-> (Option (ArrayList (slice u8))))
-  (let [(mut parts) (al-new [(slice u8)] a)
+  (let [(mut parts) (ArrayList::new [(slice u8)] a)
         n (len path)
         (mut start) 0
         (mut i) 0
@@ -91,22 +91,22 @@
                     0)
                   (set! i (+ (load i) 1)))))
     (if (load escaped)
-        (do (al-free! (mut parts)) (None))
+        (do (free! (mut parts)) (None))
         (Some (load parts)))))
 
 (defn join-components [(a (dyn Allocator)) (parts (ArrayList (slice u8)))] (-> (slice u8))
   (if (= (len parts) 0)
       "."
-      (let [(mut b) (sb-new a)
+      (let [(mut b) (StrBuf::new a)
             (mut i) 0]
         (loop (if (>= (load i) (len parts))
                   (break)
                   (do (when (> (load i) 0)
-                        (sb-push-byte! (mut b) (primitive/cast u8 #\/))
+                        (push! (mut b) (primitive/cast u8 #\/))
                         0)
-                      (sb-push-str! (mut b) (get parts (load i)))
+                      (push-str! (mut b) (get parts (load i)))
                       (set! i (+ (load i) 1)))))
-        (sb-finish! (mut b)))))
+        (finish! (mut b)))))
 
 (defn absolute-error [(a (dyn Allocator)) (workspace Workspace) (path (slice u8))] (-> (slice u8))
   (let [root (.root workspace)
@@ -194,7 +194,7 @@
                                      (= root "/") (join2 a "/" relative)
                                      :else (join3 a root "/" relative))]
                   (let [(mut owned) parts]
-                    (al-free! (mut owned)))
+                    (free! (mut owned)))
                   (match (check-links a workspace relative absolute)
                     (Err [message] (Err message))
                     (Ok [_] (Ok (ResolvedPath :absolute absolute :relative relative)))))))))

@@ -77,7 +77,8 @@
             (sin_port u16)
             (sin_addr InAddr)
             (sin_zero (array u8 8))])
-         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))] (-> i64)
+         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))]
+           (-> i64)
            (store! (field address sin_family) (primitive/cast u16 AF_INET))
            0)
          (extern ~(native-public-name `accept4)
@@ -110,7 +111,8 @@
             (sin_port u16)
             (sin_addr InAddr)
             (sin_zero (array u8 8))])
-         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))] (-> i64)
+         (defn ~(native-public-name `sockaddr-in-family!) [(address (ptr ~(native-public-name `SockaddrIn)))]
+           (-> i64)
            (store! (field address sin_len) (primitive/cast u8 16))
            (store! (field address sin_family) (primitive/cast u8 AF_INET))
            0)
@@ -129,7 +131,7 @@
                                 (primitive/cast (ptr i8) enabled)
                                 (primitive/cast u32 4))
                     (primitive/cast i32 0))
-                 (os/os-errno)
+                 (os/errno)
                  0))))))
 
 (meta (gen-native-platform))
@@ -141,37 +143,37 @@
   (io/print-str (io/stderr) message)
   (io/print-str (io/stderr) "\n")
   (abort)
-  (primitive/zeroed T))
+  (zeroed T))
 
 ;;; Mark `fd` close-on-exec so child processes never inherit it. Returns 0 or errno.
 (defn set-cloexec! [(fd i32)] (-> i64)
   (let [flags (os/fcntl fd (primitive/cast i32 F_GETFD))]
     (if (< flags (primitive/cast i32 0))
-        (os/os-errno)
+        (os/errno)
         (if (< (os/fcntl fd
                          (primitive/cast i32 F_SETFD)
-                         (primitive/ior flags (primitive/cast i32 FD_CLOEXEC)))
+                         (| flags (primitive/cast i32 FD_CLOEXEC)))
                (primitive/cast i32 0))
-            (os/os-errno)
+            (os/errno)
             0))))
 
 ;;; Put `fd` in non-blocking mode. Returns 0 or errno.
 (defn set-nonblocking! [(fd i32)] (-> i64)
   (let [flags (os/fcntl fd (primitive/cast i32 F_GETFL))]
     (if (< flags (primitive/cast i32 0))
-        (os/os-errno)
+        (os/errno)
         (if (< (os/fcntl fd
                          (primitive/cast i32 F_SETFL)
-                         (primitive/ior flags (primitive/cast i32 O_NONBLOCK)))
+                         (| flags (primitive/cast i32 O_NONBLOCK)))
                (primitive/cast i32 0))
-            (os/os-errno)
+            (os/errno)
             0))))
 
 ;;; True when `fd` currently carries FD_CLOEXEC.
 (defn cloexec? [(fd i32)] (-> bool)
   (let [flags (os/fcntl fd (primitive/cast i32 F_GETFD))]
     (and (>= flags (primitive/cast i32 0))
-         (!= (primitive/iand flags (primitive/cast i32 FD_CLOEXEC))
+         (!= (& flags (primitive/cast i32 FD_CLOEXEC))
              (primitive/cast i32 0)))))
 
 ;;; Transient accept failures leave the listener usable.
@@ -188,7 +190,7 @@
 (defn accept-error-exhausted? [(code i64)] (-> bool)
   (or (= code EMFILE) (= code ENFILE) (= code ENOBUFS) (= code ENOMEM)))
 
-(static-assert (= (primitive/sizeof SockaddrIn) 16) "sockaddr_in ABI size")
+(static-assert (= (sizeof SockaddrIn) 16) "sockaddr_in ABI size")
 
 ;;; Close `fd` and turn `code` into the negative-errno convention of `listen-ipv4`.
 (defn abandon-fd [(fd i32) (code i64)] (-> i64)
@@ -205,18 +207,17 @@
         nonblocking (if (= cloexec 0) (set-nonblocking! fd) cloexec)]
     (if (!= nonblocking 0)
         (abandon-fd fd nonblocking)
-        (let [enabled (primitive/alloc-stack i32)]
-          (set! enabled (primitive/cast i32 1))
+        (let [(mut enabled) (: (primitive/cast i32 1) i32)]
           (if (< (setsockopt fd
                              (primitive/cast i32 SOL_SOCKET)
                              (primitive/cast i32 SO_REUSEADDR)
-                             (primitive/cast (ptr i8) enabled)
+                             (primitive/cast (ptr i8) (mut enabled))
                              (primitive/cast u32 4))
                  (primitive/cast i32 0))
-              (abandon-fd fd (os/os-errno))
+              (abandon-fd fd (os/errno))
               (let [address (primitive/alloc-stack SockaddrIn)
-                    c-host (str/str->cstr a host)]
-                (set! address (primitive/zeroed SockaddrIn))
+                    c-host (str/to-cstr a host)]
+                (set! address (zeroed SockaddrIn))
                 (sockaddr-in-family! address)
                 (set! (.sin_port address) (htons (primitive/cast u16 port)))
                 (if (= (primitive/cast i64 c-host) 0)
@@ -227,10 +228,10 @@
                                        (primitive/cast (ptr i8)
                                                        (field address sin_addr)))]
                       (alloc/free-bytes a
-                                        (slice-new [u8]
-                                                   (primitive/cast (ptr u8)
-                                                                   c-host)
-                                                   (+ (len host) 1))
+                                        (slice::new [u8]
+                                                    (primitive/cast (ptr u8)
+                                                                    c-host)
+                                                    (+ (len host) 1))
                                         1)
                       (cond (!= parsed (primitive/cast i32 1))
                               (abandon-fd fd 22)
@@ -238,10 +239,10 @@
                                      (primitive/cast (ptr i8) address)
                                      (primitive/cast u32 16))
                                (primitive/cast i32 0))
-                              (abandon-fd fd (os/os-errno))
+                              (abandon-fd fd (os/errno))
                             (< (listen fd (primitive/cast i32 backlog))
                                (primitive/cast i32 0))
-                              (abandon-fd fd (os/os-errno))
+                              (abandon-fd fd (os/errno))
                             :else (primitive/cast i64 fd))))))))))
 
 ;;; Create a close-on-exec, non-blocking IPv4 listening socket with SO_REUSEADDR.
@@ -258,7 +259,7 @@
                       (primitive/cast i32 (+ SOCK_STREAM SOCKET-ATOMIC-FLAGS))
                       (primitive/cast i32 0))]
         (if (< fd (primitive/cast i32 0))
-            (- 0 (os/os-errno))
+            (- 0 (os/errno))
             (listen-ipv4-configure a fd host port backlog)))))
 
 ;;; Accept one connection as a close-on-exec, non-blocking, SIGPIPE-safe fd.
@@ -266,7 +267,7 @@
 (defn accept-connection [(listener-fd i32)] (-> i64)
   (let [fd (accept-raw listener-fd)]
     (if (< fd (primitive/cast i32 0))
-        (- 0 (os/os-errno))
+        (- 0 (os/errno))
         (let [cloexec (set-cloexec! fd)
               nonblocking (if (= cloexec 0) (set-nonblocking! fd) cloexec)
               sigpipe (if (= nonblocking 0) (suppress-sigpipe! fd) nonblocking)]

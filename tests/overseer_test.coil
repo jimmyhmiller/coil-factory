@@ -9,10 +9,10 @@
 (import "factory.proc" :use *)
 
 (defn temp-home [(a (dyn Allocator))] (-> (slice u8))
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/factory-overseer-test-")
-    (sb-push-i64! (mut path) (pid))
-    (let [home (sb-finish! (mut path))]
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-overseer-test-")
+    (push-i64! (mut path) (pid))
+    (let [home (finish! (mut path))]
       (capture a "rm" ["-rf" home] "" 10000)
       (atomic/ensure-dir! a (path-join a home "runs/r-1") 448)
       home)))
@@ -28,12 +28,12 @@
     (Err [e] "")))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn count-of [(hay (slice u8)) (needle (slice u8))] (-> i64)
   (let [(mut n) 0
         (mut from) 0]
-    (loop (match (str-find-from hay needle (load from))
+    (loop (match (find-from hay needle (load from))
             (Some [at] (do (set! n (+ (load n) 1)) (set! from (+ at 1))))
             (None [] (break))))
     (load n)))
@@ -73,11 +73,11 @@
         o (overseer/overseer-new a home config (box! a i64 0))
         w (overseer/watch-for o "r-1")]
     (for i (range 0 6)
-      (let [(mut started) (sb-new a)]
-        (sb-push-str! (mut started) "{\"t\":1000,\"kind\":\"tool.started\",\"agent\":\"plan\",\"summary\":\"$ cd /a/very/long/workspace/path/that/fills/the/summary/entirely && …\",\"args\":\"{\\\"command\\\": \\\"cd /a/very/long/workspace/path && step ")
-        (sb-push-i64! (mut started) i)
-        (sb-push-str! (mut started) "\\\"}\"}")
-        (feed! w a (sb-finish! (mut started)))
+      (let [(mut started) (StrBuf::new a)]
+        (push-str! (mut started) "{\"t\":1000,\"kind\":\"tool.started\",\"agent\":\"plan\",\"summary\":\"$ cd /a/very/long/workspace/path/that/fills/the/summary/entirely && …\",\"args\":\"{\\\"command\\\": \\\"cd /a/very/long/workspace/path && step ")
+        (push-i64! (mut started) i)
+        (push-str! (mut started) "\\\"}\"}")
+        (feed! w a (finish! (mut started)))
         (feed! w a "{\"t\":1001,\"kind\":\"tool.finished\",\"agent\":\"plan\",\"tool\":\"shell\",\"summary\":\"$ cd /a/very/long/workspace/path/that/fills/the/summary/entirely && …\",\"ok\":true,\"output\":\"\"}")))
     (overseer/check-patterns! o w a 1002)
     (assert-eq (count-of (journal a home) "\"code\":\"looping\"") 0)

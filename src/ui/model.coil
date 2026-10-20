@@ -1,5 +1,4 @@
 (module factory.ui.model)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator free])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -86,7 +85,7 @@
   (set! (.polled-overview-t d) 0)
   (set! (.polled-run-t d) 0)
   (set! (.polled-events-t d) 0)
-  (scratch/scratch-init (field d io) a)
+  (scratch/ScratchArena::init (field d io) a)
   0)
 
 ;;; Replace an owned string field's value (the old one is freed).
@@ -227,7 +226,8 @@
 ;; Chrome shared by every view
 
 ;;; Draw spans left to right from `x`, returning the x after the last one.
-(defn span! [(c (ptr Canvas)) (r Rect) (x i64) (text (slice u8)) (style Style)] (-> i64)
+(defn span! [(c (ptr Canvas)) (r Rect) (x i64) (text (slice u8)) (style Style)]
+  (-> i64)
   (+ x (put-text! c r x (.y r) text style)))
 
 ;;; The top line: "◆ factory" and breadcrumbs on the left, the clock on the right.
@@ -333,11 +333,13 @@
         (HelpRow :key "c" :what "chat with the run's current agent")
         (HelpRow :key "p" :what "pause or resume the run")
         (HelpRow :key "x" :what "stop the run (asks first)")
-        (HelpRow :key "tab"
+        (HelpRow
+          :key "tab"
           :what "switch between agents and the feed (run view)")
         (HelpRow :key "end" :what "follow the live feed again")
         (HelpRow :key "enter  shift-enter" :what "send, or add a line (chat)")
-        (HelpRow :key "ctrl-t"
+        (HelpRow
+          :key "ctrl-t"
           :what "show tool output and full reasoning (chat)")
         (HelpRow :key "esc" :what "back")
         (HelpRow :key "q  ctrl-c" :what "quit")])
@@ -349,7 +351,7 @@
         (mut i) 0]
     (loop (if (>= (load i) (len HELP-ROWS))
               (break)
-              (let [row (index (slice-data HELP-ROWS) (load i))
+              (let [row (get HELP-ROWS (load i))
                     y (+ (.y inner) (load i))]
                 (put-text! c
                            inner
@@ -366,7 +368,8 @@
                 (set! i (+ (load i) 1)))))
     0))
 
-(defn draw-confirm-stop! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))] (-> i64)
+(defn draw-confirm-stop! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))]
+  (-> i64)
   (let [r (rect-center (canvas-rect c) 52 6)
         inner
           (rect-inset-xy (draw--overlay-box! d c r "Stop run" (ToneError)) 2 1)
@@ -393,7 +396,7 @@
 
 ;;; No breadcrumbs (the overview's top line).
 (defn no-crumbs [] (-> (slice (slice u8)))
-  (slice-new [(slice u8)] (cast (ptr (slice u8)) 0) 0))
+  (slice::new [(slice u8)] (cast (ptr (slice u8)) 0) 0))
 
 ;;; After a run document arrives: keep the agent list in range and, the first
 ;;; time, put the cursor on the current station's agent.

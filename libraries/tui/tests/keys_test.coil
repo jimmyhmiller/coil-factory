@@ -2,7 +2,6 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.slice" :use *)
-(import "coil.str" :use [str-eq])
 (import "tui.keys" :use *)
 
 ;; A compact, comparable spelling of a decode result: kind * 1_000_000 + payload,
@@ -119,7 +118,7 @@
 
 (defn feed [(fd i32) (bytes (slice u8))] (-> i64)
   (cast i64
-        (write fd (cast (ptr i8) (slice-data bytes)) (cast isize (len bytes)))))
+        (write fd (cast (ptr i8) (data bytes)) (cast isize (len bytes)))))
 
 (deftest reader-reassembles-sequences-and-times-out-a-lone-escape
          (let [fds (primitive/alloc-stack (array i32 2))

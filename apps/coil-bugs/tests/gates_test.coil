@@ -132,9 +132,9 @@ elif sys.argv[1:3] == ['test', 'modernize-fast']:
     (assert (fails (fix-gate a f) "focused gate exited 1"))))
 
 (defn long-fix [(a (dyn Allocator))] (-> (slice u8))
-  (let [(mut out) (sb-new a) (mut i) 0]
-    (loop (if (>= (load i) 30) (break) (do (sb-push-str! (mut out) "explained ") (set! i (+ (load i) 1)))))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a) (mut i) 0]
+    (loop (if (>= (load i) 30) (break) (do (push-str! (mut out) "explained ") (set! i (+ (load i) 1)))))
+    (finish! (mut out))))
 
 (deftest a-fix-that-does-not-fix-is-refused
   (let [a (malloc-allocator)

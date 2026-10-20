@@ -1,6 +1,4 @@
 (module sse.core)
-(import "coil.primitive" :as primitive)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.arraylist" :use *)
 (import "coil.match" :use *)
@@ -19,7 +17,7 @@
 (deftrait SseEventSink [Self]
   (consume-sse-event [(self (ptr Self))
                       (event SseEvent)]
-                     (-> bool)))
+    (-> bool)))
 
 (defstruct SseBoundary [(found bool) (block-end i64) (consumed i64)])
 
@@ -36,20 +34,18 @@
 (defn sse-decoder-new [(allocator (dyn Allocator))
                        (sink (dyn SseEventSink))
                        (max-buffer-bytes i64)] (-> SseDecoder)
-  (let [decoder (primitive/alloc-stack SseDecoder)]
-    (set! (.allocator decoder) allocator)
-    (set! (.buffer decoder) (al-new [u8] allocator))
-    (set! (.sink decoder) sink)
-    (set! (.max-buffer-bytes decoder)
-          (if (> max-buffer-bytes 0) max-buffer-bytes 1048576))
-    (set! (.last-id decoder) (al-new [u8] allocator))
-    (set! (.retry-ms decoder) -1)
-    (set! (.pending-cr decoder) false)
-    (set! (.failed decoder) false)
-    (load decoder)))
+  (SseDecoder
+    :allocator allocator
+    :buffer (ArrayList::new [u8] allocator)
+    :sink sink
+    :max-buffer-bytes (if (> max-buffer-bytes 0) max-buffer-bytes 1048576)
+    :last-id (ArrayList::new [u8] allocator)
+    :retry-ms -1
+    :pending-cr false
+    :failed false))
 
 (defn sse-boundary [(bytes (slice u8))] (-> SseBoundary)
-  (let [result (primitive/alloc-stack SseBoundary)
+  (let [(mut result) (zeroed SseBoundary)
         n (len bytes)
         (mut i) 0
         (mut last-was-newline) false
@@ -80,7 +76,7 @@
                     (do
                       (when (!= byte 13) (set! last-was-newline false) 0)
                       (set! i (+ (load i) 1)))))))
-    (load result)))
+    result))
 
 (defn sse-field-value [(line (slice u8)) (prefix-len i64)] (-> (slice u8))
   (let [n (len line)
@@ -91,10 +87,11 @@
               prefix-len)]
     (subslice [u8] line start n)))
 
-(defn sse-dispatch-block [(decoder (ptr SseDecoder)) (frame (slice u8))] (-> bool)
-  (let [(mut data) (sb-new (.allocator decoder))
+(defn sse-dispatch-block [(decoder (ptr SseDecoder)) (frame (slice u8))]
+  (-> bool)
+  (let [(mut data) (StrBuf::new (.allocator decoder))
         (mut event-name) ""
-        (mut event-id) (al-slice [u8] (.last-id decoder))
+        (mut event-id) (slice (.last-id decoder))
         (mut id-seen) false
         (mut retry-ms) (.retry-ms decoder)
         (mut data-lines) 0
@@ -119,9 +116,9 @@
                   (cond (starts-with line "data:")
                           (do
                             (when (> (load data-lines) 0)
-                              (sb-push-str! (mut data) "\n")
+                              (push-str! (mut data) "\n")
                               0)
-                            (sb-push-str! (mut data) (sse-field-value line 5))
+                            (push-str! (mut data) (sse-field-value line 5))
                             (set! data-lines (+ (load data-lines) 1)))
                         (starts-with line "event:")
                           (set! event-name (sse-field-value line 6))
@@ -164,22 +161,21 @@
                     (set! start (+ (load end) 1))))))
     (when (load id-seen)
       (set! (.len (.last-id decoder)) 0)
-      (al-extend! [u8]
-                  (mut (.last-id decoder))
-                  (slice-data [u8] (load event-id))
-                  (len (load event-id)))
+      (extend! (mut (.last-id decoder))
+               (slice::data (load event-id))
+               (len (load event-id)))
       0)
     (let [accepted
             (if (> (load data-lines) 0)
-                (let [(mut event) (primitive/zeroed SseEvent)]
+                (let [(mut event) (zeroed SseEvent)]
                   (set! (.name event) (load event-name))
-                  (set! (.data event) (sb-str (load data)))
-                  (set! (.id event) (al-slice [u8] (.last-id decoder)))
+                  (set! (.data event) (str (load data)))
+                  (set! (.id event) (slice (.last-id decoder)))
                   (set! (.id-present event) (load id-seen))
                   (set! (.retry-ms event) (load retry-ms))
                   (consume-sse-event (.sink decoder) (load event)))
                 true)]
-      (sb-free! (mut data))
+      (free! (mut data))
       accepted)))
 
 (defn sse-drop-prefix! [(buffer (mut (ArrayList u8))) (count i64)] (-> i64)
@@ -197,13 +193,13 @@
     remaining))
 
 (defn sse-decoder-drain! [(decoder (ptr SseDecoder))] (-> bool)
-  (let [boundary (sse-boundary (al-slice [u8] (.buffer decoder)))]
+  (let [boundary (sse-boundary (slice (.buffer decoder)))]
     (if (not (.found boundary))
         true
         (let [accepted
                 (sse-dispatch-block decoder
                                     (subslice [u8]
-                                              (al-slice [u8] (.buffer decoder))
+                                              (slice (.buffer decoder))
                                               0
                                               (.block-end boundary)))]
           (sse-drop-prefix! (mut (.buffer decoder))
@@ -214,7 +210,8 @@
 
 ;;; Accept an arbitrary transport chunk. Frames may span chunks or share one chunk.
 ;;; False is sticky and means either bounded-buffer overflow or downstream rejection.
-(defn sse-decoder-feed! [(decoder (ptr SseDecoder)) (chunk (slice u8))] (-> bool)
+(defn sse-decoder-feed! [(decoder (ptr SseDecoder)) (chunk (slice u8))]
+  (-> bool)
   (if (.failed decoder)
       false
       (let [(mut at) 0
@@ -242,9 +239,10 @@
                     (set! at (+ (load at) 1)))))
         (not (.failed decoder)))))
 
-(defn sse-http-chunk [(data (ptr u8)) (length usize) (context (ptr i8))] (-> usize)
+(defn sse-http-chunk [(data (ptr u8)) (length usize) (context (ptr i8))]
+  (-> usize)
   (if (sse-decoder-feed! (cast (ptr SseDecoder) context)
-                         (slice-new [u8] data (cast i64 length)))
+                         (slice::new [u8] data (cast i64 length)))
       length
       (cast usize 0)))
 
@@ -258,11 +256,11 @@
   (.retry-ms decoder))
 
 (defn sse-decoder-last-id [(decoder (ptr SseDecoder))] (-> (slice u8))
-  (al-slice [u8] (.last-id decoder)))
+  (slice (.last-id decoder)))
 
 (defn sse-decoder-free! [(decoder (ptr SseDecoder))] (-> i64)
-  (al-free! [u8] (mut (.buffer decoder)))
-  (al-free! [u8] (mut (.last-id decoder))))
+  (free! (mut (.buffer decoder)))
+  (free! (mut (.last-id decoder))))
 
 ;;; Reject line separators in fields that must occupy one wire line.
 (defn sse-contains-byte? [(value (slice u8)) (wanted i64)] (-> bool)
@@ -284,40 +282,40 @@
           (sse-contains-byte? (.id event) 13)
           (sse-contains-byte? (.id event) 0))
       ""
-      (let [(mut out) (sb-new allocator)
+      (let [(mut out) (StrBuf::new allocator)
             (mut start) 0
             (mut at) 0
             data (.data event)
             length (len data)]
         (when (> (len (.name event)) 0)
-          (sb-push-str! (mut out) "event: ")
-          (sb-push-str! (mut out) (.name event))
-          (sb-push-str! (mut out) "\n")
+          (push-str! (mut out) "event: ")
+          (push-str! (mut out) (.name event))
+          (push-str! (mut out) "\n")
           0)
         (when (or (.id-present event) (> (len (.id event)) 0))
-          (sb-push-str! (mut out) "id: ")
-          (sb-push-str! (mut out) (.id event))
-          (sb-push-str! (mut out) "\n")
+          (push-str! (mut out) "id: ")
+          (push-str! (mut out) (.id event))
+          (push-str! (mut out) "\n")
           0)
         (when (>= (.retry-ms event) 0)
-          (sb-push-str! (mut out) "retry: ")
-          (sb-push-i64! (mut out) (.retry-ms event))
-          (sb-push-str! (mut out) "\n")
+          (push-str! (mut out) "retry: ")
+          (push-i64! (mut out) (.retry-ms event))
+          (push-str! (mut out) "\n")
           0)
         (loop (if (> (load at) length)
                   (break)
                   (if (or (= (load at) length)
                           (= (cast i64 (get data (load at))) 10))
                       (do
-                        (sb-push-str! (mut out) "data: ")
-                        (sb-push-str! (mut out)
-                                      (subslice [u8]
-                                                data
-                                                (load start)
-                                                (load at)))
-                        (sb-push-str! (mut out) "\n")
+                        (push-str! (mut out) "data: ")
+                        (push-str! (mut out)
+                                   (subslice [u8]
+                                             data
+                                             (load start)
+                                             (load at)))
+                        (push-str! (mut out) "\n")
                         (set! start (+ (load at) 1))
                         (set! at (+ (load at) 1)))
                       (set! at (+ (load at) 1)))))
-        (sb-push-str! (mut out) "\n")
-        (sb-finish! (mut out)))))
+        (push-str! (mut out) "\n")
+        (finish! (mut out)))))

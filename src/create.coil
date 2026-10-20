@@ -1,7 +1,6 @@
 (module factory.create)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.serde.value" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
@@ -13,11 +12,16 @@
 (import "factory.git" :use *)
 (import "factory.harnesses" :use [effective-model model-choices model-setting])
 (import "factory.journal" :use *)
-(import "factory.approval" :use [parse-summarizer SummarizerOk SummarizerBad approvals-problem])
+(import "factory.approval"
+        :use
+        [parse-summarizer SummarizerOk SummarizerBad approvals-problem])
 (import "factory.library" :use *)
 (import "factory.models" :use [resolve-model ModelOk ModelBad])
 (import "factory.proc" :use *)
-(import "factory.reviewer" :use [chosen-reviewers load-reviewers Chosen ChosenOk ChosenBad parse-reviewer ReviewerOk ReviewerBad])
+(import "factory.reviewer"
+        :use
+        [chosen-reviewers load-reviewers Chosen ChosenOk ChosenBad
+         parse-reviewer ReviewerOk ReviewerBad])
 (import "factory.runspec" :use *)
 (import "factory.spec" :use *)
 (import "factory.specparse" :use *)
@@ -47,253 +51,436 @@
 
 (defn expand-home [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
   (if (or (= path "~") (starts-with path "~/"))
-      (path-join a (env-or a "HOME" "/") (subslice [u8] path (if (= path "~") 1 2) (len path)))
+      (path-join a
+                 (env-or a "HOME" "/")
+                 (subslice [u8] path (if (= path "~") 1 2) (len path)))
       path))
 
 ;;; A new run id: the factory name and four hex digits.
-(defn new-run-id [(a (dyn Allocator)) (home (slice u8)) (factory (slice u8))] (-> (slice u8))
+(defn new-run-id [(a (dyn Allocator)) (home (slice u8)) (factory (slice u8))]
+  (-> (slice u8))
   (let [(mut result) ""
         (mut tries) 0]
     (loop (if (or (> (len (load result)) 0) (> (load tries) 50))
               (break)
-              (do (set! tries (+ (load tries) 1))
-                  (match (ids/random-hex a 2)
-                    (Err [failure] 0)
-                    (Ok [suffix]
-                        (let [(mut id) (sb-new a)]
-                          (sb-push-str! (mut id) factory)
-                          (sb-push-str! (mut id) "-")
-                          (sb-push-str! (mut id) suffix)
-                          (let [candidate (sb-finish! (mut id))]
-                            (match (atomic/dir-exists? a (run-dir a home candidate))
-                              (Ok [exists] (when (not exists) (set! result candidate) 0))
-                              (Err [failure] 0))
-                            0)))))))
+              (do
+                (set! tries (+ (load tries) 1))
+                (match (ids/random-hex a 2)
+                  (Err [failure] 0)
+                  (Ok [suffix]
+                      (let [(mut id) (StrBuf::new a)]
+                        (push-str! (mut id) factory)
+                        (push-str! (mut id) "-")
+                        (push-str! (mut id) suffix)
+                        (let [candidate (finish! (mut id))]
+                          (match (atomic/dir-exists? a
+                                                     (run-dir a home candidate))
+                            (Ok [exists]
+                                (when (not exists) (set! result candidate) 0))
+                            (Err [failure] 0))
+                          0)))))))
     (if (= (len (load result)) 0)
-        (primitive/zeroed (slice u8))
+        (zeroed (slice u8))
         (load result))))
 
-(defn create-run! [(a (dyn Allocator)) (config (ptr SiteConfig)) (request NewRun)] (-> Created)
+(defn create-run! [(a (dyn Allocator))
+                   (config (ptr SiteConfig))
+                   (request NewRun)] (-> Created)
   (let [home (.home config)]
-    (block :create
-           (let [text (if (> (len (.factory-text request)) 0)
-                          (.factory-text request)
-                          (match (resolve-factory a home (.factory request))
-                            (Found [entry] (let [e entry] (.text e)))
-                            (NotFound [message] (return-from :create (CreateRejected "unknown_factory" message)))))
-                 spec (match (parse-factory a text)
-                        (SpecOk [parsed] parsed)
-                        (SpecBad [problems]
-                                 (return-from :create
-                                                (CreateRejected "invalid_factory" (problems-text a problems)))))
-                 harness-trouble (if (> (len (.harness request)) 0) (harness-problem a (.harness request)) "")
-                 (mut project) ""
-                 (mut base) (.base request)
-                 (mut reviewers) (al-new [ReviewerCopy] a)
-                 (mut station-reviewers) (al-new [ReviewerCopy] a)
-                 (mut station-reviews) (al-new [StationReview] a)
-                 (mut summarizer) (ReviewerCopy :name "" :text "")]
-             (when (> (len harness-trouble) 0)
-               (return-from :create (CreateRejected "unknown_harness" harness-trouble)))
-             (let [chosen (match (load-reviewers a home (chosen-reviewers (.reviewers request) (.reviewers spec) (.reviewers config)))
-                            (ChosenOk [copies] copies)
-                            (ChosenBad [message] (return-from :create (CreateRejected "invalid_reviewer" message))))]
-               (set! reviewers chosen))
-             ;; Every agent must have a model; there is no built-in fallback.
-             (let [(mut missing) (sb-new a)
-                   (mut harness-of-missing) ""]
-               (for s (iter (.stations spec))
-                 (let [station-harness (cond (> (len (.harness request)) 0) (.harness request)
-                                             (> (len (.harness s)) 0) (.harness s)
-                                             (> (len (.harness spec)) 0) (.harness spec)
-                                             :else (.default-harness config))
-                       named (cond (> (len (.model request)) 0) (.model request)
-                                   (> (len (.model s)) 0) (.model s)
-                                   :else (.model spec))]
-                   (if (= (len (effective-model config station-harness named)) 0)
-                       (do (when (> (len (sb-str (load missing))) 0) (sb-push-str! (mut missing) ", ") 0)
-                           (sb-push-str! (mut missing) (.name s))
-                           (set! harness-of-missing station-harness)
-                           0)
-                       ;; A builtin model can be checked now: a known provider with its key.
-                       (when (= station-harness "builtin")
-                         (match (resolve-model a config (effective-model config station-harness named))
-                           (ModelOk [_] 0)
-                           (ModelBad [message] (return-from :create (CreateRejected "bad_model" (join a ["station " (.name s) ": " message])))))
-                         0))))
-               (when (> (len (sb-str (load missing))) 0)
-                 (return-from :create
-                                (CreateRejected "no_model"
-                                                (join a ["no model is chosen for " (sb-str (load missing))
-                                                         "; choose one with " (model-choices (load harness-of-missing))])))))
-             (let [trouble (reviewer-model-trouble a config (load reviewers))]
-               (when (> (len (.code trouble)) 0) (return-from :create (CreateRejected (.code trouble) (.message trouble)))))
-             (match (resolve-station-reviews a home spec)
-               (StationReviewsBad [message] (return-from :create (CreateRejected "invalid_reviewer" message)))
-               (StationReviewsOk [copies reviews]
-                                 (let [trouble (reviewer-model-trouble a config copies)]
-                                   (when (> (len (.code trouble)) 0) (return-from :create (CreateRejected (.code trouble) (.message trouble))))
-                                   (set! station-reviewers copies)
-                                   (set! station-reviews reviews)
-                                   0)))
-             ;; A station a person approves needs the approvals service and a
-             ;; summarizer that can run, checked now rather than when it is reached.
-             (let [(mut approving) false]
-               (for s (iter (.stations spec))
-                 (when (approve-choice (.approve spec) (.approve s)) (set! approving true) 0))
-               (when (load approving)
-                 (let [trouble (approvals-problem config)]
-                   (when (> (len trouble) 0) (return-from :create (CreateRejected "no_approvals" trouble))))
-                 (let [reference (if (> (len (.summarizer spec)) 0) (.summarizer spec) "summarizer")]
-                   (match (resolve-summarizer a home reference)
-                     (NotFound [message] (return-from :create (CreateRejected "invalid_summarizer" message)))
-                     (Found [entry]
-                            (match (parse-summarizer a (.text entry))
-                              (SummarizerBad [problems] (return-from :create (CreateRejected "invalid_summarizer"
-                                                                                             (join a ["summarizer " reference ":\n" (problems-text a problems)]))))
-                              (SummarizerOk [parsed]
-                                            (let [harness (if (> (len (.harness parsed)) 0) (.harness parsed) (.default-harness config))
-                                                  model (effective-model config harness (.model parsed))]
-                                              (when (= (len model) 0)
-                                                (return-from :create
-                                                               (CreateRejected "no_model"
-                                                                               (join a ["summarizer " (.name parsed) " names no model and this site has no default for the "
-                                                                                        harness " harness; add `model:` to it or set " (model-setting harness) " in site.json"]))))
-                                              (when (= harness "builtin")
-                                                (match (resolve-model a config model)
-                                                  (ModelOk [_] 0)
-                                                  (ModelBad [message] (return-from :create (CreateRejected "bad_model" (join a ["summarizer " (.name parsed) ": " message])))))
-                                                0)
-                                              (set! summarizer (ReviewerCopy :name (.name parsed) :text (.text entry)))
-                                              0))))))
-                 0)
-               0)
-             (when (> (len (.project request)) 0)
-               (let [expanded (expand-home a (.project request))]
-                 (match (real-path a expanded)
-                   (None [] (return-from :create
-                                           (CreateRejected "unknown_project"
-                                                           (join a ["no directory at " (.project request) " on this site"]))))
-                   (Some [path]
-                         (let [bare (git a path ["rev-parse" "--is-bare-repository"])]
-                           (if (and (git-ok? bare) (= (str-trim (git-output bare)) "true"))
-                               (set! project path)
-                               (match (git-toplevel a path)
-                                 (Some [top] (set! project top))
-                                 (None [] (return-from :create
-                                                         (CreateRejected "not_a_repository"
-                                                                         (join a [(.project request) " is not inside a git repository"])))))))))
-                 (when (= (len (load base)) 0)
-                   (match (git-head a (load project))
-                     (Some [head] (set! base head))
-                     (None [] (return-from :create
-                                             (CreateRejected "empty_repository"
-                                                             (join a [(.project request) " has no commits to start from"]))))))
-                 0))
-             (let [id (new-run-id a home (.name spec))]
-               (when (= (len id) 0)
-                 (return-from :create (CreateRejected "internal" "could not choose a run id")))
-               (match (atomic/ensure-dir! a (path-join a (run-dir a home id) "agents") 448)
-                 (Err [failure] (return-from :create (CreateRejected "internal" "could not create the run directory")))
-                 (Ok [made] 0))
-               (let [(mut run) (primitive/zeroed RunSpec)]
-                 (set! (.id run) id)
-                 (set! (.factory-name run) (.name spec))
-                 (set! (.factory-text run) text)
-                 (set! (.brief run) (.brief request))
-                 (set! (.project run) (load project))
-                 (set! (.base run) (load base))
-                 (set! (.branch run) (join a ["factory/" id]))
-                 (set! (.model run) (.model request))
-                 (set! (.harness run) (.harness request))
-                 (set! (.reviewers run) (load reviewers))
-                 (set! (.station-reviewers run) (load station-reviewers))
-                 (set! (.station-reviews run) (load station-reviews))
-                 (set! (.summarizer run) (load summarizer))
-                 (set! (.site run) (.name config))
-                 (set! (.created run) (wall-ms))
-                 (when (not (save-run-spec! a home (mut run)))
-                   (return-from :create (CreateRejected "internal" "could not write run.json")))
-                 (let [record (ev a "run.created")
-                       stations (jv-array a)]
-                   (for station (iter (.stations spec))
-                     (let [s station] (jv-push! stations (JStr (.name s)))))
-                   (ev-str! record "factory" (.name spec))
-                   (ev-str! record "site" (.name config))
-                   (ev-str! record "project" (load project))
-                   (ev-str! record "base" (load base))
-                   (ev-str! record "branch" (.branch run))
-                   (let [harness (cond (> (len (.harness request)) 0) (.harness request)
-                                       (> (len (.harness spec)) 0) (.harness spec)
-                                       :else (.default-harness config))]
-                     (ev-str! record "model" (effective-model config harness
-                                                              (if (> (len (.model request)) 0) (.model request) (.model spec))))
-                     (ev-str! record "harness" harness))
-                   (let [names (jv-array a)]
-                     (for copy (iter (.reviewers run)) (jv-push! names (JStr (.name copy))))
-                     (ev-put! record "reviewers" names))
-                   (ev-text! a record "brief" (.brief request) 4000)
-                   (ev-put! record "stations" stations)
-                   (match (append-run-event! a home id record)
-                     (AppendedAt [offset] (CreatedRun id))
-                     (AppendFailed [message] (CreateRejected "internal" message))))))))))
+    (block
+      :create
+        (let [text
+                (if (> (len (.factory-text request)) 0)
+                    (.factory-text request)
+                    (match (resolve-factory a home (.factory request))
+                      (Found [entry] (let [e entry] (.text e)))
+                      (NotFound [message]
+                                (return-from
+                                  :create
+                                    (CreateRejected "unknown_factory" message)))))
+              spec
+                (match (parse-factory a text)
+                  (SpecOk [parsed] parsed)
+                  (SpecBad [problems]
+                           (return-from
+                             :create
+                               (CreateRejected "invalid_factory"
+                                               (problems-text a problems)))))
+              harness-trouble
+                (if (> (len (.harness request)) 0)
+                    (harness-problem a (.harness request))
+                    "")
+              (mut project) ""
+              (mut base) (.base request)
+              (mut reviewers) (ArrayList::new [ReviewerCopy] a)
+              (mut station-reviewers) (ArrayList::new [ReviewerCopy] a)
+              (mut station-reviews) (ArrayList::new [StationReview] a)
+              (mut summarizer) (ReviewerCopy :name "" :text "")]
+          (when (> (len harness-trouble) 0)
+            (return-from
+              :create (CreateRejected "unknown_harness" harness-trouble)))
+          (let [chosen
+                  (match (load-reviewers a
+                                         home
+                                         (chosen-reviewers (.reviewers request)
+                                                           (.reviewers spec)
+                                                           (.reviewers config)))
+                    (ChosenOk [copies] copies)
+                    (ChosenBad [message]
+                               (return-from
+                                 :create
+                                   (CreateRejected "invalid_reviewer" message))))]
+            (set! reviewers chosen))
+          ;; Every agent must have a model; there is no built-in fallback.
+          (let [(mut missing) (StrBuf::new a)
+                (mut harness-of-missing) ""]
+            (for s (iter (.stations spec))
+              (let [station-harness
+                      (cond (> (len (.harness request)) 0) (.harness request)
+                            (> (len (.harness s)) 0) (.harness s)
+                            (> (len (.harness spec)) 0) (.harness spec)
+                            :else (.default-harness config))
+                    named
+                      (cond (> (len (.model request)) 0) (.model request)
+                            (> (len (.model s)) 0) (.model s)
+                            :else (.model spec))]
+                (if (= (len (effective-model config station-harness named)) 0)
+                    (do
+                      (when (> (len (str (load missing))) 0)
+                        (push-str! (mut missing) ", ")
+                        0)
+                      (push-str! (mut missing) (.name s))
+                      (set! harness-of-missing station-harness)
+                      0)
+                    ;; A builtin model can be checked now: a known provider with its key.
+                    (when (= station-harness "builtin")
+                      (match (resolve-model a
+                                            config
+                                            (effective-model config
+                                                             station-harness
+                                                             named))
+                        (ModelOk [_] 0)
+                        (ModelBad [message]
+                                  (return-from
+                                    :create
+                                      (CreateRejected "bad_model"
+                                                      (join a
+                                                            ["station "
+                                                             (.name s)
+                                                             ": "
+                                                             message])))))
+                      0))))
+            (when (> (len (str (load missing))) 0)
+              (return-from
+                :create
+                  (CreateRejected "no_model"
+                                  (join a
+                                        ["no model is chosen for "
+                                         (str (load missing))
+                                         "; choose one with "
+                                         (model-choices (load harness-of-missing))])))))
+          (let [trouble (reviewer-model-trouble a config (load reviewers))]
+            (when (> (len (.code trouble)) 0)
+              (return-from
+                :create (CreateRejected (.code trouble) (.message trouble)))))
+          (match (resolve-station-reviews a home spec)
+            (StationReviewsBad [message]
+                               (return-from
+                                 :create
+                                   (CreateRejected "invalid_reviewer" message)))
+            (StationReviewsOk [copies reviews]
+                              (let [trouble
+                                      (reviewer-model-trouble a config copies)]
+                                (when (> (len (.code trouble)) 0)
+                                  (return-from
+                                    :create
+                                      (CreateRejected (.code trouble)
+                                                      (.message trouble))))
+                                (set! station-reviewers copies)
+                                (set! station-reviews reviews)
+                                0)))
+          ;; A station a person approves needs the approvals service and a
+          ;; summarizer that can run, checked now rather than when it is reached.
+          (let [(mut approving) false]
+            (for s (iter (.stations spec))
+              (when (approve-choice (.approve spec) (.approve s))
+                (set! approving true)
+                0))
+            (when (load approving)
+              (let [trouble (approvals-problem config)]
+                (when (> (len trouble) 0)
+                  (return-from :create (CreateRejected "no_approvals" trouble))))
+              (let [reference
+                      (if (> (len (.summarizer spec)) 0)
+                          (.summarizer spec)
+                          "summarizer")]
+                (match (resolve-summarizer a home reference)
+                  (NotFound [message]
+                            (return-from
+                              :create
+                                (CreateRejected "invalid_summarizer" message)))
+                  (Found [entry]
+                         (match (parse-summarizer a (.text entry))
+                           (SummarizerBad [problems]
+                                          (return-from
+                                            :create
+                                              (CreateRejected "invalid_summarizer"
+                                                              (join a
+                                                                    ["summarizer "
+                                                                     reference
+                                                                     ":\n"
+                                                                     (problems-text a
+                                                                                    problems)]))))
+                           (SummarizerOk [parsed]
+                                         (let [harness
+                                                 (if (> (len (.harness parsed))
+                                                        0)
+                                                     (.harness parsed)
+                                                     (.default-harness config))
+                                               model
+                                                 (effective-model config
+                                                                  harness
+                                                                  (.model parsed))]
+                                           (when (= (len model) 0)
+                                             (return-from
+                                               :create
+                                                 (CreateRejected "no_model"
+                                                                 (join a
+                                                                       ["summarizer "
+                                                                        (.name parsed)
+                                                                        " names no model and this site has no default for the "
+                                                                        harness
+                                                                        " harness; add `model:` to it or set "
+                                                                        (model-setting harness)
+                                                                        " in site.json"]))))
+                                           (when (= harness "builtin")
+                                             (match (resolve-model a
+                                                                   config
+                                                                   model)
+                                               (ModelOk [_] 0)
+                                               (ModelBad [message]
+                                                         (return-from
+                                                           :create
+                                                             (CreateRejected "bad_model"
+                                                                             (join a
+                                                                                   ["summarizer "
+                                                                                    (.name parsed)
+                                                                                    ": "
+                                                                                    message])))))
+                                             0)
+                                           (set! summarizer
+                                                 (ReviewerCopy
+                                                   :name (.name parsed)
+                                                   :text (.text entry)))
+                                           0))))))
+              0)
+            0)
+          (when (> (len (.project request)) 0)
+            (let [expanded (expand-home a (.project request))]
+              (match (real-path a expanded)
+                (None []
+                      (return-from
+                        :create
+                          (CreateRejected "unknown_project"
+                                          (join a
+                                                ["no directory at "
+                                                 (.project request)
+                                                 " on this site"]))))
+                (Some [path]
+                      (let [bare
+                              (git a path ["rev-parse" "--is-bare-repository"])]
+                        (if (and (git-ok? bare)
+                                 (= (trim (git-output bare)) "true"))
+                            (set! project path)
+                            (match (git-toplevel a path)
+                              (Some [top] (set! project top))
+                              (None []
+                                    (return-from
+                                      :create
+                                        (CreateRejected "not_a_repository"
+                                                        (join a
+                                                              [(.project request)
+                                                               " is not inside a git repository"])))))))))
+              (when (= (len (load base)) 0)
+                (match (git-head a (load project))
+                  (Some [head] (set! base head))
+                  (None []
+                        (return-from
+                          :create
+                            (CreateRejected "empty_repository"
+                                            (join a
+                                                  [(.project request)
+                                                   " has no commits to start from"]))))))
+              0))
+          (let [id (new-run-id a home (.name spec))]
+            (when (= (len id) 0)
+              (return-from
+                :create (CreateRejected "internal" "could not choose a run id")))
+            (match (atomic/ensure-dir! a
+                                       (path-join a
+                                                  (run-dir a home id)
+                                                  "agents")
+                                       448)
+              (Err [failure]
+                   (return-from
+                     :create
+                       (CreateRejected "internal"
+                                       "could not create the run directory")))
+              (Ok [made] 0))
+            (let [(mut run) (zeroed RunSpec)]
+              (set! (.id run) id)
+              (set! (.factory-name run) (.name spec))
+              (set! (.factory-text run) text)
+              (set! (.brief run) (.brief request))
+              (set! (.project run) (load project))
+              (set! (.base run) (load base))
+              (set! (.branch run) (join a ["factory/" id]))
+              (set! (.model run) (.model request))
+              (set! (.harness run) (.harness request))
+              (set! (.reviewers run) (load reviewers))
+              (set! (.station-reviewers run) (load station-reviewers))
+              (set! (.station-reviews run) (load station-reviews))
+              (set! (.summarizer run) (load summarizer))
+              (set! (.site run) (.name config))
+              (set! (.created run) (wall-ms))
+              (when (not (save-run-spec! a home (mut run)))
+                (return-from
+                  :create (CreateRejected "internal" "could not write run.json")))
+              (let [record (ev a "run.created")
+                    stations (jv-array a)]
+                (for station (iter (.stations spec))
+                  (let [s station] (jv-push! stations (JStr (.name s)))))
+                (ev-str! record "factory" (.name spec))
+                (ev-str! record "site" (.name config))
+                (ev-str! record "project" (load project))
+                (ev-str! record "base" (load base))
+                (ev-str! record "branch" (.branch run))
+                (let [harness
+                        (cond (> (len (.harness request)) 0) (.harness request)
+                              (> (len (.harness spec)) 0) (.harness spec)
+                              :else (.default-harness config))]
+                  (ev-str! record
+                           "model"
+                           (effective-model config
+                                            harness
+                                            (if (> (len (.model request)) 0)
+                                                (.model request)
+                                                (.model spec))))
+                  (ev-str! record "harness" harness))
+                (let [names (jv-array a)]
+                  (for copy (iter (.reviewers run))
+                    (jv-push! names (JStr (.name copy))))
+                  (ev-put! record "reviewers" names))
+                (ev-text! a record "brief" (.brief request) 4000)
+                (ev-put! record "stations" stations)
+                (match (append-run-event! a home id record)
+                  (AppendedAt [offset] (CreatedRun id))
+                  (AppendFailed [message] (CreateRejected "internal" message))))))))))
 
 ;;; Why a reviewer cannot run on this site: `code` names the problem
 ;;; (`bad_model`, `no_model`); both are "" when every reviewer can.
 (defstruct ReviewerTrouble [(code (slice u8)) (message (slice u8))])
 
-(defn reviewer-model-trouble [(a (dyn Allocator)) (config (ptr SiteConfig)) (copies (ArrayList ReviewerCopy))] (-> ReviewerTrouble)
+(defn reviewer-model-trouble [(a (dyn Allocator))
+                              (config (ptr SiteConfig))
+                              (copies (ArrayList ReviewerCopy))]
+  (-> ReviewerTrouble)
   (block :check
-         (for copy (iter copies)
-           (match (parse-reviewer a (.text copy))
-             (ReviewerBad [problems] 0)
-             (ReviewerOk [parsed]
-                         (let [reviewer-harness (if (> (len (.harness parsed)) 0) (.harness parsed) (.default-harness config))
-                               model (effective-model config reviewer-harness (.model parsed))]
-                           (when (and (= reviewer-harness "builtin") (> (len model) 0))
-                             (match (resolve-model a config model)
-                               (ModelOk [_] 0)
-                               (ModelBad [message] (return-from :check (ReviewerTrouble :code "bad_model" :message (join a ["reviewer " (.name parsed) ": " message])))))
-                             0)
-                           (when (= (len model) 0)
-                             (return-from :check
-                                            (ReviewerTrouble :code "no_model"
-                                                             :message (join a ["reviewer " (.name parsed) " names no model and this site has no default for the "
-                                                                               reviewer-harness " harness; add `model:` to the reviewer or set "
-                                                                               (model-setting reviewer-harness)
-                                                                               " in site.json"]))))
-                           0))))
-         (ReviewerTrouble :code "" :message "")))
+    (for copy (iter copies)
+      (match (parse-reviewer a (.text copy))
+        (ReviewerBad [problems] 0)
+        (ReviewerOk [parsed]
+                    (let [reviewer-harness
+                            (if (> (len (.harness parsed)) 0)
+                                (.harness parsed)
+                                (.default-harness config))
+                          model
+                            (effective-model config
+                                             reviewer-harness
+                                             (.model parsed))]
+                      (when (and (= reviewer-harness "builtin")
+                                 (> (len model) 0))
+                        (match (resolve-model a config model)
+                          (ModelOk [_] 0)
+                          (ModelBad [message]
+                                    (return-from
+                                      :check
+                                        (ReviewerTrouble
+                                          :code "bad_model"
+                                          :message
+                                            (join a
+                                                  ["reviewer "
+                                                   (.name parsed)
+                                                   ": "
+                                                   message])))))
+                        0)
+                      (when (= (len model) 0)
+                        (return-from
+                          :check
+                            (ReviewerTrouble
+                              :code "no_model"
+                              :message
+                                (join a
+                                      ["reviewer "
+                                       (.name parsed)
+                                       " names no model and this site has no default for the "
+                                       reviewer-harness
+                                       " harness; add `model:` to the reviewer or set "
+                                       (model-setting reviewer-harness)
+                                       " in site.json"]))))
+                      0))))
+    (ReviewerTrouble :code "" :message "")))
 
 (defsum StationReviews
-  (StationReviewsOk [(copies (ArrayList ReviewerCopy)) (reviews (ArrayList StationReview))])
+  (StationReviewsOk [(copies (ArrayList ReviewerCopy))
+                     (reviews (ArrayList StationReview))])
   (StationReviewsBad [(message (slice u8))]))
 
 ;;; Resolve every station's `review` (see `station-review`): one copy of each
 ;;; reviewer any station names, and for each station the names it needs. Two
 ;;; different reviewers with one name are refused, as for `reviewers`.
-(defn resolve-station-reviews [(a (dyn Allocator)) (home (slice u8)) (spec FactorySpec)] (-> StationReviews)
-  (block :resolve
-         (let [(mut copies) (al-new [ReviewerCopy] a)
-               (mut reviews) (al-new [StationReview] a)]
-           (for s (iter (.stations spec))
-             (let [choice (review-choice (.review spec) (.review s))]
-               (when (> (len (str-trim choice)) 0)
-                 (match (load-reviewers a home choice)
-                   (ChosenBad [message] (return-from :resolve (StationReviewsBad (join a ["station " (.name s) " review: " message]))))
-                   (ChosenOk [found]
-                             (let [(mut names) (al-new [(slice u8)] a)]
-                               (for copy (iter found)
-                                 (push! (mut names) (.name copy))
-                                 (let [(mut known) false]
-                                   (for have (iter copies)
-                                     (when (= (.name have) (.name copy))
-                                       (when (not (= (.text have) (.text copy)))
-                                         (return-from :resolve (StationReviewsBad (join a ["two different reviewers are named \"" (.name copy) "\""]))))
-                                       (set! known true)
-                                       0))
-                                   (when (not (load known)) (push! (mut copies) copy) 0)))
-                               (push! (mut reviews) (StationReview :station (.name s) :names (load names)))
-                               0)))
-                 0)))
-           (StationReviewsOk (load copies) (load reviews)))))
+(defn resolve-station-reviews [(a (dyn Allocator))
+                               (home (slice u8))
+                               (spec FactorySpec)] (-> StationReviews)
+  (block
+    :resolve
+      (let [(mut copies) (ArrayList::new [ReviewerCopy] a)
+            (mut reviews) (ArrayList::new [StationReview] a)]
+        (for s (iter (.stations spec))
+          (let [choice (review-choice (.review spec) (.review s))]
+            (when (> (len (trim choice)) 0)
+              (match (load-reviewers a home choice)
+                (ChosenBad [message]
+                           (return-from
+                             :resolve
+                               (StationReviewsBad (join a
+                                                        ["station "
+                                                         (.name s)
+                                                         " review: "
+                                                         message]))))
+                (ChosenOk [found]
+                          (let [(mut names) (ArrayList::new [(slice u8)] a)]
+                            (for copy (iter found)
+                              (push! (mut names) (.name copy))
+                              (let [(mut known) false]
+                                (for have (iter copies)
+                                  (when (= (.name have) (.name copy))
+                                    (when (not (= (.text have) (.text copy)))
+                                      (return-from
+                                        :resolve
+                                          (StationReviewsBad (join a
+                                                                   ["two different reviewers are named \""
+                                                                    (.name copy)
+                                                                    "\""]))))
+                                    (set! known true)
+                                    0))
+                                (when (not (load known))
+                                  (push! (mut copies) copy)
+                                  0)))
+                            (push! (mut reviews)
+                                   (StationReview
+                                     :station (.name s)
+                                     :names (load names)))
+                            0)))
+              0)))
+        (StationReviewsOk (load copies) (load reviews)))))

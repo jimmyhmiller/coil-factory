@@ -1,7 +1,6 @@
 (module factory.library)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "durable.atomic" :as atomic)
@@ -14,13 +13,17 @@
 ;;; Anything containing a `/` or ending in `.md` is a path.
 
 (const BUNDLED-FEATURE (include-str "../factories/feature.md"))
+
 (const BUNDLED-FIX (include-str "../factories/fix.md"))
+
 (const BUNDLED-BUILD-COIL (include-str "../factories/build-coil-program.md"))
+
 (const BUNDLED-HAIKU (include-str "../factories/haiku.md"))
 
 (defstruct Bundled [(name (slice u8)) (text (slice u8))])
 
 (const BUNDLED-JUDGE (include-str "../reviewers/judge.md"))
+
 (const BUNDLED-SUMMARIZER (include-str "../summarizers/summarizer.md"))
 
 (defn bundled-summarizers [] (-> (array Bundled 1))
@@ -43,29 +46,52 @@
    (text (slice u8))])
 
 (defn path-like? [(reference (slice u8))] (-> bool)
-  (or (match (str-find reference "/") (Some [at] true) (None [] false))
+  (or (match (find reference "/") (Some [at] true) (None [] false))
       (and (> (len reference) 3)
-           (= (subslice [u8] reference (- (len reference) 3) (len reference)) ".md"))))
+           (= (subslice [u8] reference (- (len reference) 3) (len reference))
+              ".md"))))
 
-(defn library-file [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))] (-> (slice u8))
-  (let [(mut file) (sb-new a)]
-    (sb-push-str! (mut file) name)
-    (sb-push-str! (mut file) ".md")
-    (path-join a dir (sb-finish! (mut file)))))
+(defn library-file [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))]
+  (-> (slice u8))
+  (let [(mut file) (StrBuf::new a)]
+    (push-str! (mut file) name)
+    (push-str! (mut file) ".md")
+    (path-join a dir (finish! (mut file)))))
 
 (defsum Resolved
   (Found [(entry CatalogEntry)])
   (NotFound [(message (slice u8))]))
 
-(defn resolve-factory [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
-  (resolve-in a "factory" "`factory factories`" (factories-dir a home) (bundled-factories) reference))
+(defn resolve-factory [(a (dyn Allocator))
+                       (home (slice u8))
+                       (reference (slice u8))] (-> Resolved)
+  (resolve-in a
+              "factory"
+              "`factory factories`"
+              (factories-dir a home)
+              (bundled-factories)
+              reference))
 
 ;;; A summarizer: a path, `~/.factory/summarizers/NAME.md`, or a bundled one.
-(defn resolve-summarizer [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
-  (resolve-in a "summarizer" "the bundled one is `summarizer`;" (summarizers-dir a home) (bundled-summarizers) reference))
+(defn resolve-summarizer [(a (dyn Allocator))
+                          (home (slice u8))
+                          (reference (slice u8))] (-> Resolved)
+  (resolve-in a
+              "summarizer"
+              "the bundled one is `summarizer`;"
+              (summarizers-dir a home)
+              (bundled-summarizers)
+              reference))
 
-(defn resolve-reviewer [(a (dyn Allocator)) (home (slice u8)) (reference (slice u8))] (-> Resolved)
-  (resolve-in a "reviewer" "`factory reviewers`" (reviewers-dir a home) (bundled-reviewers) reference))
+(defn resolve-reviewer [(a (dyn Allocator))
+                        (home (slice u8))
+                        (reference (slice u8))] (-> Resolved)
+  (resolve-in a
+              "reviewer"
+              "`factory reviewers`"
+              (reviewers-dir a home)
+              (bundled-reviewers)
+              reference))
 
 ;;; `reference` as a path, a file in `dir`, or one of `bundled`.
 (defn resolve-in [(a (dyn Allocator))
@@ -76,72 +102,116 @@
                   (reference (slice u8))] (-> Resolved)
   (if (path-like? reference)
       (match (atomic/read-file-if-exists a reference)
-        (Ok [found] (match found
-                      (Some [text] (Found (CatalogEntry :name reference :origin "file" :path reference :text text)))
-                      (None [] (NotFound (join a ["no " kind " file at " reference])))))
+        (Ok [found]
+            (match found
+              (Some [text]
+                    (Found (CatalogEntry
+                             :name reference
+                             :origin "file"
+                             :path reference
+                             :text text)))
+              (None [] (NotFound (join a ["no " kind " file at " reference])))))
         (Err [failure] (NotFound (join a ["cannot read " reference]))))
       (let [path (library-file a dir reference)]
         (match (atomic/read-file-if-exists a path)
           (Ok [found]
               (match found
-                (Some [text] (Found (CatalogEntry :name reference :origin "library" :path path :text text)))
+                (Some [text]
+                      (Found (CatalogEntry
+                               :name reference
+                               :origin "library"
+                               :path path
+                               :text text)))
                 (None []
-                      (let [(mut result) (NotFound (join a ["no " kind " named \"" reference "\"; " lister " lists them"]))]
+                      (let [(mut result)
+                              (NotFound (join a
+                                              ["no "
+                                               kind
+                                               " named \""
+                                               reference
+                                               "\"; "
+                                               lister
+                                               " lists them"]))]
                         (for b (iter bundled)
                           (when (= (.name b) reference)
-                            (set! result (Found (CatalogEntry :name reference :origin "bundled" :path "" :text (.text b))))
+                            (set! result
+                                  (Found (CatalogEntry
+                                           :name reference
+                                           :origin "bundled"
+                                           :path ""
+                                           :text (.text b))))
                             0))
                         (load result)))))
           (Err [failure] (NotFound (join a ["cannot read " path])))))))
 
 ;;; Every factory available by name: the library, then bundled ones it does
 ;;; not shadow.
-(defn list-factories [(a (dyn Allocator)) (home (slice u8))] (-> (ArrayList CatalogEntry))
+(defn list-factories [(a (dyn Allocator)) (home (slice u8))]
+  (-> (ArrayList CatalogEntry))
   (list-in a (factories-dir a home) (bundled-factories)))
 
 ;;; Every reviewer available by name, the same way.
-(defn list-reviewers [(a (dyn Allocator)) (home (slice u8))] (-> (ArrayList CatalogEntry))
+(defn list-reviewers [(a (dyn Allocator)) (home (slice u8))]
+  (-> (ArrayList CatalogEntry))
   (list-in a (reviewers-dir a home) (bundled-reviewers)))
 
-(defn list-in [(a (dyn Allocator)) (dir (slice u8)) (bundled (slice Bundled))] (-> (ArrayList CatalogEntry))
-  (let [(mut out) (al-new [CatalogEntry] a)]
+(defn list-in [(a (dyn Allocator)) (dir (slice u8)) (bundled (slice Bundled))]
+  (-> (ArrayList CatalogEntry))
+  (let [(mut out) (ArrayList::new [CatalogEntry] a)]
     (match (atomic/list-dir a dir)
       (Err [failure] 0)
       (Ok [names]
-          (do (for file (iter names)
-                (when (and (> (len file) 3)
-                           (= (subslice [u8] file (- (len file) 3) (len file)) ".md"))
-                  (let [name (subslice [u8] file 0 (- (len file) 3))
-                        path (path-join a dir file)]
-                    (match (atomic/read-file-if-exists a path)
-                      (Ok [found] (match found
-                                    (Some [text] (push! [CatalogEntry] (mut out)
-                                                        (CatalogEntry :name name :origin "library" :path path :text text)))
-                                    (None [] 0)))
-                      (Err [failure] 0))
-                    0)
-                  0))
-              0)))
+          (do
+            (for file (iter names)
+              (when (and (> (len file) 3)
+                         (= (subslice [u8] file (- (len file) 3) (len file))
+                            ".md"))
+                (let [name (subslice [u8] file 0 (- (len file) 3))
+                      path (path-join a dir file)]
+                  (match (atomic/read-file-if-exists a path)
+                    (Ok [found]
+                        (match found
+                          (Some [text]
+                                (push! [CatalogEntry]
+                                       (mut out)
+                                       (CatalogEntry
+                                         :name name
+                                         :origin "library"
+                                         :path path
+                                         :text text)))
+                          (None [] 0)))
+                    (Err [failure] 0))
+                  0)
+                0))
+            0)))
     (for b (iter bundled)
       (let [(mut shadowed) false]
         (for existing (iter out)
           (let [e existing]
             (when (= (.name e) (.name b)) (set! shadowed true) 0)))
         (when (not (load shadowed))
-          (push! [CatalogEntry] (mut out) (CatalogEntry :name (.name b) :origin "bundled" :path "" :text (.text b)))
+          (push! [CatalogEntry]
+                 (mut out)
+                 (CatalogEntry
+                   :name (.name b)
+                   :origin "bundled"
+                   :path ""
+                   :text (.text b)))
           0)))
     (load out)))
 
 (defn join [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (for part (iter parts) (sb-push-str! (mut out) part))
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
 
 ;; ---------------------------------------------------------------------------
 ;; Skills for Claude Code, bundled so `factory skills install` needs no checkout.
 
 (const SKILL-DESIGN (include-str "../skills/factory-design/SKILL.md"))
+
 (const SKILL-OPERATE (include-str "../skills/factory-operate/SKILL.md"))
+
 (const SKILL-SITES (include-str "../skills/factory-sites/SKILL.md"))
 
 (defn bundled-skills [] (-> (array Bundled 3))

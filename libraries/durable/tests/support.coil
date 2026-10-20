@@ -1,5 +1,4 @@
 (module durable.test-support)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
 (import "coil.io" :as io)
 (import "coil.os" :as os)
@@ -11,7 +10,8 @@
 ;; Shared helpers for the durable test suites.
 
 ;;; Abort the test with a description of `err` (the test runner reports the abort).
-(defn fail-with [(a (dyn Allocator)) (what (slice u8)) (err DurableError)] (-> i64)
+(defn fail-with [(a (dyn Allocator)) (what (slice u8)) (err DurableError)]
+  (-> i64)
   (io/print-str (io/stderr) what)
   (io/print-str (io/stderr) ": ")
   (io/print-str (io/stderr) (error-describe a err))
@@ -27,30 +27,31 @@
     (Err [e]
          (do
            (fail-with a what e)
-           (primitive/zeroed T)))))
+           (zeroed T)))))
 
 ;;; A fresh, empty directory unique to this process and call:
 ;;; `/tmp/durable-test-<pid>-<label>-<hex>`, owned by `a`.
 (defn fresh-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
-  (let [(mut sb) (sb-new a)
+  (let [(mut sb) (StrBuf::new a)
         token (expect-ok a "random-hex" (random-hex a 6))]
-    (sb-push-str! (mut sb) "/tmp/durable-test-")
-    (sb-push-i64! (mut sb) (cast i64 (os/getpid)))
-    (sb-push-str! (mut sb) "-")
-    (sb-push-str! (mut sb) label)
-    (sb-push-str! (mut sb) "-")
-    (sb-push-str! (mut sb) token)
-    (let [dir (sb-finish! (mut sb))]
+    (push-str! (mut sb) "/tmp/durable-test-")
+    (push-i64! (mut sb) (cast i64 (os/getpid)))
+    (push-str! (mut sb) "-")
+    (push-str! (mut sb) label)
+    (push-str! (mut sb) "-")
+    (push-str! (mut sb) token)
+    (let [dir (finish! (mut sb))]
       (expect-ok a "ensure-dir!" (ensure-dir! a dir 448))
       dir)))
 
 ;;; `dir/name`, owned by `a`.
-(defn join [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))] (-> (slice u8))
-  (let [(mut sb) (sb-new a)]
-    (sb-push-str! (mut sb) dir)
-    (sb-push-str! (mut sb) "/")
-    (sb-push-str! (mut sb) name)
-    (sb-finish! (mut sb))))
+(defn join [(a (dyn Allocator)) (dir (slice u8)) (name (slice u8))]
+  (-> (slice u8))
+  (let [(mut sb) (StrBuf::new a)]
+    (push-str! (mut sb) dir)
+    (push-str! (mut sb) "/")
+    (push-str! (mut sb) name)
+    (finish! (mut sb))))
 
 (defn cleanup [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
   (expect-ok a "remove-tree!" (remove-tree! a dir))

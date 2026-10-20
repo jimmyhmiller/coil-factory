@@ -8,7 +8,7 @@
 (import "factory.specparse" :use [problems-text])
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn parsed-or-fail [(a (dyn Allocator)) (text (slice u8))] (-> AgentSpec)
   (match (parse-agent a text)
@@ -24,7 +24,7 @@
     (AgentSpecBad [problems] (problems-text a problems))))
 
 (defn tool-at [(spec (ptr AgentSpec)) (i i64)] (-> (ptr AgentToolSpec))
-  (al-elem [AgentToolSpec] (field spec agent-tools) i))
+  (elem (field spec agent-tools) i))
 
 (const SCHEMA "```json\n{\"type\": \"object\", \"properties\": {\"original\": {\"type\": \"string\"}, \"count\": {\"type\": \"integer\"}}, \"required\": [\"original\"]}\n```\n")
 
@@ -127,9 +127,9 @@
 (deftest the-guide-s-complete-example-is-a-valid-agent
   (let [a (malloc-allocator)
         open "````markdown\n"
-        start (match (str-find GUIDE open) (Some [at] (+ at (len open))) (None [] (do (assert false) 0)))
+        start (match (find GUIDE open) (Some [at] (+ at (len open))) (None [] (do (assert false) 0)))
         rest (subslice GUIDE start (len GUIDE))
-        end (match (str-find rest "\n````") (Some [at] at) (None [] (do (assert false) 0)))
+        end (match (find rest "\n````") (Some [at] at) (None [] (do (assert false) 0)))
         (mut spec) (parsed-or-fail a (subslice rest 0 (+ end 1)))]
     (assert (= (.name spec) "grammar"))
     (assert-eq (len (.agent-tools spec)) 3)

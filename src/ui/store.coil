@@ -1,5 +1,4 @@
 (module factory.ui.store)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.scratch" :as scratch)
 (import "coil.serde.value" :use *)
@@ -12,25 +11,25 @@
 (defstruct Arenas [(pair (array scratch/ScratchArena 2)) (current i64)])
 
 (defn arenas-init! [(arenas (ptr Arenas)) (parent (dyn Allocator))] (-> i64)
-  (scratch/scratch-init (index (field arenas pair) 0) parent)
-  (scratch/scratch-init (index (field arenas pair) 1) parent)
+  (scratch/ScratchArena::init (index (field arenas pair) 0) parent)
+  (scratch/ScratchArena::init (index (field arenas pair) 1) parent)
   (set! (.current arenas) 0)
   0)
 
 (defn arenas-close! [(arenas (ptr Arenas))] (-> i64)
-  (scratch/scratch-close! (index (field arenas pair) 0))
-  (scratch/scratch-close! (index (field arenas pair) 1))
+  (close! (index (field arenas pair) 0))
+  (close! (index (field arenas pair) 1))
   0)
 
 ;;; The arena holding what is shown now.
 (defn arenas-active [(arenas (ptr Arenas))] (-> (dyn Allocator))
-  (scratch/scratch-allocator (index (field arenas pair) (.current arenas))))
+  (allocator (index (field arenas pair) (.current arenas))))
 
 ;;; The other arena, emptied, for building a replacement.
 (defn arenas-spare [(arenas (ptr Arenas))] (-> (dyn Allocator))
   (let [spare (index (field arenas pair) (- 1 (.current arenas)))]
-    (scratch/scratch-recycle! spare)
-    (scratch/scratch-allocator spare)))
+    (recycle! spare)
+    (allocator spare)))
 
 ;;; Make the spare arena the active one.
 (defn arenas-flip! [(arenas (ptr Arenas))] (-> i64)
@@ -39,7 +38,7 @@
 
 ;;; Empty the active arena (everything allocated from it becomes invalid).
 (defn arenas-clear! [(arenas (ptr Arenas))] (-> i64)
-  (scratch/scratch-recycle! (index (field arenas pair) (.current arenas)))
+  (recycle! (index (field arenas pair) (.current arenas)))
   0)
 
 ;;; One fetched JSON document. `value` lives in the active arena; `has` is

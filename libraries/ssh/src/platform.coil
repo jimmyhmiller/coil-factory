@@ -13,4 +13,4 @@
 ;;; engine (the `Eq` impl drags in `coil.slice/slice-new`, whose debug-check
 ;;; macro is then called as a function), so that rewrite breaks the build.
 (defn platform-pick [(linux Code) (darwin Code)] (-> Code)
-  (if (primitive/code-eq (primitive/target-os) `linux) linux darwin))
+  (if (= (primitive/target-os) `linux) linux darwin))

@@ -1,7 +1,6 @@
 (module http_app.sse)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "http_app.router" :use *)
@@ -25,7 +24,7 @@
 ;;; `sse-release` is called exactly once when the response ends for any reason.
 (deftrait SseSource [Self]
   (sse-next [(self (ptr Self)) (allocator (dyn Allocator)) (cursor (slice u8))]
-            (-> SseBatch))
+    (-> SseBatch))
   (sse-release [(self (ptr Self)) (reason StreamEndReason)] (-> i64)))
 
 ;;; `keep-alive-ms`: after this long without any write, send a `: keep-alive`
@@ -34,10 +33,7 @@
 (defstruct SseOptions [(keep-alive-ms i64) (retry-ms i64)])
 
 (defn sse-options [] (-> SseOptions)
-  (let [(mut options) (primitive/zeroed SseOptions)]
-    (set! (.keep-alive-ms options) 15000)
-    (set! (.retry-ms options) -1)
-    (load options)))
+  (SseOptions :keep-alive-ms 15000 :retry-ms -1))
 
 ;;; The `ResponseStream` adapter behind `sse-response`. Its cursor tracks the id of
 ;;; the last event written.
@@ -53,13 +49,13 @@
   (not (sse/sse-contains-byte? (.data event) 13)))
 
 (defn sse-cursor [(stream (ptr SseStream))] (-> (slice u8))
-  (al-slice [u8] (.cursor stream)))
+  (slice (.cursor stream)))
 
 (defn retry-into! [(stream (ptr SseStream)) (out (mut StrBuf))] (-> i64)
   (when (and (.retry-pending stream) (>= (.retry-ms (.options stream)) 0))
-    (sb-push-str! (mut out) "retry: ")
-    (sb-push-i64! (mut out) (.retry-ms (.options stream)))
-    (sb-push-str! (mut out) "\n\n")
+    (push-str! (mut out) "retry: ")
+    (push-i64! (mut out) (.retry-ms (.options stream)))
+    (push-str! (mut out) "\n\n")
     0)
   (set! (.retry-pending stream) false)
   0)
@@ -70,9 +66,9 @@
                   (allocator (dyn Allocator))
                   (idle-ms i64)] (-> StreamStep)
   (cond (.retry-pending stream)
-          (let [(mut out) (sb-new allocator)]
+          (let [(mut out) (StrBuf::new allocator)]
             (retry-into! stream (mut out))
-            (StreamChunk (sb-finish! (mut out))))
+            (StreamChunk (finish! (mut out))))
         (>= idle-ms (.keep-alive-ms (.options stream)))
           (StreamChunk ": keep-alive\n\n")
         :else (StreamIdle)))
@@ -80,7 +76,7 @@
 (defn events-step [(stream (ptr SseStream))
                    (allocator (dyn Allocator))
                    (events (slice sse/SseEvent))] (-> StreamStep)
-  (let [(mut out) (sb-new allocator)
+  (let [(mut out) (StrBuf::new allocator)
         (mut i) 0
         (mut valid) true
         (mut last-id) (None [(slice u8)])]
@@ -95,7 +91,7 @@
                 (if (= (len encoded) 0)
                     (set! valid false)
                     (do
-                      (sb-push-str! (mut out) encoded)
+                      (push-str! (mut out) encoded)
                       (when (or (.id-present event) (> (len (.id event)) 0))
                         (set! last-id (Some (.id event)))
                         0)
@@ -106,13 +102,12 @@
           (match (load last-id)
             (Some [id]
                   (do
-                    (al-clear! [u8] (mut (.cursor stream)))
-                    (al-extend! [u8]
-                                (mut (.cursor stream))
-                                (slice-data id)
-                                (len id))))
+                    (clear! (mut (.cursor stream)))
+                    (extend! (mut (.cursor stream))
+                             (data id)
+                             (len id))))
             (None [] 0))
-          (StreamChunk (sb-finish! (mut out)))))))
+          (StreamChunk (finish! (mut out)))))))
 
 (defn next-sse-step [(stream (ptr SseStream))
                      (allocator (dyn Allocator))
@@ -130,11 +125,11 @@
   (stream-next [(self (ptr SseStream))
                 (allocator (dyn Allocator))
                 (idle-ms i64)]
-               (-> StreamStep)
-               (next-sse-step self allocator idle-ms))
+    (-> StreamStep)
+    (next-sse-step self allocator idle-ms))
   (stream-release [(self (ptr SseStream)) (reason StreamEndReason)]
-                  (-> i64)
-                  (sse-release (.source self) reason)))
+    (-> i64)
+    (sse-release (.source self) reason)))
 
 ;;; The client's `Last-Event-ID` header, or "" when absent.
 (defn last-event-id [(ctx RequestContext)] (-> (slice u8))
@@ -148,13 +143,13 @@
                     (source (dyn SseSource))
                     (cursor (slice u8))
                     (options SseOptions)] (-> Response)
-  (let [(mut initial) (primitive/zeroed SseStream)
-        (mut headers) (al-new [ResponseHeader] a)
-        (mut cache) (primitive/zeroed ResponseHeader)
-        (mut buffering) (primitive/zeroed ResponseHeader)]
+  (let [(mut initial) (zeroed SseStream)
+        (mut headers) (ArrayList::new [ResponseHeader] a)
+        (mut cache) (zeroed ResponseHeader)
+        (mut buffering) (zeroed ResponseHeader)]
     (set! (.source initial) source)
-    (set! (.cursor initial) (al-new [u8] a))
-    (al-extend! [u8] (mut (.cursor initial)) (slice-data cursor) (len cursor))
+    (set! (.cursor initial) (ArrayList::new [u8] a))
+    (extend! (mut (.cursor initial)) (data cursor) (len cursor))
     (set! (.options initial) options)
     (set! (.retry-pending initial) (>= (.retry-ms options) 0))
     (set! (.name cache) "Cache-Control")
@@ -166,15 +161,15 @@
     (let [stream (box! a SseStream (load initial))]
       (stream-response 200
                        "text/event-stream; charset=utf-8"
-                       (al-slice [ResponseHeader] headers)
+                       (slice headers)
                        stream))))
 
 ;;; An `SseEvent` with data and optional id/name (empty = omitted).
-(defn sse-event [(name (slice u8)) (id (slice u8)) (data (slice u8))] (-> sse/SseEvent)
-  (let [(mut event) (primitive/zeroed sse/SseEvent)]
-    (set! (.name event) name)
-    (set! (.data event) data)
-    (set! (.id event) id)
-    (set! (.id-present event) (> (len id) 0))
-    (set! (.retry-ms event) -1)
-    (load event)))
+(defn sse-event [(name (slice u8)) (id (slice u8)) (data (slice u8))]
+  (-> sse/SseEvent)
+  (sse/SseEvent
+    :name name
+    :data data
+    :id id
+    :id-present (> (len id) 0)
+    :retry-ms -1))

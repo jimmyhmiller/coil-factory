@@ -12,21 +12,35 @@
 ;;; declare. Every extern lives here, once, so two importers never collide.
 
 (extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
 (extern readlink :cc c [(ptr i8) (ptr i8) i64] (-> i64))
+
 (extern access :cc c [(ptr i8) i32] (-> i32))
+
 (extern strerror :cc c [i32] (-> (ptr i8)))
+
 (extern waitid :cc c [i32 u32 (ptr u8) i32] (-> i32))
+
 (extern sigemptyset :cc c [(ptr u8)] (-> i32))
+
 (extern sigaddset :cc c [(ptr u8) i32] (-> i32))
+
 (extern sigismember :cc c [(ptr u8) i32] (-> i32))
+
 (extern sigpending :cc c [(ptr u8)] (-> i32))
+
 (extern sigwait :cc c [(ptr u8) (ptr i32)] (-> i32))
+
 (extern pthread_sigmask :cc c [i32 (ptr u8) (ptr u8)] (-> i32))
 
 (const ENOENT 2)
+
 (const EINTR 4)
+
 (const EEXIST 17)
+
 (const ENOTDIR 20)
+
 (const X_OK 1)
 
 ;;; Large enough for `realpath`'s output buffer on every supported platform
@@ -41,34 +55,49 @@
 
 ;;; waitid flags and the siginfo_t layout differ between Linux and macOS.
 (const P_PID 1)
+
 (const WNOHANG 1)
+
 (const WEXITED 4)
+
 (const WNOWAIT (wnowait-code))
+
 (const SIGINFO_PID_OFFSET (siginfo-pid-offset-code))
+
 ;;; siginfo_t is 128 bytes on both platforms.
 (const SIGINFO_BYTES 128)
 
 ;;; Report an unrecoverable condition on stderr and abort the process.
 (defn fatal [(message (slice u8))] (-> i64)
   (let [prefix "agent-tools: fatal: "]
-    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data prefix)) (primitive/cast isize (len prefix)))
-    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data message)) (primitive/cast isize (len message)))
-    (io/write (primitive/cast i32 2) (primitive/cast (ptr i8) (slice-data "\n")) (primitive/cast isize 1))
+    (io/write (primitive/cast i32 2)
+              (primitive/cast (ptr i8) (data prefix))
+              (primitive/cast isize (len prefix)))
+    (io/write (primitive/cast i32 2)
+              (primitive/cast (ptr i8) (data message))
+              (primitive/cast isize (len message)))
+    (io/write (primitive/cast i32 2)
+              (primitive/cast (ptr i8) (data "\n"))
+              (primitive/cast isize 1))
     (abort)
     0))
 
 ;;; Monotonic milliseconds. The clock cannot fail on a supported system; if it
 ;;; does, the process stops with a clear message rather than inventing a time.
 (defn monotonic-ms [] (-> i64)
-  (match (time/monotonic-now-ms)
-    (Ok [ms] ms)
-    (Err [_] (fatal "the monotonic clock is unavailable"))))
+  (try (let [ms
+               (try-or! (time/monotonic-now-ms)
+                        (fatal "the monotonic clock is unavailable"))]
+         ms)))
 
 ;;; A duration of `ms` (non-negative) milliseconds.
 (defn millis [(ms i64)] (-> time/Duration)
-  (match (time/duration-millis ms)
-    (Ok [d] d)
-    (Err [_] (do (fatal "a negative duration was requested") (time/Duration :sec 0 :nsec 0)))))
+  (try (let [d
+               (try-or! (time/Duration::millis ms)
+                        (do
+                          (fatal "a negative duration was requested")
+                          (time/Duration :sec 0 :nsec 0)))]
+         d)))
 
 (defn sleep-ms [(ms i64)] (-> i64)
   (match (time/sleep (millis ms))
@@ -78,21 +107,21 @@
 ;;; The system's description of an errno value, such as "No such file or
 ;;; directory". Borrowed from libc; copy it before the next call.
 (defn errno-text [(code i64)] (-> (slice u8))
-  (cstr->str (strerror (primitive/cast i32 code))))
+  (from-cstr (strerror (primitive/cast i32 code))))
 
 ;;; A NUL-terminated copy of `s`, or null when allocation fails.
 (defn c-string [(a (dyn Allocator)) (s (slice u8))] (-> (ptr i8))
-  (str->cstr a s))
+  (to-cstr a s))
 
 (defn c-string-free [(a (dyn Allocator)) (s (slice u8)) (c (ptr i8))] (-> i64)
   (if (= (primitive/cast i64 c) 0)
       0
-      (free-bytes a (slice-new (primitive/cast (ptr u8) c) (+ (len s) 1)) 1)))
+      (free-bytes a (slice::new (primitive/cast (ptr u8) c) (+ (len s) 1)) 1)))
 
 (defn copy-bytes [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
-  (let [(mut b) (sb-new a)]
-    (sb-push-str! (mut b) s)
-    (sb-finish! (mut b))))
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) s)
+    (finish! (mut b))))
 
 ;;; The outcome of a path query that can fail with an errno.
 (defsum PathQuery
@@ -107,22 +136,22 @@
         (match (alloc [i8] a PATH_BUFFER_BYTES)
           (None [] (do (c-string-free a path c) (PathErrno 12)))
           (Some [buffer]
-                (let [r (realpath c (slice-data buffer))
-                      code (if (= (primitive/cast i64 r) 0) (os/os-errno) 0)]
+                (let [r (realpath c (data buffer))
+                      code (if (= (primitive/cast i64 r) 0) (os/errno) 0)]
                   (c-string-free a path c)
                   (if (= (primitive/cast i64 r) 0)
                       (do (free [i8] a buffer) (PathErrno code))
-                      (let [result (copy-bytes a (cstr->str r))]
+                      (let [result (copy-bytes a (from-cstr r))]
                         (free [i8] a buffer)
                         (PathOk result)))))))))
 
 ;;; Whether `path` itself (not what it points to) is a symbolic link.
 (defn symlink? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
   (let [c (c-string a path)
-        buffer (primitive/alloc-stack (array i8 8))]
+        (mut buffer) (zeroed (array i8 8))]
     (if (= (primitive/cast i64 c) 0)
         false
-        (let [n (readlink c (primitive/cast (ptr i8) buffer) 8)]
+        (let [n (readlink c (primitive/cast (ptr i8) (mut buffer)) 8)]
           (c-string-free a path c)
           (>= n 0)))))
 
@@ -147,12 +176,13 @@
           (and (= r (primitive/cast i32 0)) (not (directory? a path)))))))
 
 ;;; Create one directory. Ok when it was created or already exists as a directory.
-(defn make-directory [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64 i64))
+(defn make-directory [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result i64 i64))
   (let [c (c-string a path)]
     (if (= (primitive/cast i64 c) 0)
         (Err 12)
         (let [r (fs/make-dir c 493)
-              code (if (< r (primitive/cast i32 0)) (os/os-errno) 0)]
+              code (if (< r (primitive/cast i32 0)) (os/errno) 0)]
           (c-string-free a path c)
           (cond (= code 0) (Ok 0)
                 (and (= code EEXIST) (directory? a path)) (Ok 0)
@@ -162,54 +192,67 @@
 (defn existing-file? [(a (dyn Allocator)) (path (slice u8))] (-> bool)
   (match (real-path a path)
     (PathErrno [_] false)
-    (PathOk [real] (let [result (not (directory? a real))]
-                     (free-bytes a real 1)
-                     result))))
+    (PathOk [real]
+            (let [result (not (directory? a real))]
+              (free-bytes a real 1)
+              result))))
 
 ;;; Read a whole file that must be at most `limit` bytes.
-(defn read-small-file [(a (dyn Allocator)) (path (slice u8)) (limit i64)] (-> (Result (slice u8) (slice u8)))
+(defn read-small-file [(a (dyn Allocator)) (path (slice u8)) (limit i64)]
+  (-> (Result (slice u8) (slice u8)))
   (match (fs/read-file a path)
-    (Err [error] (Err (match error
-                        (io/Errno [code] (copy-bytes a (errno-text code)))
-                        (_ "read failed"))))
-    (Ok [bytes] (if (> (len bytes) limit)
-                    (do (free-bytes a bytes 1) (Err "file is larger than expected"))
-                    (Ok bytes)))))
+    (Err [error]
+         (Err (match error
+                (io/Errno [code] (copy-bytes a (errno-text code)))
+                (_ "read failed"))))
+    (Ok [bytes]
+        (if (> (len bytes) limit)
+            (do (free-bytes a bytes 1) (Err "file is larger than expected"))
+            (Ok bytes)))))
 
 ;;; The first executable named `name` on PATH, allocated in `a`.
-(defn find-on-path [(a (dyn Allocator)) (name (slice u8))] (-> (Option (slice u8)))
-  (match (os/env-get a "PATH")
-    (Err [_] (do (fatal "cannot read the PATH environment variable") (None)))
-    (Ok [maybe]
-        (match maybe
-          (None [] (None))
-          (Some [owned]
-                (let [path (os/owned-string-slice owned)
-                      n (len path)
-                      (mut start) 0
-                      (mut i) 0
-                      (mut found) (: (None) (Option (slice u8)))]
-                  (loop (if (or (> (load i) n) (match (load found) (Some [_] true) (None [] false)))
-                            (break)
-                            (do (when (or (= (load i) n) (= (get path (load i)) (primitive/cast u8 #\:)))
-                                  (let [dir (subslice path (load start) (load i))]
-                                    (when (> (len dir) 0)
-                                      (let [(mut b) (sb-new a)]
-                                        (sb-push-str! (mut b) dir)
-                                        (sb-push-str! (mut b) "/")
-                                        (sb-push-str! (mut b) name)
-                                        (let [candidate (sb-finish! (mut b))]
-                                          (if (executable? a candidate)
-                                              (set! found (Some candidate))
-                                              (free-bytes a candidate 1))))
-                                      0)
-                                    (set! start (+ (load i) 1))
-                                    0)
-                                  0)
-                                (set! i (+ (load i) 1)))))
-                  (let [(mut o) owned]
-                    (os/owned-string-free a (mut o)))
-                  (load found)))))))
+(defn find-on-path [(a (dyn Allocator)) (name (slice u8))]
+  (-> (Option (slice u8)))
+  (try (let [maybe
+               (try-or! (os/get-env a "PATH")
+                        (do
+                          (fatal "cannot read the PATH environment variable")
+                          (None)))]
+         (match maybe
+           (None [] (None))
+           (Some [owned]
+                 (let [path (slice owned)
+                       n (len path)
+                       (mut start) 0
+                       (mut i) 0
+                       (mut found) (: (None) (Option (slice u8)))]
+                   (loop (if (or (> (load i) n)
+                                 (match (load found)
+                                   (Some [_] true)
+                                   (None [] false)))
+                             (break)
+                             (do
+                               (when (or (= (load i) n)
+                                         (= (get path (load i))
+                                            (primitive/cast u8 #\:)))
+                                 (let [dir (subslice path (load start) (load i))]
+                                   (when (> (len dir) 0)
+                                     (let [(mut b) (StrBuf::new a)]
+                                       (push-str! (mut b) dir)
+                                       (push-str! (mut b) "/")
+                                       (push-str! (mut b) name)
+                                       (let [candidate (finish! (mut b))]
+                                         (if (executable? a candidate)
+                                             (set! found (Some candidate))
+                                             (free-bytes a candidate 1))))
+                                     0)
+                                   (set! start (+ (load i) 1))
+                                   0)
+                                 0)
+                               (set! i (+ (load i) 1)))))
+                   (let [(mut o) owned]
+                     (os/OwnedString::free! a (mut o)))
+                   (load found)))))))
 
 ;;; The target of the symbolic link at `path`, or None when it is not a link.
 (defn read-link [(a (dyn Allocator)) (path (slice u8))] (-> (Option (slice u8)))
@@ -219,11 +262,15 @@
         (match (alloc [i8] a PATH_BUFFER_BYTES)
           (None [] (do (c-string-free a path c) (None)))
           (Some [buffer]
-                (let [n (readlink c (slice-data buffer) PATH_BUFFER_BYTES)]
+                (let [n (readlink c (data buffer) PATH_BUFFER_BYTES)]
                   (c-string-free a path c)
                   (if (< n 0)
                       (do (free [i8] a buffer) (None))
-                      (let [target (copy-bytes a (slice-new (primitive/cast (ptr u8) (slice-data buffer)) n))]
+                      (let [target
+                              (copy-bytes a
+                                          (slice::new (primitive/cast (ptr u8)
+                                                                      (data buffer))
+                                                      n))]
                         (free [i8] a buffer)
                         (Some target)))))))))
 
@@ -234,8 +281,11 @@
   (if (= (primitive/target-os) `linux) `2 `3))
 
 (const EPIPE 32)
+
 (const SIGPIPE 13)
+
 (const SIG_BLOCK (sig-block-code))
+
 (const SIG_SETMASK (sig-setmask-code))
 
 ;;; `write(2)` with SIGPIPE blocked on the calling thread, so a reader that
@@ -244,26 +294,35 @@
 ;;; is restored (unless the caller already blocked it). Returns the byte count
 ;;; or -errno.
 (defn write-without-sigpipe [(fd i32) (data (ptr i8)) (count i64)] (-> i64)
-  (let [block (primitive/alloc-stack (array u8 256))
-        previous (primitive/alloc-stack (array u8 256))
-        pending (primitive/alloc-stack (array u8 256))
-        received (primitive/alloc-stack i32)
-        block-set (primitive/cast (ptr u8) block)
-        previous-set (primitive/cast (ptr u8) previous)
-        pending-set (primitive/cast (ptr u8) pending)]
+  (let [(mut block) (zeroed (array u8 256))
+        (mut previous) (zeroed (array u8 256))
+        (mut pending) (zeroed (array u8 256))
+        (mut received) (zeroed i32)
+        block-set (primitive/cast (ptr u8) (mut block))
+        previous-set (primitive/cast (ptr u8) (mut previous))
+        pending-set (primitive/cast (ptr u8) (mut pending))]
     (sigemptyset block-set)
     (sigaddset block-set (primitive/cast i32 SIGPIPE))
-    (when (!= (pthread_sigmask (primitive/cast i32 SIG_BLOCK) block-set previous-set) (primitive/cast i32 0))
+    (when (!= (pthread_sigmask (primitive/cast i32 SIG_BLOCK)
+                               block-set
+                               previous-set)
+              (primitive/cast i32 0))
       (fatal "could not block SIGPIPE around a pipe write")
       0)
-    (let [written (primitive/cast i64 (io/write fd data (primitive/cast isize count)))
-          error (if (< written 0) (os/os-errno) 0)]
-      (when (and (= error EPIPE) (= (sigismember previous-set (primitive/cast i32 SIGPIPE)) (primitive/cast i32 0)))
+    (let [written
+            (primitive/cast i64 (io/write fd data (primitive/cast isize count)))
+          error (if (< written 0) (os/errno) 0)]
+      (when (and (= error EPIPE)
+                 (= (sigismember previous-set (primitive/cast i32 SIGPIPE))
+                    (primitive/cast i32 0)))
         (sigemptyset pending-set)
         (sigpending pending-set)
-        (when (= (sigismember pending-set (primitive/cast i32 SIGPIPE)) (primitive/cast i32 1))
-          (sigwait block-set received)
+        (when (= (sigismember pending-set (primitive/cast i32 SIGPIPE))
+                 (primitive/cast i32 1))
+          (sigwait block-set (mut received))
           0)
         0)
-      (pthread_sigmask (primitive/cast i32 SIG_SETMASK) previous-set (primitive/cast (ptr u8) 0))
+      (pthread_sigmask (primitive/cast i32 SIG_SETMASK)
+                       previous-set
+                       (primitive/cast (ptr u8) 0))
       (if (< written 0) (- 0 error) written))))

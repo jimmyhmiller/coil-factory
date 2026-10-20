@@ -33,7 +33,7 @@
 (const SHELL "/bin/sh")
 
 (defn sandbox-options [(allow-network bool)] (-> SandboxOptions)
-  (SandboxOptions :allow-network allow-network :extra-writable (slice-new (primitive/cast (ptr (slice u8)) 0) 0)))
+  (SandboxOptions :allow-network allow-network :extra-writable (slice::new (primitive/cast (ptr (slice u8)) 0) 0)))
 
 (defn sandbox-options-with-paths [(allow-network bool) (extra-writable (slice (slice u8)))] (-> SandboxOptions)
   (SandboxOptions :allow-network allow-network :extra-writable extra-writable))
@@ -47,29 +47,29 @@
 ;;; A string literal in the sandbox profile language: quotes and backslashes
 ;;; are escaped, everything else is taken literally.
 (defn sbpl-string [(b (mut StrBuf)) (text (slice u8))] (-> i64)
-  (sb-push-byte! (mut b) (primitive/cast u8 #\"))
+  (push! (mut b) (primitive/cast u8 #\"))
   (let [(mut i) 0]
     (loop (if (>= (load i) (len text))
               (break)
               (let [c (get text (load i))]
                 (when (or (= c (primitive/cast u8 #\")) (= c (primitive/cast u8 #\\)))
-                  (sb-push-byte! (mut b) (primitive/cast u8 #\\))
+                  (push! (mut b) (primitive/cast u8 #\\))
                   0)
-                (sb-push-byte! (mut b) c)
+                (push! (mut b) c)
                 (set! i (+ (load i) 1))))))
-  (sb-push-byte! (mut b) (primitive/cast u8 #\"))
+  (push! (mut b) (primitive/cast u8 #\"))
   0)
 
 (defn sbpl-subpath [(b (mut StrBuf)) (path (slice u8))] (-> i64)
-  (sb-push-str! (mut b) " (subpath ")
+  (push-str! (mut b) " (subpath ")
   (sbpl-string (mut b) path)
-  (sb-push-str! (mut b) ")")
+  (push-str! (mut b) ")")
   0)
 
 (defn sbpl-literal [(b (mut StrBuf)) (path (slice u8))] (-> i64)
-  (sb-push-str! (mut b) " (literal ")
+  (push-str! (mut b) " (literal ")
   (sbpl-string (mut b) path)
-  (sb-push-str! (mut b) ")")
+  (push-str! (mut b) ")")
   0)
 
 ;;; The macOS sandbox profile. Everything is allowed except writing files,
@@ -79,9 +79,9 @@
 ;;; Without network access, IP traffic in both directions is denied; local
 ;;; Unix-domain sockets (used by system services) keep working.
 (defn mac-profile [(a (dyn Allocator)) (root (slice u8)) (options SandboxOptions)] (-> (slice u8))
-  (let [(mut b) (sb-new a)
+  (let [(mut b) (StrBuf::new a)
         extra (.extra-writable options)]
-    (sb-push-str! (mut b) "(version 1)(allow default)(deny file-write*)(allow file-write*")
+    (push-str! (mut b) "(version 1)(allow default)(deny file-write*)(allow file-write*")
     (sbpl-subpath (mut b) root)
     (sbpl-subpath (mut b) "/private/tmp")
     (sbpl-subpath (mut b) "/private/var/tmp")
@@ -98,11 +98,11 @@
                 (break)
                 (do (sbpl-subpath (mut b) (get extra (load i)))
                     (set! i (+ (load i) 1))))))
-    (sb-push-str! (mut b) ")")
+    (push-str! (mut b) ")")
     (when (not (.allow-network options))
-      (sb-push-str! (mut b) "(deny network-outbound (remote ip))(deny network-inbound (local ip))")
+      (push-str! (mut b) "(deny network-outbound (remote ip))(deny network-inbound (local ip))")
       0)
-    (sb-finish! (mut b))))
+    (finish! (mut b))))
 
 (defn push-all! [(argv (mut (ArrayList (slice u8)))) (items (slice (slice u8)))] (-> i64)
   (let [(mut i) 0]
@@ -122,7 +122,7 @@
 ;;; `policy`, with the workspace root as the writable directory: for confining
 ;;; a whole program, such as another agent, rather than one shell command.
 (defn sandbox-program-argv [(a (dyn Allocator)) (policy SandboxPolicy) (root (slice u8)) (program (slice (slice u8)))] (-> (ArrayList (slice u8)))
-  (let [(mut argv) (al-new [(slice u8)] a)]
+  (let [(mut argv) (ArrayList::new [(slice u8)] a)]
     (match policy
       (NoSandbox [] 0)
       (MacSandbox [options]
@@ -184,7 +184,7 @@
 ;;; main repository's `.git`; that common directory is returned (canonical), so
 ;;; a sandboxed agent can still commit. Err explains a malformed `.git` file.
 (defn workspace-git-dirs [(a (dyn Allocator)) (workspace Workspace)] (-> (Result (ArrayList (slice u8)) (slice u8)))
-  (let [(mut dirs) (al-new [(slice u8)] a)
+  (let [(mut dirs) (ArrayList::new [(slice u8)] a)
         root (workspace-root workspace)
         dotgit (join2 a root "/.git")]
     (if (or (not (sys/existing-file? a dotgit)) (sys/directory? a dotgit))
@@ -226,4 +226,4 @@
   (match (workspace-git-dirs a workspace)
     (Err [message] (Err message))
     (Ok [dirs] (let [(mut owned) dirs]
-                 (Ok (sandbox-options-with-paths allow-network (al-into-slice (mut owned))))))))
+                 (Ok (sandbox-options-with-paths allow-network (into-slice (mut owned))))))))

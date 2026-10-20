@@ -1,7 +1,6 @@
 (module coilbugs.main)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "coil.os" :as os)
@@ -18,15 +17,17 @@
 ;;; time, opens pull requests, and leaves notes the Mac writes into the pad.
 
 (defn arg [(argv (ptr (ptr i8))) (i i64)] (-> (slice u8))
-  (cstr->str (load (primitive/index argv i))))
+  (from-cstr (load (index argv i))))
 
-(defn args-of [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (al-new [(slice u8)] a)
+(defn args-of [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
         (mut i) 1]
     (loop (if (>= (load i) (cast i64 argc))
               (break)
-              (do (push! (mut out) (arg argv (load i)))
-                  (set! i (+ (load i) 1)))))
+              (do
+                (push! (mut out) (arg argv (load i)))
+                (set! i (+ (load i) 1)))))
     (load out)))
 
 ;;; The value after `--name`, or "".
@@ -34,7 +35,8 @@
   (let [(mut found) ""
         (mut i) 0]
     (loop (cond (>= (+ (load i) 1) (len args)) (break)
-                (= (get args (load i)) name) (do (set! found (get args (+ (load i) 1))) (break))
+                (= (get args (load i)) name)
+                  (do (set! found (get args (+ (load i) 1))) (break))
                 :else (set! i (+ (load i) 1))))
     (load found)))
 
@@ -47,11 +49,16 @@
   (if (< i (len args)) (get args i) ""))
 
 (defn cwd [(a (dyn Allocator))] (-> (slice u8))
-  (match (os/current-dir a)
-    (Ok [dir] (os/owned-string-slice dir))
-    (Err [_] (do (println "coil-bugs: cannot read the current directory") (abort) ""))))
+  (try (let [dir
+               (try-or! (os/current-dir a)
+                        (do
+                          (println "coil-bugs: cannot read the current directory")
+                          (abort)
+                          ""))]
+         (slice dir))))
 
-(const USAGE "usage:
+(const USAGE
+       "usage:
   coil-bugs mac --config FILE                      the Mac's heartbeat
   coil-bugs controller --config FILE [--resume]    the server's heartbeat; --resume clears a halt
   coil-bugs build-base --config FILE --commit SHA  build a base compiler (run by systemd-run)
@@ -63,7 +70,8 @@
 
 (defn needs [(args (ArrayList (slice u8))) (names (slice (slice u8)))] (-> bool)
   (let [(mut ok) true]
-    (for name (iter names) (when (= (len (flag args name)) 0) (set! ok false) 0))
+    (for name (iter names)
+      (when (= (len (flag args name)) 0) (set! ok false) 0))
     (load ok)))
 
 (defn or-default [(value (slice u8)) (fallback (slice u8))] (-> (slice u8))
@@ -80,18 +88,42 @@
         command (word args 0)
         sub (word args 1)]
     (remember-argv0! (arg argv 0))
-    (cond (and (= command "mac") (needs args ["--config"])) (mac-main a (flag args "--config"))
-          (and (= command "controller") (needs args ["--config"])) (controller-main a (flag args "--config") (has? args "--resume"))
-          (and (= command "build-base") (needs args ["--config" "--commit"])) (build-base-main a (flag args "--config") (flag args "--commit"))
+    (cond (and (= command "mac") (needs args ["--config"]))
+            (mac-main a (flag args "--config"))
+          (and (= command "controller") (needs args ["--config"]))
+            (controller-main a (flag args "--config") (has? args "--resume"))
+          (and (= command "build-base") (needs args ["--config" "--commit"]))
+            (build-base-main a (flag args "--config") (flag args "--commit"))
           (= command "install-mac")
-            (report (install-mac a (or-default (flag args "--gate-url") "https://computer.jimmyhmiller.com/coil-bugs")
-                                   (or-default (flag args "--token-file") "~/.config/gatekeeper/token")))
-          (and (= command "install-linux") (needs args ["--factory" "--recipes" "--model" "--review-model"]))
-            (report (install-linux a (flag args "--factory") (flag args "--recipes") (flag args "--model") (flag args "--review-model")
+            (report (install-mac a
+                                 (or-default (flag args "--gate-url")
+                                             "https://computer.jimmyhmiller.com/coil-bugs")
+                                 (or-default (flag args "--token-file")
+                                             "~/.config/gatekeeper/token")))
+          (and (= command "install-linux")
+               (needs args ["--factory" "--recipes" "--model" "--review-model"]))
+            (report (install-linux a
+                                   (flag args "--factory")
+                                   (flag args "--recipes")
+                                   (flag args "--model")
+                                   (flag args "--review-model")
                                    (has? args "--enable")))
-          (and (= command "gate") (= sub "triage") (needs args ["--scope"])) (gate-report (gate-triage a (cwd a) (flag args "--scope")))
-          (and (= command "gate") (= sub "repro") (needs args ["--bug" "--base" "--base-compiler"]))
-            (gate-report (gate-repro a (cwd a) (flag args "--bug") (flag args "--base") (flag args "--base-compiler")))
-          (and (= command "gate") (= sub "fix") (needs args ["--bug" "--base" "--base-compiler"]))
-            (gate-report (gate-fix a (cwd a) (flag args "--bug") (flag args "--base") (flag args "--base-compiler")))
+          (and (= command "gate") (= sub "triage") (needs args ["--scope"]))
+            (gate-report (gate-triage a (cwd a) (flag args "--scope")))
+          (and (= command "gate")
+               (= sub "repro")
+               (needs args ["--bug" "--base" "--base-compiler"]))
+            (gate-report (gate-repro a
+                                     (cwd a)
+                                     (flag args "--bug")
+                                     (flag args "--base")
+                                     (flag args "--base-compiler")))
+          (and (= command "gate")
+               (= sub "fix")
+               (needs args ["--bug" "--base" "--base-compiler"]))
+            (gate-report (gate-fix a
+                                   (cwd a)
+                                   (flag args "--bug")
+                                   (flag args "--base")
+                                   (flag args "--base-compiler")))
           :else (do (println "{s}" USAGE) 64))))

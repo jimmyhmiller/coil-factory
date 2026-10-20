@@ -1,5 +1,4 @@
 (module factory.ui.chatview)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.slice" :use *)
 (import "coil.serde.value" :use *)

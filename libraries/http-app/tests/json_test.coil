@@ -33,5 +33,5 @@
            (set! (index bytes 3) (cast u8 175))
            (set! (index bytes 4) (cast u8 226))
            (set! (index bytes 5) (cast u8 130))
-           (assert (= (json-quote a (slice-new [u8] (cast (ptr u8) bytes) 6))
+           (assert (= (json-quote a (slice::new [u8] (cast (ptr u8) bytes) 6))
                       "\"a\\ufffd\\ufffd\\ufffd\\ufffd\\ufffd\""))))

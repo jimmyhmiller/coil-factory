@@ -11,7 +11,6 @@
 ;; The prompter buffers input it has read past the current line, so use one
 ;; Prompter for every question asked of a stream.
 (module cli.prompt)
-(import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.arraylist" :use *)
 (import "coil.io" :as io)
@@ -69,11 +68,11 @@
     :out-fd out-fd
     :term term
     :interactive interactive
-    :pending (al-new [u8] a)
+    :pending (ArrayList::new [u8] a)
     :eof false))
 
 (defn prompter-free! [(p (mut Prompter))] (-> i64)
-  (al-free! (mut (.pending p))))
+  (free! (mut (.pending p))))
 
 (defn write-fd! [(fd i32) (bytes (slice u8))] (-> (Result i64 PromptError))
   (let [(mut done) 0
@@ -84,13 +83,13 @@
                       (cast i64
                             (io/write fd
                                       (cast (ptr i8)
-                                            (index (slice-data bytes)
+                                            (index (data bytes)
                                                    (load done)))
                                       (cast isize (- (len bytes) (load done)))))]
                 (cond (> n 0) (set! done (+ (load done) n))
-                      (and (< n 0) (= (os/os-errno) 4)) 0
+                      (and (< n 0) (= (os/errno) 4)) 0
                       :else
-                        (do (set! failure (if (< n 0) (os/os-errno) 5)) (break))))))
+                        (do (set! failure (if (< n 0) (os/errno) 5)) (break))))))
     (if (= (load failure) 0) (Ok (len bytes)) (Err (PromptIo (load failure))))))
 
 ;; Show `text` when interactive; non-interactive prompters stay silent.
@@ -99,32 +98,31 @@
 
 ;; Read more input into the pending buffer. Returns false at end of input.
 (defn fill! [(p (mut Prompter))] (-> (Result bool PromptError))
-  (let [chunk (primitive/alloc-stack (array u8 4096))
+  (let [(mut chunk) (zeroed (array u8 4096))
         (mut outcome) (Ok [bool PromptError] false)]
     (loop (let [n
                   (cast i64
                         (io/read (.in-fd p)
-                                 (cast (ptr i8) chunk)
+                                 (cast (ptr i8) (mut chunk))
                                  (cast isize 4096)))]
             (cond (> n 0)
                     (do
-                      (al-extend! (mut (.pending p)) (cast (ptr u8) chunk) n)
+                      (extend! (mut (.pending p)) (cast (ptr u8) (mut chunk)) n)
                       (set! outcome (Ok true))
                       (break))
                   (= n 0)
                     (do (set! (.eof p) true) (set! outcome (Ok false)) (break))
-                  (= (os/os-errno) 4) 0
-                  :else
-                    (do (set! outcome (Err (PromptIo (os/os-errno)))) (break)))))
+                  (= (os/errno) 4) 0
+                  :else (do (set! outcome (Err (PromptIo (os/errno)))) (break)))))
     (load outcome)))
 
 (defn take-pending! [(p (mut Prompter)) (count i64) (skip i64)] (-> (slice u8))
-  (let [all (al-slice (.pending p))
+  (let [all (slice (.pending p))
         line (subslice all 0 count)
-        (mut copy) (sb-new (.allocator p))
+        (mut copy) (StrBuf::new (.allocator p))
         rest (- (len all) (+ count skip))
         (mut k) 0]
-    (sb-push-str! (mut copy) line)
+    (push-str! (mut copy) line)
     (loop (if (>= (load k) rest)
               (break)
               (do
@@ -133,16 +131,16 @@
                       (get all (+ (+ count skip) (load k))))
                 (set! k (+ (load k) 1)))))
     (set! (.len (.pending p)) rest)
-    (sb-finish! (mut copy))))
+    (finish! (mut copy))))
 
 ;;; The next input line without its line ending (`\n` or `\r\n`), allocated
 ;;; from the prompter's allocator; `None` at end of input. A final line without
 ;;; a newline is still returned.
-(defn read-line! [(p (mut Prompter))] (-> (Result (Option (slice u8))
-                                                  PromptError))
+(defn read-line! [(p (mut Prompter))]
+  (-> (Result (Option (slice u8)) PromptError))
   (let [(mut outcome) (Ok [(Option (slice u8)) PromptError] (None))]
-    (loop (let [all (al-slice (.pending p))]
-            (match (str-find all "\n")
+    (loop (let [all (slice (.pending p))]
+            (match (find all "\n")
               (Some [at]
                     (let [end
                             (if (and (> at 0)
@@ -179,66 +177,67 @@
                   (Err (PromptEof))))))
     (Err [failure] (Err failure))))
 
-(defn question! [(out (mut StrBuf)) (p (mut Prompter)) (question (slice u8))] (-> i64)
+(defn question! [(out (mut StrBuf)) (p (mut Prompter)) (question (slice u8))]
+  (-> i64)
   (style/paint-into! (mut out) (.term p) (style/accent-style) "?")
-  (sb-push-byte! (mut out) 32)
+  (push! (mut out) 32)
   (style/paint-into! (mut out) (.term p) (style/strong-style) question))
 
 ;; Tell an interactive user why an answer was rejected.
-(defn complain! [(p (mut Prompter)) (message (slice u8))] (-> (Result i64
-                                                                      PromptError))
-  (let [(mut out) (sb-new (.allocator p))]
-    (sb-push-str! (mut out) "  ")
+(defn complain! [(p (mut Prompter)) (message (slice u8))]
+  (-> (Result i64 PromptError))
+  (let [(mut out) (StrBuf::new (.allocator p))]
+    (push-str! (mut out) "  ")
     (style/paint-into! (mut out)
                        (.term p)
                        (style/err-style)
                        (style/glyph-cross (.term p)))
-    (sb-push-byte! (mut out) 32)
-    (sb-push-str! (mut out) message)
-    (sb-push-byte! (mut out) 10)
-    (let [result (show! (mut p) (sb-str (load out)))]
-      (sb-free! (mut out))
+    (push! (mut out) 32)
+    (push-str! (mut out) message)
+    (push! (mut out) 10)
+    (let [result (show! (mut p) (str (load out)))]
+      (free! (mut out))
       result)))
 
 ;;; Ask for a line of text. The default, when non-empty, is shown and returned
 ;;; for an empty answer: `? Project name (demo): `.
-(defn ask [(p (mut Prompter)) (question (slice u8)) (default (slice u8))] (-> (Result (slice u8)
-                                                                                      PromptError))
-  (let [(mut out) (sb-new (.allocator p))]
+(defn ask [(p (mut Prompter)) (question (slice u8)) (default (slice u8))]
+  (-> (Result (slice u8) PromptError))
+  (let [(mut out) (StrBuf::new (.allocator p))]
     (question! (mut out) (mut p) question)
     (when (> (len default) 0)
-      (sb-push-str! (mut out) " (")
+      (push-str! (mut out) " (")
       (style/paint-into! (mut out) (.term p) (style/muted-style) default)
-      (sb-push-byte! (mut out) 41)
+      (push! (mut out) 41)
       0)
-    (sb-push-str! (mut out) ": ")
-    (let [shown (show! (mut p) (sb-str (load out)))]
-      (sb-free! (mut out))
+    (push-str! (mut out) ": ")
+    (let [shown (show! (mut p) (str (load out)))]
+      (free! (mut out))
       (match shown
         (Err [failure] (Err failure))
         (Ok [_]
             (match (answer! (mut p))
-              (Ok [text] (Ok (if (= (len (str-trim text)) 0) default text)))
+              (Ok [text] (Ok (if (= (len (trim text)) 0) default text)))
               (Err [failure] (Err failure))))))))
 
 ;;; Ask for several lines of text, ended by a line containing only `.` or by
 ;;; end of input. The lines are returned joined by newlines, without a final one.
-(defn ask-multiline [(p (mut Prompter)) (question (slice u8))] (-> (Result (slice u8)
-                                                                           PromptError))
-  (let [(mut out) (sb-new (.allocator p))]
+(defn ask-multiline [(p (mut Prompter)) (question (slice u8))]
+  (-> (Result (slice u8) PromptError))
+  (let [(mut out) (StrBuf::new (.allocator p))]
     (question! (mut out) (mut p) question)
     (sb-byte-newline! (mut out))
-    (sb-push-str! (mut out) "  ")
+    (push-str! (mut out) "  ")
     (style/paint-into! (mut out)
                        (.term p)
                        (style/muted-style)
                        "(end with a line containing only '.', or Ctrl-D)")
     (sb-byte-newline! (mut out))
-    (let [shown (show! (mut p) (sb-str (load out)))
-          (mut text) (sb-new (.allocator p))
+    (let [shown (show! (mut p) (str (load out)))
+          (mut text) (StrBuf::new (.allocator p))
           (mut lines) 0
           (mut outcome) (Ok [(slice u8) PromptError] "")]
-      (sb-free! (mut out))
+      (free! (mut out))
       (match shown
         (Err [failure] (set! outcome (Err failure)))
         (Ok [_]
@@ -252,16 +251,16 @@
                                     (break)
                                     (do
                                       (when (> (load lines) 0)
-                                        (sb-push-byte! (mut text) 10)
+                                        (push! (mut text) 10)
                                         0)
-                                      (sb-push-str! (mut text) content)
+                                      (push-str! (mut text) content)
                                       (set! lines (+ (load lines) 1)))))))))))
       (match (load outcome)
-        (Err [failure] (do (sb-free! (mut text)) (Err failure)))
-        (Ok [_] (Ok (sb-finish! (mut text))))))))
+        (Err [failure] (do (free! (mut text)) (Err failure)))
+        (Ok [_] (Ok (finish! (mut text))))))))
 
 (defn sb-byte-newline! [(out (mut StrBuf))] (-> i64)
-  (sb-push-byte! (mut out) 10))
+  (push! (mut out) 10))
 
 (defn ascii-lower-eq? [(left (slice u8)) (right (slice u8))] (-> bool)
   (if (!= (len left) (len right))
@@ -282,8 +281,8 @@
 ;; The option index an answer selects: a 1-based number or an option's text
 ;; (ignoring ASCII case); -1 when it selects nothing.
 (defn choice-index [(options (slice (slice u8))) (answer (slice u8))] (-> i64)
-  (let [trimmed (str-trim answer)]
-    (match (str-parse-int trimmed)
+  (let [trimmed (trim answer)]
+    (match (parse-int trimmed)
       (Some [number]
             (if (and (>= number 1) (<= number (len options))) (- number 1) -1))
       (None []
@@ -297,11 +296,11 @@
               (load found))))))
 
 (defn range-message [(a (dyn Allocator)) (count i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) "enter a number from 1 to ")
-    (sb-push-i64! (mut out) count)
-    (sb-push-str! (mut out) " or an option's name")
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "enter a number from 1 to ")
+    (push-i64! (mut out) count)
+    (push-str! (mut out) " or an option's name")
+    (finish! (mut out))))
 
 ;;; Ask the user to pick one of `options`, shown numbered from 1. The answer is
 ;;; a number or an option's text; an empty answer picks `default` (an index into
@@ -316,40 +315,40 @@
   (when (>= default (len options))
     (cli-fail! "choose: the default index is out of range")
     0)
-  (let [(mut out) (sb-new (.allocator p))
+  (let [(mut out) (StrBuf::new (.allocator p))
         (mut k) 0]
     (question! (mut out) (mut p) question)
     (sb-byte-newline! (mut out))
     (loop (if (>= (load k) (len options))
               (break)
               (do
-                (sb-push-str! (mut out) "  ")
+                (push-str! (mut out) "  ")
                 (style/paint-into! (mut out)
                                    (.term p)
                                    (style/muted-style)
                                    (number-label (.allocator p) (+ (load k) 1)))
-                (sb-push-byte! (mut out) 32)
-                (sb-push-str! (mut out) (get options (load k)))
+                (push! (mut out) 32)
+                (push-str! (mut out) (get options (load k)))
                 (sb-byte-newline! (mut out))
                 (set! k (+ (load k) 1)))))
-    (let [listing (sb-finish! (mut out))
-          (mut prompt) (sb-new (.allocator p))
+    (let [listing (finish! (mut out))
+          (mut prompt) (StrBuf::new (.allocator p))
           (mut outcome) (Ok [i64 PromptError] -1)]
-      (sb-push-str! (mut prompt) "  Choose 1-")
-      (sb-push-i64! (mut prompt) (len options))
+      (push-str! (mut prompt) "  Choose 1-")
+      (push-i64! (mut prompt) (len options))
       (when (>= default 0)
-        (sb-push-str! (mut prompt) " (")
+        (push-str! (mut prompt) " (")
         (style/paint-into! (mut prompt)
                            (.term p)
                            (style/muted-style)
                            (get options default))
         (sb-byte-close! (mut prompt))
         0)
-      (sb-push-str! (mut prompt) ": ")
+      (push-str! (mut prompt) ": ")
       (match (show! (mut p) listing)
         (Err [failure] (set! outcome (Err failure)))
         (Ok [_]
-            (loop (match (show! (mut p) (sb-str (load prompt)))
+            (loop (match (show! (mut p) (str (load prompt)))
                     (Err [failure] (do (set! outcome (Err failure)) (break)))
                     (Ok [_]
                         (match (answer! (mut p))
@@ -357,7 +356,7 @@
                                (do (set! outcome (Err failure)) (break)))
                           (Ok [text]
                               (let [picked
-                                      (if (and (= (len (str-trim text)) 0)
+                                      (if (and (= (len (trim text)) 0)
                                                (>= default 0))
                                           default
                                           (choice-index options text))]
@@ -378,33 +377,33 @@
                                                 (Err (InvalidAnswer (range-message (.allocator p)
                                                                                    (len options)))))
                                           (break)))))))))))
-      (sb-free! (mut prompt))
+      (free! (mut prompt))
       (load outcome))))
 
 (defn sb-byte-close! [(out (mut StrBuf))] (-> i64)
-  (sb-push-byte! (mut out) 41))
+  (push! (mut out) 41))
 
 (defn number-label [(a (dyn Allocator)) (n i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-i64! (mut out) n)
-    (sb-push-byte! (mut out) 41)
-    (sb-finish! (mut out))))
+  (let [(mut out) (StrBuf::new a)]
+    (push-i64! (mut out) n)
+    (push! (mut out) 41)
+    (finish! (mut out))))
 
 ;;; Ask a yes/no question: `? Deploy now? [Y/n]: `. Accepts y/yes/n/no in any
 ;;; case; an empty answer is `default`.
-(defn confirm [(p (mut Prompter)) (question (slice u8)) (default bool)] (-> (Result bool
-                                                                                    PromptError))
-  (let [(mut prompt) (sb-new (.allocator p))
+(defn confirm [(p (mut Prompter)) (question (slice u8)) (default bool)]
+  (-> (Result bool PromptError))
+  (let [(mut prompt) (StrBuf::new (.allocator p))
         (mut outcome) (Ok [bool PromptError] default)]
     (question! (mut prompt) (mut p) question)
-    (sb-push-str! (mut prompt) (if default " [Y/n]: " " [y/N]: "))
-    (loop (match (show! (mut p) (sb-str (load prompt)))
+    (push-str! (mut prompt) (if default " [Y/n]: " " [y/N]: "))
+    (loop (match (show! (mut p) (str (load prompt)))
             (Err [failure] (do (set! outcome (Err failure)) (break)))
             (Ok [_]
                 (match (answer! (mut p))
                   (Err [failure] (do (set! outcome (Err failure)) (break)))
                   (Ok [text]
-                      (let [answer (str-trim text)]
+                      (let [answer (trim text)]
                         (cond (= (len answer) 0)
                                 (do (set! outcome (Ok default)) (break))
                               (or (ascii-lower-eq? answer "y")
@@ -423,26 +422,28 @@
                                   (set! outcome
                                         (Err (InvalidAnswer "answer y or n")))
                                   (break)))))))))
-    (sb-free! (mut prompt))
+    (free! (mut prompt))
     (load outcome)))
 
 ;;; Everything readable from `fd` until end of input, allocated from `a`.
-(defn read-fd-all [(a (dyn Allocator)) (fd i32)] (-> (Result (slice u8)
-                                                             PromptError))
-  (let [(mut bytes) (al-new [u8] a)
-        chunk (primitive/alloc-stack (array u8 8192))
+(defn read-fd-all [(a (dyn Allocator)) (fd i32)]
+  (-> (Result (slice u8) PromptError))
+  (let [(mut bytes) (ArrayList::new [u8] a)
+        (mut chunk) (zeroed (array u8 8192))
         (mut failure) 0]
     (loop (let [n
                   (cast i64
-                        (io/read fd (cast (ptr i8) chunk) (cast isize 8192)))]
-            (cond (> n 0) (al-extend! (mut bytes) (cast (ptr u8) chunk) n)
+                        (io/read fd
+                                 (cast (ptr i8) (mut chunk))
+                                 (cast isize 8192)))]
+            (cond (> n 0) (extend! (mut bytes) (cast (ptr u8) (mut chunk)) n)
                   (= n 0) (break)
-                  (= (os/os-errno) 4) 0
-                  :else (do (set! failure (os/os-errno)) (break)))))
+                  (= (os/errno) 4) 0
+                  :else (do (set! failure (os/errno)) (break)))))
     (if (= (load failure) 0)
-        (Ok (al-into-slice (mut bytes)))
+        (Ok (into-slice (mut bytes)))
         (do
-          (al-free! (mut bytes))
+          (free! (mut bytes))
           (Err (PromptIo (load failure)))))))
 
 ;;; All of standard input, for `--brief-file -` style arguments.

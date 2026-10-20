@@ -11,6 +11,7 @@
 (import "agent_tools.shell" :use *)
 (import "agent_tools.sys" :as sys)
 (import "agent_tools.text" :use *)
+
 (export StreamSpec StreamEnd LineSink stream-lines)
 
 ;;; A program whose standard output is read line by line while it runs, such
@@ -22,15 +23,25 @@
 ;;; do) are found while it still runs and stopped with it.
 
 (const POLL_INTERVAL_MS 100)
+
 (const TERM_GRACE_MS 2000)
+
 (const READ_CHUNK_BYTES 65536)
+
 (const SIGTERM 15)
+
 (const SIGKILL 9)
+
 (const EAGAIN_DARWIN 35)
+
 (const EAGAIN_LINUX 11)
+
 (const STDOUT_TOKEN 1)
+
 (const STDERR_TOKEN 2)
+
 (const STDIN_TOKEN 3)
+
 ;;; A write of at most PIPE_BUF bytes to a pipe that polled writable never blocks.
 (const STDIN_CHUNK_BYTES 512)
 
@@ -79,7 +90,10 @@
 
 ;;; Feed a chunk; deliver each completed line unless `deliver` is false.
 ;;; Returns false when the sink asked to stop.
-(defn lines-feed! [(lines (mut Lines)) (bytes (slice u8)) (sink (dyn LineSink)) (deliver bool)] (-> bool)
+(defn lines-feed! [(lines (mut Lines))
+                   (bytes (slice u8))
+                   (sink (dyn LineSink))
+                   (deliver bool)] (-> bool)
   (let [(mut i) 0
         (mut go) true
         n (len bytes)]
@@ -87,32 +101,39 @@
               (break)
               (let [byte (get bytes (load i))]
                 (if (= byte (primitive/cast u8 #\newline))
-                    (do (when (load go)
-                          (set! go (lines-emit! (mut lines) sink deliver))
-                          0)
+                    (do
+                      (when (load go)
+                        (set! go (lines-emit! (mut lines) sink deliver))
                         0)
+                      0)
                     (cond (.overlong lines) 0
                           (>= (len (.pending lines)) (.max lines))
-                            (do (set! (.overlong lines) true)
-                                (al-clear! (mut (.pending lines)))
-                                0)
+                            (do
+                              (set! (.overlong lines) true)
+                              (clear! (mut (.pending lines)))
+                              0)
                           :else (do (push! (mut (.pending lines)) byte) 0)))
                 (set! i (+ (load i) 1)))))
     (load go)))
 
 ;;; End the current line: deliver it (without a trailing carriage return),
 ;;; or count it when it was too long.
-(defn lines-emit! [(lines (mut Lines)) (sink (dyn LineSink)) (deliver bool)] (-> bool)
-  (let [result (if (.overlong lines)
-                   (do (set! (.dropped lines) (+ (.dropped lines) 1)) true)
-                   (let [text (al-slice (.pending lines))
-                         n (len text)
-                         trimmed (if (and (> n 0) (= (get text (- n 1)) (primitive/cast u8 #\return)))
-                                     (subslice text 0 (- n 1))
-                                     text)]
-                     (if deliver (on-line sink trimmed) true)))]
+(defn lines-emit! [(lines (mut Lines)) (sink (dyn LineSink)) (deliver bool)]
+  (-> bool)
+  (let [result
+          (if (.overlong lines)
+              (do (set! (.dropped lines) (+ (.dropped lines) 1)) true)
+              (let [text (slice (.pending lines))
+                    n (len text)
+                    trimmed
+                      (if (and (> n 0)
+                               (= (get text (- n 1))
+                                  (primitive/cast u8 #\return)))
+                          (subslice text 0 (- n 1))
+                          text)]
+                (if deliver (on-line sink trimmed) true)))]
     (set! (.overlong lines) false)
-    (al-clear! (mut (.pending lines)))
+    (clear! (mut (.pending lines)))
     result))
 
 ;;; The parent's ends of the pipes: input still to write, and the two outputs.
@@ -139,7 +160,10 @@
 (defn feed-input! [(pipes (mut Pipes))] (-> i64)
   (let [rest (subslice (.input pipes) (.written pipes) (len (.input pipes)))
         n (if (< (len rest) STDIN_CHUNK_BYTES) (len rest) STDIN_CHUNK_BYTES)
-        wrote (sys/write-without-sigpipe (.in-fd pipes) (primitive/cast (ptr i8) (slice-data rest)) n)]
+        wrote
+          (sys/write-without-sigpipe (.in-fd pipes)
+                                     (primitive/cast (ptr i8) (data rest))
+                                     n)]
     (cond (> wrote 0) (set! (.written pipes) (+ (.written pipes) wrote))
           (and (< wrote 0) (transient-errno? (- 0 wrote))) 0
           :else (close-input! (mut pipes)))
@@ -149,7 +173,10 @@
     0))
 
 (defn read-into [(fd i32) (buffer (slice u8))] (-> i64)
-  (primitive/cast i64 (io/read fd (primitive/cast (ptr i8) (slice-data buffer)) (primitive/cast isize (len buffer)))))
+  (primitive/cast i64
+                  (io/read fd
+                           (primitive/cast (ptr i8) (data buffer))
+                           (primitive/cast isize (len buffer)))))
 
 (defn transient-errno? [(code i64)] (-> bool)
   (or (= code sys/EINTR) (= code EAGAIN_DARWIN) (= code EAGAIN_LINUX)))
@@ -166,56 +193,88 @@
              (wait-ms i64)] (-> bool)
   (if (not (or (.out-open pipes) (.err-open pipes) (.in-open pipes)))
       (do (sys/sleep-ms wait-ms) true)
-      (let [(mut watches) [(selectors/watch (.out-fd pipes) (selectors/interest-readable) STDOUT_TOKEN)
-                           (selectors/watch (.err-fd pipes) (selectors/interest-readable) STDERR_TOKEN)
-                           (selectors/watch (.in-fd pipes) (selectors/interest-writable) STDIN_TOKEN)]
+      (let [(mut watches)
+              [(selectors/watch (.out-fd pipes)
+                                (selectors/interest-readable)
+                                STDOUT_TOKEN)
+               (selectors/watch (.err-fd pipes)
+                                (selectors/interest-readable)
+                                STDERR_TOKEN)
+               (selectors/watch (.in-fd pipes)
+                                (selectors/interest-writable)
+                                STDIN_TOKEN)]
             (mut count) 0]
         (when (.in-open pipes)
-          (set! (mut watches) (load count) (selectors/watch (.in-fd pipes) (selectors/interest-writable) STDIN_TOKEN))
+          (set! (mut watches)
+                (load count)
+                (selectors/watch (.in-fd pipes)
+                                 (selectors/interest-writable)
+                                 STDIN_TOKEN))
           (set! count (+ (load count) 1))
           0)
         (when (.out-open pipes)
-          (set! (mut watches) (load count) (selectors/watch (.out-fd pipes) (selectors/interest-readable) STDOUT_TOKEN))
+          (set! (mut watches)
+                (load count)
+                (selectors/watch (.out-fd pipes)
+                                 (selectors/interest-readable)
+                                 STDOUT_TOKEN))
           (set! count (+ (load count) 1))
           0)
         (when (.err-open pipes)
-          (set! (mut watches) (load count) (selectors/watch (.err-fd pipes) (selectors/interest-readable) STDERR_TOKEN))
+          (set! (mut watches)
+                (load count)
+                (selectors/watch (.err-fd pipes)
+                                 (selectors/interest-readable)
+                                 STDERR_TOKEN))
           (set! count (+ (load count) 1))
           0)
-        (match (selectors/wait-many-for a (subslice watches 0 (load count)) (sys/millis (if (< wait-ms 0) 0 wait-ms)))
+        (match (selectors/wait-many-for a
+                                        (subslice watches 0 (load count))
+                                        (sys/millis (if (< wait-ms 0) 0 wait-ms)))
           (Err [error]
                (match error
                  (selectors/Timeout [] true)
-                 (selectors/Syscall [code] (if (= code sys/EINTR)
-                                               true
-                                               (do (set! (.out-open pipes) false)
-                                                   (set! (.err-open pipes) false)
-                                                   (close-input! (mut pipes))
-                                                   true)))
-                 (selectors/InvalidFd [] (do (set! (.out-open pipes) false)
-                                             (set! (.err-open pipes) false)
-                                             (close-input! (mut pipes))
-                                             true))))
+                 (selectors/Syscall [code]
+                                    (if (= code sys/EINTR)
+                                        true
+                                        (do
+                                          (set! (.out-open pipes) false)
+                                          (set! (.err-open pipes) false)
+                                          (close-input! (mut pipes))
+                                          true)))
+                 (selectors/InvalidFd []
+                                      (do
+                                        (set! (.out-open pipes) false)
+                                        (set! (.err-open pipes) false)
+                                        (close-input! (mut pipes))
+                                        true))))
           (Ok [selected]
-            (if (= (.token selected) STDIN_TOKEN)
-              (do (feed-input! (mut pipes)) true)
-              (let [stdout? (= (.token selected) STDOUT_TOKEN)
-                    fd (if stdout? (.out-fd pipes) (.err-fd pipes))
-                    n (read-into fd (.buffer pipes))]
-                (cond (> n 0)
-                        (if stdout?
-                            (lines-feed! (mut lines) (subslice (.buffer pipes) 0 n) sink deliver)
-                            (do (capture-push! (mut errors) (subslice (.buffer pipes) 0 n)) true))
-                      (and (< n 0) (transient-errno? (os/os-errno))) true
-                      :else
-                        ;; End of file (or a failed descriptor): a last line
-                        ;; without a newline is still a line.
-                        (if stdout?
-                            (do (set! (.out-open pipes) false)
-                                (if (> (len (.pending lines)) 0)
-                                    (lines-emit! (mut lines) sink deliver)
-                                    true))
-                            (do (set! (.err-open pipes) false) true))))))))))
+              (if (= (.token selected) STDIN_TOKEN)
+                  (do (feed-input! (mut pipes)) true)
+                  (let [stdout? (= (.token selected) STDOUT_TOKEN)
+                        fd (if stdout? (.out-fd pipes) (.err-fd pipes))
+                        n (read-into fd (.buffer pipes))]
+                    (cond (> n 0)
+                            (if stdout?
+                                (lines-feed! (mut lines)
+                                             (subslice (.buffer pipes) 0 n)
+                                             sink
+                                             deliver)
+                                (do
+                                  (capture-push! (mut errors)
+                                                 (subslice (.buffer pipes) 0 n))
+                                  true))
+                          (and (< n 0) (transient-errno? (os/errno))) true
+                          :else
+                            ;; End of file (or a failed descriptor): a last line
+                            ;; without a newline is still a line.
+                            (if stdout?
+                                (do
+                                  (set! (.out-open pipes) false)
+                                  (if (> (len (.pending lines)) 0)
+                                      (lines-emit! (mut lines) sink deliver)
+                                      true))
+                                (do (set! (.err-open pipes) false) true))))))))))
 
 ;;; Keep reading until both pipes close or `until-ms` (monotonic) passes.
 (defn drain-until! [(a (dyn Allocator))
@@ -231,8 +290,15 @@
               (let [now (sys/monotonic-ms)]
                 (if (>= now until-ms)
                     (break)
-                    (when (not (pump! a (mut pipes) (mut lines) (mut errors) sink (load go)
-                                      (if (< (- until-ms now) POLL_INTERVAL_MS) (- until-ms now) POLL_INTERVAL_MS)))
+                    (when (not (pump! a
+                                      (mut pipes)
+                                      (mut lines)
+                                      (mut errors)
+                                      sink
+                                      (load go)
+                                      (if (< (- until-ms now) POLL_INTERVAL_MS)
+                                          (- until-ms now)
+                                          POLL_INTERVAL_MS)))
                       (set! go false)
                       0)))))
     0))
@@ -249,8 +315,15 @@
   (let [(mut exited) (exited-unreaped? pid info)]
     (loop (if (or (load exited) (>= (sys/monotonic-ms) until-ms))
               (break)
-              (do (pump! a (mut pipes) (mut lines) (mut errors) sink false POLL_INTERVAL_MS)
-                  (set! exited (exited-unreaped? pid info)))))
+              (do
+                (pump! a
+                       (mut pipes)
+                       (mut lines)
+                       (mut errors)
+                       sink
+                       false
+                       POLL_INTERVAL_MS)
+                (set! exited (exited-unreaped? pid info)))))
     (load exited)))
 
 ;;; A process to stop: `group` when it leads a process group of its own.
@@ -263,9 +336,14 @@
         n (len line)]
     (loop (if (> (load i) n)
               (break)
-              (let [c (if (< (load i) n) (primitive/cast i64 (get line (load i))) 32)]
+              (let [c
+                      (if (< (load i) n)
+                          (primitive/cast i64 (get line (load i)))
+                          32)]
                 (if (and (>= c 48) (<= c 57))
-                    (set! value (+ (* (if (< (load value) 0) 0 (load value)) 10) (- c 48)))
+                    (set! value
+                          (+ (* (if (< (load value) 0) 0 (load value)) 10)
+                             (- c 48)))
                     (when (>= (load value) 0)
                       (when (< (load field) 3)
                         (set! (index out (load field)) (load value))
@@ -281,65 +359,96 @@
 ;;; `root` still runs (once it exits, its children are reparented and can no
 ;;; longer be traced to it). Empty when `ps` cannot be run.
 (defn strays-of [(a (dyn Allocator)) (root i32)] (-> (ArrayList Stray))
-  (let [(mut out) (al-new [Stray] a)
-        slot (primitive/alloc-stack subprocess/RunResult)
-        options (subprocess/run-options "/bin/ps" ["-A" "-o" "pid=" "-o" "ppid=" "-o" "pgid="] ""
-                                        4194304 65536 (None)
-                                        (primitive/cast (ptr coil.cancellation.Cancellation) 0)
-                                        (sys/millis 1000))]
-    (match (subprocess/run a slot options)
-      (Err [_] 0)
-      (Ok [ran]
-          (let [(mut pids) (al-new [i64] a)
-                (mut parents) (al-new [i64] a)
-                (mut groups) (al-new [i64] a)
-                (mut marked) (al-new [bool] a)
-                (mut fields) (primitive/zeroed (array i64 3))
-                root-pid (primitive/cast i64 root)]
-            (for line (iter (str-split a (.stdout ran) "\n"))
-              (when (= (parse-fields line (mut fields)) 3)
-                (push! (mut pids) (get fields 0))
-                (push! (mut parents) (get fields 1))
-                (push! (mut groups) (get fields 2))
-                (push! (mut marked) false)
-                0))
-            ;; Mark descendants until nothing changes (the table is small).
-            (let [(mut changed) true]
-              (loop (if (not (load changed))
-                        (break)
-                        (do (set! changed false)
-                            (let [(mut i) 0]
-                              (loop (if (>= (load i) (len pids))
-                                        (break)
-                                        (do (when (and (not (get marked (load i)))
-                                                       (let [parent (get parents (load i))
-                                                             (mut j) 0
-                                                             (mut hit) (= parent root-pid)]
-                                                         (loop (if (or (load hit) (>= (load j) (len pids)))
-                                                                   (break)
-                                                                   (do (when (and (get marked (load j)) (= (get pids (load j)) parent))
-                                                                         (set! hit true)
-                                                                         0)
-                                                                       (set! j (+ (load j) 1)))))
-                                                         (load hit)))
-                                              (set! (mut marked) (load i) true)
-                                              (set! changed true)
-                                              0)
-                                            (set! i (+ (load i) 1))))))))))
-            (let [(mut i) 0]
-              (loop (if (>= (load i) (len pids))
-                        (break)
-                        (do (when (and (get marked (load i)) (!= (get groups (load i)) root-pid))
-                              (push! (mut out) (Stray :pid (get pids (load i))
-                                                      :group (= (get groups (load i)) (get pids (load i)))))
-                              0)
-                            (set! i (+ (load i) 1))))))
-            (al-free! (mut pids))
-            (al-free! (mut parents))
-            (al-free! (mut groups))
-            (al-free! (mut marked))
-            (subprocess/run-result-free a ran)
-            0)))
+  (let [(mut out) (ArrayList::new [Stray] a)
+        (mut slot) (zeroed subprocess/RunResult)
+        options
+          (subprocess/RunOptions::new "/bin/ps"
+                                      ["-A"
+                                       "-o"
+                                       "pid="
+                                       "-o"
+                                       "ppid="
+                                       "-o"
+                                       "pgid="]
+                                      ""
+                                      4194304
+                                      65536
+                                      (None)
+                                      (primitive/cast (ptr coil.cancellation.Cancellation)
+                                                      0)
+                                      (sys/millis 1000))]
+    (try (let [ran (try-or! (subprocess/run a (mut slot) options) 0)]
+           (let [(mut pids) (ArrayList::new [i64] a)
+                 (mut parents) (ArrayList::new [i64] a)
+                 (mut groups) (ArrayList::new [i64] a)
+                 (mut marked) (ArrayList::new [bool] a)
+                 (mut fields) (zeroed (array i64 3))
+                 root-pid (primitive/cast i64 root)]
+             (for line (iter (split a (.stdout ran) "\n"))
+               (when (= (parse-fields line (mut fields)) 3)
+                 (push! (mut pids) (get fields 0))
+                 (push! (mut parents) (get fields 1))
+                 (push! (mut groups) (get fields 2))
+                 (push! (mut marked) false)
+                 0))
+             ;; Mark descendants until nothing changes (the table is small).
+             (let [(mut changed) true]
+               (loop (if (not (load changed))
+                         (break)
+                         (do
+                           (set! changed false)
+                           (let [(mut i) 0]
+                             (loop (if (>= (load i) (len pids))
+                                       (break)
+                                       (do
+                                         (when (and (not (get marked (load i)))
+                                                    (let [parent
+                                                            (get parents
+                                                                 (load i))
+                                                          (mut j) 0
+                                                          (mut hit)
+                                                            (= parent root-pid)]
+                                                      (loop (if (or (load hit)
+                                                                    (>= (load j)
+                                                                        (len pids)))
+                                                                (break)
+                                                                (do
+                                                                  (when (and (get marked
+                                                                                  (load j))
+                                                                             (= (get pids
+                                                                                     (load j))
+                                                                                parent))
+                                                                    (set! hit
+                                                                          true)
+                                                                    0)
+                                                                  (set! j
+                                                                        (+ (load j)
+                                                                           1)))))
+                                                      (load hit)))
+                                           (set! (mut marked) (load i) true)
+                                           (set! changed true)
+                                           0)
+                                         (set! i (+ (load i) 1))))))))))
+             (let [(mut i) 0]
+               (loop (if (>= (load i) (len pids))
+                         (break)
+                         (do
+                           (when (and (get marked (load i))
+                                      (!= (get groups (load i)) root-pid))
+                             (push! (mut out)
+                                    (Stray
+                                      :pid (get pids (load i))
+                                      :group
+                                        (= (get groups (load i))
+                                           (get pids (load i)))))
+                             0)
+                           (set! i (+ (load i) 1))))))
+             (free! (mut pids))
+             (free! (mut parents))
+             (free! (mut groups))
+             (free! (mut marked))
+             (subprocess/RunResult::free a ran)
+             0)))
     (load out)))
 
 ;;; Signal each stray: its whole group when it leads one, else itself.
@@ -347,8 +456,10 @@
   (for stray (iter strays)
     (when (> (.pid stray) 1)
       (if (.group stray)
-          (os/kill (- (primitive/cast i32 0) (primitive/cast i32 (.pid stray))) (primitive/cast i32 signal))
-          (os/kill (primitive/cast i32 (.pid stray)) (primitive/cast i32 signal)))
+          (os/kill (- (primitive/cast i32 0) (primitive/cast i32 (.pid stray)))
+                   (primitive/cast i32 signal))
+          (os/kill (primitive/cast i32 (.pid stray))
+                   (primitive/cast i32 signal)))
       0))
   0)
 
@@ -357,97 +468,169 @@
 ;;; exits has the rest of its output (up to a grace period) delivered; one that
 ;;; is stopped or times out receives SIGTERM, then SIGKILL, and nothing more is
 ;;; delivered. Err when the program could not be started or reaped.
-(defn stream-lines [(a (dyn Allocator)) (spec StreamSpec) (sink (dyn LineSink))] (-> (Result StreamEnd (slice u8)))
+(defn stream-lines [(a (dyn Allocator)) (spec StreamSpec) (sink (dyn LineSink))]
+  (-> (Result StreamEnd (slice u8)))
   (let [cwd (sys/c-string a (.cwd spec))
         child (primitive/alloc-stack subprocess/Child)
-        spawned (subprocess/spawn-with-options a
-                                               child
-                                               (.program spec)
-                                               (.args spec)
-                                               (if (> (len (.input spec)) 0) (subprocess/pipe-stdio) (subprocess/null-stdio))
-                                               (subprocess/pipe-stdio)
-                                               (subprocess/pipe-stdio)
-                                               (subprocess/SpawnOptions :cwd cwd :new-process-group true))]
+        spawned
+          (subprocess/Child::spawn-with-options a
+                                                child
+                                                (.program spec)
+                                                (.args spec)
+                                                (if (> (len (.input spec)) 0)
+                                                    (subprocess/pipe-stdio)
+                                                    (subprocess/null-stdio))
+                                                (subprocess/pipe-stdio)
+                                                (subprocess/pipe-stdio)
+                                                (subprocess/SpawnOptions
+                                                  :cwd cwd
+                                                  :new-process-group true))]
     (sys/c-string-free a (.cwd spec) cwd)
     (match spawned
       (Err [error]
            (Err (join3 a
-                       (join3 a "could not start " (quoted a (.program spec)) " in ")
+                       (join3 a
+                              "could not start "
+                              (quoted a (.program spec))
+                              " in ")
                        (quoted a (.cwd spec))
                        (join2 a ": " (subprocess-error-text a error)))))
       (Ok [_]
           (match (alloc [u8] a READ_CHUNK_BYTES)
             (None []
-                  (do (subprocess/child-kill-and-wait child)
-                      (subprocess/child-close child)
-                      (Err "out of memory allocating the output buffer")))
+                  (do
+                    (kill-and-wait child)
+                    (close child)
+                    (Err "out of memory allocating the output buffer")))
             (Some [buffer]
                   (let [pid (.pid child)
-                        info (primitive/alloc-stack (array u8 128))
-                        info-ptr (primitive/cast (ptr u8) info)
-                        (mut pipes) (Pipes :in-fd (.stdin-fd child) :in-open (> (len (.input spec)) 0)
-                                           :input (.input spec) :written 0
-                                           :out-fd (.stdout-fd child) :out-open true
-                                           :err-fd (.stderr-fd child) :err-open true
-                                           :buffer buffer)
-                        (mut lines) (Lines :pending (al-new [u8] a) :max (.max-line-bytes spec)
-                                           :overlong false :dropped 0)
-                        (mut errors) (capture-new a (.stderr-bytes spec) (.stderr-bytes spec))
-                        deadline (if (> (.timeout-ms spec) 0) (+ (sys/monotonic-ms) (.timeout-ms spec)) 0)
+                        (mut info) (zeroed (array u8 128))
+                        info-ptr (primitive/cast (ptr u8) (mut info))
+                        (mut pipes)
+                          (Pipes
+                            :in-fd (.stdin-fd child)
+                            :in-open (> (len (.input spec)) 0)
+                            :input (.input spec)
+                            :written 0
+                            :out-fd (.stdout-fd child)
+                            :out-open true
+                            :err-fd (.stderr-fd child)
+                            :err-open true
+                            :buffer buffer)
+                        (mut lines)
+                          (Lines
+                            :pending (ArrayList::new [u8] a)
+                            :max (.max-line-bytes spec)
+                            :overlong false
+                            :dropped 0)
+                        (mut errors)
+                          (capture-new a
+                                       (.stderr-bytes spec)
+                                       (.stderr-bytes spec))
+                        deadline
+                          (if (> (.timeout-ms spec) 0)
+                              (+ (sys/monotonic-ms) (.timeout-ms spec))
+                              0)
                         (mut exited) false
                         (mut stopped) false
                         (mut timed-out) false]
                     ;; Run: deliver output, and watch for exit, a stop, the deadline.
                     (loop (if (or (load exited) (load stopped) (load timed-out))
                               (break)
-                              (do (when (not (pump! a (mut pipes) (mut lines) (mut errors) sink true POLL_INTERVAL_MS))
-                                    (set! stopped true)
-                                    0)
-                                  (set! exited (exited-unreaped? pid info-ptr))
-                                  (when (not (or (load exited) (load stopped)))
-                                    (cond (not (on-tick sink)) (set! stopped true)
-                                          (and (> deadline 0) (>= (sys/monotonic-ms) deadline)) (set! timed-out true)
-                                          :else 0)
-                                    0))))
+                              (do
+                                (when (not (pump! a
+                                                  (mut pipes)
+                                                  (mut lines)
+                                                  (mut errors)
+                                                  sink
+                                                  true
+                                                  POLL_INTERVAL_MS))
+                                  (set! stopped true)
+                                  0)
+                                (set! exited (exited-unreaped? pid info-ptr))
+                                (when (not (or (load exited) (load stopped)))
+                                  (cond (not (on-tick sink)) (set! stopped true)
+                                        (and (> deadline 0)
+                                             (>= (sys/monotonic-ms) deadline))
+                                          (set! timed-out true)
+                                        :else 0)
+                                  0))))
                     (if (load exited)
                         ;; It finished on its own: what it wrote last still counts.
                         (when (not (load stopped))
-                          (drain-until! a (mut pipes) (mut lines) (mut errors) sink true (+ (sys/monotonic-ms) TERM_GRACE_MS))
+                          (drain-until! a
+                                        (mut pipes)
+                                        (mut lines)
+                                        (mut errors)
+                                        sink
+                                        true
+                                        (+ (sys/monotonic-ms) TERM_GRACE_MS))
                           0)
                         (let [(mut strays) (strays-of a pid)]
-                            (close-input! (mut pipes))
-                            (signal-strays (al-slice strays) SIGTERM)
-                            (signal-group pid SIGTERM)
-                            (set! exited (await-exit! a pid info-ptr (mut pipes) (mut lines) (mut errors) sink
-                                                      (+ (sys/monotonic-ms) TERM_GRACE_MS)))
-                            (when (not (load exited))
-                              (signal-group pid SIGKILL)
-                              (await-exit! a pid info-ptr (mut pipes) (mut lines) (mut errors) sink
-                                           (+ (sys/monotonic-ms) TERM_GRACE_MS))
-                              0)
-                            (signal-strays (al-slice strays) SIGKILL)
-                            (al-free! (mut strays))
-                            0))
+                          (close-input! (mut pipes))
+                          (signal-strays (slice strays) SIGTERM)
+                          (signal-group pid SIGTERM)
+                          (set! exited
+                                (await-exit! a
+                                             pid
+                                             info-ptr
+                                             (mut pipes)
+                                             (mut lines)
+                                             (mut errors)
+                                             sink
+                                             (+ (sys/monotonic-ms)
+                                                TERM_GRACE_MS)))
+                          (when (not (load exited))
+                            (signal-group pid SIGKILL)
+                            (await-exit! a
+                                         pid
+                                         info-ptr
+                                         (mut pipes)
+                                         (mut lines)
+                                         (mut errors)
+                                         sink
+                                         (+ (sys/monotonic-ms) TERM_GRACE_MS))
+                            0)
+                          (signal-strays (slice strays) SIGKILL)
+                          (free! (mut strays))
+                          0))
                     ;; Stop whatever the program left behind in its group. The
                     ;; leader is still unreaped here, so the group id is ours.
                     (signal-group pid SIGTERM)
-                    (drain-until! a (mut pipes) (mut lines) (mut errors) sink false (+ (sys/monotonic-ms) TERM_GRACE_MS))
+                    (drain-until! a
+                                  (mut pipes)
+                                  (mut lines)
+                                  (mut errors)
+                                  sink
+                                  false
+                                  (+ (sys/monotonic-ms) TERM_GRACE_MS))
                     (signal-group pid SIGKILL)
-                    (drain-until! a (mut pipes) (mut lines) (mut errors) sink false (+ (sys/monotonic-ms) TERM_GRACE_MS))
-                    (let [result (match (subprocess/child-wait child)
-                                   (Err [error]
-                                        (Err (join2 a "could not collect the program's exit status: " (subprocess-error-text a error))))
-                                   (Ok [status]
-                                       (let [parts (status-parts status)]
-                                         (Ok (StreamEnd :exit-code (.code parts)
-                                                        :signal (.signal parts)
-                                                        :stopped (load stopped)
-                                                        :timed-out (load timed-out)
-                                                        :errors (capture-render a (mut errors))
-                                                        :dropped-lines (.dropped lines))))))]
+                    (drain-until! a
+                                  (mut pipes)
+                                  (mut lines)
+                                  (mut errors)
+                                  sink
+                                  false
+                                  (+ (sys/monotonic-ms) TERM_GRACE_MS))
+                    (let [result
+                            (match (wait child)
+                              (Err [error]
+                                   (Err (join2 a
+                                               "could not collect the program's exit status: "
+                                               (subprocess-error-text a error))))
+                              (Ok [status]
+                                  (let [parts (status-parts status)]
+                                    (Ok (StreamEnd
+                                          :exit-code (.code parts)
+                                          :signal (.signal parts)
+                                          :stopped (load stopped)
+                                          :timed-out (load timed-out)
+                                          :errors
+                                            (capture-render a (mut errors))
+                                          :dropped-lines (.dropped lines))))))]
                       (close-input! (mut pipes))
-                      (subprocess/child-close child)
+                      (close child)
                       (capture-free! (mut errors))
-                      (al-free! (mut (.pending lines)))
+                      (free! (mut (.pending lines)))
                       (free [u8] a buffer)
                       result))))))))

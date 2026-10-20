@@ -105,8 +105,8 @@ def install(args):
                   "recipe": str(runtime / "factories/papers.md"), "enabled": True,
                   "timezone": "America/Indiana/Indianapolis", "start_time": args.start_time or "09:00",
                   "archive_url": "https://jimmyhmiller.com/readings",
-                  "free_model": "opencode/big-pickle", "paid_model": "gpt-5.5",
-                  "free_idle_seconds": 300, "paid_idle_seconds": 900, "gate_idle_seconds": 1800,
+                  "free_model": "opencode/big-pickle", "paid_model": "gpt-6.1-sol",
+                  "free_idle_seconds": 900, "paid_idle_seconds": 900, "gate_idle_seconds": 1800,
                   "free_max_seconds": 5400, "paid_max_seconds": 10800, "paid_attempts": 2,
                   "pad": programs["pad"]}
     validate_config(config)

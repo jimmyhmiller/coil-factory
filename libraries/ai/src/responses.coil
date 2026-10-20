@@ -1,0 +1,661 @@
+(module ai.responses)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.http.client" :as http)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "sse.core" :as sse)
+(import "ai.chat" :use *)
+(import "ai.openai" :as openai)
+
+;;; OpenAI's Responses API, streamed, as a `ChatProvider`. It was written for
+;;; ChatGPT's Codex endpoint (`https://chatgpt.com/backend-api/codex/responses`),
+;;; which serves a ChatGPT subscription's models to programs logged in with
+;;; that subscription, and which refuses a request unless it streams
+;;; (`stream: true`) and keeps nothing (`store: false`).
+;;;
+;;; The transcript stays in the Chat Completions shape every other provider
+;;; uses (system, user, assistant with `tool_calls`, tool results), and is
+;;; translated on the way out: system messages become `instructions`, the rest
+;;; become input items. The model's own output items (its messages, tool
+;;; calls, and encrypted reasoning) are kept on the assistant message as
+;;; `response_items` and sent back as they were, so nothing of its reasoning
+;;; is lost between requests although the server stores nothing.
+;;;
+;;; Prompt caching. The server caches the longest prefix of a request that it
+;;; has seen recently, and charges much less for the cached part, so every
+;;; request of a conversation starts the same way: the same instructions and
+;;; tools, then the earlier items exactly as they were. A request also names
+;;; its conversation, as Codex does, with `prompt_cache_key` and a `session_id`
+;;; header. ChatGPT's endpoint caches nothing without the header (verified
+;;; 2026-10-12: the same 4.6k-token request twice had 0 tokens cached without
+;;; it, 3.8k with it). The key is a hash of the model, the instructions, and
+;;; the first input item, which are the same in every request of one
+;;; conversation.
+;;;
+;;; Credentials come from a `ResponsesLogin`: a bearer token, and the ChatGPT
+;;; account it belongs to. When the server refuses one (401), the login is
+;;; asked to renew it, and the request is made once more.
+
+(defstruct ResponsesCredentials [(token (slice u8)) (account (slice u8))])
+
+(defsum CredentialResult
+  (CredentialsOk [(credentials ResponsesCredentials)])
+  (CredentialsBad [(message (slice u8))]))
+
+(deftrait ResponsesLogin [Self]
+  ;;; The credentials to send now.
+  (login-current [(self (ptr Self)) (a (dyn Allocator))] (-> CredentialResult))
+  ;;; The server refused `rejected`: credentials to try once more, or why
+  ;;; there are none.
+  (login-renew [(self (ptr Self))
+                (a (dyn Allocator))
+                (rejected ResponsesCredentials)] (-> CredentialResult)))
+
+;;; Where a streamed response's body goes, chunk by chunk.
+(deftrait ResponseBytes [Self]
+  (on-response-bytes [(self (ptr Self)) (bytes (slice u8))] (-> bool)))
+
+(deftrait ResponsesTransport [Self]
+  ;;; POST `body` to `url` with `headers`, handing the response body to
+  ;;; `bytes` as it arrives. The reply's `body` is unused.
+  (post-stream [(self (ptr Self))
+                (a (dyn Allocator))
+                (url (slice u8))
+                (headers (slice http/Header))
+                (body (slice u8))
+                (timeout-ms i64)
+                (bytes (dyn ResponseBytes))]
+    (-> openai/HttpReply)))
+
+(defstruct NativeResponsesHttp [(reserved u8)])
+
+(defstruct BytesContext [(sink (dyn ResponseBytes))])
+
+(defn response-chunk [(data (ptr u8)) (length i64) (context (ptr i8))] (-> i64)
+  (if (on-response-bytes (.sink (cast (ptr BytesContext) context))
+                         (slice::new [u8] data length))
+      http/BODY-CONTINUE
+      http/BODY-STOP))
+
+(impl ResponsesTransport NativeResponsesHttp
+  (post-stream [(self (ptr NativeResponsesHttp))
+                (a (dyn Allocator))
+                (url (slice u8))
+                (headers (slice http/Header))
+                (body (slice u8))
+                (timeout-ms i64)
+                (bytes (dyn ResponseBytes))]
+    (-> openai/HttpReply)
+    (let [(mut request) (zeroed http/Request)
+          (mut context) (zeroed BytesContext)
+          (mut sink) (zeroed http/BodySink)
+          (mut reply) (zeroed openai/HttpReply)]
+      (set! (.method request) "POST")
+      (set! (.url request) url)
+      (set! (.headers request) headers)
+      (set! (.body request) body)
+      (set! (.connect-timeout-ms request) timeout-ms)
+      (set! (.timeout-ms request) timeout-ms)
+      (set! (.follow-redirects request) false)
+      (set! (.ca-info request) "")
+      (set! (.sink context) bytes)
+      (set! (.context sink) (cast (ptr i8) (mut context)))
+      (set! (.consume sink) (fnptr-of response-chunk))
+      (match (http/request-stream a (mut request) sink)
+        (Err [failure]
+             (do
+               (set! (.status reply) 0)
+               (set! (.error reply) "HTTP transport failed")))
+        (Ok [response]
+            (do
+              (set! (.status reply) (http/streaming-response-status response))
+              (http/streaming-response-free a response))))
+      (load reply))))
+
+(defstruct ResponsesChat
+  [(url (slice u8))
+   (login (dyn ResponsesLogin))
+   (transport (dyn ResponsesTransport))])
+
+;; ---------------------------------------------------------------------------
+;; JSON helpers (the ai library has no others)
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
+
+(defn put! [(object (ptr JVal)) (key (slice u8)) (value JVal)] (-> i64)
+  (do (object-put! object key value) 0))
+
+(defn push-to! [(array (ptr JVal)) (value JVal)] (-> i64)
+  (do (array-push! array value) 0))
+
+(defn text-or [(value JVal) (fallback (slice u8))] (-> (slice u8))
+  (match value (JStr [s] s) (_ fallback)))
+
+(defn encoded [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
+  (try (let [text (try-or! (to-json-str a value) "")] text)))
+
+;; ---------------------------------------------------------------------------
+;; The request
+
+;;; FNV-1a, 32 bits, from `basis`, over `parts` (each followed by a 0 byte).
+;;; Kept below 2^32 after every step, so nothing overflows an i64.
+(defn fnv32 [(basis i64) (parts (slice (slice u8)))] (-> i64)
+  (let [(mut hash) basis]
+    (for part (iter parts)
+      (for byte (iter part)
+        (set! hash (& (* (^ (load hash) (cast i64 byte)) 16777619) 4294967295)))
+      (set! hash (& (* (load hash) 16777619) 4294967295)))
+    (load hash)))
+
+(defn push-hex32! [(out (mut StrBuf)) (n i64)] (-> i64)
+  (let [(mut shift) 28]
+    (loop (if (< (load shift) 0)
+              (break)
+              (let [digit (& (>> n (load shift)) 15)]
+                (push! (mut out)
+                       (cast u8 (if (< digit 10) (+ digit 48) (+ digit 87))))
+                (set! shift (- (load shift) 4)))))
+    0))
+
+;;; Two FNV-1a hashes of `parts` (different bases), as 16 hex digits.
+(defn fnv-hex [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (push-hex32! (mut out) (fnv32 2166136261 parts))
+    (push-hex32! (mut out) (fnv32 3735928559 parts))
+    (finish! (mut out))))
+
+;;; The conversation's `prompt_cache_key`: the same for every request of it.
+(defn cache-key [(a (dyn Allocator))
+                 (model (slice u8))
+                 (instructions (slice u8))
+                 (input JVal)] (-> (slice u8))
+  (cat a
+       ["factory-"
+        (fnv-hex a [model instructions (encoded a (jv-nth input 0))])]))
+
+(defsum Built
+  ;;; `session` names the conversation (see prompt caching above).
+  (BuiltOk [(body (slice u8)) (session (slice u8))])
+  (BuiltBad [(message (slice u8))]))
+
+(defn input-text [(a (dyn Allocator)) (kind (slice u8)) (text (slice u8))]
+  (-> JVal)
+  (let [(mut part) (object-new a)
+        (mut parts) (array-new a)]
+    (put! (mut part) "type" (JStr kind))
+    (put! (mut part) "text" (JStr text))
+    (push-to! (mut parts) (load part))
+    (load parts)))
+
+(defn role-item [(a (dyn Allocator))
+                 (role (slice u8))
+                 (kind (slice u8))
+                 (text (slice u8))] (-> JVal)
+  (let [(mut item) (object-new a)]
+    (put! (mut item) "role" (JStr role))
+    (put! (mut item) "content" (input-text a kind text))
+    (load item)))
+
+;;; A Chat Completions tool definition as a Responses one.
+(defn response-tool [(a (dyn Allocator)) (tool JVal)] (-> JVal)
+  (let [function (jv-get tool "function")
+        (mut out) (object-new a)]
+    (put! (mut out) "type" (JStr "function"))
+    (put! (mut out) "name" (jv-get function "name"))
+    (put! (mut out)
+          "description"
+          (JStr (text-or (jv-get function "description") "")))
+    (put! (mut out) "parameters" (jv-get function "parameters"))
+    (put! (mut out) "strict" (JBool false))
+    (load out)))
+
+;;; The request body for `request`, or why it cannot be made.
+(defn responses-payload [(a (dyn Allocator)) (request ChatRequest)] (-> Built)
+  (block
+    :build
+      (let [(mut instructions) (StrBuf::new a)
+            (mut input) (array-new a)
+            messages (.messages request)
+            (mut i) 0]
+        (loop (if (>= (load i) (jv-len messages))
+                  (break)
+                  (let [message (jv-nth messages (load i))
+                        role (text-or (jv-get message "role") "")
+                        content (jv-get message "content")]
+                    (cond (= role "system")
+                            (match content
+                              (JStr [text]
+                                    (do
+                                      (when (> (len (str (load instructions)))
+                                               0)
+                                        (push-str! (mut instructions) "\n\n")
+                                        0)
+                                      (push-str! (mut instructions) text)
+                                      0))
+                              (_ (return-from
+                                   :build
+                                     (BuiltBad "a system message whose content is not text cannot be sent to a Responses endpoint"))))
+                          (= role "user")
+                            (match content
+                              (JStr [text]
+                                    (push-to! (mut input)
+                                              (role-item a
+                                                         "user"
+                                                         "input_text"
+                                                         text)))
+                              (_ (return-from
+                                   :build
+                                     (BuiltBad "a user message whose content is not text cannot be sent to a Responses endpoint"))))
+                          (= role "assistant")
+                            (let [kept (jv-get message "response_items")]
+                              (if (not (jv-null? kept))
+                                  ;; The model's own items, as it made them.
+                                  (let [(mut j) 0]
+                                    (loop (if (>= (load j) (jv-len kept))
+                                              (break)
+                                              (do
+                                                (push-to! (mut input)
+                                                          (jv-nth kept (load j)))
+                                                (set! j (+ (load j) 1)))))
+                                    0)
+                                  ;; Written some other way (another provider, a
+                                  ;; restored checkpoint): rebuilt from its fields.
+                                  (let [text (text-or content "")
+                                        calls (jv-get message "tool_calls")
+                                        (mut j) 0]
+                                    (when (> (len text) 0)
+                                      (push-to! (mut input)
+                                                (role-item a
+                                                           "assistant"
+                                                           "output_text"
+                                                           text))
+                                      0)
+                                    (loop (if (>= (load j) (jv-len calls))
+                                              (break)
+                                              (let [call (jv-nth calls (load j))
+                                                    function
+                                                      (jv-get call "function")
+                                                    (mut item) (object-new a)]
+                                                (put! (mut item)
+                                                      "type"
+                                                      (JStr "function_call"))
+                                                (put! (mut item)
+                                                      "call_id"
+                                                      (jv-get call "id"))
+                                                (put! (mut item)
+                                                      "name"
+                                                      (jv-get function "name"))
+                                                (put! (mut item)
+                                                      "arguments"
+                                                      (JStr (text-or (jv-get function
+                                                                             "arguments")
+                                                                     "{}")))
+                                                (push-to! (mut input)
+                                                          (load item))
+                                                (set! j (+ (load j) 1)))))
+                                    0)))
+                          (= role "tool")
+                            (let [(mut item) (object-new a)]
+                              (put! (mut item)
+                                    "type"
+                                    (JStr "function_call_output"))
+                              (put! (mut item)
+                                    "call_id"
+                                    (jv-get message "tool_call_id"))
+                              (put! (mut item)
+                                    "output"
+                                    (JStr (text-or content "")))
+                              (push-to! (mut input) (load item)))
+                          :else
+                            (return-from
+                              :build
+                                (BuiltBad (cat a
+                                               ["a message with role \""
+                                                role
+                                                "\" cannot be sent to a Responses endpoint"]))))
+                    (set! i (+ (load i) 1)))))
+        (let [(mut payload) (object-new a)
+              (mut include) (array-new a)
+              tools (.tools request)]
+          (let [text (finish! (mut instructions))
+                session (cache-key a (.model request) text (load input))]
+            (put! (mut payload) "model" (JStr (.model request)))
+            (put! (mut payload) "instructions" (JStr text))
+            (put! (mut payload) "input" (load input))
+            (put! (mut payload) "prompt_cache_key" (JStr session))
+            (when (> (jv-len tools) 0)
+              (let [(mut converted) (array-new a)
+                    (mut j) 0]
+                (loop (if (>= (load j) (jv-len tools))
+                          (break)
+                          (do
+                            (push-to! (mut converted)
+                                      (response-tool a (jv-nth tools (load j))))
+                            (set! j (+ (load j) 1)))))
+                (put! (mut payload) "tools" (load converted))
+                (put! (mut payload) "tool_choice" (JStr "auto"))
+                (put! (mut payload) "parallel_tool_calls" (JBool true))))
+            (push-to! (mut include) (JStr "reasoning.encrypted_content"))
+            (put! (mut payload) "include" (load include))
+            (put! (mut payload) "store" (JBool false))
+            (put! (mut payload) "stream" (JBool true))
+            (let [body (encoded a (load payload))]
+              (if (= (len body) 0)
+                  (BuiltBad "could not encode the request")
+                  (BuiltOk body session))))))))
+
+;; ---------------------------------------------------------------------------
+;; The response
+
+;;; What the stream has said so far.
+(defstruct Collected
+  [(allocator (dyn Allocator))
+   (items JVal)
+   (text (ptr StrBuf))
+   (reasoning (ptr StrBuf))
+   (calls JVal)
+   (input-tokens i64)
+   (cached-input-tokens i64)
+   (output-tokens i64)
+   ;;; `response.completed` or `response.incomplete` arrived.
+   (finished bool)
+   (finish-reason (slice u8))
+   (failure (slice u8))
+   (invalid bool)])
+
+(defn collected-new [(a (dyn Allocator))] (-> Collected)
+  (Collected
+    :allocator a
+    :items (array-new a)
+    :text (box! a StrBuf (StrBuf::new a))
+    :reasoning (box! a StrBuf (StrBuf::new a))
+    :calls (array-new a)
+    :input-tokens 0
+    :cached-input-tokens 0
+    :output-tokens 0
+    :finished false
+    :finish-reason ""
+    :failure ""
+    :invalid false))
+
+;;; The texts of `content` parts of kind `kind`, appended to `out`.
+(defn append-parts! [(out (ptr StrBuf))
+                     (parts JVal)
+                     (kind (slice u8))
+                     (field-name (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (jv-len parts))
+              (break)
+              (let [part (jv-nth parts (load i))]
+                (when (or (= (len kind) 0)
+                          (= (text-or (jv-get part "type") "") kind))
+                  (when (> (len (str (load out))) 0) (push-str! out "\n") 0)
+                  (push-str! out (text-or (jv-get part field-name) ""))
+                  0)
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn take-item! [(c (ptr Collected)) (item JVal)] (-> i64)
+  (let [a (.allocator c)
+        kind (text-or (jv-get item "type") "")]
+    (array-push! (field c items) item)
+    (cond (= kind "message")
+            (append-parts! (.text c)
+                           (jv-get item "content")
+                           "output_text"
+                           "text")
+          (= kind "reasoning")
+            (append-parts! (.reasoning c) (jv-get item "summary") "" "text")
+          (= kind "function_call")
+            (let [(mut function) (object-new a)
+                  (mut call) (object-new a)]
+              (put! (mut function) "name" (jv-get item "name"))
+              (put! (mut function)
+                    "arguments"
+                    (JStr (text-or (jv-get item "arguments") "{}")))
+              (put! (mut call) "id" (jv-get item "call_id"))
+              (put! (mut call) "type" (JStr "function"))
+              (put! (mut call) "function" (load function))
+              (array-push! (field c calls) (load call))
+              0)
+          :else 0)))
+
+(defn take-usage! [(c (ptr Collected)) (response JVal)] (-> i64)
+  (let [usage (jv-get response "usage")]
+    (set! (.input-tokens c) (jv-int (jv-get usage "input_tokens")))
+    (set! (.cached-input-tokens c)
+          (jv-int (jv-get (jv-get usage "input_tokens_details") "cached_tokens")))
+    (set! (.output-tokens c) (jv-int (jv-get usage "output_tokens")))
+    0))
+
+(defn failure-text [(a (dyn Allocator)) (error JVal) (fallback (slice u8))]
+  (-> (slice u8))
+  (let [message (text-or (jv-get error "message") "")]
+    (if (> (len message) 0)
+        (let [code (text-or (jv-get error "code") "")]
+          (if (> (len code) 0) (cat a [message " (" code ")"]) message))
+        fallback)))
+
+(impl sse/SseEventSink Collected
+  (consume-sse-event [(self (ptr Collected)) (event sse/SseEvent)] (-> bool)
+    (let [a (.allocator self)]
+      (match (concat a "" (.data event))
+        (None [] (do (set! (.invalid self) true) false))
+        (Some [owned]
+              (try (let [root
+                           (try-or! (from-json [JVal] a owned)
+                                    (do (set! (.invalid self) true) false))]
+                     (let [kind (text-or (jv-get root "type") "")]
+                       (cond (= kind "response.output_item.done")
+                               (do (take-item! self (jv-get root "item")) true)
+                             (= kind "response.completed")
+                               (do
+                                 (take-usage! self (jv-get root "response"))
+                                 (set! (.finished self) true)
+                                 (set! (.finish-reason self)
+                                       (if (> (jv-len (.calls self)) 0)
+                                           "tool_calls"
+                                           "stop"))
+                                 true)
+                             (= kind "response.incomplete")
+                               (let [response (jv-get root "response")]
+                                 (take-usage! self response)
+                                 (set! (.finished self) true)
+                                 (set! (.finish-reason self)
+                                       (text-or (jv-get (jv-get response
+                                                                "incomplete_details")
+                                                        "reason")
+                                                "incomplete"))
+                                 true)
+                             (= kind "response.failed")
+                               (do
+                                 (set! (.failure self)
+                                       (failure-text a
+                                                     (jv-get (jv-get root
+                                                                     "response")
+                                                             "error")
+                                                     "the response failed"))
+                                 false)
+                             (= kind "error")
+                               (do
+                                 (set! (.failure self)
+                                       (failure-text a root (encoded a root)))
+                                 false)
+                             :else true)))))))))
+
+;;; The body bytes: fed to the SSE decoder, and the start of them kept, so a
+;;; refusal (which is JSON, not a stream) can be shown.
+(defstruct BodyBytes
+  [(decoder (ptr sse/SseDecoder))
+   (head (ptr StrBuf))])
+
+(const HEAD-BYTES 4096)
+
+(impl ResponseBytes BodyBytes
+  (on-response-bytes [(self (ptr BodyBytes)) (bytes (slice u8))] (-> bool)
+    (do
+      (let [room (- HEAD-BYTES (len (str (load (.head self)))))]
+        (when (> room 0)
+          (push-str! (.head self)
+                     (if (> (len bytes) room)
+                         (subslice [u8] bytes 0 room)
+                         bytes))
+          0))
+      (sse/sse-decoder-feed! (.decoder self) bytes))))
+
+(defn assistant-raw [(a (dyn Allocator)) (c (ptr Collected))] (-> JVal)
+  (let [(mut message) (object-new a)
+        (mut choice) (object-new a)
+        (mut choices) (array-new a)
+        (mut root) (object-new a)
+        reasoning (str (load (.reasoning c)))]
+    (put! (mut message) "role" (JStr "assistant"))
+    (put! (mut message) "content" (JStr (str (load (.text c)))))
+    (when (> (jv-len (.calls c)) 0)
+      (put! (mut message) "tool_calls" (.calls c))
+      0)
+    (when (> (len reasoning) 0)
+      (put! (mut message) "reasoning_content" (JStr reasoning))
+      0)
+    (put! (mut message) "response_items" (.items c))
+    (put! (mut choice) "message" (load message))
+    (push-to! (mut choices) (load choice))
+    (put! (mut root) "choices" (load choices))
+    (load root)))
+
+(defsum Attempt
+  (AttemptDone [(result ChatResult)])
+  ;;; The server refused the credentials.
+  (AttemptRefused [(message (slice u8))]))
+
+(defn header [(name (slice u8)) (value (slice u8))] (-> http/Header)
+  (http/Header :name name :value value))
+
+(defn attempt [(self (ptr ResponsesChat))
+               (a (dyn Allocator))
+               (body (slice u8))
+               (session (slice u8))
+               (credentials ResponsesCredentials)
+               (timeout-ms i64)] (-> Attempt)
+  (let [c (box! a Collected (collected-new a))
+        decoder (box! a sse/SseDecoder (sse/sse-decoder-new a c 16777216))
+        bytes
+          (box! a
+                BodyBytes
+                (BodyBytes
+                  :decoder decoder
+                  :head (box! a StrBuf (StrBuf::new a))))
+        (mut headers) (ArrayList::new [http/Header] a)]
+    (push! (mut headers) (header "Content-Type" "application/json"))
+    (push! (mut headers) (header "Accept" "text/event-stream"))
+    (push! (mut headers)
+           (header "Authorization" (cat a ["Bearer " (.token credentials)])))
+    (push! (mut headers) (header "session_id" session))
+    (when (> (len (.account credentials)) 0)
+      (push! (mut headers) (header "chatgpt-account-id" (.account credentials)))
+      0)
+    (let [reply
+            (post-stream (.transport self)
+                         a
+                         (.url self)
+                         (slice headers)
+                         body
+                         timeout-ms
+                         bytes)
+          head (str (load (.head bytes)))
+          stopped (sse/sse-decoder-failed? decoder)]
+      (sse/sse-decoder-free! decoder)
+      (cond (> (len (.error reply)) 0)
+              (AttemptDone (ChatFailed (chat-error "transport" 0 (.error reply))))
+            (= (.status reply) 401) (AttemptRefused head)
+            (or (< (.status reply) 200) (>= (.status reply) 300))
+              (AttemptDone (ChatFailed (chat-error "provider"
+                                                   (.status reply)
+                                                   head)))
+            (> (len (.failure c)) 0)
+              (AttemptDone (ChatFailed (chat-error "provider"
+                                                   (.status reply)
+                                                   (.failure c))))
+            (.invalid c)
+              (AttemptDone (ChatFailed (chat-error "protocol"
+                                                   0
+                                                   "a model stream event is not valid JSON")))
+            stopped
+              (AttemptDone (ChatFailed (chat-error "protocol"
+                                                   0
+                                                   "the model stream could not be decoded")))
+            (not (.finished c))
+              (AttemptDone (ChatFailed (chat-error "protocol"
+                                                   0
+                                                   "the model stream ended before the response completed")))
+            :else
+              (let [(mut response) (zeroed ChatResponse)]
+                (set! (.text response) (str (load (.text c))))
+                (set! (.tool-calls response) (.calls c))
+                (set! (.finish-reason response) (.finish-reason c))
+                (set! (.input-tokens response) (.input-tokens c))
+                (set! (.cached-input-tokens response) (.cached-input-tokens c))
+                (set! (.output-tokens response) (.output-tokens c))
+                (set! (.raw response) (assistant-raw a c))
+                (AttemptDone (ChatOk (load response))))))))
+
+(defn login-failure [(message (slice u8))] (-> ChatResult)
+  (ChatFailed (chat-error "authentication" 401 message)))
+
+(impl ChatProvider ResponsesChat
+  (complete [(self (ptr ResponsesChat))
+             (a (dyn Allocator))
+             (request ChatRequest)] (-> ChatResult)
+    (block :complete
+      (when (or (= (len (.model request)) 0)
+                (not (match (.messages request) (JArr [_] true) (_ false))))
+        (return-from
+          :complete
+            (ChatFailed (chat-error "invalid_request"
+                                    0
+                                    "model and message array are required"))))
+      (let [built (responses-payload a request)
+            body
+              (match built
+                (BuiltBad [message]
+                          (return-from
+                            :complete
+                              (ChatFailed (chat-error "invalid_request"
+                                                      0
+                                                      message))))
+                (BuiltOk [text session] text))
+            session
+              (match built (BuiltOk [text session] session) (BuiltBad [_] ""))
+            credentials
+              (match (login-current (.login self) a)
+                (CredentialsBad [message]
+                                (return-from :complete (login-failure message)))
+                (CredentialsOk [found] found))]
+        (match (attempt self a body session credentials (.timeout-ms request))
+          (AttemptDone [result] result)
+          (AttemptRefused [why]
+                          (match (login-renew (.login self) a credentials)
+                            (CredentialsBad [message]
+                                            (login-failure (cat a
+                                                                ["the server refused the login ("
+                                                                 why
+                                                                 "), and it could not be renewed: "
+                                                                 message])))
+                            (CredentialsOk [renewed]
+                                           (match (attempt self
+                                                           a
+                                                           body
+                                                           session
+                                                           renewed
+                                                           (.timeout-ms request))
+                                             (AttemptDone [result] result)
+                                             (AttemptRefused [again]
+                                                             (login-failure (cat a
+                                                                                 ["the server refused the renewed login too: "
+                                                                                  again]))))))))))))

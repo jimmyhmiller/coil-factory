@@ -7,26 +7,26 @@
 (import "factory.proc" :use *)
 
 (defn temp-dir [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
-  (let [(mut path) (sb-new a)]
-    (sb-push-str! (mut path) "/tmp/factory-git-test-")
-    (sb-push-i64! (mut path) (pid))
-    (sb-push-str! (mut path) "-")
-    (sb-push-str! (mut path) name)
-    (let [p (sb-finish! (mut path))]
+  (let [(mut path) (StrBuf::new a)]
+    (push-str! (mut path) "/tmp/factory-git-test-")
+    (push-i64! (mut path) (pid))
+    (push-str! (mut path) "-")
+    (push-str! (mut path) name)
+    (let [p (finish! (mut path))]
       (capture a "rm" ["-rf" p] "" 10000)
       (capture a "mkdir" ["-p" p] "" 10000)
       p)))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (deftest a-run-worktree-commits-on-its-own-branch
   (let [a (malloc-allocator)
         repo (temp-dir a "repo")
-        (mut wt) (sb-new a)]
-    (sb-push-str! (mut wt) repo)
-    (sb-push-str! (mut wt) "-wt")
-    (let [worktree (sb-finish! (mut wt))]
+        (mut wt) (StrBuf::new a)]
+    (push-str! (mut wt) repo)
+    (push-str! (mut wt) "-wt")
+    (let [worktree (finish! (mut wt))]
       (capture a "rm" ["-rf" worktree] "" 10000)
       (assert (git-ok? (git-init-scratch a repo)))
       (let [base (match (git-head a repo) (Some [h] h) (None [] ""))]
@@ -49,4 +49,4 @@
         (assert (not (git-dirty? a repo)))))))
 
 (defn str-concat-or [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
-  (match (str-concat a x y) (Some [s] s) (None [] "")))
+  (match (concat a x y) (Some [s] s) (None [] "")))

@@ -8,17 +8,17 @@
 ;;; in the allocator passed in, unless it is documented as a borrowed view.
 
 (defn join2 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
-  (let [(mut b) (sb-new a)]
-    (sb-push-str! (mut b) x)
-    (sb-push-str! (mut b) y)
-    (sb-finish! (mut b))))
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) x)
+    (push-str! (mut b) y)
+    (finish! (mut b))))
 
 (defn join3 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8)) (z (slice u8))] (-> (slice u8))
-  (let [(mut b) (sb-new a)]
-    (sb-push-str! (mut b) x)
-    (sb-push-str! (mut b) y)
-    (sb-push-str! (mut b) z)
-    (sb-finish! (mut b))))
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) x)
+    (push-str! (mut b) y)
+    (push-str! (mut b) z)
+    (finish! (mut b))))
 
 ;;; `"text"` with the quotes, for messages.
 (defn quoted [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
@@ -74,17 +74,17 @@
 (defn sanitize-utf8 [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
   (if (utf8-valid? s)
       s
-      (let [(mut b) (sb-new a)
+      (let [(mut b) (StrBuf::new a)
             (mut i) 0]
         (loop (if (>= (load i) (len s))
                   (break)
                   (let [w (utf8-sequence-length s (load i))]
                     (if (= w 0)
-                        (do (sb-push-str! (mut b) "\xfffd;")
+                        (do (push-str! (mut b) "\xfffd;")
                             (set! i (+ (load i) 1)))
-                        (do (sb-push-str! (mut b) (subslice s (load i) (+ (load i) w)))
+                        (do (push-str! (mut b) (subslice s (load i) (+ (load i) w)))
                             (set! i (+ (load i) w)))))))
-        (sb-finish! (mut b)))))
+        (finish! (mut b)))))
 
 ;;; The longest prefix of `s` that is at most `limit` bytes and does not end in
 ;;; the middle of a UTF-8 sequence. A borrowed view.
@@ -142,8 +142,8 @@
   (let [(mut pad) (- 5 (decimal-width line))]
     (loop (if (<= (load pad) 0)
               (break)
-              (do (sb-push-byte! (mut b) (primitive/cast u8 #\space))
+              (do (push! (mut b) (primitive/cast u8 #\space))
                   (set! pad (- (load pad) 1)))))
-    (sb-push-i64! (mut b) line)
-    (sb-push-str! (mut b) "\x2502; ")
+    (push-i64! (mut b) line)
+    (push-str! (mut b) "\x2502; ")
     0))

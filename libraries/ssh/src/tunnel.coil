@@ -105,8 +105,8 @@
     :running false
     :failures 0
     :retry-after-ms 0
-    :last-error (al-new [u8] a)
-    :stderr-tail (al-new [u8] a)))
+    :last-error (ArrayList::new [u8] a)
+    :stderr-tail (ArrayList::new [u8] a)))
 
 ;;; The delay before retry number `failures` (1-based): `base` doubling, capped
 ;;; at `ceiling`.
@@ -130,16 +130,18 @@
           "the keepalive interval must be positive"
         :else ""))
 
-(defn number-text [(a (dyn Allocator)) (prefix (slice u8)) (value i64)] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) prefix)
-    (sb-push-i64! (mut out) value)
-    (sb-finish! (mut out))))
+(defn number-text [(a (dyn Allocator)) (prefix (slice u8)) (value i64)]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) prefix)
+    (push-i64! (mut out) value)
+    (finish! (mut out))))
 
 ;; `127.0.0.1:LOCAL:HOST:PORT`, bracketing an IPv6 remote host. The explicit
 ;; local bind address keeps the forwarded service off every other interface.
-(defn forward-arg [(a (dyn Allocator)) (local-port i64) (spec TunnelSpec)] (-> (slice u8))
-  (let [(mut out) (sb-new a)
+(defn forward-arg [(a (dyn Allocator)) (local-port i64) (spec TunnelSpec)]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
         host (.remote-host spec)
         (mut ipv6) false
         (mut k) 0]
@@ -148,23 +150,24 @@
               (if (= (cast i64 (get host (load k))) 58)
                   (do (set! ipv6 true) (break))
                   (set! k (+ (load k) 1)))))
-    (sb-push-str! (mut out) "127.0.0.1:")
-    (sb-push-i64! (mut out) local-port)
-    (sb-push-byte! (mut out) 58)
-    (when (load ipv6) (sb-push-byte! (mut out) 91) 0)
-    (sb-push-str! (mut out) host)
-    (when (load ipv6) (sb-push-byte! (mut out) 93) 0)
-    (sb-push-byte! (mut out) 58)
-    (sb-push-i64! (mut out) (.remote-port spec))
-    (sb-finish! (mut out))))
+    (push-str! (mut out) "127.0.0.1:")
+    (push-i64! (mut out) local-port)
+    (push! (mut out) 58)
+    (when (load ipv6) (push! (mut out) 91) 0)
+    (push-str! (mut out) host)
+    (when (load ipv6) (push! (mut out) 93) 0)
+    (push! (mut out) 58)
+    (push-i64! (mut out) (.remote-port spec))
+    (finish! (mut out))))
 
 ;;; The ssh argument vector (without the program) for forwarding `local-port`:
 ;;; the shared non-interactive options, then `-N` (no remote command), `-T`,
 ;;; `ExitOnForwardFailure=yes` (a forward that cannot bind kills ssh instead of
 ;;; leaving a connection that forwards nothing), `ServerAliveInterval`/
 ;;; `ServerAliveCountMax=3`, the `-L` forward, and the destination.
-(defn tunnel-args [(a (dyn Allocator)) (local-port i64) (spec TunnelSpec)] (-> (slice (slice u8)))
-  (let [(mut args) (al-new [(slice u8)] a)]
+(defn tunnel-args [(a (dyn Allocator)) (local-port i64) (spec TunnelSpec)]
+  (-> (slice (slice u8)))
+  (let [(mut args) (ArrayList::new [(slice u8)] a)]
     (ssh-common-args a (mut args) (.options spec))
     (push! (mut args) "-N")
     (push! (mut args) "-T")
@@ -184,7 +187,7 @@
                 (do
                   (push! (mut args) (get destination (load k)))
                   (set! k (+ (load k) 1))))))
-    (al-into-slice (mut args))))
+    (into-slice (mut args))))
 
 ;; Ask the kernel for a free loopback port by binding port 0, then release it
 ;; for ssh. Losing the race to another process is detected: with
@@ -193,42 +196,50 @@
 (defn reserve-local-port [(a (dyn Allocator))] (-> i64)
   (let [listener (primitive/alloc-stack socket/TcpListener)]
     (try (let [opened
-                 (try-or! (socket/tcp-listen a listener "127.0.0.1" 0 false 1)
+                 (try-or! (socket/TcpListener::listen a
+                                                      listener
+                                                      "127.0.0.1"
+                                                      0
+                                                      false
+                                                      1)
                           -1)]
            (let [port
-                   (match (socket/tcp-listener-port opened)
+                   (match (port opened)
                      (Ok [value] value)
                      (Err [_] -1))]
-             (socket/tcp-listener-close! opened)
+             (close! opened)
              port)))))
 
 (defn port-accepting? [(a (dyn Allocator)) (port i64)] (-> bool)
   (let [connection (primitive/alloc-stack socket/TcpConnection)]
     (try (let [opened
-                 (try-or! (socket/tcp-connect a connection "127.0.0.1" port)
+                 (try-or! (socket/TcpConnection::connect a
+                                                         connection
+                                                         "127.0.0.1"
+                                                         port)
                           false)]
-           (do (socket/tcp-connection-close! opened) true)))))
+           (do (close! opened) true)))))
 
 ;; Move whatever ssh has written to stderr into the bounded tail. ssh logs a
 ;; line for every forwarded connection whose remote channel fails to open, so
 ;; the pipe is drained on every check to keep it from filling and stalling ssh.
 (defn drain-stderr! [(tunnel (mut Tunnel))] (-> i64)
-  (let [chunk (primitive/alloc-stack (array u8 1024))]
+  (let [(mut chunk) (zeroed (array u8 1024))]
     (loop (let [fd (.stderr-fd (.child tunnel))]
             (if (< fd 0)
                 (break)
                 (let [n
                         (cast i64
                               (io/read fd
-                                       (cast (ptr i8) chunk)
+                                       (cast (ptr i8) (mut chunk))
                                        (cast isize 1024)))]
                   (cond (> n 0)
-                          (al-extend! (mut (.stderr-tail tunnel))
-                                      (cast (ptr u8) chunk)
-                                      n)
-                        (and (< n 0) (= (os/os-errno) EINTR)) 0
+                          (extend! (mut (.stderr-tail tunnel))
+                                   (cast (ptr u8) (mut chunk))
+                                   n)
+                        (and (< n 0) (= (os/errno) EINTR)) 0
                         :else (break))))))
-    (let [tail (al-slice (.stderr-tail tunnel))
+    (let [tail (slice (.stderr-tail tunnel))
           excess (- (len tail) STDERR_TAIL)]
       (when (> excess 0)
         (let [(mut k) 0]
@@ -250,7 +261,7 @@
       (do
         (drain-stderr! (mut tunnel))
         (try (let [status
-                     (try-or! (subprocess/child-try-wait (field tunnel child))
+                     (try-or! (try-wait (field tunnel child))
                               false)]
                (match status
                  (Some [_] false)
@@ -260,19 +271,19 @@
 (defn tunnel-close! [(tunnel (mut Tunnel))] (-> i64)
   (when (.running tunnel)
     (try (let [status
-                 (try-or! (subprocess/child-try-wait (field tunnel child))
+                 (try-or! (try-wait (field tunnel child))
                           (do
-                            (subprocess/child-kill-and-wait (field tunnel child))
+                            (kill-and-wait (field tunnel child))
                             0))]
            (match status
              (Some [_] 0)
              (None []
                    (do
-                     (subprocess/child-terminate (field tunnel child))
-                     (subprocess/child-wait (field tunnel child))
+                     (terminate (field tunnel child))
+                     (wait (field tunnel child))
                      0)))))
     (drain-stderr! (mut tunnel))
-    (subprocess/child-close (field tunnel child))
+    (close (field tunnel child))
     (set! (.running tunnel) false)
     (set! (.local-port tunnel) 0)
     0)
@@ -281,12 +292,12 @@
 ;;; Close the tunnel and release its buffers.
 (defn tunnel-free! [(tunnel (mut Tunnel))] (-> i64)
   (tunnel-close! (mut tunnel))
-  (al-free! (mut (.last-error tunnel)))
-  (al-free! (mut (.stderr-tail tunnel))))
+  (free! (mut (.last-error tunnel)))
+  (free! (mut (.stderr-tail tunnel))))
 
 (defn set-last-error! [(tunnel (mut Tunnel)) (message (slice u8))] (-> i64)
   (set! (.len (.last-error tunnel)) 0)
-  (al-extend! (mut (.last-error tunnel)) (slice-data message) (len message)))
+  (extend! (mut (.last-error tunnel)) (data message) (len message)))
 
 ;; Record a failed attempt: tear down, count it, schedule the next retry.
 (defn fail! [(tunnel (mut Tunnel)) (message (slice u8))] (-> TunnelStatus)
@@ -298,26 +309,27 @@
            (tunnel-backoff-ms (.failures tunnel)
                               (.backoff-base-ms (.spec tunnel))
                               (.backoff-ceiling-ms (.spec tunnel)))))
-  (TunnelFailed (al-slice (.last-error tunnel))))
+  (TunnelFailed (slice (.last-error tunnel))))
 
 ;; "ssh tunnel to HOST REASON: what ssh said".
 (defn failure-text [(tunnel (mut Tunnel)) (reason (slice u8))] (-> (slice u8))
   (drain-stderr! (mut tunnel))
   (let [a (.allocator tunnel)
-        detail (str-trim (al-slice (.stderr-tail tunnel)))
-        (mut out) (sb-new a)]
-    (sb-push-str! (mut out) "ssh tunnel to ")
-    (sb-push-str! (mut out) (target-display a (.target (.spec tunnel))))
-    (sb-push-byte! (mut out) 32)
-    (sb-push-str! (mut out) reason)
+        detail (trim (slice (.stderr-tail tunnel)))
+        (mut out) (StrBuf::new a)]
+    (push-str! (mut out) "ssh tunnel to ")
+    (push-str! (mut out) (target-display a (.target (.spec tunnel))))
+    (push! (mut out) 32)
+    (push-str! (mut out) reason)
     (when (> (len detail) 0)
-      (sb-push-str! (mut out) ": ")
-      (sb-push-str! (mut out) detail)
+      (push-str! (mut out) ": ")
+      (push-str! (mut out) detail)
       0)
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;; Fail with ssh's own explanation appended to `reason`.
-(defn fail-explained! [(tunnel (mut Tunnel)) (reason (slice u8))] (-> TunnelStatus)
+(defn fail-explained! [(tunnel (mut Tunnel)) (reason (slice u8))]
+  (-> TunnelStatus)
   (let [message (failure-text (mut tunnel) reason)
         status (fail! (mut tunnel) message)]
     (alloc/free (.allocator tunnel) message)
@@ -340,15 +352,16 @@
                      "could not reserve a local port for the ssh tunnel")
               (try (let [; is it installed and on PATH?"))
                          _
-                           (try-or! (subprocess/spawn a
-                                                      (field tunnel child)
-                                                      (.ssh-binary (.options (.spec tunnel)))
-                                                      (tunnel-args a
-                                                                   port
-                                                                   (.spec tunnel))
-                                                      (subprocess/null-stdio)
-                                                      (subprocess/null-stdio)
-                                                      (subprocess/pipe-stdio))
+                           (try-or! (subprocess/Child::spawn a
+                                                             (field tunnel
+                                                                    child)
+                                                             (.ssh-binary (.options (.spec tunnel)))
+                                                             (tunnel-args a
+                                                                          port
+                                                                          (.spec tunnel))
+                                                             (subprocess/null-stdio)
+                                                             (subprocess/null-stdio)
+                                                             (subprocess/pipe-stdio))
                                     (fail! (mut tunnel)
                                            "could not start ssh; is it installed and on PATH?"))]
                      (do
@@ -389,7 +402,7 @@
         (and (> (.failures tunnel) 0) (< (now-ms) (.retry-after-ms tunnel)))
           (do
             (tunnel-close! (mut tunnel))
-            (TunnelFailed (al-slice (.last-error tunnel))))
+            (TunnelFailed (slice (.last-error tunnel))))
         :else (tunnel-open! (mut tunnel))))
 
 ;;; The local port of a running tunnel, 0 when closed.
@@ -399,7 +412,7 @@
 ;;; The most recent failure message ("" after a success). Borrowed; valid until
 ;;; the next open.
 (defn tunnel-last-error [(tunnel Tunnel)] (-> (slice u8))
-  (al-slice (.last-error tunnel)))
+  (slice (.last-error tunnel)))
 
 ;;; `http://127.0.0.1:PORT` for a ready tunnel's local port.
 (defn tunnel-base-url [(a (dyn Allocator)) (port i64)] (-> (slice u8))

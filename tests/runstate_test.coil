@@ -67,7 +67,7 @@
     (assert (= (.summary (station-at (mut st) "implement")) "Wrapped at walls."))
     (assert (= (.phase (agent-at (mut st) "implement")) "done"))
     (let [json (jv-encode a (runstate-json a (mut st)))]
-      (match (str-find json "\"status\":\"succeeded\"")
+      (match (find json "\"status\":\"succeeded\"")
         (Some [at] 0)
         (None [] (assert false))))))
 
@@ -132,7 +132,7 @@
     (assert-eq (.review-rejections (station-at (mut st) "build")) 1)))
 
 (defn contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (deftest folds-approvals-so-a-restart-waits-on-the-same-request
   (let [a (malloc-allocator)

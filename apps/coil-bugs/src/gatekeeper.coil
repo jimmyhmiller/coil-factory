@@ -2,7 +2,6 @@
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.http.client" :as http)
-(import "coil.primitive" :as primitive)
 (import "coil.serde" :use *)
 (import "coil.serde.json" :use *)
 (import "coil.serde.value" :use *)
@@ -18,9 +17,14 @@
 
 ;;; What the heartbeat needs from the function; tests supply their own.
 (deftrait MacGate [Self]
-  (gate-notes [(self (ptr Self)) (a (dyn Allocator))] (-> (Result (ArrayList NoteListing) (slice u8))))
-  (gate-deliver [(self (ptr Self)) (a (dyn Allocator)) (id (slice u8)) (cell-id (slice u8))] (-> (Result i64 (slice u8))))
-  (gate-snapshot [(self (ptr Self)) (a (dyn Allocator)) (upload SnapshotUpload)] (-> (Result SnapshotReceipt (slice u8)))))
+  (gate-notes [(self (ptr Self)) (a (dyn Allocator))]
+    (-> (Result (ArrayList NoteListing) (slice u8))))
+  (gate-deliver [(self (ptr Self))
+                 (a (dyn Allocator))
+                 (id (slice u8))
+                 (cell-id (slice u8))] (-> (Result i64 (slice u8))))
+  (gate-snapshot [(self (ptr Self)) (a (dyn Allocator)) (upload SnapshotUpload)]
+    (-> (Result SnapshotReceipt (slice u8)))))
 
 (defstruct Gatekeeper [(base (slice u8)) (token-file (slice u8))])
 
@@ -28,49 +32,89 @@
   (if (ends-with? text "/") (subslice text 0 (- (len text) 1)) text))
 
 (defn gatekeeper-for [(a (dyn Allocator)) (config MacConfig)] (-> Gatekeeper)
-  (Gatekeeper :base (trim-slash (.gate-url config)) :token-file (expand-home a (.token-file config))))
+  (Gatekeeper
+    :base (trim-slash (.gate-url config))
+    :token-file (expand-home a (.token-file config))))
 
 (defstruct Answer [(status i64) (body (slice u8))])
 
-(defn gate-call [(a (dyn Allocator)) (gate (ptr Gatekeeper)) (method (slice u8)) (path (slice u8)) (body (slice u8))] (-> (Result Answer (slice u8)))
+(defn gate-call [(a (dyn Allocator))
+                 (gate (ptr Gatekeeper))
+                 (method (slice u8))
+                 (path (slice u8))
+                 (body (slice u8))] (-> (Result Answer (slice u8)))
   (match (read-required a (.token-file gate))
     (Err [why] (Err why))
     (Ok [token]
-        (let [(mut headers) (al-new [http/Header] a)
-              request (box! a http/Request (primitive/zeroed http/Request))]
-          (push! (mut headers) (http/Header :name "Authorization" :value (join a ["Bearer " (str-trim token)])))
-          (push! (mut headers) (http/Header :name "Accept" :value "application/json"))
+        (let [(mut headers) (ArrayList::new [http/Header] a)
+              request (box! a http/Request (zeroed http/Request))]
+          (push! (mut headers)
+                 (http/Header
+                   :name "Authorization"
+                   :value (join a ["Bearer " (trim token)])))
+          (push! (mut headers)
+                 (http/Header :name "Accept" :value "application/json"))
           (when (> (len body) 0)
-            (push! (mut headers) (http/Header :name "Content-Type" :value "application/json"))
+            (push! (mut headers)
+                   (http/Header :name "Content-Type" :value "application/json"))
             (push! (mut headers) (http/Header :name "X-Coil-Bugs" :value "1"))
             0)
           (set! (.method request) method)
           (set! (.url request) (join a [(.base gate) path]))
-          (set! (.headers request) (al-slice headers))
+          (set! (.headers request) (slice headers))
           (set! (.body request) body)
           (set! (.connect-timeout-ms request) 15000)
           (set! (.timeout-ms request) 60000)
           (set! (.follow-redirects request) false)
           (set! (.ca-info request) "")
           (match (http/request a request)
-            (Err [failure] (Err (join a [method " " (.base gate) path ": the Gatekeeper is not reachable"
-                                         (match failure
-                                           (http/Transport [code message] (join a [" (curl " (int-text a code) ": " message ")"]))
-                                           (http/InvalidRequest [] " (invalid request)")
-                                           (http/OutOfMemory [] " (out of memory)"))])))
+            (Err [failure]
+                 (Err (join a
+                            [method
+                             " "
+                             (.base gate)
+                             path
+                             ": the Gatekeeper is not reachable"
+                             (match failure
+                               (http/Transport [code message]
+                                               (join a
+                                                     [" (curl "
+                                                      (int-text a code)
+                                                      ": "
+                                                      message
+                                                      ")"]))
+                               (http/InvalidRequest [] " (invalid request)")
+                               (http/OutOfMemory [] " (out of memory)"))])))
             (Ok [response]
-                (let [answer (Answer :status (http/response-status response)
-                                     :body (copy-bytes a (http/response-body response)))]
+                (let [answer
+                        (Answer
+                          :status (http/response-status response)
+                          :body (copy-bytes a (http/response-body response)))]
                   (http/response-free a response)
                   (Ok answer))))))))
 
-(defn refused [(a (dyn Allocator)) (method (slice u8)) (path (slice u8)) (answer Answer)] (-> (slice u8))
-  (let [said (match (jv-parse a (.body answer))
-               (Some [o] (jv-string-or (jv-get o "error") ""))
-               (None [] ""))]
-    (join a [method " " path ": HTTP " (int-text a (.status answer)) (if (> (len said) 0) (join a [": " said]) "")])))
+(defn refused [(a (dyn Allocator))
+               (method (slice u8))
+               (path (slice u8))
+               (answer Answer)] (-> (slice u8))
+  (let [said
+          (match (jv-parse a (.body answer))
+            (Some [o] (jv-string-or (jv-get o "error") ""))
+            (None [] ""))]
+    (join a
+          [method
+           " "
+           path
+           ": HTTP "
+           (int-text a (.status answer))
+           (if (> (len said) 0) (join a [": " said]) "")])))
 
-(defn expect [(T Deserialize)] [(a (dyn Allocator)) (method (slice u8)) (path (slice u8)) (answer Answer) (ok i64) (also i64)] (-> (Result T (slice u8)))
+(defn expect [(T Deserialize)] [(a (dyn Allocator))
+                                (method (slice u8))
+                                (path (slice u8))
+                                (answer Answer)
+                                (ok i64)
+                                (also i64)] (-> (Result T (slice u8)))
   (if (and (!= (.status answer) ok) (!= (.status answer) also))
       (Err (refused a method path answer))
       (match (from-json [T] a (.body answer))
@@ -78,18 +122,32 @@
         (Err [e] (Err (decode-error a (join a [method " " path "'s reply"]) e))))))
 
 (impl MacGate Gatekeeper
-  (gate-notes [(self (ptr Gatekeeper)) (a (dyn Allocator))] (-> (Result (ArrayList NoteListing) (slice u8)))
-              (match (gate-call a self "GET" "/v1/notes" "")
-                (Err [why] (Err why))
-                (Ok [answer] (expect [(ArrayList NoteListing)] a "GET" "/v1/notes" answer 200 200))))
-  (gate-deliver [(self (ptr Gatekeeper)) (a (dyn Allocator)) (id (slice u8)) (cell-id (slice u8))] (-> (Result i64 (slice u8)))
-                (let [path (join a ["/v1/notes/" id "/delivered"])]
-                  (match (gate-call a self "POST" path (encode a (DeliveryUpload :cell-id cell-id)))
-                    (Err [why] (Err why))
-                    (Ok [answer] (match (expect [Delivery] a "POST" path answer 201 200)
-                                   (Ok [_] (Ok 0))
-                                   (Err [why] (Err why)))))))
-  (gate-snapshot [(self (ptr Gatekeeper)) (a (dyn Allocator)) (upload SnapshotUpload)] (-> (Result SnapshotReceipt (slice u8)))
-                 (match (gate-call a self "POST" "/v1/snapshots" (encode a upload))
-                   (Err [why] (Err why))
-                   (Ok [answer] (expect [SnapshotReceipt] a "POST" "/v1/snapshots" answer 201 201)))))
+  (gate-notes [(self (ptr Gatekeeper)) (a (dyn Allocator))]
+    (-> (Result (ArrayList NoteListing) (slice u8)))
+    (match (gate-call a self "GET" "/v1/notes" "")
+      (Err [why] (Err why))
+      (Ok [answer]
+          (expect [(ArrayList NoteListing)] a "GET" "/v1/notes" answer 200 200))))
+  (gate-deliver [(self (ptr Gatekeeper))
+                 (a (dyn Allocator))
+                 (id (slice u8))
+                 (cell-id (slice u8))] (-> (Result i64 (slice u8)))
+    (let [path (join a ["/v1/notes/" id "/delivered"])]
+      (match (gate-call a
+                        self
+                        "POST"
+                        path
+                        (encode a (DeliveryUpload :cell-id cell-id)))
+        (Err [why] (Err why))
+        (Ok [answer]
+            (match (expect [Delivery] a "POST" path answer 201 200)
+              (Ok [_] (Ok 0))
+              (Err [why] (Err why)))))))
+  (gate-snapshot [(self (ptr Gatekeeper))
+                  (a (dyn Allocator))
+                  (upload SnapshotUpload)]
+    (-> (Result SnapshotReceipt (slice u8)))
+    (match (gate-call a self "POST" "/v1/snapshots" (encode a upload))
+      (Err [why] (Err why))
+      (Ok [answer]
+          (expect [SnapshotReceipt] a "POST" "/v1/snapshots" answer 201 201)))))

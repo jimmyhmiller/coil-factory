@@ -1,6 +1,5 @@
 (module http_app.json)
 (import "coil.alloc" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "http_app.router" :use *)
@@ -61,50 +60,50 @@
 (defn json-string-into! [(out (mut StrBuf)) (value (slice u8))] (-> i64)
   (let [(mut at) 0
         n (len value)]
-    (sb-push-byte! (mut out) (cast u8 34))
+    (push! (mut out) (cast u8 34))
     (loop (if (>= (load at) n)
               (break)
               (let [b (cast i64 (get value (load at)))
                     width (utf8-sequence-length value (load at))]
-                (cond (= b 34) (sb-push-str! (mut out) "\\\"")
-                      (= b 92) (sb-push-str! (mut out) "\\\\")
-                      (= b 10) (sb-push-str! (mut out) "\\n")
-                      (= b 13) (sb-push-str! (mut out) "\\r")
-                      (= b 9) (sb-push-str! (mut out) "\\t")
-                      (= b 8) (sb-push-str! (mut out) "\\b")
-                      (= b 12) (sb-push-str! (mut out) "\\f")
+                (cond (= b 34) (push-str! (mut out) "\\\"")
+                      (= b 92) (push-str! (mut out) "\\\\")
+                      (= b 10) (push-str! (mut out) "\\n")
+                      (= b 13) (push-str! (mut out) "\\r")
+                      (= b 9) (push-str! (mut out) "\\t")
+                      (= b 8) (push-str! (mut out) "\\b")
+                      (= b 12) (push-str! (mut out) "\\f")
                       (< b 32)
                         (do
-                          (sb-push-str! (mut out) "\\u00")
-                          (sb-push-byte! (mut out) (hex-digit (/ b 16)))
-                          (sb-push-byte! (mut out) (hex-digit (% b 16))))
-                      (= width 0) (sb-push-str! (mut out) "\\ufffd")
+                          (push-str! (mut out) "\\u00")
+                          (push! (mut out) (hex-digit (/ b 16)))
+                          (push! (mut out) (hex-digit (% b 16))))
+                      (= width 0) (push-str! (mut out) "\\ufffd")
                       :else
-                        (sb-push-str! (mut out)
-                                      (subslice [u8]
-                                                value
-                                                (load at)
-                                                (+ (load at) width))))
+                        (push-str! (mut out)
+                                   (subslice [u8]
+                                             value
+                                             (load at)
+                                             (+ (load at) width))))
                 (set! at (+ (load at) (if (= width 0) 1 width))))))
-    (sb-push-byte! (mut out) (cast u8 34))))
+    (push! (mut out) (cast u8 34))))
 
 ;;; `value` as an allocator-owned JSON string literal, including quotes.
 (defn json-quote [(a (dyn Allocator)) (value (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
+  (let [(mut out) (StrBuf::new a)]
     (json-string-into! (mut out) value)
-    (sb-finish! (mut out))))
+    (finish! (mut out))))
 
 ;;; The body `{"error":{"code":CODE,"message":MESSAGE}}`, allocated from `a`.
 (defn json-error-body [(a (dyn Allocator))
                        (code (slice u8))
                        (message (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
-    (sb-push-str! (mut out) "{\"error\":{\"code\":")
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "{\"error\":{\"code\":")
     (json-string-into! (mut out) code)
-    (sb-push-str! (mut out) ",\"message\":")
+    (push-str! (mut out) ",\"message\":")
     (json-string-into! (mut out) message)
-    (sb-push-str! (mut out) "}}")
-    (sb-finish! (mut out))))
+    (push-str! (mut out) "}}")
+    (finish! (mut out))))
 
 ;;; A JSON error response with body `{"error":{"code":..,"message":..}}`.
 (defn json-error [(a (dyn Allocator))
@@ -124,5 +123,5 @@
                    (status i64)
                    (code (slice u8))
                    (message (slice u8))]
-                  (-> Response)
-                  (json-error allocator status code message)))
+    (-> Response)
+    (json-error allocator status code message)))

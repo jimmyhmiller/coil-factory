@@ -1,8 +1,8 @@
 (module tui.term)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
-(import "coil.str" :use [cstr->str str-eq str-find])
-(import "coil.os" :use [getenv os-errno])
+(import "coil.str" :use [from-cstr])
+(import "coil.os" :use [getenv])
 (import "tui.fatal"
         :use
         [fatal fatal-set-restore-hook! fatal-clear-restore-hook!])
@@ -117,13 +117,14 @@
   (primitive/alloc-static TermState))
 
 (defn term--signal [(i i64)] (-> i64)
-  (case i 0
-        SIGHUP 1
-        SIGINT 2
-        SIGQUIT 3
-        SIGABRT 4
-        SIGSEGV 5
-        SIGTERM (term--sigbus)))
+  (case i
+    0 SIGHUP
+    1 SIGINT
+    2 SIGQUIT
+    3 SIGABRT
+    4 SIGSEGV
+    5 SIGTERM
+    (term--sigbus)))
 
 ;;; True when file descriptor `fd` is a terminal.
 (defn fd-tty? [(fd i64)] (-> bool)
@@ -147,11 +148,11 @@
                       (cast i64
                             (write (cast i32 fd)
                                    (cast (ptr i8)
-                                         (index (slice-data bytes) (load at)))
+                                         (index (data bytes) (load at)))
                                    (cast isize (- n (load at)))))]
                 (if (> written 0)
                     (set! at (+ (load at) written))
-                    (let [errno (os-errno)]
+                    (let [errno (coil.os/errno)]
                       (when (!= errno 4)
                         (set! failure (if (= errno 0) -1 errno))
                         (break)))))))
@@ -163,10 +164,10 @@
 
 (defn term--env [(name (ptr i8))] (-> (slice u8))
   (let [value (getenv name)]
-    (if (= (cast i64 value) 0) "" (cstr->str value))))
+    (if (= (cast i64 value) 0) "" (from-cstr value))))
 
 (defn term--contains? [(hay (slice u8)) (needle (slice u8))] (-> bool)
-  (match (str-find hay needle) (Some [at] true) (None [] false)))
+  (match (find hay needle) (Some [at] true) (None [] false)))
 
 (defn term--env-int [(name (ptr i8))] (-> i64)
   (let [text (term--env name)
@@ -194,7 +195,8 @@
         rows (if ok (cast i64 (.rows ws)) 0)
         env-cols (term--env-int c"COLUMNS")
         env-rows (term--env-int c"LINES")]
-    (TermSize :width (cond (> cols 0) cols (> env-cols 0) env-cols :else 80)
+    (TermSize
+      :width (cond (> cols 0) cols (> env-cols 0) env-cols :else 80)
       :height (cond (> rows 0) rows (> env-rows 0) env-rows :else 24))))
 
 ;;; The color capability implied by these environment values: NO_COLOR (any
@@ -228,7 +230,7 @@
 (defn term--raw-write [(text (slice u8))] (-> i64)
   ;; Used from signal handlers: plain write(2), no allocation, errors ignored
   ;; because there is nothing left to report them to.
-  (write (cast i32 1) (cast (ptr i8) (slice-data text)) (cast isize (len text)))
+  (write (cast i32 1) (cast (ptr i8) (data text)) (cast isize (len text)))
   0)
 
 (defn term--emit-enter [(options TermOptions)] (-> i64)
@@ -275,10 +277,9 @@
 
 (defn term--winch-handler [(sig i32)] (-> i64)
   (let [state (term--state)
-        byte (primitive/alloc-stack u8)]
-    (set! byte (cast u8 1))
+        (mut byte) (: (cast u8 1) u8)]
     (when (>= (cast i64 (.wake-write state)) 0)
-      (write (.wake-write state) (cast (ptr i8) byte) (cast isize 1))
+      (write (.wake-write state) (cast (ptr i8) (mut byte)) (cast isize 1))
       0)
     0))
 
@@ -318,17 +319,15 @@
   (let [state (term--state)
         (mut fds) (zeroed (array i32 2))]
     (if (!= (pipe (index fds 0)) (cast i32 0))
-        (os-errno)
+        (coil.os/errno)
         (let [r (load (index fds 0))
               w (load (index fds 1))]
           (fcntl r
                  (cast i32 F-SETFL)
-                 (primitive/ior (cast i64 (fcntl r (cast i32 F-GETFL)))
-                                (term--o-nonblock)))
+                 (| (cast i64 (fcntl r (cast i32 F-GETFL))) (term--o-nonblock)))
           (fcntl w
                  (cast i32 F-SETFL)
-                 (primitive/ior (cast i64 (fcntl w (cast i32 F-GETFL)))
-                                (term--o-nonblock)))
+                 (| (cast i64 (fcntl w (cast i32 F-GETFL))) (term--o-nonblock)))
           (set! (.wake-read state) r)
           (set! (.wake-write state) w)
           0))))
@@ -351,13 +350,13 @@
     (cond (.active state) (Err (AlreadyActive))
           (or (not (stdin-tty?)) (not (stdout-tty?))) (Err (NotATerminal))
           (!= (tcgetattr (cast i32 0) (mut (.saved state))) (cast i32 0))
-            (Err (GetAttrFailed (os-errno)))
+            (Err (GetAttrFailed (coil.os/errno)))
           :else
             (let [(mut raw) (.saved state)]
               (cfmakeraw (mut raw))
               (if (!= (tcsetattr (cast i32 0) (cast i32 TCSAFLUSH) (mut raw))
                       (cast i32 0))
-                  (Err (SetAttrFailed (os-errno)))
+                  (Err (SetAttrFailed (coil.os/errno)))
                   (do
                     (set! (.wake-read state) (cast i32 -1))
                     (set! (.wake-write state) (cast i32 -1))

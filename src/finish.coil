@@ -1,6 +1,5 @@
 (module factory.finish)
 (import "coil.alloc" :use *)
-(import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
 (import "agent.tool" :use *)
@@ -16,41 +15,57 @@
 
 (impl Tool FinishTool
   (tool-spec [(self (ptr FinishTool))] (-> ToolSpec)
-             (ToolSpec :name "finish"
-                       :description "End this station. outcome \"done\" when the work is complete and verified (the factory then runs the station's gate, if any); outcome \"blocked\" when you need a person, with your question in the summary."
-                       :parameters "{\"type\":\"object\",\"properties\":{\"outcome\":{\"type\":\"string\",\"enum\":[\"done\",\"blocked\"],\"description\":\"done or blocked\"},\"summary\":{\"type\":\"string\",\"description\":\"What changed and how you verified it; or, when blocked, exactly what you need.\"}},\"required\":[\"outcome\",\"summary\"],\"additionalProperties\":false}"
-                       :self-checked false))
-  (tool-summary [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall)] (-> (slice u8))
-                (let [(mut out) (sb-new a)]
-                  (sb-push-str! (mut out) "finish: ")
-                  (sb-push-str! (mut out) (call-string call "outcome"))
-                  (sb-finish! (mut out))))
-  (tool-run [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall) (context (dyn ToolContext))] (-> ToolOutcome)
-            (if (= (call-string call "outcome") "blocked")
-                (ToolOk "Recorded. The station is waiting for a person; their answer will arrive as a message.")
-                (if (> (len (.gate self)) 0)
-                    (ToolOk "Recorded. The factory is running the gate now.")
-                    (ToolOk "Recorded. The station is complete.")))))
+    (ToolSpec
+      :name "finish"
+      :description
+        "End this station. outcome \"done\" when the work is complete and verified (the factory then runs the station's gate, if any); outcome \"blocked\" when you need a person, with your question in the summary."
+      :parameters
+        "{\"type\":\"object\",\"properties\":{\"outcome\":{\"type\":\"string\",\"enum\":[\"done\",\"blocked\"],\"description\":\"done or blocked\"},\"summary\":{\"type\":\"string\",\"description\":\"What changed and how you verified it; or, when blocked, exactly what you need.\"}},\"required\":[\"outcome\",\"summary\"],\"additionalProperties\":false}"
+      :self-checked false))
+  (tool-summary [(self (ptr FinishTool)) (a (dyn Allocator)) (call ToolCall)]
+    (-> (slice u8))
+    (let [(mut out) (StrBuf::new a)]
+      (push-str! (mut out) "finish: ")
+      (push-str! (mut out) (call-string call "outcome"))
+      (finish! (mut out))))
+  (tool-run [(self (ptr FinishTool))
+             (a (dyn Allocator))
+             (call ToolCall)
+             (context (dyn ToolContext))] (-> ToolOutcome)
+    (if (= (call-string call "outcome") "blocked")
+        (ToolOk "Recorded. The station is waiting for a person; their answer will arrive as a message.")
+        (if (> (len (.gate self)) 0)
+            (ToolOk "Recorded. The factory is running the gate now.")
+            (ToolOk "Recorded. The station is complete.")))))
 
 ;;; Writes `path` when a client initializes the server, so the harness can
 ;;; tell a run whose finish tool never existed from one whose agent ignored it.
 (defstruct ReadyFile [(allocator (dyn Allocator)) (path (slice u8))])
 
 (impl mcp/ServerHooks ReadyFile
-  (on-initialize [(self (ptr ReadyFile)) (client (slice u8)) (version (slice u8))] (-> i64)
-                 (if (= (len (.path self)) 0)
-                     0
-                     (match (atomic/write-file-atomic! (.allocator self) (.path self) version 384)
-                       (Ok [_] 0)
-                       (Err [_] 0)))))
+  (on-initialize [(self (ptr ReadyFile))
+                  (client (slice u8))
+                  (version (slice u8))] (-> i64)
+    (if (= (len (.path self)) 0)
+        0
+        (match (atomic/write-file-atomic! (.allocator self)
+                                          (.path self)
+                                          version
+                                          384)
+          (Ok [_] 0)
+          (Err [_] 0)))))
 
 ;;; `factory _mcp-finish [--gate] [--ready FILE]`: serve the finish tool over
 ;;; MCP on stdio until stdin closes. `--gate` says the station has a gate,
 ;;; which changes only what the tool tells the agent; `--ready` names the file
 ;;; written when a client initializes the server.
-(defn finish-mcp-main [(a (dyn Allocator)) (has-gate bool) (ready (slice u8))] (-> i64)
+(defn finish-mcp-main [(a (dyn Allocator)) (has-gate bool) (ready (slice u8))]
+  (-> i64)
   (let [(mut registry) (registry-new a)
         finish (box! a FinishTool (FinishTool :gate (if has-gate "gate" "")))
         hooks (box! a ReadyFile (ReadyFile :allocator a :path ready))]
     (registry-add! (mut registry) finish)
-    (mcp/serve-stdio a (mut registry) (mcp/ServerInfo :name "factory" :version "0.1.0") hooks)))
+    (mcp/serve-stdio a
+                     (mut registry)
+                     (mcp/ServerInfo :name "factory" :version "0.1.0")
+                     hooks)))

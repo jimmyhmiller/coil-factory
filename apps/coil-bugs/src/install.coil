@@ -20,18 +20,18 @@
 (defn run [(a (dyn Allocator)) (program (slice u8)) (args (slice (slice u8)))] (-> (Result (slice u8) (slice u8)))
   (let [result (capture a program args "" 120000)]
     (if (.ok result)
-        (Ok (str-trim (.output result)))
-        (Err (join a [program " " (get args 0) " failed: " (str-trim (.error result)) (str-trim (.output result))])))))
+        (Ok (trim (.output result)))
+        (Err (join a [program " " (get args 0) " failed: " (trim (.error result)) (trim (.output result))])))))
 
 (defn xml [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
-  (let [(mut out) (sb-new a)]
+  (let [(mut out) (StrBuf::new a)]
     (for byte (iter text)
       (let [c (cast i64 byte)]
-        (cond (= c 38) (sb-push-str! (mut out) "&amp;")
-              (= c 60) (sb-push-str! (mut out) "&lt;")
-              (= c 62) (sb-push-str! (mut out) "&gt;")
-              :else (sb-push-byte! (mut out) byte))))
-    (sb-finish! (mut out))))
+        (cond (= c 38) (push-str! (mut out) "&amp;")
+              (= c 60) (push-str! (mut out) "&lt;")
+              (= c 62) (push-str! (mut out) "&gt;")
+              :else (push! (mut out) byte))))
+    (finish! (mut out))))
 
 (const LABEL "com.jimmyhmiller.coil-bugs-factory")
 
@@ -44,7 +44,7 @@
              log (path-join a root "logs/heartbeat.log")
              pad (match (search-path a "pad") (Some [p] p) (None [] (return-from :install (Err "pad is not on PATH"))))
              token (expand-home a token-file)
-             (mut notebooks) (al-new [(slice u8)] a)
+             (mut notebooks) (ArrayList::new [(slice u8)] a)
              plist-path (path-join a home (join a ["Library/LaunchAgents/" LABEL ".plist"]))
              uid (try! (run a "id" ["-u"]))]
          (when (not (file-exists? a token)) (return-from :install (Err (join a ["no Gatekeeper token at " token]))))

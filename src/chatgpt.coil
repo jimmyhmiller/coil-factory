@@ -1,0 +1,267 @@
+(module factory.chatgpt)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.time" :as time)
+(import "coil.http.client" :as http)
+(import "durable.atomic" :as atomic)
+(import "ai.responses" :as responses)
+(import "agent.json" :use *)
+(import "factory.proc" :use [env-or])
+
+;;; The ChatGPT login Codex keeps, used to reach a ChatGPT subscription's
+;;; models directly (the `chatgpt/` provider), without running Codex.
+;;;
+;;; Codex writes the login to `CODEX_HOME/auth.json` (`~/.codex/auth.json`):
+;;;
+;;;     {"OPENAI_API_KEY": null,
+;;;      "tokens": {"id_token": …, "access_token": …, "refresh_token": …, "account_id": …},
+;;;      "last_refresh": "2026-10-05T22:35:57.764766Z"}
+;;;
+;;; The access token is sent as the bearer token, with the account id. It
+;;; expires (after about ten days); when the server refuses it, the file is
+;;; read again first, because Codex or the ChatGPT app may have renewed it
+;;; meanwhile. Only if it is unchanged is it renewed here, with the same OAuth
+;;; refresh Codex makes, and written back the way Codex writes it, so Codex
+;;; and the factory go on sharing one login. Refresh tokens are used once: the
+;;; new one must be written back, or the next renewal (by anyone) fails.
+
+;;; Codex's OAuth client: the one its tokens were issued to, and so the only
+;;; one that can renew them.
+(const CODEX-CLIENT-ID "app_EMoamEEZ73f0CkXaXp7hrann")
+
+(const REFRESH-URL "https://auth.openai.com/oauth/token")
+
+;;; ChatGPT's endpoint for the models of a subscription, as Codex uses it.
+(const CHATGPT-RESPONSES-URL "https://chatgpt.com/backend-api/codex/responses")
+
+(defstruct CodexLogin
+  [(allocator (dyn Allocator))
+   ;;; The auth.json file.
+   (path (slice u8))
+   (refresh-url (slice u8))])
+
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
+
+;;; Codex's home: CODEX_HOME, else `~/.codex`.
+(defn codex-home-dir [(a (dyn Allocator))] (-> (slice u8))
+  (let [given (env-or a "CODEX_HOME" "")]
+    (if (> (len given) 0) given (cat a [(env-or a "HOME" "/") "/.codex"]))))
+
+(defn codex-login [(a (dyn Allocator))] (-> CodexLogin)
+  (CodexLogin
+    :allocator a
+    :path (cat a [(codex-home-dir a) "/auth.json"])
+    :refresh-url REFRESH-URL))
+
+(defsum LoginFile
+  (LoginFileOk [(root JVal)])
+  (LoginFileBad [(message (slice u8))]))
+
+(defn read-login [(a (dyn Allocator)) (path (slice u8))] (-> LoginFile)
+  (try (let [found
+               (try-or! (atomic/read-file-if-exists a path)
+                        (LoginFileBad (cat a
+                                           ["cannot read the ChatGPT login in "
+                                            path])))]
+         (match found
+           (None []
+                 (LoginFileBad (cat a
+                                    ["there is no ChatGPT login ("
+                                     path
+                                     " does not exist); log in with `codex login`"])))
+           (Some [text]
+                 (match (jv-parse a text)
+                   (None [] (LoginFileBad (cat a [path " is not JSON"])))
+                   (Some [root] (LoginFileOk root))))))))
+
+;;; The credentials `root` holds, or why it holds none.
+(defn login-credentials [(a (dyn Allocator)) (path (slice u8)) (root JVal)]
+  (-> responses/CredentialResult)
+  (let [tokens (jv-get root "tokens")
+        token (jv-string-or (jv-get tokens "access_token") "")
+        account (jv-string-or (jv-get tokens "account_id") "")]
+    (cond (> (len token) 0)
+            (responses/CredentialsOk (responses/ResponsesCredentials
+                                       :token token
+                                       :account account))
+          (> (len (jv-string-or (jv-get root "OPENAI_API_KEY") "")) 0)
+            (responses/CredentialsBad (cat a
+                                           ["Codex is logged in with an API key, not a ChatGPT account ("
+                                            path
+                                            "); a chatgpt/ model needs `codex login` with ChatGPT"]))
+          :else
+            (responses/CredentialsBad (cat a
+                                           [path
+                                            " holds no ChatGPT access token; log in with `codex login`"])))))
+
+;; ---------------------------------------------------------------------------
+;; Renewing
+
+(defn two-digits! [(out (mut StrBuf)) (n i64)] (-> i64)
+  (do
+    (when (< n 10) (push-str! (mut out) "0") 0)
+    (push-i64! (mut out) n)
+    0))
+
+;;; `ms` since the epoch as RFC 3339 in UTC, as Codex writes `last_refresh`.
+(defn rfc3339 [(a (dyn Allocator)) (ms i64)] (-> (slice u8))
+  (let [seconds (/ ms 1000)
+        days (/ seconds 86400)
+        of-day (% seconds 86400)
+        ;; Days to a civil date (Howard Hinnant's algorithm).
+        z (+ days 719468)
+        era (/ z 146097)
+        doe (- z (* era 146097))
+        yoe (/ (- (- (+ doe (/ doe 36524)) (/ doe 1460)) (/ doe 146096)) 365)
+        doy (- doe (- (+ (* 365 yoe) (/ yoe 4)) (/ yoe 100)))
+        mp (/ (+ (* 5 doy) 2) 153)
+        day (+ (- doy (/ (+ (* 153 mp) 2) 5)) 1)
+        month (if (< mp 10) (+ mp 3) (- mp 9))
+        year (+ (+ yoe (* era 400)) (if (<= month 2) 1 0))
+        (mut out) (StrBuf::new a)]
+    (push-i64! (mut out) year)
+    (push-str! (mut out) "-")
+    (two-digits! (mut out) month)
+    (push-str! (mut out) "-")
+    (two-digits! (mut out) day)
+    (push-str! (mut out) "T")
+    (two-digits! (mut out) (/ of-day 3600))
+    (push-str! (mut out) ":")
+    (two-digits! (mut out) (/ (% of-day 3600) 60))
+    (push-str! (mut out) ":")
+    (two-digits! (mut out) (% of-day 60))
+    (push-str! (mut out) ".")
+    (let [millis (% ms 1000)]
+      (when (< millis 100) (push-str! (mut out) "0") 0)
+      (when (< millis 10) (push-str! (mut out) "0") 0)
+      (push-i64! (mut out) millis))
+    (push-str! (mut out) "Z")
+    (finish! (mut out))))
+
+;;; The login file after a refresh: `root` with the tokens the refresh
+;;; returned (`reply`) and `last_refresh`, everything else kept. Err when the
+;;; reply has no access token.
+(defn renewed-login [(a (dyn Allocator)) (root JVal) (reply JVal) (now-ms i64)]
+  (-> (Result JVal (slice u8)))
+  (let [access (jv-string-or (jv-get reply "access_token") "")]
+    (if (= (len access) 0)
+        (Err (cat a
+                  ["the refresh answered without an access token: "
+                   (jv-encode a reply)]))
+        (let [updated (jv-clone a root)
+              tokens (jv-get updated "tokens")]
+          (jv-put! tokens "access_token" (JStr access))
+          (for key (iter ["id_token" "refresh_token"])
+            (let [value (jv-string-or (jv-get reply key) "")]
+              (when (> (len value) 0) (jv-put! tokens key (JStr value)) 0)))
+          (jv-put! updated "last_refresh" (JStr (rfc3339 a now-ms)))
+          (Ok updated)))))
+
+(defn refresh-request [(a (dyn Allocator))
+                       (url (slice u8))
+                       (refresh-token (slice u8))] (-> (Result JVal (slice u8)))
+  (let [body (jv-object a)
+        (mut headers) (ArrayList::new [http/Header] a)
+        request (box! a http/Request (zeroed http/Request))]
+    (jv-put! body "client_id" (JStr CODEX-CLIENT-ID))
+    (jv-put! body "grant_type" (JStr "refresh_token"))
+    (jv-put! body "refresh_token" (JStr refresh-token))
+    (jv-put! body "scope" (JStr "openid profile email"))
+    (push! (mut headers)
+           (http/Header :name "Content-Type" :value "application/json"))
+    (push! (mut headers) (http/Header :name "Accept" :value "application/json"))
+    (set! (.method request) "POST")
+    (set! (.url request) url)
+    (set! (.headers request) (slice headers))
+    (set! (.body request) (jv-encode a body))
+    (set! (.connect-timeout-ms request) 15000)
+    (set! (.timeout-ms request) 60000)
+    (set! (.follow-redirects request) false)
+    (set! (.ca-info request) "")
+    (try (let [response
+                 (try-or! (http/request a request)
+                          (Err (cat a ["cannot reach " url])))]
+           (let [status (http/response-status response)
+                 text (copy-bytes a (http/response-body response))]
+             (http/response-free a response)
+             (if (and (>= status 200) (< status 300))
+                 (match (jv-parse a text)
+                   (None []
+                         (Err (cat a
+                                   [url
+                                    " answered with something that is not JSON"])))
+                   (Some [reply] (Ok reply)))
+                 (let [(mut code) (StrBuf::new a)]
+                   (push-i64! (mut code) status)
+                   (Err (cat a
+                             [url
+                              " refused the refresh ("
+                              (finish! (mut code))
+                              "): "
+                              text
+                              "; log in again with `codex login`"])))))))))
+
+(defn now-ms [] (-> i64)
+  (try (let [ms (try-or! (time/wall-now-ms) 0)] ms)))
+
+(impl responses/ResponsesLogin CodexLogin
+  (login-current [(self (ptr CodexLogin)) (a (dyn Allocator))]
+    (-> responses/CredentialResult)
+    (match (read-login a (.path self))
+      (LoginFileBad [message] (responses/CredentialsBad message))
+      (LoginFileOk [root] (login-credentials a (.path self) root))))
+  (login-renew [(self (ptr CodexLogin))
+                (a (dyn Allocator))
+                (rejected responses/ResponsesCredentials)]
+    (-> responses/CredentialResult)
+    (block
+      :renew
+        (let [root
+                (match (read-login a (.path self))
+                  (LoginFileBad [message]
+                                (return-from
+                                  :renew (responses/CredentialsBad message)))
+                  (LoginFileOk [found] found))]
+          ;; Renewed meanwhile, by Codex or the ChatGPT app: use theirs.
+          (match (login-credentials a (.path self) root)
+            (responses/CredentialsOk [current]
+                                     (when (!= (.token current)
+                                               (.token rejected))
+                                       (return-from
+                                         :renew
+                                           (responses/CredentialsOk current))))
+            (responses/CredentialsBad [message]
+                                      (return-from
+                                        :renew
+                                          (responses/CredentialsBad message))))
+          (let [refresh-token
+                  (jv-string-or (jv-get (jv-get root "tokens") "refresh_token")
+                                "")]
+            (when (= (len refresh-token) 0)
+              (return-from
+                :renew
+                  (responses/CredentialsBad (cat a
+                                                 [(.path self)
+                                                  " has no refresh token; log in again with `codex login`"]))))
+            (match (refresh-request a (.refresh-url self) refresh-token)
+              (Err [message] (responses/CredentialsBad message))
+              (Ok [reply]
+                  (match (renewed-login a root reply (now-ms))
+                    (Err [message] (responses/CredentialsBad message))
+                    (Ok [updated]
+                        (match (atomic/write-file-atomic! a
+                                                          (.path self)
+                                                          (jv-encode a updated)
+                                                          384)
+                          (Err [_]
+                               (responses/CredentialsBad (cat a
+                                                              ["the login was renewed but could not be written back to "
+                                                               (.path self)
+                                                               "; Codex's copy is now stale, so log in again with `codex login`"])))
+                          (Ok [_] (login-credentials a (.path self) updated))))))))))))
