@@ -104,11 +104,13 @@
                            [(.tools opts)
                             (if (> (len (.tools opts)) 0) "," "")
                             "mcp__factory__*"])
-                     "--model"
-                     (.model opts)
                      "--append-system-prompt"
                      (.system h)])
       (push! (mut argv) word))
+    (when (> (len (.model opts)) 0)
+      (push! (mut argv) "--model")
+      (push! (mut argv) (.model opts))
+      0)
     (when (> (len (.session h)) 0)
       (push! (mut argv) "--resume")
       (push! (mut argv) (.session h))

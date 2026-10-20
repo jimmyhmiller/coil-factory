@@ -1,0 +1,125 @@
+(module factory.workbench-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "tui.keys" :use *)
+(import "tui.widgets" :use *)
+(import "tui.app" :use [app-snapshot])
+(import "factory.client" :use [Hub])
+(import "factory.client" :as client)
+(import "factory.session" :as session)
+(import "factory.ui.store" :use *)
+(import "agent.json" :use *)
+(import "coil.serde.value" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.dashboard" :use *)
+(import "factory.ui.workbench" :as workbench)
+(import "factory.ui.network" :as network)
+(import "factory.ui-views-test" :use [str-contains?])
+(import "agent.loop" :use [sleep-ms])
+(import "factory.session-test" :use [fresh-home])
+
+(defn standalone [(a (dyn Allocator)) (tag (slice u8))] (-> (ptr Dash))
+  (let [d (box! a Dash (zeroed Dash))]
+    (dash-init! d a (Hub :base-url "http://127.0.0.1:1" :token ""))
+    (workbench/init! (field d workbench) a (fresh-home a tag))
+    (new-personal! d)
+    d))
+
+(deftest standalone-opens-without-a-hub-and-preserves-draft-across-factory-view
+  (let [a (malloc-allocator)
+        d (standalone a "draft")]
+    (assert (str-contains? (app-snapshot d 120 30 0 a)
+                           "What would you like to work on?"))
+    (dashboard-key! d (Paste "Build something useful"))
+    (dashboard-key! d (Ctrl #\f))
+    (assert (match (.view d) (ViewOverview [] true) (_ false)))
+    (dashboard-key! d (Ctrl #\f))
+    (assert (match (.view d) (ViewPersonal [] true) (_ false)))
+    (assert (= (input-text (field (field d personal) input))
+               "Build something useful"))
+    (dashboard-key! d (Ctrl #\g))
+    (assert (.settings-open (.workbench d)))
+    (dashboard-key! d (Escape))
+    (assert (not (.settings-open (.workbench d))))))
+
+(deftest connection-token-is-masked-and-small-terminals-render
+  (let [a (malloc-allocator)
+        d (standalone a "mask")
+        w (field d workbench)]
+    (input-set-text! (index (field w connection) 1)
+                     "do-not-display-this-secret")
+    (dashboard-key! d (Ctrl #\k))
+    (let [screen (app-snapshot d 110 32 0 a)]
+      (assert (str-contains? screen "Factory connections"))
+      (assert (str-contains? screen "********"))
+      (assert (not (str-contains? screen "do-not-display-this-secret"))))
+    (for size (iter [0 1 4 20 50])
+      (app-snapshot d size size 0 a))
+    (dashboard-key! d (Escape))
+    (dashboard-key! d (Ctrl #\g))
+    (for size (iter [0 1 4 20 50])
+      (app-snapshot d size size 0 a))))
+
+(deftest failed-background-connection-does-not-take-over-conversation
+  (let [a (malloc-allocator)
+        d (standalone a "async")
+        w (field d workbench)]
+    (input-set-text! (index (field w connection) 0) "http://127.0.0.1:1")
+    (input-set-text! (index (field w connection) 2) "Offline test factory")
+    (connect! d 1)
+    (dashboard-key! d (Paste "still typing while connecting"))
+    (assert (= (input-text (field (field d personal) input))
+               "still typing while connecting"))
+    (let [(mut attempts) 0]
+      (loop (when (or (network/ready? (.job w)) (> (load attempts) 400))
+              (break))
+        (sleep-ms 10)
+        (set! attempts (+ (load attempts) 1))))
+    (assert (network/ready? (.job w)))
+    (poll-network! d)
+    (assert (= (cast i64 (.job w)) 0))
+    (assert (not (.connected w)))
+    (assert (match (.view d) (ViewPersonal [] true) (_ false)))
+    (assert (= (input-text (field (field d personal) input))
+               "still typing while connecting"))))
+
+(deftest applying-a-connection-preserves-personal-session-and-saves-the-profile
+  (let [a (malloc-allocator)
+        d (standalone a "profile")
+        w (field d workbench)
+        job
+          (network/start a
+                         1
+                         (.home w)
+                         (Hub
+                           :base-url "http://127.0.0.1:1"
+                           :token "saved-token")
+                         "http://127.0.0.1:1"
+                         "Test computer")]
+    (let [(mut attempts) 0]
+      (loop (when (or (network/ready? job) (> (load attempts) 400)) (break))
+        (sleep-ms 10)
+        (set! attempts (+ (load attempts) 1))))
+    (assert (network/ready? job))
+    ;; Exercise result application separately from transport and credentials.
+    (set! (.reply job)
+          (client/ReplyOk
+            :status 200
+            :body (jv-object a)
+            :text "{}"))
+    (set! (.job w) job)
+    (own! d (field w session-id) "0123456789abcdef01234567")
+    (dashboard-key! d (Paste "my draft"))
+    (poll-network! d)
+    (assert (.connected w))
+    (assert (match (.view d) (ViewPersonal [] true) (_ false)))
+    (assert (= (.session-id w) "0123456789abcdef01234567"))
+    (assert (= (input-text (field (field d personal) input)) "my draft"))
+    (assert (= (.connection-name w) "Test computer"))
+    (let [(mut reloaded) (zeroed workbench/Workbench)]
+      (workbench/init! (mut reloaded) a (.home w))
+      (let [profile (jv-nth (.value (.profiles reloaded)) 0)]
+        (assert (= (session/str profile "name") "Test computer"))
+        (assert (= (session/str profile "token") "saved-token"))))
+    (network/close! a (.active-connection w))
+    (set! (.active-connection w) (cast (ptr network/Job) 0))))

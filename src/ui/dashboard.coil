@@ -1,11 +1,22 @@
 (module factory.ui.dashboard)
-(import "coil.alloc" :use [Allocator free])
+(import "coil.alloc" :use [Allocator free box!])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
-(import "coil.str" :use [trim])
+(import "coil.str" :use [trim starts-with])
 (import "coil.serde.value" :use *)
 (import "coil.time" :as time)
-(import "agent.json" :use [copy-bytes jv-object jv-put! jv-encode])
+(import "coil.thread" :as thread)
+(import "coil.os" :as os)
+(import "factory.config" :as config)
+(import "factory.proc" :as proc)
+(import "factory.session" :as session)
+(import "factory.client" :as client)
+(import "factory.ui.workbench" :as workbench)
+(import "factory.ui.personal" :as personal)
+(import "factory.ui.network" :as network)
+(import "agent.json"
+        :use
+        [copy-bytes jv-object jv-put! jv-encode jv-clone jv-array jv-push!])
 (import "tui.canvas" :use *)
 (import "tui.keys" :use *)
 (import "tui.widgets" :use *)
@@ -50,13 +61,16 @@
   (let [reply (hub-call a (.hub d) method path body 5000)]
     (match reply
       (ReplyFailed [message]
-                   (own! d
-                         (field d hub-error)
-                         (concat a [message " (" (.base-url (.hub d)) ")"])))
+                   (do
+                     (set! (.connected (field d workbench)) false)
+                     (own! d
+                           (field d hub-error)
+                           (concat a [message " (" (.base-url (.hub d)) ")"]))))
       (ReplyOk [status value text]
                (do
                  (own! d (field d hub-error) "")
                  (set! (.hub-ok-t d) (.now d))
+                 (set! (.connected (field d workbench)) (reply-ok? reply))
                  0)))
     reply))
 
@@ -199,11 +213,12 @@
 ;;; Refresh whatever the current view shows, at most once a second (events
 ;;; twice a second).
 (defn poll! [(d (ptr Dash))] (-> i64)
+  (poll-network! d)
+  (poll-personal! d)
   (let [now (.now d)]
     (match (.view d)
-      (ViewOverview []
-                    (when (>= (- now (.polled-overview-t d)) 1000)
-                      (fetch-overview! d)))
+      (ViewPersonal [] (refresh-factory-background! d))
+      (ViewOverview [] (refresh-factory-background! d))
       (ViewRun []
                (do
                  (when (>= (- now (.polled-run-t d)) 1000) (fetch-run! d))
@@ -256,6 +271,7 @@
 
 (defn back! [(d (ptr Dash))] (-> i64)
   (match (.view d)
+    (ViewPersonal [] 0)
     (ViewChat []
               (if (.chat-from-run d)
                   (open-run! d (.run-id d))
@@ -266,6 +282,7 @@
 ;;; The run the current view is about.
 (defn focused-run [(d (ptr Dash))] (-> JVal)
   (match (.view d)
+    (ViewPersonal [] (JNull))
     (ViewOverview [] (selected-run d))
     (_ (.value (field d run)))))
 
@@ -469,6 +486,7 @@
 ;;; stale run or agent across refreshes. IDs are stable, independent of filtering.
 (defn focused-agent [(d (ptr Dash))] (-> (slice u8))
   (match (.view d)
+    (ViewPersonal [] "")
     (ViewChat [] (.agent (.chat d)))
     (ViewRun [] (selected-agent d))
     (ViewOverview [] (default-agent (selected-run d)))))
@@ -533,14 +551,47 @@
                           :title "Inspect tool calls"
                           :detail "Expand arguments, results and delegated work"
                           :enabled
-                            (match (.view d) (ViewChat [] true) (_ false)))])
+                            (match (.view d)
+                              (ViewChat [] true)
+                              (ViewPersonal []
+                                            (> (len (.session-id (.workbench d)))
+                                               0))
+                              (_ false)))
+                        (Command
+                          :id 11
+                          :title "New conversation"
+                          :detail "Work in your project without a factory"
+                          :enabled true)
+                        (Command
+                          :id 12
+                          :title "Return to conversation"
+                          :detail "Keep your conversation and draft"
+                          :enabled true)
+                        (Command
+                          :id 13
+                          :title "Conversation settings"
+                          :detail "Project, harness and model"
+                          :enabled true)
+                        (Command
+                          :id 14
+                          :title "Factory connections"
+                          :detail "Local, HTTP or SSH factories"
+                          :enabled true)
+                        (Command
+                          :id 15
+                          :title "Start local factory"
+                          :detail "Start and connect this computer"
+                          :enabled true)])
       (push! (mut commands) command))
     (load commands)))
 
 (defn command-selected! [(d (ptr Dash)) (id i64)] (-> AppFlow)
   (set! (.commands-open d) false)
   (cond (= id 1)
-          (do (set! (.view d) (ViewOverview)) (fetch-overview! d) (Continue))
+          (do
+            (set! (.view d) (ViewOverview))
+            (refresh-factory-background! d)
+            (Continue))
         (= id 2) (do (open-run! d (js (focused-run d) "id")) (Continue))
         (= id 3)
           (let [run (focused-run d)]
@@ -552,6 +603,13 @@
         (= id 8) (Quit)
         (= id 9) (do (set! (.launch-open d) true) (Continue))
         (= id 10) (do (set! (.inspection-open d) true) (Continue))
+        (= id 11) (do (new-personal! d) (Continue))
+        (= id 12) (do (set! (.view d) (ViewPersonal)) (Continue))
+        (= id 13)
+          (do (set! (.settings-open (field d workbench)) true) (Continue))
+        (= id 14)
+          (do (set! (.connections-open (field d workbench)) true) (Continue))
+        (= id 15) (do (connect! d 3) (Continue))
         :else (Continue)))
 
 (defn submit-launch! [(d (ptr Dash))] (-> i64)
@@ -559,26 +617,37 @@
         problem (launch-problem form)]
     (if (> (len problem) 0)
         (toast! d problem (ToneWarning))
-        (let [a (io-allocator d)
-              reply
-                (request! d
-                          a
-                          "POST"
-                          "/v1/runs"
-                          (jv-encode a (launch-body a form)))]
-          (if (reply-ok? reply)
-              (let [id (js (reply-body reply) "id")]
-                (if (= (len id) 0)
+        (if (not (.connected (.workbench d)))
+            (let [w (field d workbench)]
+              (if (= (.connection-name w) "Local factory")
+                  (do (set! (.auto-submit w) true) (connect! d 3))
+                  (do
+                    (set! (.connections-open w) true)
                     (toast! d
-                            "The site accepted the run but returned no run id; check the overview before retrying."
-                            (ToneWarning))
-                    (do
-                      (set! (.launch-open d) false)
-                      (open-run! d id))))
-              (complain! d a reply))))))
+                            "Connect this factory before starting the run."
+                            (ToneWarning)))))
+            (let [a (io-allocator d)
+                  reply
+                    (request! d
+                              a
+                              "POST"
+                              "/v1/runs"
+                              (jv-encode a (launch-body a form)))]
+              (if (reply-ok? reply)
+                  (let [id (js (reply-body reply) "id")]
+                    (if (= (len id) 0)
+                        (toast! d
+                                "The site accepted the run but returned no run id; check the overview before retrying."
+                                (ToneWarning))
+                        (do
+                          (set! (.launch-open d) false)
+                          (open-run! d id))))
+                  (complain! d a reply)))))))
 
 (defn dashboard-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (cond (match key (Ctrl [l] (= l #\c)) (_ false)) (Quit)
+        (.settings-open (.workbench d)) (settings-key! d key)
+        (.connections-open (.workbench d)) (connections-key! d key)
         (.inspection-open d)
           (do
             (match key
@@ -630,8 +699,35 @@
             (palette-reset! (field d commands))
             (set! (.commands-open d) true)
             (Continue))
+        (match key (Ctrl [l] (= l #\n)) (_ false))
+          (do (new-personal! d) (Continue))
+        (match key (Ctrl [l] (= l #\f)) (_ false))
+          (do
+            (set! (.view d)
+                  (match (.view d)
+                    (ViewPersonal [] (ViewOverview))
+                    (_ (ViewPersonal))))
+            (Continue))
+        (match key (Ctrl [l] (= l #\k)) (_ false))
+          (do (set! (.connections-open (.workbench d)) true) (Continue))
+        (match key (Ctrl [l] (= l #\g)) (_ false))
+          (do (set! (.settings-open (.workbench d)) true) (Continue))
+        (and (match (.view d) (ViewPersonal [] true) (_ false))
+             (match key (Ctrl [l] (= l #\b)) (_ false)))
+          (do
+            (set! (.history-focus (.workbench d))
+                  (not (.history-focus (.workbench d))))
+            (Continue))
+        (and (match (.view d) (ViewPersonal [] true) (_ false))
+             (match key (Ctrl [l] (= l #\x)) (_ false)))
+          (do
+            (session/cancel! (.allocator d)
+                             (.home (.workbench d))
+                             (.session-id (.workbench d)))
+            (Continue))
         :else
           (match (.view d)
+            (ViewPersonal [] (personal-key! d key))
             (ViewOverview [] (overview-key! d key))
             (ViewRun [] (run-key! d key))
             (ViewChat [] (chat-key! d key)))))
@@ -643,6 +739,7 @@
     (-> i64)
     (set! (.tick self) (.tick frame))
     (match (.view self)
+      (ViewPersonal [] (personal/draw-personal! self frame))
       (ViewOverview [] (draw-overview! self frame))
       (ViewRun [] (draw-run-view! self frame))
       (ViewChat [] (draw-chat-view! self frame)))
@@ -661,6 +758,10 @@
       (draw-launch! (field self launch) (.canvas frame) (.theme self)))
     (when (.inspection-open self)
       (draw-inspection! self (.canvas frame) (.scratch frame)))
+    (when (.settings-open (.workbench self))
+      (personal/draw-settings! self (.canvas frame)))
+    (when (.connections-open (.workbench self))
+      (personal/draw-connections! self (.canvas frame) (.scratch frame)))
     0)
   (app-event [(self (ptr Dash)) (event Event)]
     (-> AppFlow)
@@ -678,19 +779,334 @@
                      (hub Hub)
                      (initial-run (slice u8))
                      (initial-agent (slice u8))] (-> i64)
-  (let [(mut d) (zeroed Dash)]
-    (dash-init! (mut d) a hub)
+  (let [d (box! a Dash (zeroed Dash))]
+    (dash-init! d a hub)
+    (workbench/init! (field d workbench) a (config/factory-home a))
+    (new-personal! d)
+    (let [w (field d workbench)]
+      (input-set-text! (index (field w connection) 0) (.base-url hub))
+      (input-set-text! (index (field w connection) 1) (.token hub))
+      (input-set-text! (index (field w connection) 2) "Local factory")
+      (when (> (jv-len (.value (field w profiles))) 0)
+        (use-profile! d)))
     (set! (.now d) (wall-now))
     (cond (and (> (len initial-run) 0) (> (len initial-agent) 0))
-            (open-chat! (mut d) initial-run initial-agent false)
-          (> (len initial-run) 0) (open-run! (mut d) initial-run)
-          :else (fetch-overview! (mut d)))
-    (match (app-run (mut d) (app-options-default) a)
-      (Ok [_] 0)
-      (Err [e]
-           (match e
-             (NotATerminal []
-                           (do
-                             (println "factory: the dashboard needs an interactive terminal (try `factory ps`)")
-                             1))
-             (_ (do (println "factory: could not take over the terminal") 1)))))))
+            (open-chat! d initial-run initial-agent false)
+          (> (len initial-run) 0) (open-run! d initial-run)
+          :else 0)
+    (let [result
+            (match (app-run d (app-options-default) a)
+              (Ok [_] 0)
+              (Err [e]
+                   (match e
+                     (NotATerminal []
+                                   (do
+                                     (println "factory: the dashboard needs an interactive terminal (try `factory ps`)")
+                                     1))
+                     (_ (do
+                          (println "factory: could not take over the terminal")
+                          1)))))]
+      (network/close! a (.job (.workbench d)))
+      (network/close! a (.active-connection (.workbench d)))
+      result)))
+
+;;; Conversation-first workbench control. Local messages never pass through a
+;;; factory hub; remote jobs publish results back to this event loop.
+(defn new-personal! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        chat (field d personal)]
+    (own! d (field w session-id) "")
+    (snap-reset! (field w current))
+    (tree-free! (field d inspection))
+    (set! (.inspection d) (tree-new (.allocator d)))
+    (chat-open! chat "draft" "assistant")
+    (set! (.exact chat) true)
+    (set! (.needs-transcript chat) false)
+    (set! (.status w) "new")
+    (set! (.history-focus w) false)
+    (set! (.view d) (ViewPersonal))
+    0))
+
+(defn open-personal! [(d (ptr Dash)) (id (slice u8))] (-> i64)
+  (let [w (field d workbench)]
+    (tree-free! (field d inspection))
+    (set! (.inspection d) (tree-new (.allocator d)))
+    (own! d (field w session-id) id)
+    (chat-open! (field d personal) id "assistant")
+    (set! (.exact (.personal d)) true)
+    (set! (.needs-transcript (.personal d)) false)
+    (set! (.view d) (ViewPersonal))
+    (set! (.history-focus w) false)
+    (set! (.polled w) 0)
+    (poll-personal! d)
+    0))
+
+(defn poll-personal! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        chat (field d personal)]
+    (when (and (> (len (.home w)) 0) (>= (- (.now d) (.polled w)) 250))
+      (set! (.polled w) (.now d))
+      (let [a (snap-spare (field w sessions))]
+        (snap-commit! (field w sessions)
+                      (session/list-sessions a (.home w))
+                      (.now d)))
+      (when (> (len (.session-id w)) 0)
+        (let [a (snap-spare (field w current))
+              doc
+                (session/state-info a
+                                    (.home w)
+                                    (.session-id w)
+                                    (.inspection-open d))]
+          (snap-commit! (field w current) doc (.now d))
+          (set! (.status w) (js doc "status"))
+          (let [state (jv-object a)]
+            (jv-put! state "cursor" (JInt (+ (ji doc "inbox_cursor") 1)))
+            (chat-sync-pending! chat state)))
+        (let [a (io-allocator d)
+              page (session/events a (.home w) (.session-id w) (.cursor chat))]
+          (chat-ingest-page! chat page)))
+      0)
+    0))
+
+(defn send-personal! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        chat (field d personal)
+        text (trim (input-text (field chat input)))]
+    (block :send
+      (when (= (len text) 0) (return-from :send 0))
+      (let [a (io-allocator d)]
+        (when (= (len (.session-id w)) 0)
+          (match (session/create! a
+                                  (.home w)
+                                  (trim (workbench/value w 1))
+                                  (trim (workbench/value w 2))
+                                  (workbench/value w 0)
+                                  (first-line text))
+            (Ok [id] (own! d (field w session-id) id))
+            (Err [why] (do (toast! d why (ToneError)) (return-from :send 0)))))
+        (match (session/send! a (.home w) (.session-id w) text)
+          (Ok [ref]
+              (do
+                (chat-add-local! chat ref text (.now d))
+                (input-submit! (field chat input) a)
+                (scroll-to-bottom! (field chat sv))
+                (set! (.polled w) 0)
+                (poll-personal! d)))
+          (Err [why] (toast! d why (ToneError))))))))
+
+(defn personal-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)
+        chat (field d personal)]
+    (if (.history-focus w)
+        (match key
+          (Escape [] (do (set! (.history-focus w) false) (Continue)))
+          (Enter []
+                 (let [sessions (.value (field w sessions))
+                       i (.selected (.history w))]
+                   (when (and (>= i 0) (< i (jv-len sessions)))
+                     (open-personal! d (js (jv-nth sessions i) "id")))
+                   (Continue)))
+          (_ (do (list-handle-key! (field w history) key 8) (Continue))))
+        (match key
+          (PageUp [] (do (scroll-up! (field chat sv) 10) (Continue)))
+          (PageDown [] (do (scroll-down! (field chat sv) 10) (Continue)))
+          (Ctrl [letter]
+                (cond (= letter #\o)
+                        (do (set! (.inspection-open d) true) (Continue))
+                      (= letter #\t)
+                        (do
+                          (set! (.details chat) (not (.details chat)))
+                          (Continue))
+                      :else
+                        (do
+                          (input-handle-key! (field chat input) key)
+                          (Continue))))
+          (_ (match (input-handle-key! (field chat input) key)
+               (InputSubmitted [] (do (send-personal! d) (Continue)))
+               (_ (Continue))))))))
+
+(defn connect! [(d (ptr Dash)) (kind i64)] (-> i64)
+  (let [w (field d workbench)
+        address (trim (workbench/connection-value w 0))
+        token (trim (workbench/connection-value w 1))
+        name (trim (workbench/connection-value w 2))]
+    (cond (!= (cast i64 (.job w)) 0)
+            (toast! d
+                    "A factory connection request is already in progress."
+                    (ToneMuted))
+          (and (!= kind 3)
+               (not (or (starts-with address "http://")
+                        (starts-with address "https://")
+                        (starts-with address "ssh://"))))
+            (toast! d
+                    "Enter an https://, http://, or ssh:// factory address."
+                    (ToneWarning))
+          (and (= kind 4) (not (starts-with address "ssh://")))
+            (toast! d "Start remote requires an ssh:// address." (ToneWarning))
+          :else
+            (let [a (.allocator d)
+                  (mut local-config)
+                    (match (config/load-site-config a (.home w))
+                      (config/SiteConfigOk [c] c)
+                      (_ (zeroed config/SiteConfig)))
+                  hub
+                    (if (= kind 3)
+                        (client/hub-for a (mut local-config))
+                        (client/Hub :base-url address :token token))]
+              (set! (.starting w) true)
+              (set! (.job w)
+                    (network/start a
+                                   kind
+                                   (.home w)
+                                   hub
+                                   (if (= kind 3) (.base-url hub) address)
+                                   (if (= kind 3)
+                                       "Local factory"
+                                       (if (> (len name) 0) name address))))
+              (toast! d
+                      (if (= kind 3)
+                          "Starting local factory…"
+                          "Connecting to factory…")
+                      (ToneAccent))))))
+
+(defn save-profile! [(d (ptr Dash)) (job (ptr network/Job))] (-> bool)
+  (let [w (field d workbench)
+        a (snap-spare (field w profiles))
+        out (jv-array a)
+        entry (jv-object a)
+        old (.value (field w profiles))]
+    (jv-put! entry "url" (JStr (copy-bytes a (.address job))))
+    (jv-put! entry "token" (JStr (copy-bytes a (.token (.hub job)))))
+    (jv-put! entry "name" (JStr (copy-bytes a (.name job))))
+    (jv-push! out entry)
+    (for i (range 0 (jv-len old))
+      (let [profile (jv-nth old i)]
+        (when (and (< (jv-len out) 9)
+                   (not (= (js profile "url") (.address job))))
+          (jv-push! out (jv-clone a profile))
+          0)))
+    (snap-commit! (field w profiles) out (.now d))
+    (session/write-doc! a (session/cat a [(.home w) "/connections.json"]) out)))
+
+(defn poll-network! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        job (.job w)]
+    (when (network/ready? job)
+      (set! (.job w) (cast (ptr network/Job) 0))
+      (set! (.starting w) false)
+      (if (= (.kind job) 2)
+          (do
+            (set! (.polled-overview-t d) (.now d))
+            (if (reply-ok? (.reply job))
+                (let [a (snap-spare (field d overview))]
+                  (snap-commit! (field d overview)
+                                (jv-clone a (reply-body (.reply job)))
+                                (.now d))
+                  (sync-selection! d)
+                  (own! d (field (field d hub) base-url) (.base-url (.hub job)))
+                  (set! (.connected w) true)
+                  (own! d (field d hub-error) ""))
+                (do
+                  (set! (.connected w) false)
+                  (own! d
+                        (field d hub-error)
+                        "Factory is disconnected. ctrl-k opens connections.")))
+            (network/close! (.allocator d) job))
+          (if (reply-ok? (.reply job))
+              (do
+                (network/close! (.allocator d) (.active-connection w))
+                (set! (.active-connection w) job)
+                (own! d (field (field d hub) base-url) (.base-url (.hub job)))
+                (own! d (field (field d hub) token) (.token (.hub job)))
+                (own! d (field w connection-name) (.name job))
+                (set! (.connected w) true)
+                (set! (.connections-open w) false)
+                (own! d (field d hub-error) "")
+                (snap-reset! (field d overview))
+                (snap-reset! (field d run))
+                (set! (.polled-overview-t d) 0)
+                (when (not (match (.view d) (ViewPersonal [] true) (_ false)))
+                  (set! (.view d) (ViewOverview))
+                  0)
+                (if (save-profile! d job)
+                    (toast! d "Factory connected." (ToneSuccess))
+                    (toast! d
+                            "Factory connected, but the connection profile could not be saved."
+                            (ToneWarning)))
+                (when (.auto-submit w)
+                  (set! (.auto-submit w) false)
+                  (submit-launch! d))
+                0)
+              (do
+                (toast! d (reply-error (.allocator d) (.reply job)) (ToneError))
+                (set! (.auto-submit w) false)
+                (network/close! (.allocator d) job)))))
+    0))
+
+(defn refresh-factory-background! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)]
+    (when (and (> (len (.home w)) 0)
+               (= (cast i64 (.job w)) 0)
+               (>= (- (.now d) (.polled-overview-t d))
+                   (match (.view d) (ViewOverview [] 1000) (_ 5000))))
+      (set! (.polled-overview-t d) (.now d))
+      (set! (.job w)
+            (network/refresh (.allocator d)
+                             (.home w)
+                             (.hub d)
+                             (.connection-name w)
+                             (.active-connection w))))
+    0))
+
+(defn settings-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)]
+    (match key
+      (Escape [] (set! (.settings-open w) false))
+      (Tab [] (set! (.settings-focus w) (% (+ (.settings-focus w) 1) 3)))
+      (BackTab [] (set! (.settings-focus w) (% (+ (.settings-focus w) 2) 3)))
+      (Enter [] (do (set! (.settings-open w) false) (new-personal! d)))
+      (_ (do
+           (input-handle-key! (index (field w settings) (.settings-focus w))
+                              key)
+           0)))
+    (Continue)))
+
+(defn use-profile! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        profiles (.value (field w profiles))
+        i (.selected (.profile-list w))]
+    (when (and (>= i 0) (< i (jv-len profiles)))
+      (let [profile (jv-nth profiles i)]
+        (input-set-text! (index (field w connection) 0) (js profile "url"))
+        (input-set-text! (index (field w connection) 1) (js profile "token"))
+        (input-set-text! (index (field w connection) 2) (js profile "name"))
+        (connect! d 1))))
+  0)
+
+(defn connections-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)]
+    (match key
+      (Escape [] (set! (.connections-open w) false))
+      (Tab [] (set! (.connection-focus w) (% (+ (.connection-focus w) 1) 4)))
+      (BackTab []
+               (set! (.connection-focus w) (% (+ (.connection-focus w) 3) 4)))
+      (Enter []
+             (if (= (.connection-focus w) 3) (use-profile! d) (connect! d 1)))
+      (Ctrl [letter]
+            (cond (= letter #\l) (connect! d 3)
+                  (= letter #\r) (connect! d 4)
+                  :else
+                    (do
+                      (when (< (.connection-focus w) 3)
+                        (input-handle-key! (index (field w connection)
+                                                  (.connection-focus w))
+                                           key))
+                      0)))
+      (_ (if (= (.connection-focus w) 3)
+             (do (list-handle-key! (field w profile-list) key 8) 0)
+             (do
+               (input-handle-key! (index (field w connection)
+                                         (.connection-focus w))
+                                  key)
+               0))))
+    (Continue)))

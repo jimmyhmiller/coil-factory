@@ -16,10 +16,12 @@
 (import "factory.ui.feed" :use *)
 (import "factory.ui.chat" :use *)
 (import "factory.ui.launch" :use *)
+(import "factory.ui.workbench" :use [Workbench])
 
 ;;; The dashboard's whole state. Views draw from it; the event handler fetches
 ;;; into it. Nothing here touches the network.
 (defsum View
+  (ViewPersonal)
   (ViewOverview)
   (ViewRun)
   (ViewChat))
@@ -45,6 +47,8 @@
    (feed-focus bool)
    ;; chat view
    (chat Chat)
+   (personal Chat)
+   (workbench Workbench)
    ;; overlays and status
    (help bool)
    (commands-open bool)
@@ -68,7 +72,10 @@
 
 (defn dash-init! [(d (ptr Dash)) (a (dyn Allocator)) (hub Hub)] (-> i64)
   (set! (.allocator d) a)
-  (set! (.hub d) hub)
+  (set! (.hub d)
+        (Hub
+          :base-url (copy-bytes a (.base-url hub))
+          :token (copy-bytes a (.token hub))))
   (set! (.theme d) (theme-default))
   (set! (.view d) (ViewOverview))
   (set! (.chat-from-run d) false)
@@ -84,6 +91,7 @@
   (set! (.feed-sv d) (scroll-view-new))
   (set! (.feed-focus d) false)
   (chat-init! (field d chat) a)
+  (chat-init! (field d personal) a)
   (set! (.help d) false)
   (set! (.commands-open d) false)
   (set! (.commands d) (palette-new a))
@@ -92,6 +100,7 @@
   (set! (.inspection-open d) false)
   (set! (.inspection d) (tree-new a))
   (set! (.inspection-width d) 80)
+  (set! (.workbench d) (zeroed Workbench))
   (set! (.confirm-stop d) false)
   (set! (.confirm-run d) "")
   (set! (.toast d) "")
@@ -347,6 +356,12 @@
 
 (const HELP-ROWS
        [(HelpRow :key "ctrl-p" :what "search commands from any view")
+        (HelpRow :key "ctrl-n" :what "new personal conversation")
+        (HelpRow :key "ctrl-f" :what "switch conversation / factory activity")
+        (HelpRow :key "ctrl-k" :what "connect local, HTTP or SSH factory")
+        (HelpRow :key "ctrl-g" :what "choose project, harness and model")
+        (HelpRow :key "ctrl-b" :what "select a saved conversation")
+        (HelpRow :key "ctrl-x" :what "cancel the current personal turn")
         (HelpRow :key "n" :what "new factory run (overview)")
         (HelpRow :key "↑ ↓  pgup pgdn" :what "move, scroll")
         (HelpRow :key "enter" :what "open the run / the agent's chat")

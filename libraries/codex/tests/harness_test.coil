@@ -254,6 +254,19 @@ pwd > \"$dir/pwd.$n\"
 
 ;;; Codex's session log for thread th-1 in the fixture's Codex home: an
 ;;; earlier turn, then the run's turn with its usage so far, then `after`.
+(deftest empty-model-preserves-the-native-cli-default
+  (let [a (malloc-allocator)
+        (mut control) (zeroed Script)
+        f
+          (fixture a
+                   "default-model"
+                   (slice::new [(slice u8)] (cast (ptr (slice u8)) 0) 0)
+                   (mut control))
+        h (.harness f)]
+    (set! (.model (field h options)) "")
+    (let [argv (codex-argv a h)]
+      (for arg (iter argv) (assert (not (= arg "-m")))))))
+
 (defn session-log! [(a (dyn Allocator)) (f Fixture) (after (slice u8))] (-> i64)
   (let [day (cat a [(.dir f) "/home/sessions/2026/10/12"])]
     (run-status a "/bin/mkdir" ["-p" day])
@@ -643,9 +656,9 @@ pwd > \"$dir/pwd.$n\"
         r (.recorder f)
         (mut turn) (turn-new a h (cast (ptr scratch/ScratchArena) 0))]
     (assert (apply-event! (mut turn)
-      "{\"type\":\"item.started\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"in_progress\",\"sender_thread_id\":\"root\",\"receiver_thread_ids\":[\"child\"]}}"))
+                          "{\"type\":\"item.started\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"in_progress\",\"sender_thread_id\":\"root\",\"receiver_thread_ids\":[\"child\"]}}"))
     (assert (saw? r "tool agent spawn_agent Review the parser"))
     (assert (apply-event! (mut turn)
-      "{\"type\":\"item.completed\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"completed\",\"receiver_thread_ids\":[\"child\"],\"agents_states\":{\"child\":{\"status\":\"completed\",\"message\":\"No defects\"}}}}"))
+                          "{\"type\":\"item.completed\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"completed\",\"receiver_thread_ids\":[\"child\"],\"agents_states\":{\"child\":{\"status\":\"completed\",\"message\":\"No defects\"}}}}"))
     (assert-eq (len (.open turn)) 0)
     (assert (contains? (harness-checkpoint h a) "No defects"))))

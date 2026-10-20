@@ -9,6 +9,7 @@
 (import "factory.config" :use *)
 (import "factory.proc" :use *)
 (import "factory.worker" :as worker)
+(import "factory.session" :as session)
 (import "factory.finish" :use [finish-mcp-main])
 (import "factory.daemon" :as daemon)
 (import "factory.cli.ctx" :use *)
@@ -180,6 +181,18 @@
         home (factory-home a)]
     (remember-argv0! (arg argv 0))
     (cond ;; Internal entry points, started by the daemon and by `factory up`.
+          (and (>= argc 4) (= (arg argv 1) "_session"))
+            (let [session-home (arg argv 2)
+                  id (arg argv 3)]
+              (if (session/valid-id? id)
+                  (do
+                    (become-detached! a
+                                      (session/path a
+                                                    session-home
+                                                    id
+                                                    "process.log"))
+                    (session/worker-main a session-home id))
+                  1))
           (and (>= argc 3) (= (arg argv 1) "_run"))
             (let [id (arg argv 2)]
               (become-detached! a (run-file a home id "process.log"))
@@ -455,9 +468,10 @@
                          (args/Command
                            :name "chat"
                            :group "Talk"
-                           :summary "Talk with an agent (interactive)"
+                           :summary
+                             "Start a conversation, or talk with a factory agent"
                            :usage ""
-                           :args ["RUN/STATION"]
+                           :args ["[RUN/STATION]"]
                            :flags (args/no-flags))
                          (args/Command
                            :name "ask"

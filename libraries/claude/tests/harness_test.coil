@@ -162,6 +162,15 @@
       (Cancelled [] (assert true))
       (_ (assert false)))))
 
+(deftest empty-model-preserves-the-native-cli-default
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))]
+    (set! (.model (field (mut h) options)) "")
+    (let [argv (claude-argv a (mut h))]
+      (for arg (iter argv) (assert (not (= arg "--model")))))))
+
 ;;; Opt-in integration test: CLAUDE_LIVE_TEST=1 coil test --filter live.
 ;;; Uses the installed CLI and subscription, with no tools or file access.
 (deftest live-cli-replies-and-restores-its-conversation

@@ -1,0 +1,562 @@
+(module factory.session)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.fs" :as fs)
+(import "coil.scratch" :as scratch)
+(import "durable.atomic" :as atomic)
+(import "durable.lock" :as lock)
+(import "durable.ids" :as ids)
+(import "durable.jsonl" :as jsonl)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+(import "agent.harness" :use *)
+(import "agent.tool" :use *)
+(import "factory.config" :use *)
+(import "factory.events" :use *)
+(import "factory.harnesses" :use *)
+(import "factory.proc" :use *)
+(import "factory.journal" :use [append-record! AppendedAt AppendFailed])
+
+;;; Personal coding conversations are independent of factory runs. They work
+;;; directly in the chosen directory, persist under sessions/, and need no hub.
+;;; One supervised worker owns each conversation; enqueue and retirement share
+;;; a lock so a message racing with worker exit can never be stranded.
+(defn cat [(a (dyn Allocator)) (parts (slice (slice u8)))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (for part (iter parts) (push-str! (mut out) part))
+    (finish! (mut out))))
+
+(defn path [(a (dyn Allocator))
+            (home (slice u8))
+            (id (slice u8))
+            (file (slice u8))] (-> (slice u8))
+  (cat a [home "/sessions/" id "/" file]))
+
+(defn read-doc [(a (dyn Allocator)) (file (slice u8))] (-> JVal)
+  (match (atomic/read-file-if-exists a file)
+    (Ok [found]
+        (match found
+          (Some [text] (match (jv-parse a text) (Some [v] v) (_ (JNull))))
+          (_ (JNull))))
+    (_ (JNull))))
+
+(defn write-doc! [(a (dyn Allocator)) (file (slice u8)) (doc JVal)] (-> bool)
+  (match (atomic/write-file-atomic! a file (jv-encode a doc) 384)
+    (Ok [_] true)
+    (_ false)))
+
+(defn str [(doc JVal) (key (slice u8))] (-> (slice u8))
+  (jv-string-or (jv-get doc key) ""))
+
+(defn valid-id? [(id (slice u8))] (-> bool)
+  (block :valid
+    (when (!= (len id) 24) (return-from :valid false))
+    (for b (iter id)
+      (when (not (or (and (>= b 48) (<= b 57)) (and (>= b 97) (<= b 102))))
+        (return-from :valid false)))
+    true))
+
+(defn create! [(a (dyn Allocator))
+               (home (slice u8))
+               (harness (slice u8))
+               (model (slice u8))
+               (workdir (slice u8))
+               (title (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (block :create
+    (when (not (or (= harness "claude")
+                   (= harness "codex")
+                   (= harness "builtin")
+                   (= harness "opencode")))
+      (return-from :create (Err "Choose claude, codex, builtin, or opencode.")))
+    (let [directory
+            (match (real-path a workdir)
+              (Some [p] p)
+              (_ (return-from
+                   :create (Err "The conversation directory does not exist."))))
+          id
+            (match (ids/random-hex a 12)
+              (Ok [s] s)
+              (_ (return-from :create (Err "Could not allocate a session id."))))
+          root (path a home id "")
+          meta (jv-object a)]
+      (when (not (match (atomic/dir-exists? a directory)
+                   (Ok [exists] exists)
+                   (_ false)))
+        (return-from
+          :create (Err "The conversation project must be a directory.")))
+      (match (atomic/ensure-dir! a root 448)
+        (Ok [_] 0)
+        (_ (return-from
+             :create (Err "Could not create the conversation directory."))))
+      (jv-put! meta "id" (JStr id))
+      (jv-put! meta "harness" (JStr harness))
+      (jv-put! meta "model" (JStr model))
+      (jv-put! meta "workdir" (JStr directory))
+      (jv-put! meta "title" (JStr title))
+      (jv-put! meta "created" (JInt (wall-ms)))
+      (if (write-doc! a (path a home id "session.json") meta)
+          (Ok id)
+          (Err "Could not persist the conversation.")))))
+
+(defn worker-pid [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
+  (-> i64)
+  (jv-int (jv-get (read-doc a (path a home id "worker.json")) "pid")))
+
+(defn set-pid! [(a (dyn Allocator)) (home (slice u8)) (id (slice u8)) (pid i64)]
+  (-> bool)
+  (let [doc (jv-object a)]
+    (jv-put! doc "pid" (JInt pid))
+    (write-doc! a (path a home id "worker.json") doc)))
+
+(defn send! [(a (dyn Allocator))
+             (home (slice u8))
+             (id (slice u8))
+             (text (slice u8))] (-> (Result i64 (slice u8)))
+  (block :send
+    (when (or (not (valid-id? id)) (= (len (trim text)) 0))
+      (return-from :send (Err "The conversation or message is empty.")))
+    (when (> (len text) 1048576)
+      (return-from
+        :send
+          (Err "The message exceeds 1 MiB; put large context in project files.")))
+    (when (jv-null? (read-doc a (path a home id "session.json")))
+      (return-from :send (Err "The conversation no longer exists.")))
+    (let [(mut gate)
+            (match (lock/lock-open! a (path a home id "queue.lock"))
+              (Ok [l] l)
+              (_ (return-from
+                   :send (Err "Could not open the conversation lock."))))]
+      (match (lock/lock-wait! (mut gate))
+        (Ok [_] 0)
+        (_ (do
+             (lock/lock-close! (mut gate))
+             (return-from :send (Err "Could not lock the conversation.")))))
+      (when (and (process-alive? (worker-pid a home id))
+                 (match (atomic/file-exists? a (path a home id "cancel"))
+                   (Ok [exists] exists)
+                   (_ false)))
+        (lock/lock-close! (mut gate))
+        (return-from
+          :send
+            (Err "The assistant is stopping. Your draft is kept; send it once stopping finishes.")))
+      (let [message (ev-str! (ev a "message.sent") "text" text)
+            appended (append-record! a (path a home id "inbox.jsonl") message)
+            process (worker-pid a home id)]
+        (match appended
+          (AppendFailed [why]
+                        (do
+                          (lock/lock-close! (mut gate))
+                          (return-from :send (Err why))))
+          (_ 0))
+        (when (not (process-alive? process))
+          (atomic/unlink-path a (path a home id "cancel"))
+          (let [child
+                  (spawn-detached a (self-executable a) ["_session" home id])]
+            (when (or (< child 0) (not (set-pid! a home id child)))
+              (lock/lock-close! (mut gate))
+              (return-from
+                :send
+                  (Err "Message saved, but the conversation worker could not start. Reopen the conversation to retry.")))))
+        (lock/lock-close! (mut gate))
+        (match appended
+          (AppendedAt [offset]
+                      (Ok (+ offset (+ (len (jv-encode a message)) 1))))
+          (AppendFailed [why] (Err why)))))))
+
+(defn cancel! [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))] (-> bool)
+  (and (valid-id? id)
+       (match (atomic/write-file-atomic! a
+                                         (path a home id "cancel")
+                                         "cancel"
+                                         384)
+         (Ok [_] true)
+         (_ false))))
+
+(defstruct Worker
+  [(allocator (dyn Allocator))
+   (home (slice u8))
+   (id (slice u8))
+   (cursor i64)
+   (read-cursor i64)
+   (harness (Option (dyn Harness)))
+   (status (slice u8))
+   (error (slice u8))
+   (failed bool)])
+
+(defn record! [(w (ptr Worker)) (doc JVal)] (-> i64)
+  ;; Keep live journals bounded; the provider checkpoint retains full results.
+  (for key (iter ["text" "output" "args" "summary" "reason"])
+    (let [text (str doc key)]
+      (when (> (len text) 131072)
+        (ev-text! (.allocator w) doc key text 131072)
+        0)))
+  (match (append-record! (.allocator w)
+                         (path (.allocator w) (.home w) (.id w) "events.jsonl")
+                         doc)
+    (AppendedAt [_] 0)
+    (AppendFailed [_] (do (set! (.failed w) true) 0))))
+
+(defn save! [(w (ptr Worker))] (-> i64)
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/ScratchArena::init (mut arena) (malloc-allocator))
+    (let [a (allocator (mut arena))
+          existing (read-doc a (path a (.home w) (.id w) "checkpoint.json"))
+          doc (if (jv-null? existing) (jv-object a) existing)]
+      (jv-put! doc "status" (JStr (.status w)))
+      (jv-put! doc "error" (JStr (.error w)))
+      (jv-put! doc "updated" (JInt (wall-ms)))
+      (when (= (.read-cursor w) (.cursor w))
+        (jv-put! doc "inbox_cursor" (JInt (.cursor w)))
+        (match (.harness w)
+          (Some [h] (jv-put! doc "checkpoint" (JStr (harness-checkpoint h a))))
+          (_ 0))
+        0)
+      (when (not (write-doc! a (path a (.home w) (.id w) "checkpoint.json") doc))
+        (set! (.failed w) true)
+        0)
+      (let [status (jv-object a)]
+        (for key (iter ["status" "error" "updated" "inbox_cursor"])
+          (jv-put! status key (jv-get doc key)))
+        (when (not (write-doc! a
+                               (path a (.home w) (.id w) "status.json")
+                               status))
+          (set! (.failed w) true)
+          0))
+      0)
+    (close! (mut arena))
+    0))
+
+(impl AgentControl Worker
+  (control-check [(self (ptr Worker))] (-> Control)
+    (if (or (.failed self)
+            (match (atomic/file-exists? (.allocator self)
+                                        (path (.allocator self)
+                                              (.home self)
+                                              (.id self)
+                                              "cancel"))
+              (Ok [b] b)
+              (_ true)))
+        (Cancel)
+        (Proceed)))
+  (control-inbox [(self (ptr Worker)) (a (dyn Allocator))]
+    (-> (ArrayList Inbound))
+    (let [(mut out) (ArrayList::new [Inbound] a)]
+      (match (jsonl/journal-read a
+                                 (path a (.home self) (.id self) "inbox.jsonl")
+                                 (.read-cursor self)
+                                 128
+                                 8388608)
+        (Err [_] (set! (.failed self) true))
+        (Ok [batch]
+            (for entry (iter (jsonl/batch-records batch))
+              (match (jv-parse a (.line entry))
+                (Some [message]
+                      (push! (mut out)
+                             (Inbound
+                               :from "you"
+                               :text (str message "text")
+                               :ref (.next-offset entry))))
+                (_ (set! (.failed self) true)))
+              (set! (.read-cursor self) (.next-offset entry)))))
+      (load out)))
+  (control-idle [(self (ptr Worker))] (-> i64)
+    (sleep-ms 100)))
+
+(impl AgentObserver Worker
+  (observe [(self (ptr Worker)) (event AgentEvent)] (-> i64)
+    (let [a (.allocator self)]
+      (match event
+        (TurnStarted [n]
+                     (do
+                       (save! self)
+                       (record! self
+                                (ev-int! (ev-agent a "agent.turn" "assistant")
+                                         "turn"
+                                         n))))
+        (MessageDelivered [m]
+                          (do
+                            (set! (.cursor self) (.ref m))
+                            (record! self
+                                     (ev-str! (ev-str! (ev-int! (ev-agent a
+                                                                          "message.received"
+                                                                          "assistant")
+                                                                "ref"
+                                                                (.ref m))
+                                                       "from"
+                                                       "you")
+                                              "text"
+                                              (.text m)))))
+        (Said [text]
+              (record! self
+                       (ev-str! (ev-agent a "agent.text" "assistant")
+                                "text"
+                                text)))
+        (Thought [text]
+                 (record! self
+                          (ev-str! (ev-agent a "agent.thought" "assistant")
+                                   "text"
+                                   text)))
+        (Streaming [part chars] 0)
+        (ToolStarted [call summary]
+                     (record! self
+                              (ev-str! (ev-str! (ev-str! (ev-str! (ev-agent a
+                                                                            "tool.started"
+                                                                            "assistant")
+                                                                  "call"
+                                                                  (.id call))
+                                                         "tool"
+                                                         (.name call))
+                                                "summary"
+                                                summary)
+                                       "args"
+                                       (.arguments-json call))))
+        (ToolEnded [call summary ok output elapsed]
+                   (do
+                     (record! self
+                              (ev-str! (ev-int! (ev-bool! (ev-str! (ev-str! (ev-agent a
+                                                                                      "tool.finished"
+                                                                                      "assistant")
+                                                                            "call"
+                                                                            (.id call))
+                                                                   "tool"
+                                                                   (.name call))
+                                                          "ok"
+                                                          ok)
+                                                "elapsed_ms"
+                                                elapsed)
+                                       "output"
+                                       output))
+                     (save! self)))
+        (UsageReported [input cached output]
+                       (record! self
+                                (ev-int! (ev-int! (ev-int! (ev-agent a
+                                                                     "agent.usage"
+                                                                     "assistant")
+                                                           "input"
+                                                           input)
+                                                  "cached"
+                                                  cached)
+                                         "output"
+                                         output)))
+        (UsageUnknown [why]
+                      (record! self
+                               (ev-str! (ev-agent a
+                                                  "agent.usage-unknown"
+                                                  "assistant")
+                                        "reason"
+                                        why)))
+        (_ 0))
+      0)))
+
+(defn setup [(a (dyn Allocator))
+             (config (ptr SiteConfig))
+             (meta JVal)
+             (root (slice u8))
+             (observer (dyn AgentObserver))
+             (control (dyn AgentControl))] (-> AgentSetup)
+  (let [request
+          (AgentRequest
+            :harness (str meta "harness")
+            :model (str meta "model")
+            :tools "files,shell"
+            :finish false
+            :gate ""
+            :workspace (str meta "workdir")
+            :run-dir root
+            :station "assistant"
+            :state-key "conversation"
+            :extra-tools (no-extra-tools)
+            :agent-server (no-agent-server)
+            :stop-tool "")]
+    (cond (= (.harness request) "claude")
+            (claude-agent a config request observer control)
+          (= (.harness request) "codex")
+            (codex-agent a config request observer control)
+          :else (station-agent a config request observer control))))
+
+(defn worker-main [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
+  (-> i64)
+  (block :worker
+    (when (not (valid-id? id)) (return-from :worker 1))
+    (let [(mut gate)
+            (match (lock/lock-open! a (path a home id "worker.lock"))
+              (Ok [l] l)
+              (_ (return-from :worker 1)))]
+      (match (lock/lock-wait! (mut gate))
+        (Ok [_] 0)
+        (_ (do (lock/lock-close! (mut gate)) (return-from :worker 1))))
+      (let [meta (read-doc a (path a home id "session.json"))
+            saved (read-doc a (path a home id "checkpoint.json"))
+            config
+              (box! a
+                    SiteConfig
+                    (match (load-site-config a home)
+                      (SiteConfigOk [c] c)
+                      (_ (do
+                           (lock/lock-close! (mut gate))
+                           (return-from :worker 1)))))
+            w
+              (box! a
+                    Worker
+                    (Worker
+                      :allocator a
+                      :home home
+                      :id id
+                      :cursor (jv-int (jv-get saved "inbox_cursor"))
+                      :read-cursor (jv-int (jv-get saved "inbox_cursor"))
+                      :harness (None)
+                      :status "running"
+                      :error ""
+                      :failed false))]
+        (match (setup a config meta (path a home id "") w w)
+          (AgentUnavailable [why]
+                            (do
+                              (set! (.status w) "failed")
+                              (set! (.error w) why)))
+          (AgentReady [ready]
+                      (let [h (.harness ready)
+                            checkpoint (str saved "checkpoint")]
+                        (set! (.harness w) (Some h))
+                        (if (> (len checkpoint) 0)
+                            (when (not (harness-restore! h checkpoint))
+                              (set! (.failed w) true)
+                              (set! (.error w)
+                                    "The saved conversation checkpoint is invalid; it was preserved."))
+                            (harness-add-system! h
+                                                 "You are the user's coding assistant. Work directly in the chosen project directory, follow its instructions, and collaborate in an ongoing conversation. This is a personal session, not a factory station: there is no finish tool, gate, or automatic commit. Use subagents when the user asks or project instructions call for them."))
+                        (save! w)
+                        (when (not (.failed w))
+                          (match (harness-run! h)
+                            (Replied [_] (set! (.status w) "idle"))
+                            (Finished [_ _] (set! (.status w) "idle"))
+                            (Cancelled [] (set! (.status w) "cancelled"))
+                            (Failed [error]
+                                    (do
+                                      (set! (.status w) "failed")
+                                      (set! (.error w) (.message error)))))
+                          (when (.failed w) (set! (.status w) "failed") 0)))))
+        (when (.failed w) (set! (.status w) "failed") 0)
+        (save! w)
+        (let [(mut queue-gate)
+                (match (lock/lock-open! a (path a home id "queue.lock"))
+                  (Ok [l] l)
+                  (_ (do
+                       (lock/lock-close! (mut gate))
+                       (return-from :worker 1))))]
+          (match (lock/lock-wait! (mut queue-gate))
+            (Ok [_] 0)
+            (_ (do
+                 (lock/lock-close! (mut queue-gate))
+                 (lock/lock-close! (mut gate))
+                 (return-from :worker 1))))
+          (set-pid! a home id 0)
+          ;; A message can arrive after the provider's final inbox poll. Transfer
+          ;; ownership to a new worker before releasing the enqueue/retire lock.
+          (when (and (= (.status w) "idle") (not (.failed w)))
+            (match (jsonl/journal-read a
+                                       (path a home id "inbox.jsonl")
+                                       (.cursor w)
+                                       1
+                                       8388608)
+              (Ok [batch]
+                  (when (> (jsonl/batch-count batch) 0)
+                    (let [child
+                            (spawn-detached a
+                                            (self-executable a)
+                                            ["_session" home id])]
+                      (when (> child 0) (set-pid! a home id child) 0))))
+              (_ 0)))
+          (lock/lock-close! (mut queue-gate)))
+        (lock/lock-close! (mut gate))
+        (if (= (.status w) "failed") 1 0)))))
+
+(defn events [(a (dyn Allocator)) (home (slice u8)) (id (slice u8)) (after i64)]
+  (-> JVal)
+  (let [page (jv-object a)
+        records (jv-array a)
+        (mut cursor) after]
+    (when (valid-id? id)
+      (match (jsonl/journal-read a
+                                 (path a home id "events.jsonl")
+                                 after
+                                 512
+                                 4194304)
+        (Ok [batch]
+            (for entry (iter (jsonl/batch-records batch))
+              (match (jv-parse a (.line entry))
+                (Some [doc] (jv-push! records doc))
+                (_ 0))
+              (set! cursor (.next-offset entry))))
+        (_ 0)))
+    (jv-put! page "records" records)
+    (jv-put! page "cursor" (JInt (load cursor)))
+    page))
+
+(defn list-sessions [(a (dyn Allocator)) (home (slice u8))] (-> JVal)
+  (let [out (jv-array a)]
+    (match (fs/Directory::list a (cat a [home "/sessions"]))
+      (Ok [entries]
+          (for name (iter entries)
+            (when (valid-id? name)
+              (let [meta (read-doc a (path a home name "session.json"))
+                    saved (read-status a home name)]
+                (when (not (jv-null? meta))
+                  (jv-put! meta
+                           "status"
+                           (JStr (if (process-alive? (worker-pid a home name))
+                                     "running"
+                                     (if (= (str saved "status") "running")
+                                         "interrupted"
+                                         (if (= (len (str saved "status")) 0)
+                                             "new"
+                                             (str saved "status"))))))
+                  (jv-put! meta "error" (jv-get saved "error"))
+                  (jv-push! out meta))
+                0))))
+      (_ 0))
+    out))
+
+(defn state-info [(a (dyn Allocator))
+                  (home (slice u8))
+                  (id (slice u8))
+                  (checkpoint bool)] (-> JVal)
+  (if (not (valid-id? id))
+      (JNull)
+      (let [meta (read-doc a (path a home id "session.json"))
+            saved
+              (if checkpoint
+                  (read-doc a (path a home id "checkpoint.json"))
+                  (read-status a home id))]
+        (when (not (jv-null? meta))
+          (jv-put! meta
+                   "status"
+                   (JStr (if (process-alive? (worker-pid a home id))
+                             "running"
+                             (if (= (str saved "status") "running")
+                                 "interrupted"
+                                 (if (= (len (str saved "status")) 0)
+                                     "new"
+                                     (str saved "status"))))))
+          (jv-put! meta "error" (jv-get saved "error"))
+          (jv-put! meta "checkpoint" (jv-get saved "checkpoint"))
+          (jv-put! meta "inbox_cursor" (jv-get saved "inbox_cursor"))
+          0)
+        meta)))
+
+(defn info [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))] (-> JVal)
+  (state-info a home id true))
+
+(defn summary [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))] (-> JVal)
+  (state-info a home id false))
+
+;;; Older conversations may only have a checkpoint; new saves keep a small
+;;; status index so history polling never reloads every provider transcript.
+(defn read-status [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
+  (-> JVal)
+  (let [status (read-doc a (path a home id "status.json"))]
+    (if (jv-null? status)
+        (read-doc a (path a home id "checkpoint.json"))
+        status)))

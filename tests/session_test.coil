@@ -1,0 +1,152 @@
+(module factory.session-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+(import "coil.serde.value" :use *)
+(import "durable.atomic" :as disk)
+(import "factory.proc" :as proc)
+(import "factory.session" :as session)
+(import "factory.events" :use *)
+(import "factory.journal" :use *)
+(import "agent.json" :use *)
+(import "agent.loop" :use *)
+
+(defn fresh-home [(a (dyn Allocator)) (tag (slice u8))] (-> (slice u8))
+  (let [home
+          (session/cat a
+                       ["/private/tmp/factory-session-test-"
+                        tag
+                        "-"
+                        (let [(mut s) (StrBuf::new a)]
+                          (push-i64! (mut s) (proc/pid))
+                          (finish! (mut s)))])]
+    (proc/capture a "/bin/rm" ["-rf" home] "" 10000)
+    (match (disk/ensure-dir! a home 448) (Ok [_] 0) (_ (assert false)))
+    home))
+
+(defn created [(a (dyn Allocator)) (home (slice u8))] (-> (slice u8))
+  (match (session/create! a
+                          home
+                          "claude"
+                          "haiku"
+                          home
+                          "A personal conversation")
+    (Ok [id] id)
+    (Err [e] (do (println "{s}" e) (assert false) ""))))
+
+(deftest sessions-are-durable-conversations-without-runs-or-a-hub
+  (let [a (malloc-allocator)
+        home (fresh-home a "create")
+        id (created a home)
+        meta (session/info a home id)]
+    (assert (session/valid-id? id))
+    (assert (= (session/str meta "harness") "claude"))
+    (assert (= (session/str meta "workdir") home))
+    (assert-eq (jv-count (session/list-sessions a home)) 1)
+    (assert (match (disk/dir-exists? a (session/cat a [home "/runs"]))
+              (Ok [exists] (not exists))
+              (_ false)))
+    (assert (not (session/valid-id? "../run")))
+    (assert (jv-null? (session/info a home "../run")))))
+
+(deftest inbox-polling-does-not-redeliver-an-unacknowledged-message
+  (let [a (malloc-allocator)
+        home (fresh-home a "queue")
+        id (created a home)
+        (mut worker)
+          (session/Worker
+            :allocator a
+            :home home
+            :id id
+            :cursor 0
+            :read-cursor 0
+            :harness (None)
+            :status "running"
+            :error ""
+            :failed false)]
+    (append-record! a
+                    (session/path a home id "inbox.jsonl")
+                    (ev-str! (ev a "message.sent") "text" "Use tabs"))
+    (let [first (control-inbox (mut worker) a)
+          again (control-inbox (mut worker) a)]
+      (assert-eq (len first) 1)
+      (assert-eq (len again) 0)
+      (assert (= (.text (get first 0)) "Use tabs"))
+      (assert-eq (.cursor worker) 0)
+      (session/save! (mut worker))
+      (assert-eq (jv-int (jv-get (session/read-doc a
+                                                   (session/path a
+                                                                 home
+                                                                 id
+                                                                 "checkpoint.json"))
+                                 "inbox_cursor"))
+                 0)
+      (observe (mut worker) (MessageDelivered (get first 0)))
+      (session/save! (mut worker))
+      (assert (> (.cursor worker) 0))
+      (assert-eq (jv-int (jv-get (session/read-doc a
+                                                   (session/path a
+                                                                 home
+                                                                 id
+                                                                 "checkpoint.json"))
+                                 "inbox_cursor"))
+                 (.cursor worker)))))
+
+(deftest session-events-have-independent-cursors-and-cancellation
+  (let [a (malloc-allocator)
+        home (fresh-home a "events")
+        id (created a home)
+        (mut worker)
+          (session/Worker
+            :allocator a
+            :home home
+            :id id
+            :cursor 0
+            :read-cursor 0
+            :harness (None)
+            :status "running"
+            :error ""
+            :failed false)]
+    (observe (mut worker) (Said "hello"))
+    (set! (.status worker) "idle")
+    (session/save! (mut worker))
+    (assert (= (session/str (session/summary a home id) "status") "idle"))
+    (assert (jv-null? (jv-get (session/summary a home id) "checkpoint")))
+    (let [page (session/events a home id 0)
+          cursor (jv-int (jv-get page "cursor"))]
+      (assert-eq (jv-count (jv-get page "records")) 1)
+      (assert (> cursor 0))
+      (assert-eq (jv-count (jv-get (session/events a home id cursor) "records"))
+                 0))
+    (assert (session/cancel! a home id))
+    (assert (match (control-check (mut worker)) (Cancel [] true) (_ false)))))
+
+(deftest session-rejects-a-file-as-the-project-and-bounds-live-output
+  (let [a (malloc-allocator)
+        home (fresh-home a "bounds")
+        id (created a home)
+        file (session/cat a [home "/a-file"])
+        (mut worker)
+          (session/Worker
+            :allocator a
+            :home home
+            :id id
+            :cursor 0
+            :read-cursor 0
+            :harness (None)
+            :status "running"
+            :error ""
+            :failed false)
+        (mut output) (StrBuf::new a)]
+    (match (disk/write-file-atomic! a file "contents" 384)
+      (Ok [_] 0)
+      (_ (assert false)))
+    (assert (match (session/create! a home "claude" "" file "bad")
+              (Err [_] true)
+              (_ false)))
+    (for i (range 0 200000) (push! (mut output) (cast u8 120)))
+    (observe (mut worker) (Said (finish! (mut output))))
+    (let [records (jv-get (session/events a home id 0) "records")]
+      (assert-eq (jv-count records) 1)
+      (assert (<= (len (session/str (jv-nth records 0) "text")) 131075)))))

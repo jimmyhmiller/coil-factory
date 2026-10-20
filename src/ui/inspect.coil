@@ -3,6 +3,7 @@
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
 (import "coil.str" :use [keyops-borrowed])
+(import "agent.json" :use [jv-parse])
 (import "coil.slice" :use *)
 (import "coil.serde.value" :use *)
 (import "tui.canvas" :use *)
@@ -41,7 +42,19 @@
 (defn inspection-nodes [(d (ptr Dash)) (a (dyn Allocator)) (width i64)]
   (-> (ArrayList TreeNode))
   (let [messages
-          (jv-get (.value (field (field d chat) transcript)) "transcript")
+          (match (.view d)
+            (ViewPersonal []
+                          (match (jv-parse a
+                                           (js (.value (field (field d
+                                                                     workbench)
+                                                              current))
+                                               "checkpoint"))
+                            (Some [checkpoint]
+                                  (match checkpoint
+                                    (JArr [_] checkpoint)
+                                    (_ (jv-get checkpoint "messages"))))
+                            (_ (JNull))))
+            (_ (jv-get (.value (field (field d chat) transcript)) "transcript")))
         (mut nodes) (ArrayList::new [TreeNode] a)
         (mut results) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed))
         theme (.theme d)]

@@ -36,13 +36,12 @@
   (-> i64)
   (if (not (interactive?))
       (runs/cmd-ps ctx false)
-      (if (hub-up? ctx)
-          (dashboard/run-dashboard (.allocator ctx) (.hub ctx) run agent)
-          (hub-down-message ctx))))
+      (dashboard/run-dashboard (.allocator ctx) (.hub ctx) run agent)))
 
 (defn cmd-chat [(ctx (ptr Ctx)) (reference (slice u8))] (-> i64)
   (let [ref (agent-ref reference)]
-    (cond (= (len (.agent ref)) 0)
+    (cond (and (= (len reference) 0) (interactive?)) (cmd-dashboard ctx "" "")
+          (= (len (.agent ref)) 0)
             (fail-with ctx "name an agent: factory chat RUN/STATION")
           (interactive?) (cmd-dashboard ctx (.run ref) (.agent ref))
           :else (cmd-chat-lines ctx reference))))

@@ -234,8 +234,10 @@
       (push! (mut argv) "-C")
       (push! (mut argv) (.workdir options))
       0)
-    (push! (mut argv) "-m")
-    (push! (mut argv) (.model options))
+    (when (> (len (.model options)) 0)
+      (push! (mut argv) "-m")
+      (push! (mut argv) (.model options))
+      0)
     (setting! a (mut argv) "sandbox_mode" (toml-string a (.sandbox options)))
     (setting! a (mut argv) "approval_policy" (toml-string a "never"))
     (setting! a (mut argv) "developer_instructions" (toml-string a (.system h)))
@@ -451,9 +453,12 @@
               (Some (tool-call id "web_search" input (jv-encode a input))))
           (= kind "collab_agent_tool_call")
             (Some (tool-call id
-                            (join a ["agent." (jv-string-or (jv-get item "tool") "unknown")])
-                            (jv-clone a item)
-                            (jv-encode a item)))
+                             (join a
+                                   ["agent."
+                                    (jv-string-or (jv-get item "tool")
+                                                  "unknown")])
+                             (jv-clone a item)
+                             (jv-encode a item)))
           :else (None))))
 
 (defn item-summary [(a (dyn Allocator)) (h (ptr CodexHarness)) (item JVal)]
@@ -480,8 +485,11 @@
           (= kind "web_search")
             (join a ["search " (jv-string-or (jv-get item "query") "")])
           (= kind "collab_agent_tool_call")
-            (join a ["agent " (jv-string-or (jv-get item "tool") "") " "
-                     (jv-string-or (jv-get item "prompt") "")])
+            (join a
+                  ["agent "
+                   (jv-string-or (jv-get item "tool") "")
+                   " "
+                   (jv-string-or (jv-get item "prompt") "")])
           :else kind)))
 
 (defn item-ok? [(item JVal)] (-> bool)
