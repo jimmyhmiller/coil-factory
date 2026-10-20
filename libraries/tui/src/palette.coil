@@ -54,14 +54,33 @@
                      (commands (slice Command))]
   (-> (ArrayList Command))
   (let [(mut out) (ArrayList::new [Command] a)
-        query (input-text (field p input))]
+        query (input-text (field p input))
+        (mut aliases) false]
+    (for command (iter commands)
+      (when (and (.enabled command) (command-prefix? (.title command) query))
+        (set! aliases true)
+        0))
     (for command (iter commands)
       (when (and (.enabled command)
-                 (or (command-matches? (.title command) query)
-                     (command-matches? (.detail command) query)))
+                 (if (load aliases)
+                     (command-prefix? (.title command) query)
+                     (or (command-matches? (.title command) query)
+                         (command-matches? (.detail command) query))))
         (push! (mut out) command)
         0))
     (load out)))
+
+;;; Slash aliases take precedence over descriptive fuzzy matches.
+(defn command-prefix? [(title (slice u8)) (query (slice u8))] (-> bool)
+  (block :prefix
+    (when (or (= (len title) 0) (!= (get title 0) 47))
+      (return-from :prefix false))
+    (when (>= (len query) (len title)) (return-from :prefix false))
+    (for i (range 0 (len query))
+      (when (or (= (get title (+ i 1)) 32)
+                (!= (fold-ascii (get title (+ i 1))) (fold-ascii (get query i))))
+        (return-from :prefix false)))
+    true))
 
 ;;; Scratch allocations belong to the caller's frame or event arena.
 (defn palette-key! [(p (ptr Palette))

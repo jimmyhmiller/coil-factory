@@ -51,13 +51,13 @@
                         inner
                         (.x inner)
                         (.y inner)
-                        "ctrl-n  New conversation"
+                        "New conversation"
                         (bold (.accent theme)))
     (put-text-ellipsis! c
                         inner
                         (.x inner)
                         (+ (.y inner) 2)
-                        "ctrl-f  Factory activity"
+                        "Factory activity"
                         (.text theme))
     (put-text-ellipsis! c
                         inner
@@ -87,13 +87,13 @@
                         inner
                         (.x inner)
                         (+ (.y inner) 5)
-                        "ctrl-k  Connections"
+                        "Connections"
                         (.accent-alt theme))
     (put-text-ellipsis! c
                         inner
                         (.x inner)
                         (+ (.y inner) 7)
-                        "CONVERSATIONS · ctrl-b"
+                        "CONVERSATIONS"
                         (.subtle theme))
     (for i (range 0 (jv-len sessions))
       (let [item (jv-nth sessions i)]
@@ -189,7 +189,7 @@
                               messages-r
                               (+ (.x messages-r) 2)
                               (+ (.y messages-r) 6)
-                              "ctrl-g chooses harness, model and project. ctrl-f opens your factories."
+                              "Type / to explore commands."
                               (.subtle theme)))
         (draw-lines! c messages-r (field chat sv) lines theme))
     (put-text-ellipsis! c
@@ -197,7 +197,7 @@
                         (.x inner)
                         status-y
                         (cond (= (.status w) "running")
-                                "⟳ Working · send another message to steer · ctrl-x cancels"
+                                "⟳ Working · send another message to steer"
                               (= (.status w) "failed")
                                 (js (.value (field w current)) "error")
                               (= (.status w) "cancelled")
@@ -227,12 +227,7 @@
                           (.commands-open d))))
     (draw-footer! d
                   c
-                  (rect 0 (- (.h full) 1) (.w full) 1)
-                  [(KeyHint :key "enter" :label "send")
-                   (KeyHint :key "ctrl-f" :label "factory")
-                   (KeyHint :key "ctrl-n" :label "new")
-                   (KeyHint :key "ctrl-g" :label "settings")
-                   (KeyHint :key "ctrl-p" :label "commands")])
+                  (rect 0 (- (.h full) 1) (.w full) 1))
     0))
 
 (defn draw-settings! [(d (ptr Dash)) (c (ptr Canvas))] (-> i64)
@@ -243,7 +238,7 @@
     (canvas-hide-cursor! c)
     (fill! c r 32 (style-default))
     (set! (.footer opts)
-          "tab next · enter apply to new conversation · esc close")
+          "New conversations use these settings")
     (let [inner (rect-inset-xy (draw-box! c r opts) 1 1)]
       (for i (range 0 3)
         (let [y (+ (.y inner) (* i 2))]
@@ -274,7 +269,7 @@
     (canvas-hide-cursor! c)
     (fill! c r 32 (style-default))
     (set! (.footer opts)
-          "tab fields/saved · enter connect · ctrl-l local · ctrl-r start SSH")
+          "Local · HTTP(S) · SSH")
     (let [inner (rect-inset-xy (draw-box! c r opts) 1 0)]
       (put-text-ellipsis! c
                           inner
@@ -319,7 +314,7 @@
                           inner
                           (.x inner)
                           (+ (.y inner) 9)
-                          "Saved connections · tab here, select, enter"
+                          "Saved connections"
                           (.subtle theme))
       (let [profiles (.value (field w profiles))
             (mut labels) (ArrayList::new [(slice u8)] a)]

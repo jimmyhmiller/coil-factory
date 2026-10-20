@@ -6,29 +6,32 @@ Run `factory` in your project and start typing. No daemon, recipe, station, or
 gate is required for a personal conversation. Claude and Codex use their existing
 CLI logins; an empty model uses that CLI's default. The workbench chooses the
 site's configured harness, or an installed Claude/Codex CLI when no API model is
-configured. Press **Ctrl-G** to choose the project directory, harness and model.
+configured. Use `/settings` to choose the project directory, harness and model.
+Type `/` to browse and filter commands. The bottom line shows the selected
+command's keyboard shortcut; shortcuts stay available without persistent hints.
 
 Conversations live in `~/.factory/sessions/`, separately from factory runs.
-**Ctrl-B** selects a saved conversation; **Ctrl-N** starts another. Closing the
+`/history` selects a saved conversation; `/new` starts another. Closing the
 UI leaves active work running. Reopen a conversation to see its results and
-continue it. **Ctrl-X** cancels the current personal turn. Personal agents work
+continue it. `/cancel` cancels the current personal turn. Personal agents work
 directly in the selected project, with no factory gate or automatic commit.
 
-**Ctrl-F** switches between your conversation and factory activity, preserving
-the conversation and its draft. **Ctrl-K** opens connections: connect an HTTP(S)
+`/factory` opens factory activity and `/chat` returns to your conversation,
+preserving its draft. `/connect` opens connections: connect an HTTP(S)
 factory with its token, or use `ssh://user@host[:port]` to reach its loopback API
 through an SSH tunnel. SSH uses your normal SSH configuration and keys, discovers
 the remote port and token from `~/.factory`, and reconnects a dropped tunnel in
-the background. **Ctrl-L** in that screen starts the local factory; **Ctrl-R**
+the background. `/local` starts the local factory; `/remote`
 starts an installed remote factory over SSH. Saved connections reconnect on
 launch. Connection checks run in the background, so an unavailable factory does
 not prevent a personal conversation. Saved tokens are masked on screen and
 stored in an owner-only `connections.json` under the factory home.
 
-In factory activity, **n** opens the run composer. Choose a factory, brief,
-project, site, harness and model; **Ctrl-S** starts it. Starting a local run can
-start the local hub automatically. **Ctrl-P** searches commands in every view.
-**Ctrl-O** in a conversation opens expandable checkpointed tool calls and
+`/run` opens the run composer. Choose a factory, brief,
+project, site, harness and model. The command's bottom hint shows its submission
+shortcut; `/start` in command search also submits the form. Starting a local run
+can start the local hub automatically. Command search is available in forms too.
+`/inspect` in a conversation opens expandable checkpointed tool calls and
 results, including delegated work.
 
 A factory is a Markdown file of stations. Each station is one agent with tools,
@@ -108,7 +111,7 @@ blocks the station for a person rather than letting it through.
 factory up                                   # the hub on this machine
 factory start haiku "a lighthouse in fog" -w --model deepseek/deepseek-v4-flash
                                              # a tiny two-station run, watched live
-factory                                      # start a conversation; ctrl-f shows factory activity
+factory                                      # start a conversation; /factory shows factory activity
 ```
 
 Any model works; with no key at all, `--harness opencode --model

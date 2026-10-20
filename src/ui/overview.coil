@@ -297,7 +297,7 @@
       (if (= n 0)
           (let [msg
                   (if (.has (field d overview))
-                      "No runs yet. Press n to start one, or ctrl-p for commands."
+                      "No runs yet. Start a factory run with /run."
                       "Waiting for the hub…")]
             (put-text-ellipsis! c
                                 inner
@@ -451,17 +451,6 @@
                   (draw-lines! c inner (mut sv) (slice lines) theme))))
       0)))
 
-(const OVERVIEW-HINTS
-       [(KeyHint :key "ctrl-p" :label "commands")
-        (KeyHint :key "n" :label "new run")
-        (KeyHint :key "↑↓" :label "select")
-        (KeyHint :key "enter" :label "open")
-        (KeyHint :key "c" :label "chat")
-        (KeyHint :key "p" :label "pause/resume")
-        (KeyHint :key "x" :label "stop")
-        (KeyHint :key "?" :label "help")
-        (KeyHint :key "q" :label "quit")])
-
 (defn draw-overview! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
   (let [c (.canvas frame)
         a (.scratch frame)
@@ -486,5 +475,5 @@
     (draw-sites! d c a (index parts 2))
     (draw-runs! d c a (index parts 3) (.tick frame))
     (draw-overseer! d c a (index parts 4) (mut items))
-    (draw-footer! d c (index parts 5) OVERVIEW-HINTS)
+    (draw-footer! d c (index parts 5))
     0))

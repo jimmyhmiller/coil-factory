@@ -451,15 +451,6 @@
                          (bold (.accent theme))))
       0)))
 
-(const RUN-HINTS
-       [(KeyHint :key "↑↓" :label "agent")
-        (KeyHint :key "enter" :label "chat")
-        (KeyHint :key "tab" :label "feed")
-        (KeyHint :key "pgup/pgdn" :label "scroll")
-        (KeyHint :key "p" :label "pause/resume")
-        (KeyHint :key "x" :label "stop")
-        (KeyHint :key "esc" :label "back")])
-
 (defn draw-run-view! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
   (let [c (.canvas frame)
         a (.scratch frame)
@@ -498,5 +489,5 @@
                    (.y (index parts 2))
                    "Loading the run…"
                    (.subtle (.theme d))))
-    (draw-footer! d c (index parts 8) RUN-HINTS)
+    (draw-footer! d c (index parts 8))
     0))

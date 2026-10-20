@@ -491,6 +491,60 @@
     (ViewRun [] (selected-agent d))
     (ViewOverview [] (default-agent (selected-run d)))))
 
+(defn command-name [(id i64)] (-> (slice u8))
+  (if (and (> id 0) (<= id 22))
+      (get ["factory"
+            "open"
+            "agent"
+            "pause"
+            "resume"
+            "stop"
+            "help"
+            "quit"
+            "run"
+            "inspect"
+            "new"
+            "chat"
+            "settings"
+            "connect"
+            "local"
+            "history"
+            "cancel"
+            "details"
+            "remote"
+            "start"
+            "confirm"
+            "dismiss"]
+           (- id 1))
+      ""))
+
+(defn command-shortcut [(id i64)] (-> (slice u8))
+  (if (and (> id 0) (<= id 22))
+      (get ["Ctrl-F"
+            "Enter"
+            "c"
+            "p"
+            "p"
+            "x"
+            "?"
+            "Ctrl-C"
+            "n · Ctrl-S submits"
+            "Ctrl-O"
+            "Ctrl-N"
+            "Ctrl-F"
+            "Ctrl-G"
+            "Ctrl-K"
+            "Ctrl-L in connections"
+            "Ctrl-B"
+            "Ctrl-X"
+            "Ctrl-T"
+            "Ctrl-R in connections"
+            "Ctrl-S"
+            "y"
+            "Esc"]
+           (- id 1))
+      ""))
+
 (defn dashboard-commands [(d (ptr Dash)) (a (dyn Allocator))]
   (-> (ArrayList Command))
   (let [(mut commands) (ArrayList::new [Command] a)
@@ -533,8 +587,8 @@
                             (and (> (len id) 0) (not (finished-status? status))))
                         (Command
                           :id 7
-                          :title "Keyboard help"
-                          :detail "Navigation and controls"
+                          :title "Browse commands"
+                          :detail "Available actions"
                           :enabled true)
                         (Command
                           :id 8
@@ -581,12 +635,84 @@
                           :id 15
                           :title "Start local factory"
                           :detail "Start and connect this computer"
-                          :enabled true)])
-      (push! (mut commands) command))
+                          :enabled true)
+                        (Command
+                          :id 16
+                          :title "Saved conversations"
+                          :detail "Choose a conversation"
+                          :enabled true)
+                        (Command
+                          :id 17
+                          :title "Cancel personal turn"
+                          :detail "Stop the assistant"
+                          :enabled (> (len (.session-id (.workbench d))) 0))
+                        (Command
+                          :id 18
+                          :title "Toggle conversation details"
+                          :detail "Tool output and reasoning"
+                          :enabled
+                            (match (.view d)
+                              (ViewPersonal [] true)
+                              (ViewChat [] true)
+                              (_ false)))
+                        (Command
+                          :id 19
+                          :title "Start SSH factory"
+                          :detail "Start and connect a remote computer"
+                          :enabled true)
+                        (Command
+                          :id 20
+                          :title "Submit factory run"
+                          :detail "Start the composed run"
+                          :enabled (.launch-open d))
+                        (Command
+                          :id 21
+                          :title "Confirm stop"
+                          :detail "Cancel this run's agents"
+                          :enabled (.confirm-stop d))
+                        (Command
+                          :id 22
+                          :title "Keep running"
+                          :detail "Dismiss stop confirmation"
+                          :enabled (.confirm-stop d))])
+      (push! (mut commands)
+             (Command
+               :id (.id command)
+               :title
+                 (concat a
+                         ["/"
+                          (command-name (.id command))
+                          "  "
+                          (.title command)])
+               :detail (.detail command)
+               :enabled (.enabled command))))
     (load commands)))
 
 (defn command-selected! [(d (ptr Dash)) (id i64)] (-> AppFlow)
   (set! (.commands-open d) false)
+  (when (or (= id 1)
+            (= id 2)
+            (= id 3)
+            (= id 7)
+            (= id 9)
+            (= id 10)
+            (= id 11)
+            (= id 12)
+            (= id 13)
+            (= id 14)
+            (= id 16)
+            (= id 19))
+    (set! (.settings-open (.workbench d)) false)
+    (set! (.connections-open (.workbench d)) false)
+    (set! (.inspection-open d) false)
+    (set! (.launch-open d) false)
+    (set! (.help d) false)
+    (set! (.confirm-stop d) false)
+    0)
+  (toast! d
+          (concat (.allocator d)
+                  ["/" (command-name id) " · " (command-shortcut id)])
+          (ToneMuted))
   (cond (= id 1)
           (do
             (set! (.view d) (ViewOverview))
@@ -599,7 +725,7 @@
             (Continue))
         (or (= id 4) (= id 5)) (do (pause-or-resume! d) (Continue))
         (= id 6) (do (ask-stop! d) (Continue))
-        (= id 7) (do (set! (.help d) true) (Continue))
+        (= id 7) (open-slash! d "")
         (= id 8) (Quit)
         (= id 9) (do (set! (.launch-open d) true) (Continue))
         (= id 10) (do (set! (.inspection-open d) true) (Continue))
@@ -610,6 +736,41 @@
         (= id 14)
           (do (set! (.connections-open (field d workbench)) true) (Continue))
         (= id 15) (do (connect! d 3) (Continue))
+        (= id 16)
+          (do
+            (set! (.view d) (ViewPersonal))
+            (set! (.history-focus (.workbench d)) true)
+            (Continue))
+        (= id 17)
+          (do
+            (session/cancel! (.allocator d)
+                             (.home (.workbench d))
+                             (.session-id (.workbench d)))
+            (Continue))
+        (= id 18)
+          (do
+            (match (.view d)
+              (ViewPersonal []
+                            (set! (.details (.personal d))
+                                  (not (.details (.personal d)))))
+              (_ (set! (.details (.chat d)) (not (.details (.chat d))))))
+            (Continue))
+        (= id 19)
+          (do
+            (if (starts-with (workbench/connection-value (field d workbench) 0)
+                             "ssh://")
+                (connect! d 4)
+                (set! (.connections-open (.workbench d)) true))
+            (Continue))
+        (= id 20) (do (submit-launch! d) (Continue))
+        (= id 21)
+          (do
+            (when (.confirm-stop d)
+              (set! (.confirm-stop d) false)
+              (post-run! d (.confirm-run d) "cancel" "stopped")
+              0)
+            (Continue))
+        (= id 22) (do (set! (.confirm-stop d) false) (Continue))
         :else (Continue)))
 
 (defn submit-launch! [(d (ptr Dash))] (-> i64)
@@ -644,8 +805,45 @@
                           (open-run! d id))))
                   (complain! d a reply)))))))
 
+(defn slash-available? [(d (ptr Dash))] (-> bool)
+  (and (not (or (.settings-open (.workbench d))
+                (.connections-open (.workbench d))
+                (.inspection-open d)
+                (.launch-open d)
+                (.help d)))
+       (or (.confirm-stop d)
+           (match (.view d)
+             (ViewPersonal []
+                           (= (len (input-text (field (field d personal) input)))
+                              0))
+             (ViewChat [] (= (len (input-text (field (field d chat) input))) 0))
+             (_ true)))))
+
+(defn open-slash! [(d (ptr Dash)) (query (slice u8))] (-> AppFlow)
+  (palette-reset! (field d commands))
+  (input-set-text! (field (field d commands) input) (trim query))
+  (set! (.commands-open d) true)
+  (Continue))
+
+(defn slash-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [a (io-allocator d)
+        commands (dashboard-commands d a)]
+    (match (palette-key! (field d commands) a (slice commands) key)
+      (PaletteClose [] (do (set! (.commands-open d) false) (Continue)))
+      (PaletteSelected [id] (command-selected! d id))
+      (_ (Continue)))))
+
 (defn dashboard-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (cond (match key (Ctrl [l] (= l #\c)) (_ false)) (Quit)
+        (.commands-open d) (slash-key! d key)
+        (match key (Ctrl [l] (= l #\p)) (_ false)) (open-slash! d "")
+        (and (slash-available? d) (match key (Char [ch] (= ch #\/)) (_ false)))
+          (open-slash! d "")
+        (and (slash-available? d)
+             (match key (Paste [text] (starts-with text "/")) (_ false)))
+          (match key
+            (Paste [text] (open-slash! d (subslice text 1 (len text))))
+            (_ (Continue)))
         (.settings-open (.workbench d)) (settings-key! d key)
         (.connections-open (.workbench d)) (connections-key! d key)
         (.inspection-open d)
@@ -687,18 +885,6 @@
                     (when (or (= ch #\?) (= ch #\q)) (set! (.help d) false)))
               (_ 0))
             (Continue))
-        (.commands-open d)
-          (let [a (io-allocator d)
-                commands (dashboard-commands d a)]
-            (match (palette-key! (field d commands) a (slice commands) key)
-              (PaletteClose [] (do (set! (.commands-open d) false) (Continue)))
-              (PaletteSelected [id] (command-selected! d id))
-              (_ (Continue))))
-        (match key (Ctrl [l] (= l #\p)) (_ false))
-          (do
-            (palette-reset! (field d commands))
-            (set! (.commands-open d) true)
-            (Continue))
         (match key (Ctrl [l] (= l #\n)) (_ false))
           (do (new-personal! d) (Continue))
         (match key (Ctrl [l] (= l #\f)) (_ false))
@@ -734,6 +920,30 @@
 
 ;; ---------------------------------------------------------------------------
 ;; The app
+(defn draw-slash! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
+  (let [a (.scratch frame)
+        c (.canvas frame)
+        bounds (canvas-rect c)
+        commands (dashboard-commands d a)
+        p (field d commands)
+        items (palette-items a p (slice commands))
+        bottom (rect 0 (- (.h bounds) 1) (.w bounds) 1)]
+    (draw-palette! p c a bounds (slice commands) (.theme d))
+    (fill! c bottom 32 (style-default))
+    (when (> (len items) 0)
+      (let [selected (get items (.selected (.list p)))]
+        (put-text-ellipsis! c
+                            bottom
+                            1
+                            (.y bottom)
+                            (concat a
+                                    ["/"
+                                     (command-name (.id selected))
+                                     " · "
+                                     (command-shortcut (.id selected))])
+                            (.muted (.theme d)))))
+    0))
+
 (impl App Dash
   (app-draw [(self (ptr Dash)) (frame (ptr Frame))]
     (-> i64)
@@ -746,14 +956,6 @@
     (when (.help self) (draw-help! self (.canvas frame)))
     (when (.confirm-stop self)
       (draw-confirm-stop! self (.canvas frame) (.scratch frame)))
-    (when (.commands-open self)
-      (let [commands (dashboard-commands self (.scratch frame))]
-        (draw-palette! (field self commands)
-                       (.canvas frame)
-                       (.scratch frame)
-                       (canvas-rect (.canvas frame))
-                       (slice commands)
-                       (.theme self))))
     (when (.launch-open self)
       (draw-launch! (field self launch) (.canvas frame) (.theme self)))
     (when (.inspection-open self)
@@ -762,6 +964,7 @@
       (personal/draw-settings! self (.canvas frame)))
     (when (.connections-open (.workbench self))
       (personal/draw-connections! self (.canvas frame) (.scratch frame)))
+    (when (.commands-open self) (draw-slash! self frame))
     0)
   (app-event [(self (ptr Dash)) (event Event)]
     (-> AppFlow)
@@ -1010,7 +1213,7 @@
                   (set! (.connected w) false)
                   (own! d
                         (field d hub-error)
-                        "Factory is disconnected. ctrl-k opens connections.")))
+                        "Factory is disconnected. Use /connect to choose a connection.")))
             (network/close! (.allocator d) job))
           (if (reply-ok? (.reply job))
               (do

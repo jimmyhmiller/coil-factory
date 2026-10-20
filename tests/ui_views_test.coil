@@ -102,7 +102,7 @@
 │ ◉ 02:34 blocker-73c0  judge: stuck — the gate cannot pass                                                            │
 │ ⚠ 02:34 blocker-73c0/attempt  the gate failed on every attempt  [flailing]                                           │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────── 2 notices ─╯
- ctrl-p commands · n new run · ↑↓ select · enter open · c chat · p pause/resume · x stop · ? help · q quit
+
 "))))
   0)
 
@@ -169,7 +169,7 @@
 │ 02:34:57  critique  $  coil test                                                                           │
 │                                                                                                            │
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────── ● live ─╯
- ↑↓ agent · enter chat · tab feed · pgup/pgdn scroll · p pause/resume · x stop · esc back
+
 "))))
   0)
 
@@ -220,7 +220,7 @@
 │ │ Begin the critique station.                                                          │
 │ │ Look at the workspace.                                                               │
 │ │ Count syllables.                                                                     │
-│ │ … 2 more lines · ctrl-t shows all                                                    │
+│ │ … 2 more lines                                                                       │
 │                                                                                        │
 │ critique                                                                               │
 │ ┊ Start by listing files.                                                              │
@@ -247,7 +247,7 @@
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │ ❯ Steer the agent — it reads this at its next turn                                     │
 ╰─────────────────────────────────────────────────────────────── 6 turns · 11.9k tokens ─╯
- enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
+
 ")))
     (set! (.details chat) true)
     (let [screen (app-snapshot d 90 40 0 a)]
@@ -291,7 +291,7 @@
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │ ❯ Steer the agent — it reads this at its next turn                                     │
 ╰────────────────────────────────────────────────── 6 turns · 11.9k tokens · details on ─╯
- enter send · shift/alt-enter newline · pgup/pgdn scroll · ctrl-t details · esc back
+
 "))))
   0)
 
@@ -399,7 +399,8 @@
   0)
 
 (deftest command-palette-and-launcher-preserve-the-operators-draft
-  (let [a (malloc-allocator) d (dash-for-test a)]
+  (let [a (malloc-allocator)
+        d (dash-for-test a)]
     (dashboard-key! d (Ctrl #\p))
     (assert (.commands-open d))
     (dashboard-key! d (Paste "new factory"))
@@ -420,11 +421,19 @@
       (assert (str-contains? image "Build a tested app")))))
 
 (deftest tool-inspector-correlates-out-of-order-results-and-expands-with-keys
-  (let [a (malloc-allocator) d (dash-for-test a) chat (field d chat)]
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        chat (field d chat)]
     (chat-open! chat "haiku-4695" "write")
     (set! (.view d) (ViewChat))
-    (chat-set-transcript! chat (doc a "{'transcript':[{'role':'assistant','tool_calls':[{'id':'first','function':{'name':'Read','arguments':'file one'}},{'id':'second','function':{'name':'Agent','arguments':'review'}}]},{'role':'tool','tool_call_id':'second','content':'second result'},{'role':'tool','tool_call_id':'first','content':'first result'}]}") NOW)
-    (assert (= (inspect/result-for (jv-get (.value (field chat transcript)) "transcript") "first") "first result"))
+    (chat-set-transcript! chat
+                          (doc a
+                               "{'transcript':[{'role':'assistant','tool_calls':[{'id':'first','function':{'name':'Read','arguments':'file one'}},{'id':'second','function':{'name':'Agent','arguments':'review'}}]},{'role':'tool','tool_call_id':'second','content':'second result'},{'role':'tool','tool_call_id':'first','content':'first result'}]}")
+                          NOW)
+    (assert (= (inspect/result-for (jv-get (.value (field chat transcript))
+                                           "transcript")
+                                   "first")
+               "first result"))
     (dashboard-key! d (Ctrl #\o))
     (assert (.inspection-open d))
     (let [(mut canvas) (canvas-new a 100 30)]
@@ -444,7 +453,8 @@
     (assert (not (.inspection-open d)))))
 
 (deftest compact-overview-keeps-activity-readable
-  (let [a (malloc-allocator) d (dash-for-test a)]
+  (let [a (malloc-allocator)
+        d (dash-for-test a)]
     (snap-commit! (field d overview) (doc a OVERVIEW) NOW)
     (sync-selection! d)
     (let [screen (app-snapshot d 80 24 0 a)]

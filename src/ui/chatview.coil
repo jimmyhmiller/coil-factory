@@ -112,13 +112,6 @@
                        (.subtle theme)))
     0))
 
-(const CHAT-HINTS
-       [(KeyHint :key "enter" :label "send")
-        (KeyHint :key "shift/alt-enter" :label "newline")
-        (KeyHint :key "pgup/pgdn" :label "scroll")
-        (KeyHint :key "ctrl-t" :label "details")
-        (KeyHint :key "esc" :label "back")])
-
 (defn draw-chat-view! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
   (let [c (.canvas frame)
         a (.scratch frame)
@@ -192,5 +185,5 @@
                      (chat-placeholder (chat-run-status d))
                      (.subtle theme)
                      (not (or (.help d) (.confirm-stop d))))))
-    (draw-footer! d c (index parts 3) CHAT-HINTS)
+    (draw-footer! d c (index parts 3))
     0))

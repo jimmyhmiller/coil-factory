@@ -64,3 +64,27 @@
                        (theme-default))
         (canvas-free! (mut c))))
     (palette-free! (mut p))))
+
+(deftest slash-alias-prefixes-take-precedence-over-description-matches
+  (let [a (malloc-allocator)
+        (mut p) (palette-new a)
+        commands
+          [(Command
+             :id 9
+             :title "/run  New factory run"
+             :detail ""
+             :enabled true)
+           (Command
+             :id 11
+             :title "/new  New conversation"
+             :detail ""
+             :enabled true)]]
+    (input-set-text! (field (mut p) input) "new")
+    (let [items (palette-items a (mut p) commands)]
+      (assert-eq (len items) 1)
+      (assert-eq (.id (get items 0)) 11))
+    (input-set-text! (field (mut p) input) "factory")
+    (let [items (palette-items a (mut p) commands)]
+      (assert-eq (len items) 1)
+      (assert-eq (.id (get items 0)) 9))
+    (palette-free! (mut p))))

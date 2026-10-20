@@ -324,8 +324,7 @@
 ;;; The bottom line: key hints, or a toast while one is showing.
 (defn draw-footer! [(d (ptr Dash))
                     (c (ptr Canvas))
-                    (r Rect)
-                    (hints (slice KeyHint))] (-> i64)
+                    (r Rect)] (-> i64)
   (if (and (> (len (.toast d)) 0) (< (.now d) (.toast-until d)))
       (put-text-ellipsis! c
                           r
@@ -333,7 +332,7 @@
                           (.y r)
                           (.toast d)
                           (bold (tone-style (.theme d) (.toast-tone d))))
-      (draw-key-hints! c (rect-drop-left r 1) hints (.theme d))))
+      0))
 
 (defn draw--overlay-box! [(d (ptr Dash))
                           (c (ptr Canvas))
@@ -349,7 +348,7 @@
                :style (tone-style (.theme d) tone)
                :title title
                :title-style (bold (tone-style (.theme d) tone))
-               :footer "esc closes"
+               :footer ""
                :footer-style (.subtle (.theme d)))))
 
 (defstruct HelpRow [(key (slice u8)) (what (slice u8))])
@@ -421,15 +420,12 @@
                                  (.confirm-run d)
                                  "? Its agents are cancelled."])
                         (.text theme))
-    (let [x
-            (span! c
-                   (rect-drop-top inner 2)
-                   (.x inner)
-                   "y"
-                   (bold (.error theme)))]
-      (let [x2 (span! c (rect-drop-top inner 2) x " stop   " (.muted theme))
-            x3 (span! c (rect-drop-top inner 2) x2 "n" (bold (.accent theme)))]
-        (span! c (rect-drop-top inner 2) x3 " keep running" (.muted theme))))
+    (put-text-ellipsis! c
+                        inner
+                        (.x inner)
+                        (+ (.y inner) 2)
+                        "/confirm     /dismiss"
+                        (.muted theme))
     0))
 
 ;;; No breadcrumbs (the overview's top line).

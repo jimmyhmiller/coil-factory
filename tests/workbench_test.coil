@@ -123,3 +123,74 @@
         (assert (= (session/str profile "token") "saved-token"))))
     (network/close! a (.active-connection w))
     (set! (.active-connection w) (cast (ptr network/Job) 0))))
+
+(deftest slash-commands-reveal-shortcuts-only-while-discovering-an-action
+  (let [a (malloc-allocator)
+        d (standalone a "slash")]
+    (let [screen (app-snapshot d 110 32 0 a)]
+      (assert (not (str-contains? screen "ctrl-")))
+      (assert (not (str-contains? screen "Ctrl-"))))
+    (dashboard-key! d (Char #\/))
+    (dashboard-key! d (Paste "settings"))
+    (assert (.commands-open d))
+    (assert (= (input-text (field (field d personal) input)) ""))
+    (let [screen (app-snapshot d 110 32 0 a)]
+      (assert (str-contains? screen "/settings"))
+      (let [footer " /settings · Ctrl-G\n"]
+        (assert (= (subslice screen (- (len screen) (len footer)) (len screen))
+                   footer))))
+    (for size (iter [0 1 4 20]) (app-snapshot d size size 0 a))
+    (dashboard-key! d (Enter))
+    (assert (.settings-open (.workbench d)))
+    (assert (not (.commands-open d)))
+    (dashboard-key! d (Escape))))
+
+(deftest slash-navigation-preserves-drafts-and-leaves-message-slashes-alone
+  (let [a (malloc-allocator)
+        d (standalone a "slash-draft")]
+    (dashboard-key! d (Paste "keep this draft"))
+    (dashboard-key! d (Ctrl #\p))
+    (dashboard-key! d (Paste "factory"))
+    (dashboard-key! d (Enter))
+    (assert (match (.view d) (ViewOverview [] true) (_ false)))
+    (dashboard-key! d (Paste "/chat"))
+    (dashboard-key! d (Enter))
+    (assert (match (.view d) (ViewPersonal [] true) (_ false)))
+    (assert (= (input-text (field (field d personal) input)) "keep this draft"))
+    (dashboard-key! d (Char #\/))
+    (assert (not (.commands-open d)))
+    (assert (= (input-text (field (field d personal) input)) "keep this draft/"))))
+
+(deftest unknown-slash-command-does-not-send-a-message-and-forms-can-search-commands
+  (let [a (malloc-allocator)
+        d (standalone a "slash-unknown")]
+    (dashboard-key! d (Paste "/not-a-command"))
+    (dashboard-key! d (Enter))
+    (assert (.commands-open d))
+    (assert (= (.session-id (.workbench d)) ""))
+    (assert (str-contains? (app-snapshot d 100 28 0 a) "No matching commands"))
+    (dashboard-key! d (Escape))
+    (dashboard-key! d (Paste "/run"))
+    (dashboard-key! d (Enter))
+    (assert (.launch-open d))
+    (dashboard-key! d (Ctrl #\p))
+    (dashboard-key! d (Paste "start"))
+    (assert (str-contains? (app-snapshot d 100 28 0 a) "/start · Ctrl-S"))
+    (dashboard-key! d (Escape))
+    (assert (.launch-open d))
+    (dashboard-key! d (Ctrl #\p))
+    (dashboard-key! d (Paste "factory"))
+    (dashboard-key! d (Enter))
+    (assert (not (.launch-open d)))
+    (assert (match (.view d) (ViewOverview [] true) (_ false)))))
+
+(deftest stop-confirmation-can-be-dismissed-with-a-slash-command
+  (let [a (malloc-allocator)
+        d (standalone a "slash-confirm")]
+    (set! (.confirm-stop d) true)
+    (dashboard-key! d (Paste "/dismiss"))
+    (assert (.commands-open d))
+    (assert (str-contains? (app-snapshot d 100 28 0 a) "/dismiss · Esc"))
+    (dashboard-key! d (Enter))
+    (assert (not (.confirm-stop d)))
+    (assert (not (.commands-open d)))))

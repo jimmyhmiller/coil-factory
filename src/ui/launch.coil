@@ -81,7 +81,7 @@
   (canvas-hide-cursor! c)
   (let [r (rect-center (canvas-rect c) 94 23)
         (mut opts) (panel-opts theme "New factory run" true)]
-    (set! (.footer opts) "tab next · ctrl-s start · esc close (draft kept)")
+    (set! (.footer opts) "New factory run")
     (fill! c r 32 (style-default))
     (let [inner (rect-inset-xy (draw-box! c r opts) 1 0)
           ;; On short terminals, scroll whole fields to keep focus visible.

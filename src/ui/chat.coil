@@ -556,7 +556,7 @@
                       (concat a
                               ["… "
                                (int-text a (- n (load i)))
-                               " more lines · ctrl-t shows all"])
+                               " more lines"])
                       (ToneSubtle))))
     0))
 

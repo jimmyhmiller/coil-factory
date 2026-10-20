@@ -116,7 +116,7 @@
         (mut opts)
           (panel-opts (.theme d) "Tool inspector · latest checkpoint" true)]
     (set! (.footer opts)
-          "↑↓ select · → expand · ← collapse · esc close")
+          "Tool arguments and results")
     (fill! c r 32 (style-default))
     (let [inner (draw-box! c r opts)]
       (set! (.inspection-width d) (- (.w inner) 5))
