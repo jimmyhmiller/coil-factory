@@ -10,6 +10,7 @@
 (import "agent.loop" :use *)
 (import "agent.harness" :use *)
 (import "claude.harness" :use *)
+(import "agent_tools.stream" :as stream)
 
 (defstruct Recorder
   [(said i64) (started i64) (ended i64) (input i64) (output i64)])
@@ -265,4 +266,55 @@
         (assert (match (find (harness-checkpoint (mut h) a) "subagent")
                   (Some [_] true)
                   (None [] false))))
+      0)))
+
+(deftest background-tasks-hold-the-invocation-open-until-they-finish
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut turn) (turn-new a (mut h) (cast (ptr scratch/ScratchArena) 0))
+        feed (box! a stream/InputFeed (stream/input-feed-new a))]
+    (set! (.feed turn) feed)
+    (event! (mut turn)
+            "{'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'b1'}]}")
+    (assert-eq (.tasks turn) 1)
+    (event! (mut turn) "{'type':'result','subtype':'success'}")
+    (assert (not (.release feed)))
+    (event! (mut turn)
+            "{'type':'system','subtype':'background_tasks_changed','tasks':[]}")
+    (assert-eq (.tasks turn) 0)
+    (assert (not (.release feed)))
+    (event! (mut turn) "{'type':'result','subtype':'success'}")
+    (assert (.release feed))))
+
+;;; A turn that ends while a background subagent runs: the invocation stays up,
+;;; Claude takes the agent's result in a turn of its own, and that turn's reply
+;;; is the run's. (What this protects against needs a subagent running past
+;;; Claude's ten-minute wait after its input closes, too long to run here.)
+(deftest live-cli-waits-for-a-background-subagent
+  (let [a (malloc-allocator)]
+    (when (match (os/get-env a "CLAUDE_LIVE_TEST")
+            (Ok [value]
+                (match value (Some [s] (= (slice s) "1")) (None [] false)))
+            (Err [_] false))
+      (let [(mut r) (zeroed Recorder)
+            (mut control) (zeroed ControlScript)
+            (mut h) (fixture a (mut r) (mut control))]
+        (set! (.tools (field (mut h) options)) "Agent")
+        (set! (.idle-timeout-ms (field (mut h) options)) 60000)
+        (harness-add-user! (mut h)
+                           "Use the Agent tool with run_in_background set to true to spawn exactly one general-purpose subagent. Its entire task is: reply with violet-482 without calling tools. Right after launching it, reply with the single word STARTED and end your turn without waiting. When the subagent's result arrives later, reply with exactly what it answered.")
+        (match (harness-run! (mut h))
+          (Replied [text]
+                   (do
+                     (println "Claude replied: {s}" text)
+                     (assert (match (find text "violet-482")
+                               (Some [_] true)
+                               (None [] false)))))
+          (Failed [error]
+                  (do
+                    (println "Background run failed: {s}" (.message error))
+                    (assert false)))
+          (_ (assert false))))
       0)))

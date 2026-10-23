@@ -159,3 +159,45 @@
     (sys/sleep-ms 300)
     (assert (!= (os/kill (primitive/cast i32 stray) (primitive/cast i32 0))
                 (primitive/cast i32 0)))))
+
+;;; Answers `cat` through a held standard input: each line it echoes back gets
+;;; the next one, and the input is released after the last.
+(defstruct Echo [(allocator (dyn Allocator))
+                 (feed (ptr InputFeed))
+                 (lines (ArrayList (slice u8)))])
+
+(impl LineSink Echo
+  (on-line [(self (ptr Echo)) (line (slice u8))] (-> bool)
+    (do
+      (push! (mut (.lines self)) (sys/copy-bytes (.allocator self) line))
+      (if (= line "first")
+          (for byte (iter "second\n") (push! (mut (.more (.feed self))) byte))
+          (set! (.release (.feed self)) true))
+      true))
+  (on-tick [(self (ptr Echo))] (-> bool) true))
+
+(deftest a-held-input-takes-more-and-closes-when-released
+  (let [a (malloc-allocator)
+        feed (box! a InputFeed (input-feed-new a))
+        sink (box! a Echo (Echo :allocator a :feed feed :lines (ArrayList::new [(slice u8)] a)))
+        started (sys/monotonic-ms)]
+    (match (stream-lines-fed a
+                             (StreamSpec
+                               :program "/bin/cat"
+                               :args []
+                               :cwd "/private/tmp"
+                               :input "first\n"
+                               :timeout-ms 10000
+                               :max-line-bytes 64
+                               :stderr-bytes 1024)
+                             feed
+                             sink)
+      (Ok [end]
+          (do
+            (assert-eq (.exit-code end) 0)
+            (assert (not (.timed-out end)))
+            (assert-eq (len (.lines sink)) 2)
+            (assert (= (get (.lines sink) 1) "second"))
+            ; `cat` exited at end of input, not at the timeout
+            (assert (< (- (sys/monotonic-ms) started) 5000))))
+      (Err [message] (do (println "stream-lines-fed failed: {}" message) (assert false))))))

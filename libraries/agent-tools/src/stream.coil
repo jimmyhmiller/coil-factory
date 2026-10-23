@@ -12,7 +12,7 @@
 (import "agent_tools.sys" :as sys)
 (import "agent_tools.text" :use *)
 
-(export StreamSpec StreamEnd LineSink stream-lines)
+(export StreamSpec StreamEnd LineSink stream-lines InputFeed input-feed-new stream-lines-fed)
 
 ;;; A program whose standard output is read line by line while it runs, such
 ;;; as an agent program that reports what it does as JSON lines. It is
@@ -58,6 +58,17 @@
    (timeout-ms i64)
    (max-line-bytes i64)
    (stderr-bytes i64)])
+
+;;; More standard input for a program run by `stream-lines-fed`, which keeps its
+;;; standard input open after `input` is written instead of closing it. Bytes
+;;; pushed onto `more` are written next; standard input closes once `release`
+;;; is set and everything pushed has been written. A program that reads input
+;;; until end of file (an agent taking one message per line) keeps running
+;;; between messages.
+(defstruct InputFeed [(more (ArrayList u8)) (release bool)])
+
+(defn input-feed-new [(a (dyn Allocator))] (-> InputFeed)
+  (InputFeed :more (ArrayList::new [u8] a) :release false))
 
 ;;; The consumer of the program's output.
 (deftrait LineSink [Self]
@@ -142,6 +153,10 @@
    (in-open bool)
    (input (slice u8))
    (written i64)
+   ; null: standard input closes once `input` is written
+   (feed (ptr InputFeed))
+   ; what `input` points into after the feed refilled it
+   (held (ArrayList u8))
    (out-fd i32)
    (out-open bool)
    (err-fd i32)
@@ -155,8 +170,31 @@
     0)
   0)
 
-;;; Write the next piece of input; close stdin when it is all written or the
-;;; program stopped reading.
+;;; With everything written, take what the feed holds as the next input, or
+;;; close standard input when there is no feed or it has been released.
+(defn feed-refill! [(pipes (mut Pipes))] (-> i64)
+  (when (and (.in-open pipes) (>= (.written pipes) (len (.input pipes))))
+    (let [feed (.feed pipes)]
+      (cond (= (primitive/cast i64 feed) 0) (close-input! (mut pipes))
+            (> (len (.more feed)) 0)
+              (do
+                (clear! (mut (.held pipes)))
+                (for byte (iter (slice (.more feed))) (push! (mut (.held pipes)) byte))
+                (clear! (mut (.more feed)))
+                (set! (.input pipes) (slice (.held pipes)))
+                (set! (.written pipes) 0)
+                0)
+            (.release feed) (close-input! (mut pipes))
+            :else 0))
+    0)
+  0)
+
+;;; Is there input waiting to be written?
+(defn input-pending? [(pipes (ptr Pipes))] (-> bool)
+  (and (.in-open pipes) (< (.written pipes) (len (.input pipes)))))
+
+;;; Write the next piece of input; close stdin when it is all written (unless a
+;;; feed holds it open) or the program stopped reading.
 (defn feed-input! [(pipes (mut Pipes))] (-> i64)
   (let [rest (subslice (.input pipes) (.written pipes) (len (.input pipes)))
         n (if (< (len rest) STDIN_CHUNK_BYTES) (len rest) STDIN_CHUNK_BYTES)
@@ -167,9 +205,7 @@
     (cond (> wrote 0) (set! (.written pipes) (+ (.written pipes) wrote))
           (and (< wrote 0) (transient-errno? (- 0 wrote))) 0
           :else (close-input! (mut pipes)))
-    (when (>= (.written pipes) (len (.input pipes)))
-      (close-input! (mut pipes))
-      0)
+    (feed-refill! (mut pipes))
     0))
 
 (defn read-into [(fd i32) (buffer (slice u8))] (-> i64)
@@ -191,6 +227,7 @@
              (sink (dyn LineSink))
              (deliver bool)
              (wait-ms i64)] (-> bool)
+  (feed-refill! (mut pipes))
   (if (not (or (.out-open pipes) (.err-open pipes) (.in-open pipes)))
       (do (sys/sleep-ms wait-ms) true)
       (let [(mut watches)
@@ -204,7 +241,9 @@
                                 (selectors/interest-writable)
                                 STDIN_TOKEN)]
             (mut count) 0]
-        (when (.in-open pipes)
+        ; an open input with nothing to write is not watched: always writable,
+        ; it would wake the wait at once
+        (when (input-pending? (mut pipes))
           (set! (mut watches)
                 (load count)
                 (selectors/watch (.in-fd pipes)
@@ -470,14 +509,24 @@
 ;;; delivered. Err when the program could not be started or reaped.
 (defn stream-lines [(a (dyn Allocator)) (spec StreamSpec) (sink (dyn LineSink))]
   (-> (Result StreamEnd (slice u8)))
-  (let [cwd (sys/c-string a (.cwd spec))
+  (stream-lines-fed a spec (primitive/cast (ptr InputFeed) 0) sink))
+
+;;; `stream-lines`, with standard input held open by FEED (see InputFeed); a
+;;; null FEED is `stream-lines`.
+(defn stream-lines-fed [(a (dyn Allocator))
+                        (spec StreamSpec)
+                        (feed (ptr InputFeed))
+                        (sink (dyn LineSink))]
+  (-> (Result StreamEnd (slice u8)))
+  (let [fed (!= (primitive/cast i64 feed) 0)
+        cwd (sys/c-string a (.cwd spec))
         child (primitive/alloc-stack subprocess/Child)
         spawned
           (subprocess/Child::spawn-with-options a
                                                 child
                                                 (.program spec)
                                                 (.args spec)
-                                                (if (> (len (.input spec)) 0)
+                                                (if (or fed (> (len (.input spec)) 0))
                                                     (subprocess/pipe-stdio)
                                                     (subprocess/null-stdio))
                                                 (subprocess/pipe-stdio)
@@ -510,9 +559,11 @@
                         (mut pipes)
                           (Pipes
                             :in-fd (.stdin-fd child)
-                            :in-open (> (len (.input spec)) 0)
+                            :in-open (or fed (> (len (.input spec)) 0))
                             :input (.input spec)
                             :written 0
+                            :feed feed
+                            :held (ArrayList::new [u8] a)
                             :out-fd (.stdout-fd child)
                             :out-open true
                             :err-fd (.stderr-fd child)
@@ -631,6 +682,7 @@
                                           :dropped-lines (.dropped lines))))))]
                       (close-input! (mut pipes))
                       (close child)
+                      (free! (mut (.held pipes)))
                       (capture-free! (mut errors))
                       (free! (mut (.pending lines)))
                       (free [u8] a buffer)

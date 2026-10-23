@@ -82,6 +82,8 @@
     (for word (iter (.launcher opts)) (push! (mut argv) word))
     (for word (iter [(.program opts)
                      "--print"
+                     "--input-format"
+                     "stream-json"
                      "--verbose"
                      "--output-format"
                      "stream-json"
@@ -135,7 +137,11 @@
    (cancelled bool)
    (idle bool)
    (last-event-ms i64)
-   (last-inbox-ms i64)])
+   (last-inbox-ms i64)
+   ; Claude's standard input, held open while background tasks run
+   (feed (ptr stream/InputFeed))
+   ; background tasks (shell commands, subagents) Claude reports running
+   (tasks i64)])
 
 (defn turn-new [(a (dyn Allocator))
                 (h (ptr ClaudeHarness))
@@ -156,7 +162,37 @@
     :cancelled false
     :idle false
     :last-event-ms (now-ms)
-    :last-inbox-ms 0))
+    :last-inbox-ms 0
+    :feed (cast (ptr stream/InputFeed) 0)
+    :tasks 0))
+
+;;; One stream-json user message, as Claude reads them from standard input.
+(defn user-line [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [root (jv-object a)
+        message (jv-object a)]
+    (jv-put! message "role" (JStr "user"))
+    (jv-put! message "content" (JStr text))
+    (jv-put! root "type" (JStr "user"))
+    (jv-put! root "message" message)
+    (join a [(jv-encode a root) "\n"])))
+
+;;; Write TEXT to Claude as a further message of the running invocation.
+(defn feed-message! [(turn (ptr Turn)) (text (slice u8))] (-> i64)
+  (let [line (user-line (.allocator turn) text)]
+    (for byte (iter line) (push! (mut (.more (.feed turn))) byte))
+    0))
+
+;;; Claude stays running, reading messages, until its standard input closes.
+;;; Close it at the end of a turn unless background tasks are still running:
+;;; Claude starts a turn of its own when each finishes. Once its input has
+;;; closed, Claude waits for running background tasks only ten minutes and then
+;;; exits, taking its subagents and shell commands with it: a subagent that
+;;; built and tested for longer than that was lost with every turn's end.
+(defn release-if-idle! [(turn (ptr Turn))] (-> i64)
+  (when (and (= (.tasks turn) 0) (!= (cast i64 (.feed turn)) 0))
+    (set! (.release (.feed turn)) true)
+    0)
+  0)
 
 (defn open-index [(turn (ptr Turn)) (id (slice u8))] (-> i64)
   (block :find
@@ -331,6 +367,10 @@
                 (set! (.session h) (copy-bytes a session))
                 0)
               (cond (= kind "assistant") (assistant! turn event)
+                    (and (= kind "system")
+                         (= (jv-string-or (jv-get event "subtype") "")
+                            "background_tasks_changed"))
+                      (do (set! (.tasks turn) (jv-count (jv-get event "tasks"))) true)
                     (= kind "user") (tool-results! turn event)
                     (= kind "stream_event")
                       (let [delta (jv-get (jv-get event "event") "delta")
@@ -379,7 +419,9 @@
                                           "success")))
                           (set! (.error turn)
                                 (copy-bytes a (jv-encode s event)))
+                          (set! (.tasks turn) 0)
                           0)
+                        (release-if-idle! turn)
                         true)
                     :else true))))))
 
@@ -401,8 +443,18 @@
           (set! (.last-inbox-ms self) now)
           (let [(mut arrived) (control-inbox (.control h) (.allocator h))]
             (for message (iter arrived)
-              (push! (mut (.inbound h)) message)
-              (set! (.interrupt self) true))
+              (if (> (.tasks self) 0)
+                  ; stopping now would end the running tasks: hand the message
+                  ; to this invocation, which reads it after its current turn
+                  (let [text (join (.allocator h) ["[" (.from message) "] " (.text message)])]
+                    (feed-message! self text)
+                    (mirror-text! h "user" text)
+                    (observe (.observer h) (MessageDelivered message))
+                    0)
+                  (do
+                    (push! (mut (.inbound h)) message)
+                    (set! (.interrupt self) true)
+                    0)))
             (free! (mut arrived))
             0))
         (when (and (.interrupt self)
@@ -410,7 +462,9 @@
                    (match (.finish self) (Some [_] false) (None [] true)))
           (set! (.interrupted self) true)
           (return-from :tick false))
+        ; a background task may run for a long time without an event
         (when (and (> (.idle-timeout-ms (.options h)) 0)
+                   (= (.tasks self) 0)
                    (>= (- now (.last-event-ms self))
                        (.idle-timeout-ms (.options h))))
           (set! (.idle self) true)
@@ -477,18 +531,22 @@
                   (box! a scratch/ScratchArena (zeroed scratch/ScratchArena))
                 _ (scratch/ScratchArena::init arena a)
                 turn (box! a Turn (turn-new (allocator arena) h arena))
+                feed (box! a stream/InputFeed (stream/input-feed-new a))
+                _fed (set! (.feed turn) feed)
                 ended
-                  (stream/stream-lines a
-                                       (stream/StreamSpec
-                                         :program (get all 0)
-                                         :args (subslice all 1 (len all))
-                                         :cwd (.workdir opts)
-                                         :input prompt
-                                         :timeout-ms 0
-                                         :max-line-bytes 67108864
-                                         :stderr-bytes 8192)
-                                       turn)]
+                  (stream/stream-lines-fed a
+                                           (stream/StreamSpec
+                                             :program (get all 0)
+                                             :args (subslice all 1 (len all))
+                                             :cwd (.workdir opts)
+                                             :input (user-line a prompt)
+                                             :timeout-ms 0
+                                             :max-line-bytes 67108864
+                                             :stderr-bytes 8192)
+                                           feed
+                                           turn)]
             (free! (mut argv))
+            (free! (mut (.more feed)))
             (close! arena)
             (free! (mut (.open turn)))
             (when (not (.usage-seen turn))
