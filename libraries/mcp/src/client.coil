@@ -439,7 +439,8 @@
                                                 (subprocess/pipe-stdio)
                                                 (subprocess/SpawnOptions
                                                   :cwd cwd-c
-                                                  :new-process-group true))]
+                                                  :new-process-group true
+                                                  :pass-fds (slice::new [i32] (primitive/cast (ptr i32) 0) 0)))]
     (sys/c-string-free a cwd cwd-c)
     (match spawned
       (Err [error] (Err (cat a ["could not start the MCP server `" name "`"])))

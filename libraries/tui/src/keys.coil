@@ -1,4 +1,5 @@
 (module tui.keys)
+(import "coil.cc" :as cc)
 (import "coil.selectors" :as selectors)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
@@ -12,7 +13,7 @@
         [utf8-decode utf8-sequence-length REPLACEMENT-RUNE rune-control?])
 (import "tui.term" :use [term-size term-wake-fd term-drain-wake! TermSize])
 
-(extern read :cc c [i32 (ptr i8) isize] (-> isize))
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
 ;;; One input event. `Char` is a printable Unicode scalar. `Ctrl` carries a
 ;;; lowercase ASCII letter, or one of `@ [ \ ] ^ _` / space for the other C0

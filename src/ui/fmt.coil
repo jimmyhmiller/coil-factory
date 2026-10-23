@@ -1,4 +1,5 @@
 (module factory.ui.fmt)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.slice" :use *)
@@ -84,7 +85,7 @@
 ;; Time
 (defstruct Tm [(fields (array i32 16))])
 
-(extern localtime_r :cc c [(ptr i64) (ptr Tm)] (-> (ptr Tm)))
+(extern localtime_r :cc (cc/C) [(ptr i64) (ptr Tm)] (-> (ptr Tm)))
 
 ;;; Local wall-clock time of `t-ms` as "HH:MM" or, with `seconds`, "HH:MM:SS".
 (defn fmt-clock [(a (dyn Allocator)) (t-ms i64) (seconds bool)] (-> (slice u8))

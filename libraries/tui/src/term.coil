@@ -1,4 +1,5 @@
 (module tui.term)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 (import "coil.str" :use [from-cstr])
@@ -8,29 +9,29 @@
         [fatal fatal-set-restore-hook! fatal-clear-restore-hook!])
 (import "tui.canvas" :use [ColorMode NoColor Ansi16 Ansi256 TrueColor])
 
-(extern isatty :cc c [i32] (-> i32))
+(extern isatty :cc (cc/C) [i32] (-> i32))
 
-(extern ioctl :cc c [i32 u64 ...] (-> i32))
+(extern ioctl :cc (cc/C) [i32 u64 ...] (-> i32))
 
-(extern tcgetattr :cc c [i32 (ptr Termios)] (-> i32))
+(extern tcgetattr :cc (cc/C) [i32 (ptr Termios)] (-> i32))
 
-(extern tcsetattr :cc c [i32 i32 (ptr Termios)] (-> i32))
+(extern tcsetattr :cc (cc/C) [i32 i32 (ptr Termios)] (-> i32))
 
-(extern cfmakeraw :cc c [(ptr Termios)] (-> void))
+(extern cfmakeraw :cc (cc/C) [(ptr Termios)] (-> void))
 
-(extern raise :cc c [i32] (-> i32))
+(extern raise :cc (cc/C) [i32] (-> i32))
 
-(extern signal :cc c [i32 (ptr i8)] (-> (ptr i8)))
+(extern signal :cc (cc/C) [i32 (ptr i8)] (-> (ptr i8)))
 
-(extern pipe :cc c [(ptr i32)] (-> i32))
+(extern pipe :cc (cc/C) [(ptr i32)] (-> i32))
 
-(extern fcntl :cc c [i32 i32 ...] (-> i32))
+(extern fcntl :cc (cc/C) [i32 i32 ...] (-> i32))
 
-(extern close :cc c [i32] (-> i32))
+(extern close :cc (cc/C) [i32] (-> i32))
 
-(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
-(extern read :cc c [i32 (ptr i8) isize] (-> isize))
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
 ;;; Expression macro: `linux` on Linux targets, `darwin` otherwise.
 (defn term--os [(linux Code) (darwin Code)] (-> Code)

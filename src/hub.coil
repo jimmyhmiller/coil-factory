@@ -1,4 +1,5 @@
 (module factory.hub)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.http.client" :as http)
@@ -25,7 +26,7 @@
 ;;; `~/.factory/sites.json` (0600):
 ;;;     {"sites": [{"name": "box2", "ssh": "me@box2", "token": "…", "port": 7788}]}
 
-(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+(extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
 
 (defstruct Remote
   [(name (slice u8))

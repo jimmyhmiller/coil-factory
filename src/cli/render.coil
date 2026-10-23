@@ -1,4 +1,5 @@
 (module factory.cli.render)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.serde.value" :use *)
@@ -165,7 +166,7 @@
 (defn two [(a (dyn Allocator)) (n i64)] (-> (slice u8))
   (if (< n 10) (join a ["0" (int-text a n)]) (int-text a n)))
 
-(extern localtime_r :cc c [(ptr i64) (ptr u8)] (-> (ptr u8)))
+(extern localtime_r :cc (cc/C) [(ptr i64) (ptr u8)] (-> (ptr u8)))
 
 ;;; Seconds since local midnight for a wall-clock millisecond time.
 (defn local-hms [(t i64)] (-> i64)

@@ -12,6 +12,7 @@
 ;; are given, exactly sized; free it with `(alloc/free [u8] a s)` or, more simply,
 ;; build output in an arena that is released as a whole.
 (module cli.style)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.arraylist" :use *)
 (import "coil.os" :as os)
@@ -99,7 +100,7 @@
         plural
         count-noun)
 
-(extern isatty :cc c [i32] (-> i32))
+(extern isatty :cc (cc/C) [i32] (-> i32))
 
 ;;; Rendering capabilities of one output stream. `color` enables SGR escape
 ;;; sequences; `unicode` selects the Unicode glyphs over their ASCII fallbacks.

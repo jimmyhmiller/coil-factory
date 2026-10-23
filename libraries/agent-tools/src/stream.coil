@@ -484,7 +484,8 @@
                                                 (subprocess/pipe-stdio)
                                                 (subprocess/SpawnOptions
                                                   :cwd cwd
-                                                  :new-process-group true))]
+                                                  :new-process-group true
+                                                  :pass-fds (slice::new [i32] (primitive/cast (ptr i32) 0) 0)))]
     (sys/c-string-free a (.cwd spec) cwd)
     (match spawned
       (Err [error]

@@ -1,4 +1,5 @@
 (module agent_tools.sys)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
 (import "coil.fs" :as fs)
@@ -11,27 +12,27 @@
 ;;; libc entry points this library needs that the standard library does not
 ;;; declare. Every extern lives here, once, so two importers never collide.
 
-(extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern realpath :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
 
-(extern readlink :cc c [(ptr i8) (ptr i8) i64] (-> i64))
+(extern readlink :cc (cc/C) [(ptr i8) (ptr i8) i64] (-> i64))
 
-(extern access :cc c [(ptr i8) i32] (-> i32))
+(extern access :cc (cc/C) [(ptr i8) i32] (-> i32))
 
-(extern strerror :cc c [i32] (-> (ptr i8)))
+(extern strerror :cc (cc/C) [i32] (-> (ptr i8)))
 
-(extern waitid :cc c [i32 u32 (ptr u8) i32] (-> i32))
+(extern waitid :cc (cc/C) [i32 u32 (ptr u8) i32] (-> i32))
 
-(extern sigemptyset :cc c [(ptr u8)] (-> i32))
+(extern sigemptyset :cc (cc/C) [(ptr u8)] (-> i32))
 
-(extern sigaddset :cc c [(ptr u8) i32] (-> i32))
+(extern sigaddset :cc (cc/C) [(ptr u8) i32] (-> i32))
 
-(extern sigismember :cc c [(ptr u8) i32] (-> i32))
+(extern sigismember :cc (cc/C) [(ptr u8) i32] (-> i32))
 
-(extern sigpending :cc c [(ptr u8)] (-> i32))
+(extern sigpending :cc (cc/C) [(ptr u8)] (-> i32))
 
-(extern sigwait :cc c [(ptr u8) (ptr i32)] (-> i32))
+(extern sigwait :cc (cc/C) [(ptr u8) (ptr i32)] (-> i32))
 
-(extern pthread_sigmask :cc c [i32 (ptr u8) (ptr u8)] (-> i32))
+(extern pthread_sigmask :cc (cc/C) [i32 (ptr u8) (ptr u8)] (-> i32))
 
 (const ENOENT 2)
 

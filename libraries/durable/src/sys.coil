@@ -1,4 +1,5 @@
 (module durable.sys)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 
 ;; The single home of every libc declaration the durable package adds. Coil does not
@@ -6,31 +7,30 @@
 ;; exactly once and the other modules `:use` it. Symbols the bundled library already
 ;; declares (`open`/`close`/`kill`/`getpid` in coil.os, `read`/`write` in coil.io,
 ;; `readdir`/`closedir`/`rename`/`ftruncate` in coil.fs) are used from there.
-(extern flock :cc c [i32 i32] (-> i32))
+(extern flock :cc (cc/C) [i32 i32] (-> i32))
 
-(extern pread :cc c [i32 (ptr i8) i64 i64] (-> i64))
+(extern pread :cc (cc/C) [i32 (ptr i8) i64 i64] (-> i64))
 
-(extern lseek :cc c [i32 i64 i32] (-> i64))
+(extern lseek :cc (cc/C) [i32 i64 i32] (-> i64))
 
-(extern fsync :cc c [i32] (-> i32))
+(extern fsync :cc (cc/C) [i32] (-> i32))
 
+(extern unlink :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern unlink :cc c [(ptr i8)] (-> i32))
+(extern openat :cc (cc/C) [i32 (ptr i8) i32 ...] (-> i32))
 
-(extern openat :cc c [i32 (ptr i8) i32 ...] (-> i32))
+(extern unlinkat :cc (cc/C) [i32 (ptr i8) i32] (-> i32))
 
-(extern unlinkat :cc c [i32 (ptr i8) i32] (-> i32))
+(extern fdopendir :cc (cc/C) [i32] (-> (ptr i8)))
 
-(extern fdopendir :cc c [i32] (-> (ptr i8)))
+(extern dup :cc (cc/C) [i32] (-> i32))
 
-(extern dup :cc c [i32] (-> i32))
+(extern getentropy :cc (cc/C) [(ptr i8) i64] (-> i32))
 
-(extern getentropy :cc c [(ptr i8) i64] (-> i32))
-
-(extern strerror :cc c [i32] (-> (ptr i8)))
+(extern strerror :cc (cc/C) [i32] (-> (ptr i8)))
 
 ;; Used by the test suites to build symbolic-link fixtures.
-(extern symlink :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern symlink :cc (cc/C) [(ptr i8) (ptr i8)] (-> i32))
 
 ;;; Choose a platform spelling at compile time. The generic Linux column covers
 ;;; x86_64 and the asm-generic architectures; 32- and 64-bit ARM Linux use their own
@@ -93,7 +93,7 @@
 
 (const SYS-SEEK-END 2)
 
-(extern rewinddir :cc c [(ptr i8)] (-> void))
+(extern rewinddir :cc (cc/C) [(ptr i8)] (-> void))
 
 ;;; The thread's errno cell, needed to tell readdir(3)'s end-of-directory from its
 ;;; failure (both return NULL). The accessor's symbol differs by platform, so the
@@ -103,7 +103,7 @@
            :as
            ~(sys-pick `"__errno_location" `"__errno_location" `"__error")
            :cc
-           c
+           (cc/C)
            []
            (-> (ptr i32))))
 

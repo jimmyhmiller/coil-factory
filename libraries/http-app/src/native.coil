@@ -1,4 +1,5 @@
 (module http_app.native)
+(import "coil.cc" :as cc)
 (import "coil.io" :as io)
 (import "coil.os" :as os)
 (import "coil.primitive" :as primitive)
@@ -9,11 +10,11 @@
 ;;; Host ABI facts the server needs beyond `coil.socket`. Every value that differs
 ;;; between Darwin and Linux is chosen at compile time for the target, the same way
 ;;; `coil.socket` chooses its own layouts.
-(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+(extern pthread_detach :cc (cc/C) [(ptr i8)] (-> i32))
 
-(extern shutdown :cc c [i32 i32] (-> i32))
+(extern shutdown :cc (cc/C) [i32 i32] (-> i32))
 
-(extern abort :cc c [] (-> void))
+(extern abort :cc (cc/C) [] (-> void))
 
 (const F_GETFD 1)
 
@@ -40,19 +41,19 @@
 (defn native-public-name [(name Code)] (-> Code)
   (primitive/syntax->datum name))
 
-(extern socket :cc c [i32 i32 i32] (-> i32))
+(extern socket :cc (cc/C) [i32 i32 i32] (-> i32))
 
-(extern setsockopt :cc c [i32 i32 i32 (ptr i8) u32] (-> i32))
+(extern setsockopt :cc (cc/C) [i32 i32 i32 (ptr i8) u32] (-> i32))
 
-(extern bind :cc c [i32 (ptr i8) u32] (-> i32))
+(extern bind :cc (cc/C) [i32 (ptr i8) u32] (-> i32))
 
-(extern listen :cc c [i32 i32] (-> i32))
+(extern listen :cc (cc/C) [i32 i32] (-> i32))
 
-(extern accept :cc c [i32 (ptr i8) (ptr u32)] (-> i32))
+(extern accept :cc (cc/C) [i32 (ptr i8) (ptr u32)] (-> i32))
 
-(extern htons :cc c [u16] (-> u16))
+(extern htons :cc (cc/C) [u16] (-> u16))
 
-(extern inet_pton :cc c [i32 (ptr i8) (ptr i8)] (-> i32))
+(extern inet_pton :cc (cc/C) [i32 (ptr i8) (ptr i8)] (-> i32))
 
 (const AF_INET 2)
 
@@ -83,7 +84,7 @@
            0)
          (extern ~(native-public-name `accept4)
                  :cc
-                 c
+                 (cc/C)
                  [i32 (ptr i8) (ptr u32) i32]
                  (-> i32))
          (defn ~(native-public-name `accept-raw) [(listener-fd i32)] (-> i32)

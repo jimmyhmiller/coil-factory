@@ -1,4 +1,5 @@
 (module factory.proc)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :as fs)
@@ -15,9 +16,9 @@
 ;;; this executable so it can start copies of itself, and turning the current
 ;;; process into a detached one with its output in a log file.
 
-(extern setsid :cc c [] (-> i32))
+(extern setsid :cc (cc/C) [] (-> i32))
 
-(extern realpath :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern realpath :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
 
 (defn env-or [(a (dyn Allocator)) (name (slice u8)) (fallback (slice u8))]
   (-> (slice u8))

@@ -1,4 +1,5 @@
 (module tui.keys-test)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.slice" :use *)
@@ -110,11 +111,11 @@
                         (_ (do (assert false) 0)))))
            (Incomplete [] (do (assert false) 0))))
 
-(extern pipe :cc c [(ptr i32)] (-> i32))
+(extern pipe :cc (cc/C) [(ptr i32)] (-> i32))
 
-(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
-(extern close :cc c [i32] (-> i32))
+(extern close :cc (cc/C) [i32] (-> i32))
 
 (defn feed [(fd i32) (bytes (slice u8))] (-> i64)
   (cast i64

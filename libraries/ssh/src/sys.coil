@@ -3,6 +3,7 @@
 ;; and a pipe write that reports a vanished reader as EPIPE instead of letting
 ;; SIGPIPE kill the process.
 (module ssh.sys)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :as alloc)
 (import "coil.io" :as io)
 (import "coil.os" :as os)
@@ -71,17 +72,17 @@
             (os/errno)
             0))))
 
-(extern sigemptyset :cc c [(ptr u8)] (-> i32))
+(extern sigemptyset :cc (cc/C) [(ptr u8)] (-> i32))
 
-(extern sigaddset :cc c [(ptr u8) i32] (-> i32))
+(extern sigaddset :cc (cc/C) [(ptr u8) i32] (-> i32))
 
-(extern sigismember :cc c [(ptr u8) i32] (-> i32))
+(extern sigismember :cc (cc/C) [(ptr u8) i32] (-> i32))
 
-(extern sigpending :cc c [(ptr u8)] (-> i32))
+(extern sigpending :cc (cc/C) [(ptr u8)] (-> i32))
 
-(extern sigwait :cc c [(ptr u8) (ptr i32)] (-> i32))
+(extern sigwait :cc (cc/C) [(ptr u8) (ptr i32)] (-> i32))
 
-(extern pthread_sigmask :cc c [i32 (ptr u8) (ptr u8)] (-> i32))
+(extern pthread_sigmask :cc (cc/C) [i32 (ptr u8) (ptr u8)] (-> i32))
 
 ;;; `write(2)` with SIGPIPE blocked on the calling thread. If the reader is gone
 ;;; the result is -1 with errno EPIPE, and the SIGPIPE the kernel raised is

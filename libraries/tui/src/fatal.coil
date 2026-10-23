@@ -1,21 +1,22 @@
 (module tui.fatal)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
 
-(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
 
-(extern abort :cc c [] (-> void))
+(extern abort :cc (cc/C) [] (-> void))
 
 ;;; The terminal-restoration callback run before a fatal error aborts the process.
 ;;; `tui.term` installs it while the terminal is in raw mode so that a failure
 ;;; never leaves the user's shell in the alternate screen with echo disabled.
-(defstruct FatalHook [(installed bool) (restore (fnptr c [] i64))])
+(defstruct FatalHook [(installed bool) (restore (fnptr (cc/C) [] i64))])
 
 (defn fatal-hook [] (-> (ptr FatalHook))
   (primitive/alloc-static FatalHook))
 
 ;;; Register `restore` to run (once) before any `fatal` abort.
-(defn fatal-set-restore-hook! [(restore (fnptr c [] i64))] (-> i64)
+(defn fatal-set-restore-hook! [(restore (fnptr (cc/C) [] i64))] (-> i64)
   (set! (.restore (fatal-hook)) restore)
   (set! (.installed (fatal-hook)) true)
   0)
