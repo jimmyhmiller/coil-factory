@@ -309,9 +309,12 @@ env > \"$dir/env.$n\"
                    "streaming"
                    [(cat a
                          [(step-start a)
-                          (ev a "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":4000")
-                          (ev a "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":120")
-                          (ev a "\"type\":\"reasoning\",\"part\":{\"type\":\"reasoning\",\"text\":\"weighing candidates\"}")
+                          (ev a
+                              "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":4000")
+                          (ev a
+                              "\"type\":\"factory_streaming\",\"part\":\"reasoning\",\"chars\":120")
+                          (ev a
+                              "\"type\":\"reasoning\",\"part\":{\"type\":\"reasoning\",\"text\":\"weighing candidates\"}")
                           (text-event a "done")
                           (step-finish a "stop")])]
                    (script a))
@@ -329,7 +332,8 @@ env > \"$dir/env.$n\"
       (assert (saw? r "thought weighing candidates"))
       (assert (contains? (read a plugin-path) "message.part.delta"))
       (assert (contains? (read a plugin-path) "factory_streaming"))
-      (assert (contains? config (cat a ["\"plugin\":[\"file://" plugin-path "\"]"]))))))
+      (assert (contains? config
+                         (cat a ["\"plugin\":[\"file://" plugin-path "\"]"]))))))
 
 (deftest continues-the-session-and-replies
   (let [a (malloc-allocator)
@@ -450,6 +454,75 @@ env > \"$dir/env.$n\"
                          "opencode exited with status 3: boom: no such column: name")))
       (_ (assert false)))))
 
+(deftest a-retry-that-needs-a-person-ends-the-run-at-once
+  (let [a (malloc-allocator)
+        f
+          (fixture a
+                   "retry-action"
+                   [(cat a
+                         [(step-start a)
+                          (ev a
+                              "\"type\":\"factory_retry\",\"attempt\":1,\"message\":\"Free usage exceeded, subscribe to Go\",\"action\":\"free_tier_limit\",\"delayMs\":72000000")
+                          "sleep 20\necho never\n"])]
+                   (script a))
+        h (.harness f)
+        started (sys/monotonic-ms)]
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h)
+      (Failed [error]
+              (assert (= (.message error)
+                         "the provider refused (free_tier_limit): Free usage exceeded, subscribe to Go; OpenCode would retry in 1200 minutes")))
+      (_ (assert false)))
+    (assert (< (- (sys/monotonic-ms) started) 8000))
+    (assert (saw? (.recorder f) "retry"))))
+
+(deftest a-retry-past-the-idle-limit-ends-the-run
+  (let [a (malloc-allocator)
+        f
+          (fixture a
+                   "retry-late"
+                   [(cat a
+                         [(step-start a)
+                          (ev a
+                              "\"type\":\"factory_retry\",\"attempt\":2,\"message\":\"Too many requests\",\"action\":\"\",\"delayMs\":3600000")
+                          "sleep 20\necho never\n"])]
+                   (script a))
+        h (.harness f)
+        started (sys/monotonic-ms)]
+    (set! (.idle-timeout-ms (field h options)) 60000)
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h)
+      (Failed [error]
+              (assert (= (.message error)
+                         "the provider refused: Too many requests; OpenCode would retry in 60 minutes")))
+      (_ (assert false)))
+    (assert (< (- (sys/monotonic-ms) started) 8000))))
+
+(deftest a-short-retry-is-reported-and-waited-for
+  (let [a (malloc-allocator)
+        f
+          (fixture a
+                   "retry-short"
+                   [(cat a
+                         [(step-start a)
+                          (ev a
+                              "\"type\":\"factory_retry\",\"attempt\":1,\"message\":\"Provider is overloaded\",\"action\":\"\",\"delayMs\":2000")
+                          (text-event a "done")
+                          (step-finish a "stop")])]
+                   (script a))
+        h (.harness f)]
+    (set! (.idle-timeout-ms (field h options)) 60000)
+    (harness-add-system! h "sys")
+    (harness-add-user! h "Begin.")
+    (match (harness-run! h)
+      (Replied [text] (assert (= text "done")))
+      (_ (assert false)))
+    (assert (saw? (.recorder f) "retry"))
+    (assert (contains? (read a (cat a [(.dir f) "/state/factory-streaming.js"]))
+                       "factory_retry"))))
+
 (deftest a-stop-tool-that-never-started-is-a-failure
   (let [a (malloc-allocator)
         f
@@ -468,3 +541,28 @@ env > \"$dir/env.$n\"
       (Failed [error]
               (assert (contains? (.message error) "never started in OpenCode")))
       (_ (assert false)))))
+
+(deftest handoff-context-travels-on-stdin-once-and-is-not-a-new-user-message
+  (let [a (malloc-allocator)
+        reply
+          (cat a [(step-start a) (text-event a "ok") (step-finish a "stop")])
+        f (fixture a "handoff-context" [reply reply] (script a))
+        h (.harness f)]
+    (harness-add-system! h "system")
+    (harness-add-context! h "PRIOR-HISTORY-MARKER")
+    (harness-add-user! h "first question")
+    (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+    (assert (harness-restore! h (harness-checkpoint h a)))
+    (harness-add-user! h "second question")
+    (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+    (assert (contains? (read a (cat a [(.dir f) "/stdin.1"]))
+                       "PRIOR-HISTORY-MARKER"))
+    (assert (not (contains? (read a (cat a [(.dir f) "/argv.1"]))
+                            "PRIOR-HISTORY-MARKER")))
+    (assert (not (contains? (read a (cat a [(.dir f) "/stdin.2"]))
+                            "PRIOR-HISTORY-MARKER")))
+    (assert (contains? (read a (cat a [(.dir f) "/stdin.2"])) "second question"))
+    (for i (range 0 (jv-count (.messages h)))
+      (assert (not (= (jv-string-or (jv-get (jv-nth (.messages h) i) "content")
+                                    "")
+                      "PRIOR-HISTORY-MARKER"))))))
