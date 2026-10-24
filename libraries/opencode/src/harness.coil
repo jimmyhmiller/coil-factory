@@ -467,7 +467,8 @@ export const FactoryStreaming = async () => ({
                                                                  (jv-string-or (jv-get event
                                                                                        "message")
                                                                                ""))
-                                                (jv-int (jv-get event "delayMs"))))
+                                                (jv-int (jv-get event "delayMs"))
+                                                (jv-string-or (jv-get event "action") "")))
                         (if (> (len refusal) 0)
                             (do (set! (.error turn) (copy-bytes a refusal)) false)
                             true))

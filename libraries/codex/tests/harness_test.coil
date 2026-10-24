@@ -49,7 +49,7 @@
               (ToolStarted [call summary] (cat a ["tool " summary]))
               (ToolEnded [call summary ok output elapsed]
                          (cat a [(if ok "ok " "failed ") output]))
-              (ModelRetrying [attempt error delay] "retry")
+              (ModelRetrying [attempt error delay action] "retry")
               (PausedEvent [] "paused")
               (ResumedEvent [] "resumed")
               (UsageUnknown [reason] (cat a ["usage unknown: " reason]))

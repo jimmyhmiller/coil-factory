@@ -158,6 +158,17 @@ is on `/papers/models.html`.
   was imported from `research-2026-10-09.json`.
 - **Real runs count**: a free attempt that fails in a paper run for any reason
   (stall, time limit, provider error, failed gate) puts its model out for 3 days.
+- **Provider refusals pause, they don't blame**: the free quota is anonymous and
+  per IP per UTC day, and its size isn't published. Once it is spent, OpenCode
+  says a person must act (`action`, e.g. `free_tier_limit`) and would retry at
+  the provider's `retry-after`, which is UTC midnight. The OpenCode harness fails
+  the turn at once with that message. The worker logs it as an `agent.retry`
+  event with `action` and `delay_ms`. Whichever side meets it records a
+  `free_pause` until that retry time: the controller in `state.json`, the
+  registry in `models.json`. Either one pauses both: no probes, and paper runs
+  start on the paid model with the pause as the reason. The refused probe keeps
+  the model's last result, and a refused paper attempt is not an incident. The
+  pause shows on `/papers/models.html`.
 - **Rank**: models that pass everything, by test score, then published score,
   then test time. Measured results decide; research only breaks ties. A ranking
   older than 2 hours is not trusted, and the paper run starts on the paid model.

@@ -65,7 +65,13 @@
               (ok bool)
               (output (slice u8))
               (elapsed-ms i64)])
-  (ModelRetrying [(attempt i64) (error chat/ChatError) (delay-ms i64)])
+  ;;; The model call failed and will be tried again after `delay-ms`.
+  ;;; `action` is nonempty when the provider says a person must act first (an
+  ;;; exhausted quota, say), so waiting alone will not help.
+  (ModelRetrying [(attempt i64)
+                  (error chat/ChatError)
+                  (delay-ms i64)
+                  (action (slice u8))])
   (PausedEvent [])
   (ResumedEvent [])
   ;;; Older tool output and reasoning were elided to fit the context budget.
@@ -390,7 +396,8 @@
                                                 (ModelRetrying
                                                   :attempt (load attempt)
                                                   :error error
-                                                  :delay-ms delay))
+                                                  :delay-ms delay
+                                                  :action ""))
                                        (let [(mut waited) 0]
                                          (loop (if (>= (load waited) delay)
                                                    (break)

@@ -324,7 +324,7 @@
                                              term
                                              (truncate a (trim text) 300))
                                 "\n"])))
-        (ModelRetrying [attempt error delay]
+        (ModelRetrying [attempt error delay action]
                        (write-err (join a
                                         [(style/warn a term "… ")
                                          "the model failed; trying again\n"])))

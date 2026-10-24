@@ -18,6 +18,9 @@ Its native runs share the factory daemon with the other workflows.
   with sources. It informs the page and breaks ties only; measured results
   decide.
 - A model whose free attempt fails in a real paper run is out for a while.
+- When the provider refuses until a person acts (the free quota is spent), no
+  model is to blame: probes and free paper attempts pause until the retry time
+  the provider gave, and the refused probe does not count.
 
 The ranking (state/models.json) is what the paper controller's `free_model:
 "auto"` uses (controller.chosen_free_model); models.html in the library shows every model and why it is in or out.
@@ -42,7 +45,8 @@ import tempfile
 import uuid
 
 from . import probe_tasks
-from .controller import TERMINAL, APIError, NativeAPI, atomic_json, read_json
+from .controller import (TERMINAL, APIError, NativeAPI, atomic_json, free_pause, later_pause, pause_text,
+                         read_json, refusal)
 
 LOG = logging.getLogger("paper-models")
 PROGRESS_KINDS = {"agent.turn", "agent.streaming", "agent.text", "agent.thought", "tool.started", "tool.finished",
@@ -185,18 +189,21 @@ class Registry:
 
     def start_next(self):
         candidates = [m for m, r in self.state["models"].items() if r.get("listed") and not self.denied(m)]
+        # Research runs on the paid model, so only probes wait out a pause.
+        paused = free_pause(self.root, self.timestamp)
         never = [m for m in candidates if "probe" not in self.record(m)]
-        if never:
+        if never and not paused:
             return self.start("probe", min(never, key=lambda m: self.record(m)["first_seen"]))
         # Research only models that actually answered in their test.
-        unresearched = [m for m in candidates if "research" not in self.record(m)
+        probed = [m for m in candidates if "probe" in self.record(m)]
+        unresearched = [m for m in probed if "research" not in self.record(m)
                         and self.record(m)["probe"]["turns"] > 0
                         and self.timestamp - self.record(m).get("research_failed", 0) >= self.settings["research_retry_seconds"]]
         if unresearched:
             return self.start("research", min(unresearched, key=lambda m: self.record(m)["first_seen"]))
-        stale = [m for m in candidates
+        stale = [m for m in probed
                  if self.timestamp - self.record(m)["probe"]["checked"] >= self.settings["probe_every_seconds"]]
-        if stale:
+        if stale and not paused:
             return self.start("probe", min(stale, key=lambda m: self.record(m)["probe"]["checked"]))
 
     def start(self, kind, model):
@@ -252,6 +259,8 @@ class Registry:
                     break
                 event = json.loads(line)
                 active["journal_offset"] = stream.tell()
+                if refusal(event):
+                    active["refusal"] = {**refusal(event), "run_id": active["run_id"]}
                 if event.get("kind") == "run.started":
                     active["run_started"] = event["t"] / 1000
                 if event.get("kind") == "run.finished":
@@ -311,7 +320,11 @@ class Registry:
         active = self.state["active"]
         model, record = active["model"], self.record(active["model"])
         workspace = Path(self.settings["site_home"]) / "runs" / active["run_id"] / "workspace" if active.get("run_id") else None
-        if active["kind"] == "probe":
+        if active["kind"] == "probe" and active.get("refusal"):
+            # The provider refused everyone; the model keeps its last result.
+            self.state["free_pause"] = later_pause(self.state.get("free_pause"), active["refusal"])
+            self.note(f"Probe of {model} not counted: " + pause_text(self.state["free_pause"]))
+        elif active["kind"] == "probe":
             try:
                 answers = read_json(workspace / "ANSWERS.json") if workspace else None
             except (OSError, ValueError):
@@ -371,7 +384,7 @@ class Registry:
             for attempt in job.get("attempts", []):
                 failure = attempt.get("failure") or ""
                 when = attempt.get("finished") or attempt.get("stop_started") or 0
-                if attempt.get("tier") == "free" and attempt.get("model") and failure and \
+                if attempt.get("tier") == "free" and attempt.get("model") and failure and not attempt.get("refusal") and \
                         self.timestamp - when < self.settings["incident_seconds"]:
                     found.setdefault(attempt["model"], []).append(f'{job.get("id", job["date"])}: {failure}')
         return found
@@ -414,7 +427,7 @@ class Registry:
         self.state["out"] = {r["model"]: r["reason"] for r in rows if r["reason"] is not None}
         self.state["ranked"] = self.timestamp
         self.save()
-        write_page(self.config, self.state)
+        write_page(self.config, self.state, free_pause(self.root, self.timestamp))
 
 
 def make_repository(path, files):
@@ -463,7 +476,7 @@ def describe(record):
     return "<br>".join(parts)
 
 
-def write_page(config, state):
+def write_page(config, state, pause=None):
     root = Path(config["output_dir"])
     root.mkdir(parents=True, exist_ok=True)
     def when(t):
@@ -480,6 +493,8 @@ def write_page(config, state):
                     f'<td>{html.escape(status)}</td><td>{describe(record)}</td><td>{speed}</td><td>{html.escape(test)}<br><small>{when((probe or {}).get("checked"))}</small></td></tr>')
     active = state.get("active")
     now = f'<p>Testing now: {html.escape(active["kind"])} of {html.escape(active["model"])}.</p>' if active else ""
+    if pause:
+        now += f'<p><b>{html.escape(pause_text(pause))}.</b> No model is tested or used until then.</p>'
     page = ('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Free models</title>'
             '<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;padding:0 16px}td,th{padding:10px;text-align:left;vertical-align:top;border-bottom:1px solid #ddd}table{width:100%}a{color:#087c78}small{color:#666}</style>'
             '<h1>Free models</h1><p><a href="index.html">Daily paper tutorials</a> · Paper runs start on the top-ranked model. '

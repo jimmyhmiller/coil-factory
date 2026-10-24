@@ -220,6 +220,25 @@ class RegistryTests(unittest.TestCase):
         # Three days later it may compete again.
         self.assertNotIn(model, self.registry(self.time + dt.timedelta(days=4)).incidents())
 
+    def test_a_provider_refusal_pauses_probes_without_blaming_the_model(self):
+        self.tick()
+        model = self.registry().state["active"]["model"]
+        _, run, workspace = self.run_for(model)
+        self.journal(workspace, [(0, "run.started", {}),
+                                 (1, "agent.retry", {"agent": "solve", "attempt": 1, "status": 0, "delay_ms": 3600000,
+                                                     "message": "Free usage exceeded, subscribe to Go", "action": "free_tier_limit"}),
+                                 (1, "run.finished", {"status": "failed", "reason": "the provider refused"})])
+        run.update(status="failed", alive=False, reason="the provider refused")
+        state = self.tick(5).state
+        self.assertNotIn("probe", state["models"][model])
+        self.assertEqual(state["out"][model], "not yet tested")
+        self.assertEqual(state["free_pause"]["until"], self.time.timestamp() + 3601)
+        self.assertIsNone(state["active"])
+        self.assertIn("Free models are paused until 2026-10-09 13:00 UTC: the provider refused (free_tier_limit): "
+                      "Free usage exceeded, subscribe to Go", (Path(self.config["output_dir"]) / "models.html").read_text())
+        self.assertIsNone(self.tick(3000).state["active"])
+        self.assertEqual(self.tick(3700).state["active"]["kind"], "probe")
+
     def test_models_that_answered_are_researched_and_bad_research_is_rejected(self):
         self.tick()
         for _ in range(2):
@@ -300,6 +319,27 @@ class ControllerUsesRankingTests(unittest.TestCase):
         self.assertEqual((job["attempts"][0]["tier"], job["attempts"][0]["model"]), ("paid", "gpt-5.5"))
         self.assertIn("No free attempt: no free model currently qualifies; starting on the paid model",
                       [e["message"] for e in job["events"]])
+
+    def test_a_refused_free_attempt_pauses_free_models_and_is_not_an_incident(self):
+        self.ranking(["opencode/step-5"])
+        job = self.tick()
+        journal = Path(self.config["site_home"]) / "runs/papers-1/events.jsonl"
+        journal.write_text(json.dumps({"t": int(self.time.timestamp() * 1000) + 1000, "kind": "agent.retry", "agent": "select",
+                                       "attempt": 1, "status": 0, "delay_ms": 7200000, "action": "free_tier_limit",
+                                       "message": "Free usage exceeded, subscribe to Go"}) + "\n")
+        self.api.runs["papers-1"].update(status="failed", alive=False, reason="the provider refused")
+        job = self.tick()
+        job = self.tick()
+        self.assertEqual(job["attempts"][-1]["tier"], "paid")
+        pause = Controller(self.config, api=self.api, now=self.time).state["free_pause"]
+        self.assertEqual(pause["until"], self.time.timestamp() + 7201)
+        model, why = chosen_free_model(self.config, self.time.timestamp() + 60)
+        self.assertIsNone(model)
+        self.assertTrue(why.startswith("Free models are paused until 2026-10-08 15:00 UTC: the provider refused (free_tier_limit)"))
+        self.ranking(["opencode/step-5"], age=-7300)  # A fresh ranking once the pause is over.
+        self.assertEqual(chosen_free_model(self.config, self.time.timestamp() + 7300), ("opencode/step-5", None))
+        registry = Registry(self.config, api=self.api, now=self.time, opencode=None, seed=lambda: 1)
+        self.assertEqual(registry.incidents(), {})
 
     def test_stale_ranking_is_not_trusted(self):
         self.ranking(["opencode/step-5"], age=7201)

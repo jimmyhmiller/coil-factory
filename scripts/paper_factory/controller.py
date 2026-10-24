@@ -78,9 +78,45 @@ def same_paper(left, right):
     return title_key(left["title"]) == title_key(right["title"]) or url_key(left["url"]) == url_key(right["url"])
 
 
+def refusal(event):
+    """A journal event saying the provider refused until a person acts (an
+    exhausted free quota, say), with when it would let the run retry; None for
+    every other event. The pause is the provider's, not any one model's."""
+    if event.get("kind") != "agent.retry" or not event.get("action"):
+        return None
+    return {"action": event["action"], "message": event.get("message", ""),
+            "until": event["t"] / 1000 + event.get("delay_ms", 0) / 1000, "seen": event["t"] / 1000}
+
+
+def free_pause(state_dir, now):
+    """The pause on free models in effect at `now`, or None. The controller
+    (state.json) and the model registry (models.json) each record the
+    refusals their own runs meet; either one pauses both."""
+    pauses = []
+    for name in ("state.json", "models.json"):
+        path = Path(state_dir) / name
+        pause = read_json(path).get("free_pause") if path.exists() else None
+        if pause and pause["until"] > now:
+            pauses.append(pause)
+    return max(pauses, key=lambda p: p["until"], default=None)
+
+
+def pause_text(pause):
+    until = dt.datetime.fromtimestamp(pause["until"], dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f'Free models are paused until {until}: the provider refused ({pause["action"]}): {pause["message"]}'
+
+
+def later_pause(current, pause):
+    """The pause that lasts longer of `current` (may be None) and `pause`."""
+    return pause if not current or pause["until"] > current["until"] else current
+
+
 def chosen_free_model(config, now):
     """The free model for a paper run: the configured one, or with "auto" the
     model registry's top-ranked model. (None, why) when there is none."""
+    pause = free_pause(config["state_dir"], now)
+    if pause:
+        return None, pause_text(pause)
     if config["free_model"] != "auto":
         return config["free_model"], None
     path = Path(config["state_dir"]) / "models.json"
@@ -516,6 +552,8 @@ class Controller:
                     break
                 event = json.loads(line)
                 attempt["journal_offset"] = stream.tell()
+                if refusal(event):
+                    attempt["refusal"] = {**refusal(event), "run_id": attempt["run_id"]}
                 if event.get("kind") in PROGRESS_KINDS:
                     attempt["last_progress"] = max(attempt["last_progress"], event["t"] / 1000)
 
@@ -610,6 +648,9 @@ class Controller:
         attempt.update(status="failed", failure=reason, finished=self.timestamp)
         paid_count = sum(a["tier"] == "paid" for a in job["attempts"])
         self.note(job, reason)
+        if attempt.get("refusal"):
+            self.state["free_pause"] = later_pause(self.state.get("free_pause"), attempt["refusal"])
+            self.note(job, pause_text(self.state["free_pause"]))
         self.record_interest_review(job, attempt)
         if paid_count >= self.config["paid_attempts"]:
             if job.get("interest_veto") and not job.get("veto_draw"):

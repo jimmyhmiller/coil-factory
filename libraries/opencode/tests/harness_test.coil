@@ -53,7 +53,7 @@
               (ToolStarted [call summary] (cat a ["tool " summary]))
               (ToolEnded [call summary ok output elapsed]
                          (cat a [(if ok "ok " "failed ") output]))
-              (ModelRetrying [attempt error delay] "retry")
+              (ModelRetrying [attempt error delay action] (cat a ["retry " action]))
               (PausedEvent [] "paused")
               (ResumedEvent [] "resumed")
               (UsageUnknown [reason] (cat a ["usage unknown: " reason]))
@@ -475,7 +475,7 @@ env > \"$dir/env.$n\"
                          "the provider refused (free_tier_limit): Free usage exceeded, subscribe to Go; OpenCode would retry in 1200 minutes")))
       (_ (assert false)))
     (assert (< (- (sys/monotonic-ms) started) 8000))
-    (assert (saw? (.recorder f) "retry"))))
+    (assert (saw? (.recorder f) "retry free_tier_limit"))))
 
 (deftest a-retry-past-the-idle-limit-ends-the-run
   (let [a (malloc-allocator)
@@ -519,7 +519,7 @@ env > \"$dir/env.$n\"
     (match (harness-run! h)
       (Replied [text] (assert (= text "done")))
       (_ (assert false)))
-    (assert (saw? (.recorder f) "retry"))
+    (assert (saw? (.recorder f) "retry "))
     (assert (contains? (read a (cat a [(.dir f) "/state/factory-streaming.js"]))
                        "factory_retry"))))
 

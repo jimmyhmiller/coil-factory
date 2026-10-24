@@ -340,20 +340,26 @@
                                                 "output"
                                                 output
                                                 1500))))
-        (ModelRetrying [attempt failure delay]
+        (ModelRetrying [attempt failure delay action]
                        (let [error failure]
                          (observe-record! self
                                           (ev-text! a
-                                                    (ev-int! (ev-int! (ev-agent a
-                                                                                "agent.retry"
-                                                                                name)
-                                                                      "attempt"
-                                                                      attempt)
-                                                             "status"
-                                                             (.status error))
-                                                    "message"
-                                                    (.message error)
-                                                    400))))
+                                                    (ev-text! a
+                                                              (ev-int! (ev-int! (ev-int! (ev-agent a
+                                                                                                   "agent.retry"
+                                                                                                   name)
+                                                                                         "attempt"
+                                                                                         attempt)
+                                                                                "status"
+                                                                                (.status error))
+                                                                       "delay_ms"
+                                                                       delay)
+                                                              "message"
+                                                              (.message error)
+                                                              400)
+                                                    "action"
+                                                    action
+                                                    100))))
         (PausedEvent [] (observe-record! self (ev-agent a "agent.paused" name)))
         (ResumedEvent []
                       (observe-record! self (ev-agent a "agent.resumed" name)))
