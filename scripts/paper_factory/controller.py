@@ -138,6 +138,49 @@ def announced_choice(workspace):
     return {"title": chosen["title"].strip(), "url": chosen["url"].strip()}
 
 
+def drawn_candidate(candidates, roll):
+    """The candidate a random selection must take. The recipe gives the selector
+    this same computation: sort by url, index by the persisted roll."""
+    return sorted(candidates, key=lambda c: c["url"])[roll % len(candidates)]
+
+
+def read_candidates(workspace, selection):
+    """The selector's CANDIDATES.json, checked for shape and history."""
+    candidates = read_json(workspace / "CANDIDATES.json")
+    if not isinstance(candidates, list) or len(candidates) < 5:
+        raise ValueError("CANDIDATES.json must list at least five candidates")
+    for candidate in candidates:
+        if (not isinstance(candidate, dict) or type(candidate.get("qualifies")) is not bool
+                or any(not isinstance(candidate.get(k), str) or not candidate[k].strip() for k in ("title", "url", "reason"))):
+            raise ValueError("CANDIDATES.json entries need title, url, reason and a boolean qualifies")
+        if any(same_paper(candidate, previous) for previous in selection["prior_papers"]):
+            raise ValueError(f'CANDIDATES.json lists a previous selection: {candidate["title"]}')
+    if any(same_paper(a, b) for i, a in enumerate(candidates) for b in candidates[i + 1:]):
+        raise ValueError("CANDIDATES.json lists the same paper twice")
+    return candidates
+
+
+def check_candidates(workspace, selection, paper):
+    """Lack of interest never leaves a day without a paper: when no candidate
+    clears the bar, the paper is drawn from the shortlist by the controller's
+    persisted candidate_roll, and this checks the draw was honored."""
+    candidates = read_candidates(workspace, selection)
+    entry = next((c for c in candidates if same_paper(c, paper)), None)
+    if entry is None:
+        raise ValueError("the selected paper is not one of CANDIDATES.json")
+    if paper.get("selected_by") == "choice":
+        if not entry["qualifies"]:
+            raise ValueError("a chosen paper must be a candidate that qualifies")
+    elif paper.get("selected_by") == "random":
+        if any(c["qualifies"] for c in candidates):
+            raise ValueError("a candidate qualifies, so the paper must be chosen, not drawn")
+        drawn = drawn_candidate(candidates, selection["candidate_roll"])
+        if not same_paper(drawn, paper):
+            raise ValueError(f'the random draw is {drawn["title"]}, not the selected paper')
+    else:
+        raise ValueError('PAPER.json.selected_by must be "choice" or "random"')
+
+
 def metadata(workspace, job):
     paper = read_json(workspace / "PAPER.json")
     if not isinstance(paper, dict):
@@ -158,13 +201,20 @@ def metadata(workspace, job):
     selection = read_json(workspace / "SELECTION.json")
     if not isinstance(selection, dict):
         raise ValueError("SELECTION.json must be an object")
-    for key in ("date", "roll", "mode", "archive_url", "prior_papers"):
-        if selection.get(key) != job["selection"][key]:
+    for key in ("date", "roll", "candidate_roll", "mode", "archive_url", "prior_papers"):
+        if selection.get(key) != job["selection"].get(key):
             raise ValueError(f"SELECTION.json changed {key}")
     if job.get("paper") and not same_paper(paper, job["paper"]):
         raise ValueError("attempt changed the already selected paper")
     if any(same_paper(paper, previous) for previous in job["selection"]["prior_papers"]):
         raise ValueError("paper repeats a previous daily selection")
+    # After a veto the controller drew the paper itself; the lock above holds it.
+    if job.get("veto_draw"):
+        if paper.get("selected_by") != "random":
+            raise ValueError('a paper drawn after a veto must have selected_by "random"')
+    # Selections persisted before the random draw existed carry no candidate_roll.
+    elif "candidate_roll" in job["selection"]:
+        check_candidates(workspace, job["selection"], paper)
     with (workspace / "source/paper.pdf").open("rb") as stream:
         if stream.read(5) != b"%PDF-":
             raise ValueError("paper source is not a PDF")
@@ -246,11 +296,12 @@ class NativeAPI:
 
 
 class Controller:
-    def __init__(self, config, api=None, now=None, coin=None):
+    def __init__(self, config, api=None, now=None, coin=None, draw=None):
         self.config = config
         self.api = api or NativeAPI(config)
         self.now = now or dt.datetime.now(dt.timezone.utc)
         self.coin = coin or (lambda: secrets.randbelow(2))
+        self.draw = draw or (lambda: secrets.randbits(32))
         self.root = Path(config["state_dir"])
         self.state_path = self.root / "state.json"
         self.state = read_json(self.state_path) if self.state_path.exists() else {"version": 1, "jobs": {}, "seeds": []}
@@ -278,8 +329,10 @@ class Controller:
     def history(self):
         result = list(self.state["seeds"])
         for job in self.state["jobs"].values():
-            if job.get("paper") and not any(same_paper(job["paper"], p) for p in result):
-                result.append(job["paper"])
+            vetoed = [job["veto_draw"]["vetoed"]] if job.get("veto_draw") else []
+            for paper in vetoed + ([job["paper"]] if job.get("paper") else []):
+                if not any(same_paper(paper, p) for p in result):
+                    result.append(paper)
         return result
 
     def tick(self):
@@ -328,9 +381,10 @@ class Controller:
         roll = self.coin()
         job.update(status="running", started=self.timestamp,
                    selection={"date": job["date"], "roll": roll, "mode": "archive" if roll == 0 else "inspired",
+                              "candidate_roll": self.draw(),
                               "archive_url": self.config["archive_url"], "prior_papers": self.history(),
-                              "instructions": "SELECTION.json in the workspace is this selection, written by the controller; never edit it, reroll or repeat a prior paper. Deliver a novice-friendly interactive tutorial and tested implementation."})
-        self.note(job, f'Persisted roll {roll}: {job["selection"]["mode"]}')
+                              "instructions": "SELECTION.json in the workspace is this selection, written by the controller; never edit it, reroll or repeat a prior paper. If no candidate clears the interest bar, candidate_roll draws the paper from the candidates. Deliver a novice-friendly interactive tutorial and tested implementation."})
+        self.note(job, f'Persisted roll {roll}: {job["selection"]["mode"]}; candidate roll {job["selection"]["candidate_roll"]}')
         self.new_attempt(job, "free")
         self.submit(job, job["attempts"][-1])
 
@@ -420,7 +474,7 @@ class Controller:
         tag = f'paper-day/{job["id"]}/{tier}-{number}/{uuid.uuid4().hex}'
         attempt = {"tier": tier, "tag": tag, "created": self.timestamp, "status": "submitting",
                    "model": model if tier == "free" else self.config["paid_model"]}
-        brief = {"selection": job["selection"], "locked_paper": job.get("paper"),
+        brief = {"selection": job["selection"], "locked_paper": job.get("paper"), "veto_draw": job.get("veto_draw"),
                  "implementation_tier": tier,
                  "recovery_snapshot": str(recovery) if recovery else None,
                  "previous_findings": job["events"][-6:], "project_pad": "coil-factory-papers"}
@@ -556,7 +610,11 @@ class Controller:
         attempt.update(status="failed", failure=reason, finished=self.timestamp)
         paid_count = sum(a["tier"] == "paid" for a in job["attempts"])
         self.note(job, reason)
+        self.record_interest_review(job, attempt)
         if paid_count >= self.config["paid_attempts"]:
+            if job.get("interest_veto") and not job.get("veto_draw"):
+                self.draw_after_veto(job)
+                return
             job["status"] = "failed"
             self.note(job, "Paid repair budget exhausted; retained evidence and no artifact published")
             return
@@ -572,6 +630,47 @@ class Controller:
                 except (OSError, ValueError, KeyError):
                     pass
         self.new_attempt(job, "paid", snapshot)
+
+    def record_interest_review(self, job, attempt):
+        """Remember whether the judge last vetoed the chosen paper for interest.
+
+        Repairs keep the paper and may overturn the veto by showing what is
+        surprising about it. Only a judge's own verdict counts; a later passing
+        interest review clears an earlier veto.
+        """
+        if attempt.get("station") != "judge" or not attempt.get("run_id") or job.get("veto_draw"):
+            return
+        workspace = Path(self.config["site_home"]) / "runs" / attempt["run_id"] / "workspace"
+        try:
+            verdict = read_json(workspace / "JUDGMENT.json")["interest_review"]["verdict"]
+            paper = read_json(workspace / "PAPER.json")
+        except (OSError, ValueError, KeyError, TypeError):
+            return  # No judgment written: the judge failed, which is not a veto.
+        if verdict == "pass":
+            job.pop("interest_veto", None)
+            self.save()
+        elif verdict == "fail" and paper.get("selected_by") == "choice" and "candidate_roll" in job["selection"]:
+            try:
+                candidates = read_candidates(workspace, job["selection"])
+            except (OSError, ValueError) as exc:
+                self.note(job, f"Judge vetoed the paper for interest, but its candidates cannot be drawn from: {exc}")
+                return
+            job["interest_veto"] = {"run_id": attempt["run_id"], "candidates": candidates}
+            self.note(job, f'Judge vetoed {job["paper"]["title"]} for lack of interest')
+
+    def draw_after_veto(self, job):
+        """Repairs could not overturn the veto: draw another candidate by the
+        persisted roll and give it one more paid attempt, which the judge does
+        not veto for interest."""
+        vetoed = job["paper"]
+        remaining = [c for c in job["interest_veto"]["candidates"] if not same_paper(c, vetoed)]
+        drawn = drawn_candidate(remaining, job["selection"]["candidate_roll"])
+        job["veto_draw"] = {"vetoed": vetoed, "candidates": remaining,
+                            "drawn": {"title": drawn["title"], "url": drawn["url"]}}
+        job["paper"] = dict(job["veto_draw"]["drawn"])
+        self.note(job, f'Repairs did not overturn the interest veto; drew {drawn["title"]} '
+                       f'from {len(remaining)} remaining candidates for one more paid attempt')
+        self.new_attempt(job, "paid")
 
     def accept(self, job, attempt, run, workspace):
         if not run["stations"] or any(s["status"] != "passed" for s in run["stations"]) or not any(s["name"] == "judge" for s in run["stations"]):

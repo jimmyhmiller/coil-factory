@@ -76,7 +76,7 @@ class ControllerTests(unittest.TestCase):
         def coin():
             self.coin_calls += 1
             return 1
-        return Controller(self.config, api=self.api, now=now or self.time, coin=coin)
+        return Controller(self.config, api=self.api, now=now or self.time, coin=coin, draw=lambda: 7)
 
     def start(self):
         self.controller().tick()
@@ -87,8 +87,10 @@ class ControllerTests(unittest.TestCase):
         paper = {"title": "Example fixture paper", "url": "https://example.org/paper", "year": 2006,
                  "authors": ["Fixture Author"], "scope": "Fixture scope", "mode": "inspired",
                  "seed_title": "Fixture seed", "seed_url": "https://example.org/seed",
-                 "relationship": "Test relationship", "interestingness": "Test mechanism", "omitted_claims": ["Test omission"]}
+                 "relationship": "Test relationship", "interestingness": "Test mechanism", "omitted_claims": ["Test omission"],
+                 "selected_by": "choice"}
         atomic_json(workspace / "PAPER.json", paper)
+        atomic_json(workspace / "CANDIDATES.json", self.candidates(paper, qualifies=True))
         atomic_json(workspace / "SELECTION.json", job["selection"])
         atomic_json(workspace / "JUDGMENT.json", {"verdict": "approved", "checks_run": ["fixture only"], "evidence": ["fixture only"]})
         (workspace / "source").mkdir(exist_ok=True)
@@ -99,6 +101,22 @@ class ControllerTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
         subprocess.run(["git", "add", "."], cwd=workspace, check=True)
         return workspace, paper
+
+    def candidates(self, paper, qualifies):
+        others = [{"title": f"Other candidate {i}", "url": f"https://example.org/other-{i}",
+                   "qualifies": False, "reason": "fixture only"} for i in range(4)]
+        return others + [{"title": paper["title"], "url": paper["url"], "qualifies": qualifies, "reason": "fixture only"}]
+
+    def drawn(self, workspace, job, title):
+        """Rewrite the fixture so `title` is a random draw from five nonqualifying candidates."""
+        candidates = read(workspace / "CANDIDATES.json")
+        for candidate in candidates:
+            candidate["qualifies"] = False
+        atomic_json(workspace / "CANDIDATES.json", candidates)
+        chosen = next(c for c in candidates if c["title"] == title)
+        paper = dict(read(workspace / "PAPER.json"), title=chosen["title"], url=chosen["url"], selected_by="random")
+        atomic_json(workspace / "PAPER.json", paper)
+        return paper
 
     def finish(self, run_id, status="succeeded", alive=False):
         run = self.api.runs[run_id]
@@ -267,6 +285,116 @@ class ControllerTests(unittest.TestCase):
         atomic_json(workspace / "SELECTION.json", selection)
         with self.assertRaisesRegex(ValueError, "changed roll"):
             metadata(workspace, job)
+
+    def test_unqualified_candidates_draw_the_paper_by_the_persisted_roll(self):
+        job = self.start()
+        self.assertEqual(job["selection"]["candidate_roll"], 7)
+        workspace, _ = self.fixtures(job)
+        # Sorted by url (other-0..3, paper), roll 7 of five candidates is index 2.
+        paper = self.drawn(workspace, job, "Other candidate 2")
+        self.assertEqual(metadata(workspace, job)["title"], paper["title"])
+
+    def test_a_random_selection_must_be_the_drawn_candidate(self):
+        job = self.start()
+        workspace, _ = self.fixtures(job)
+        self.drawn(workspace, job, "Other candidate 1")
+        with self.assertRaisesRegex(ValueError, "random draw is Other candidate 2"):
+            metadata(workspace, job)
+
+    def test_no_draw_when_a_candidate_qualifies(self):
+        job = self.start()
+        workspace, _ = self.fixtures(job)
+        self.drawn(workspace, job, "Other candidate 2")
+        candidates = read(workspace / "CANDIDATES.json")
+        candidates[0]["qualifies"] = True
+        atomic_json(workspace / "CANDIDATES.json", candidates)
+        with self.assertRaisesRegex(ValueError, "must be chosen, not drawn"):
+            metadata(workspace, job)
+
+    def test_a_chosen_paper_must_qualify(self):
+        job = self.start()
+        workspace, paper = self.fixtures(job)
+        atomic_json(workspace / "CANDIDATES.json", self.candidates(paper, qualifies=False))
+        with self.assertRaisesRegex(ValueError, "must be a candidate that qualifies"):
+            metadata(workspace, job)
+
+    def test_candidates_must_exclude_history_and_include_the_paper(self):
+        job = self.start()
+        workspace, paper = self.fixtures(job)
+        job["selection"]["prior_papers"] = [{"title": "Other candidate 3", "url": "https://example.org/old"}]
+        atomic_json(workspace / "SELECTION.json", job["selection"])
+        with self.assertRaisesRegex(ValueError, "lists a previous selection"):
+            metadata(workspace, job)
+        job["selection"]["prior_papers"] = []
+        atomic_json(workspace / "SELECTION.json", job["selection"])
+        atomic_json(workspace / "CANDIDATES.json", self.candidates(paper, qualifies=True)[:4] +
+                    [{"title": "Unrelated", "url": "https://example.org/unrelated", "qualifies": True, "reason": "x"}])
+        with self.assertRaisesRegex(ValueError, "not one of CANDIDATES.json"):
+            metadata(workspace, job)
+
+    def test_selections_without_a_candidate_roll_are_not_drawn(self):
+        job = self.start()
+        workspace, _ = self.fixtures(job)
+        del job["selection"]["candidate_roll"]
+        atomic_json(workspace / "SELECTION.json", job["selection"])
+        (workspace / "CANDIDATES.json").unlink()
+        metadata(workspace, job)
+
+    def judged(self, job, run_id, interest):
+        """Run `run_id` to a judge that rejects with the given interest verdict."""
+        workspace, paper = self.fixtures(job, run_id)
+        atomic_json(workspace / "JUDGMENT.json", {"verdict": "rejected", "interest_review": {"verdict": interest}})
+        run = self.api.runs[run_id]
+        run.update(status="blocked", alive=False, current="judge")
+        run["stations"] = [{"name": "select", "status": "passed"}, {"name": "build", "status": "passed"},
+                           {"name": "judge", "status": "blocked"}]
+        for _ in range(3):
+            self.controller().tick()
+        return paper
+
+    def test_a_veto_that_survives_repairs_draws_another_candidate(self):
+        job = self.start()
+        vetoed = self.judged(job, "papers-1", "fail")
+        self.judged(job, "papers-2", "fail")
+        self.judged(job, "papers-3", "fail")
+        job = self.controller().state["jobs"][job["id"]]
+        self.assertEqual(job["status"], "running")
+        # Without the vetoed paper, other-0..3 remain; roll 7 of four is index 3.
+        self.assertEqual(job["paper"], {"title": "Other candidate 3", "url": "https://example.org/other-3"})
+        self.assertEqual(self.api.creates, 4)
+        brief = json.loads(self.api.posts[3]["brief"].split("\n", 1)[1])
+        self.assertEqual(brief["locked_paper"], job["paper"])
+        self.assertEqual(brief["veto_draw"]["vetoed"]["title"], vetoed["title"])
+        self.assertIsNone(brief["recovery_snapshot"])
+        workspace, _ = self.fixtures(job, "papers-4")
+        self.drawn(workspace, job, "Other candidate 3")
+        self.finish("papers-4")
+        self.controller().tick()
+        job = self.controller().state["jobs"][job["id"]]
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(job["paper"]["title"], "Other candidate 3")
+        self.assertTrue(any(same_paper(vetoed, p) for p in self.controller().history()))
+
+    def test_a_drawn_paper_must_be_marked_random(self):
+        job = self.start()
+        for run_id in ("papers-1", "papers-2", "papers-3"):
+            self.judged(job, run_id, "fail")
+        job = self.controller().state["jobs"][job["id"]]
+        workspace, _ = self.fixtures(job, "papers-4")
+        paper = dict(self.drawn(workspace, job, "Other candidate 3"), selected_by="choice")
+        atomic_json(workspace / "PAPER.json", paper)
+        with self.assertRaisesRegex(ValueError, "drawn after a veto"):
+            metadata(workspace, job)
+
+    def test_a_repair_that_passes_interest_review_clears_the_veto(self):
+        job = self.start()
+        self.judged(job, "papers-1", "fail")
+        self.judged(job, "papers-2", "pass")
+        self.judged(job, "papers-3", "pass")
+        job = self.controller().state["jobs"][job["id"]]
+        self.assertEqual(job["status"], "failed")
+        self.assertNotIn("veto_draw", job)
+        self.assertEqual(self.api.creates, 3)
 
     def test_locked_paper_cannot_change_during_paid_repair(self):
         job = self.start()

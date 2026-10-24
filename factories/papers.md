@@ -33,9 +33,12 @@ Use the archive to infer the user's taste; do not simply pick the nearest relate
 paper or the easiest demo. For each serious finalist, search for its closest
 related work, read original sources, and explain why the idea is distinct from
 those neighbors. Do not claim "nothing else like it" without evidence or confuse
-a failed search with uniqueness. Choose only a candidate with a defensible wow
-payoff that the proof of concept can actually demonstrate. If none qualifies,
-finish blocked with the shortlist and reasons instead of lowering the bar.
+a failed search with uniqueness. A candidate qualifies only if it has a defensible
+wow payoff that the proof of concept can actually demonstrate; choose the best
+qualifying candidate, and never call a candidate qualifying to avoid a draw.
+Lack of interest never leaves a day without a paper: if no candidate qualifies,
+the paper is drawn at random from the eligible candidates, as the select station
+describes. Never finish blocked because no candidate is interesting enough.
 
 The unattended brief starts with a controller request tag, then a JSON object.
 Its `selection` object is the authoritative record. The controller has already
@@ -129,6 +132,38 @@ a surprising capability, or an unexpected mechanism with a compelling consequenc
 Reject novelty pitches based solely on being early, niche, clever, fast, or useful.
 A conventional demo does not become distinctive because the paper is obscure.
 
+Every candidate must be eligible: under the brief's selection mode, within the
+fields above, not a prior paper, not an excluded family, with an obtainable
+original source, and implementable as a proof of concept. Being uninteresting
+does not make a candidate ineligible. Also write CANDIDATES.json, an array of at
+least five distinct eligible candidates, each an object with title, url (the
+original source link), qualifies (true only if it clears the interest bar) and
+reason (why it does or does not qualify). If any candidate qualifies, choose the
+best qualifying one and set PAPER.json's selected_by to "choice". If none
+qualifies, do not keep searching to escape the draw and do not finish blocked:
+the controller's persisted candidate_roll in SELECTION.json picks the paper.
+Finish CANDIDATES.json first, then print the draw with exactly this command and
+take that candidate, setting selected_by to "random":
+
+    python3 -c 'import json; r=json.load(open("SELECTION.json"))["candidate_roll"]; c=sorted(json.load(open("CANDIDATES.json")), key=lambda x: x["url"]); print(json.dumps(c[r % len(c)]))'
+
+The controller repeats this computation and rejects a selection that does not
+match it, or a random selection when some candidate qualifies. Never edit
+CANDIDATES.json after the draw. For a drawn paper, still write INTEREST.md and
+the interest metadata below honestly: find the most surprising real mechanism or
+consequence the paper offers and design the experiment around it, without
+claiming a wow payoff the paper does not have. In place of why it beats the other
+candidates, say that it was drawn because none qualified.
+
+If the brief has `veto_draw`, the judge vetoed `veto_draw.vetoed` for lack of
+interest and paid repairs did not overturn the veto, so the controller drew
+`locked_paper` from the remaining candidates (`veto_draw.candidates`). Start
+fresh on the drawn paper; there is no recovery snapshot. Write
+`veto_draw.candidates` unchanged as CANDIDATES.json, record the veto and the draw
+in CANDIDATES.md, set selected_by to "random", and complete the selection for
+locked_paper as above. Do not run the draw command: the controller has already drawn,
+and check_selection.py must accept a selection that equals locked_paper.
+
 Write INTEREST.md with:
 - The specific surprising claim, in plain language, without marketing adjectives.
 - The conventional expectation it challenges and why an experienced programmer
@@ -146,7 +181,8 @@ work. If a later finding makes you change your choice, rewrite CHOSEN.json
 first. Then download its source to source/paper.pdf, and extract readable text to source/paper.txt using
 pdftotext or a PDF library. Read the relevant sections rather than the abstract
 alone. Write PAPER.json with title, authors (array), year, url, mode, seed_title,
-seed_url, relationship, interestingness, scope and omitted_claims (array).
+seed_url, relationship, interestingness, scope, omitted_claims (array) and
+selected_by ("choice" or "random").
 Interestingness must state the actual unusual mechanism and observable payoff,
 not generic praise. Include wow_claim, conventional_expectation, distinctive_idea,
 closest_related_work (array of at least three objects with title, url, difference),
@@ -162,7 +198,8 @@ when the paper's central contribution can be isolated.
 Create scripts/check_selection.py using Python's standard library. It must check
 the required metadata types and nonempty values, a nonempty real PDF and readable
 source text, the persisted selection mode, and the plan. Also validate CANDIDATES.md and
-INTEREST.md exist and are nonempty, the extra interest metadata is well typed and
+INTEREST.md exist and are nonempty, CANDIDATES.json and selected_by follow the
+rules above (including the draw for a random selection), the extra interest metadata is well typed and
 nonempty, and closest_related_work has at least three entries with required fields.
 These structural checks do not prove interest; the independent judge must assess
 its substance. It must exit nonzero on
@@ -237,7 +274,15 @@ that the selector's enthusiasm or the paper's reputation establishes a wow payof
 State what is genuinely different, what conventional expectation it overturns,
 and what observed experiment substantiates it. If those answers are weak, reject.
 Do not request cosmetic prose to rescue a fundamentally unsuitable paper; say the
-selection is unsuitable. A failed day is preferable to publishing another dull paper.
+selection is unsuitable.
+
+When PAPER.json's selected_by is "random", the paper was drawn by the controller's
+roll, either because no candidate cleared the bar or because a chosen paper's
+interest veto survived repairs; the controller has already verified the draw. Do not veto the paper for lack of interest. Instead, interest_review judges
+whether the article finds and demonstrates the most surprising real aspect of the
+drawn paper, and whether it avoids claiming a payoff the paper does not have; its
+evidence arrays record what that aspect is and what experiment shows it. The rest
+of the review is unchanged.
 
 Read the original paper text,
 PLAN.md, source code and tests. Run verification yourself as permitted by the macOS rule below and inspect the

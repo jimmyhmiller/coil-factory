@@ -24,13 +24,35 @@ objection, and a runnable experiment that exposes the unusual contribution.
 alone do not qualify. CRDTs, collaborative editing, operational transformation,
 and their historical precursors are excluded after explicit user feedback.
 
-The independent judge has a paper-choice veto. Native acceptance additionally
+The independent judge has a paper-choice veto over a chosen paper. Native acceptance additionally
 requires `interest_review.verdict == "pass"` with distinctiveness and experiment
-evidence. A correct, polished implementation of a dull idea is rejected. If no
-candidate meets the bar, the selector blocks with evidence rather than publishing
-a weak choice. Once selected, existing repair rules preserve the paper; a bad
-selection can therefore exhaust the day's budget without publishing a tutorial.
-The archive/inspired coin and daily schedule remain unchanged.
+evidence. A correct, polished implementation of a dull idea is rejected.
+
+Lack of interest never leaves a day without a paper. The selector also writes
+`CANDIDATES.json`: at least five eligible candidates (right mode and field, not
+in history, not excluded, source obtainable, implementable), each with `title`,
+`url`, `qualifies` and `reason`. If one qualifies it is chosen
+(`PAPER.json.selected_by: "choice"`). If none does, the paper is drawn
+(`selected_by: "random"`): the controller persists a 32-bit `candidate_roll` in
+the selection alongside the coin, and the draw is the candidate at
+`candidate_roll mod n` after sorting by `url`. The controller repeats the draw when
+it reserves the paper and rejects a mismatch, a draw while some candidate
+qualifies, or a choice that does not qualify. The judge does not veto a drawn
+paper for interest; it checks that the article demonstrates the most surprising
+real aspect of that paper without overselling it. Selections persisted before
+`candidate_roll` existed are not checked this way. Once selected, existing repair
+rules preserve the paper.
+
+The veto on a chosen paper also cannot end the day. Repairs keep the paper and may
+overturn the veto; a later passing `interest_review` clears it. If the last
+judge verdict on the chosen paper is still an interest veto when the paid budget
+is spent, the controller draws another paper from that attempt's
+`CANDIDATES.json` (without the vetoed one, by the same sort and roll), records
+`veto_draw` and locks the drawn paper. It then starts one more paid attempt,
+outside the repair budget and without a snapshot. That paper is `selected_by:
+"random"`, so the judge does not veto it, and the vetoed paper stays in history.
+If that attempt fails, the day fails. The archive/inspired coin and daily schedule
+remain unchanged.
 
 ## The article: a blog post, not a demo page
 
@@ -65,6 +87,16 @@ Codex repair, with at most **two paid attempts** per day. Codex uses the existin
 account login; this is the paid/subscription fallback, not a new API key or billing
 account. No result is published after the repair budget is exhausted.
 
+Codex receives the full factory system prompt through its native
+`model_instructions_file` setting. The harness writes a unique private file beside
+the workspace and passes only its path on the command line; user messages travel
+on stdin. The file supplies Codex's base instructions, including the factory,
+station, brief and handoffs, while native tool and permission instructions still
+come from Codex. It is recreated on resume and removed after the process exits,
+including cancellation and launch failures. Instructions are never truncated to
+fit Linux's per-argument size limit. If the file cannot be written, the harness
+fails without starting an agent with missing instructions.
+
 The controller cancels through the native API and waits for the worker to exit
 before taking a source snapshot or starting the fallback. Snapshots include
 unfinished source and exclude Git metadata, dependencies and caches. An already
@@ -97,8 +129,8 @@ daily work, so the controller cannot accumulate overlapping model processes.
 free-model registry (`paper_factory.models`), recorded in the attempt as
 `model`. The registry keeps an up-to-date list of free models and decides
 which are good enough, on its own heartbeat (`paper-models.timer`, every
-minute) and its own factory site (`paper-models-site.service`, port 7798), so
-its runs never hold up a paper run. Every model and the reason it is in or out
+minute). Model probes and paper runs share `factory.service`, which runs independent
+workflows concurrently. Every model and the reason it is in or out
 is on `/papers/models.html`.
 
 - **Discovery** (hourly): refresh OpenCode's catalogue and list every model at
@@ -155,21 +187,24 @@ Accepted artifacts are exported atomically to `/srv/paper-factory/YYYY-MM-DD/`
 Each directory contains the tutorial, source, implementation, tests, judgment,
 run receipt, checksums, and `bundle.zip`. `/srv/paper-factory/index.html`
 is the tutorial library. Failed/in-progress days appear in the library without
-links to unapproved work. Transcripts remain under the dedicated site's `runs/`.
+links to unapproved work. Transcripts remain under `~/.factory/runs/`.
 Server status is available in the library and systemd journal. Deployment notes live in the project's `coil-factory-papers` pad.
 
 ## Server deployment
 
 The production host is **computer.jimmyhmiller.com** (hostname `metaphysics`).
-The runtime, native binary, configuration and durable state live under
-`~/.local/share/paper-factory/`. The site's API listens locally on port 7799.
+The paper runtime, controller configuration and durable controller state live under
+`~/.local/share/paper-factory/`. The shared native binary and run history live under
+`~/.factory/`; `factory.service` listens locally on port 7788 with unlimited
+concurrency (`max_runs: 0`). Coil bug repairs use the same daemon.
 User systemd lingering keeps the services running without an SSH session.
 The Mac daily LaunchAgent is disabled to avoid duplicate daily jobs.
 
-`paper_factory.install_linux` installs the dedicated site and optional existing
+`paper_factory.install_linux` uses the existing shared site and installs an optional existing
 Signal daemon. It leaves the controller disabled until hosting and a live fallback
 run have been verified. The runtime must first contain `paper_factory` and the
-recipe under `runtime/factories/papers.md`; the native binary must target Linux.
+recipe under `runtime/factories/papers.md`; the supplied Linux binary must match
+`~/.factory/bin/factory`, and `factory.service` must already be active.
 
 ```sh
 PYTHONPATH="$HOME/.local/share/paper-factory/runtime" python3 -m paper_factory.install_linux \
