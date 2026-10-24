@@ -11,6 +11,8 @@
 (import "factory.journal" :use *)
 (import "agent.json" :use *)
 (import "agent.loop" :use *)
+(import "claude.harness" :as claude)
+(import "codex.harness" :as codex)
 
 (defn fresh-home [(a (dyn Allocator)) (tag (slice u8))] (-> (slice u8))
   (let [home
@@ -62,6 +64,8 @@
             :cursor 0
             :read-cursor 0
             :harness (None)
+            :selection (JNull)
+            :history (JNull)
             :status "running"
             :error ""
             :failed false)]
@@ -105,6 +109,8 @@
             :cursor 0
             :read-cursor 0
             :harness (None)
+            :selection (JNull)
+            :history (JNull)
             :status "running"
             :error ""
             :failed false)]
@@ -135,6 +141,8 @@
             :cursor 0
             :read-cursor 0
             :harness (None)
+            :selection (JNull)
+            :history (JNull)
             :status "running"
             :error ""
             :failed false)
@@ -150,3 +158,214 @@
     (let [records (jv-get (session/events a home id 0) "records")]
       (assert-eq (jv-count records) 1)
       (assert (<= (len (session/str (jv-nth records 0) "text")) 131075)))))
+
+(defn contains? [(text (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find text needle) (Some [_] true) (_ false)))
+
+(defn switch-worker [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
+  (-> (ptr session/Worker))
+  (let [w (box! a session/Worker (zeroed session/Worker))]
+    (set! (.allocator w) a)
+    (set! (.home w) home)
+    (set! (.id w) id)
+    (set! (.harness w) (None))
+    (set! (.selection w)
+          (session/read-doc a (session/path a home id "session.json")))
+    (set! (.history w) (jv-array a))
+    (set! (.status w) "idle")
+    w))
+
+(deftest model-switch-persists-on-the-same-session-and-reserves-new-inbox-for-next-worker
+  (let [a (malloc-allocator)
+        home (fresh-home a "switch-queue")
+        id (created a home)
+        w (switch-worker a home id)]
+    (append-record! a
+                    (session/path a home id "inbox.jsonl")
+                    (ev-str! (ev a "message.sent")
+                             "text"
+                             "continue on the new model"))
+    (assert (match (session/select-model! a home id "codex" "next-model")
+              (Ok [_] true)
+              (_ false)))
+    (assert-eq (len (control-inbox w a)) 0)
+    (assert-eq (.read-cursor w) 0)
+    (session/save! w)
+    (let [next (switch-worker a home id)
+          messages (control-inbox next a)]
+      (assert-eq (len messages) 1)
+      (assert (= (.text (get messages 0)) "continue on the new model"))
+      (assert (= (session/str (.selection next) "harness") "codex"))
+      (assert (= (session/str (.selection next) "model") "next-model")))
+    (let [meta (session/info a home id)]
+      (assert (= (session/str meta "id") id))
+      (assert (= (session/str meta "workdir") home))
+      (assert (= (session/str meta "title") "A personal conversation"))
+      (assert-eq (jv-count (session/list-sessions a home)) 1))
+    (assert (match (session/select-model! a home id "invalid" "bad")
+              (Err [_] true)
+              (_ false)))
+    (assert (= (session/str (session/info a home id) "model") "next-model"))))
+
+(deftest cross-harness-switches-carry-complete-history-without-reusing-provider-sessions
+  (let [a (malloc-allocator)
+        home (fresh-home a "switch-history")
+        id (created a home)
+        w (switch-worker a home id)
+        claude
+          (box! a
+                claude/ClaudeHarness
+                (claude/claude-new a (zeroed claude/ClaudeOptions) w w))]
+    (assert (session/restore-conversation! w (.selection w) (JNull) claude))
+    (set! (.session claude) "claude-original")
+    (claude/mirror-text! claude "user" "Remember the marker ALPHA-42")
+    (claude/mirror-text! claude "assistant" "I remember ALPHA-42")
+    (session/save! w)
+    (assert (match (session/select-model! a home id "codex" "codex-choice")
+              (Ok [_] true)
+              (_ false)))
+    (let [next (switch-worker a home id)
+          options (zeroed codex/CodexOptions)
+          codex
+            (box! a codex/CodexHarness (codex/codex-new a options next next))
+          saved (session/read-doc a (session/path a home id "checkpoint.json"))]
+      (assert (session/restore-conversation! next (.selection next) saved codex))
+      (assert (= (.session codex) ""))
+      (assert-eq (jv-count (.history next)) 2)
+      (assert (contains? (.context codex) "ALPHA-42"))
+      (assert (not (contains? (.context codex) "claude-original")))
+      (let [user (jv-object a)
+            assistant (jv-object a)]
+        (jv-put! user "role" (JStr "user"))
+        (jv-put! user "content" (JStr "Now also remember BETA-73"))
+        (jv-put! assistant "role" (JStr "assistant"))
+        (jv-put! assistant "content" (JStr "Both markers are saved"))
+        (jv-push! (.messages codex) user)
+        (jv-push! (.messages codex) assistant))
+      (set! (.session codex) "codex-original")
+      (session/save! next)
+      (assert (match (session/select-model! a home id "claude" "sonnet")
+                (Ok [_] true)
+                (_ false)))
+      (let [third (switch-worker a home id)
+            claude2
+              (box! a
+                    claude/ClaudeHarness
+                    (claude/claude-new a
+                                       (zeroed claude/ClaudeOptions)
+                                       third
+                                       third))]
+        (assert (session/restore-conversation! third
+                                               (.selection third)
+                                               (session/read-doc a
+                                                                 (session/path a
+                                                                               home
+                                                                               id
+                                                                               "checkpoint.json"))
+                                               claude2))
+        (assert (= (.session claude2) ""))
+        (assert-eq (jv-count (.history third)) 4)
+        (assert (contains? (.context claude2) "ALPHA-42"))
+        (assert (contains? (.context claude2) "BETA-73"))
+        (set! (.session claude2) "claude-returned")
+        (session/save! third)
+        (assert (match (session/select-model! a home id "claude" "opus")
+                  (Ok [_] true)
+                  (_ false)))
+        (let [fourth (switch-worker a home id)
+              (mut options) (zeroed claude/ClaudeOptions)]
+          (set! (.model options) "opus")
+          (let [claude3
+                  (box! a
+                        claude/ClaudeHarness
+                        (claude/claude-new a options fourth fourth))]
+            (assert (session/restore-conversation! fourth
+                                                   (.selection fourth)
+                                                   (session/read-doc a
+                                                                     (session/path a
+                                                                                   home
+                                                                                   id
+                                                                                   "checkpoint.json"))
+                                                   claude3))
+            (assert (= (.session claude3) "claude-returned"))
+            (assert (= (.model (.options claude3)) "opus"))
+            (assert-eq (jv-count (.history fourth)) 4)
+            (assert (contains? (.context claude3) "ALPHA-42"))
+            (assert (contains? (.context claude3) "BETA-73"))))))))
+
+(deftest invalid-checkpoint-is-preserved-when-changing-models
+  (let [a (malloc-allocator)
+        home (fresh-home a "switch-invalid")
+        id (created a home)
+        saved (jv-object a)]
+    (jv-put! saved "checkpoint" (JStr "invalid-json"))
+    (assert (session/write-doc! a
+                                (session/path a home id "checkpoint.json")
+                                saved))
+    (assert (match (session/select-model! a home id "codex" "choice")
+              (Ok [_] true)
+              (_ false)))
+    (let [w (switch-worker a home id)
+          h
+            (box! a
+                  codex/CodexHarness
+                  (codex/codex-new a (zeroed codex/CodexOptions) w w))]
+      (assert (not (session/restore-conversation! w (.selection w) saved h)))
+      (session/save! w)
+      (assert (= (session/str (session/read-doc a
+                                                (session/path a
+                                                              home
+                                                              id
+                                                              "checkpoint.json"))
+                              "checkpoint")
+                 "invalid-json")))))
+
+(deftest fast-mode-persists-and-retires-the-worker-at-the-next-turn
+  (let [a (malloc-allocator)
+        home (fresh-home a "fast-mode")
+        id
+          (match (session/create-tier! a
+                                       home
+                                       "codex"
+                                       "gpt-6-sol"
+                                       home
+                                       "Fast"
+                                       "priority")
+            (Ok [id] id)
+            (_ (do (assert false) "")))
+        fast (session/info a home id)
+        w (switch-worker a home id)]
+    (let [h
+            (box! a
+                  codex/CodexHarness
+                  (codex/codex-new a (zeroed codex/CodexOptions) w w))]
+      (assert (session/restore-conversation! w (.selection w) (JNull) h)))
+    (assert (= (session/str fast "service_tier") "priority"))
+    (assert (match (session/select-model! a home id "codex" "gpt-6-sol")
+              (Ok [_] true)
+              (_ false)))
+    (let [standard (session/info a home id)]
+      (assert (= (session/str standard "service_tier") ""))
+      (assert (not (session/same-selection? fast standard))))
+    (append-record! a
+                    (session/path a home id "inbox.jsonl")
+                    (ev-str! (ev a "message.sent") "text" "standard next"))
+    (assert-eq (len (control-inbox w a)) 0)
+    (session/save! w)
+    (assert (= (session/str (session/read-doc a
+                                              (session/path a
+                                                            home
+                                                            id
+                                                            "checkpoint.json"))
+                            "service_tier")
+               "priority"))
+    (assert-eq (len (control-inbox (switch-worker a home id) a)) 1)
+    (assert (match (session/select-model-tier! a
+                                               home
+                                               id
+                                               "claude"
+                                               "opus"
+                                               "priority")
+              (Err [_] true)
+              (_ false)))
+    (assert (= (session/str (session/info a home id) "harness") "codex"))))

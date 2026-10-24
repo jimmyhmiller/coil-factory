@@ -1,0 +1,87 @@
+(module factory.actions-ui-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "factory.ui-views-test" :use [str-contains?])
+(import "coil.serde.value" :use *)
+(import "tui.keys" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.app" :use [app-snapshot])
+(import "agent.json" :use *)
+(import "factory.sidebar-test" :use [json])
+(import "factory.ui.model" :use *)
+(import "factory.ui.store" :use *)
+(import "factory.ui.fmt" :use [js ji])
+(import "factory.ui.dashboard" :use [dashboard-key! click!])
+(import "factory.ui.actions" :as actions)
+(import "factory.ui.network" :as network)
+(import "factory.workbench-test" :use [standalone])
+
+(defn fixture! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        a (snap-spare (field w actions))]
+    (actions/own! d (field w actions-project) (actions/project d))
+    (set! (.actions-unavailable w) false)
+    (snap-commit! (field w actions)
+                  (json a
+                        "{\"token\":\"fixture-token\",\"actions\":[{\"id\":\"dev\",\"label\":\"A long application label that wraps across narrow sidebars\",\"command\":\"npm run dev\",\"cwd\":\".\",\"env\":{\"PRESERVE\":\"yes\"},\"run\":{\"run_id\":\"first\",\"state\":\"exited\",\"exit_code\":0}},{\"id\":\"test\",\"label\":\"Tests\",\"command\":\"npm test\"}]}")
+                  0))
+  0)
+
+(deftest action-sidebar-renders-wraps-scrolls-and-edits-the-clicked-action
+  (let [a (malloc-allocator)
+        d (standalone a "action-sidebar-ui")
+        w (field d workbench)]
+    (fixture! d)
+    (set! (.context-width w) 18)
+    (set! (.sidebar-focus w) true)
+    (let [screen (app-snapshot d 110 32 0 a)]
+      (assert (str-contains? screen "Actions"))
+      (assert (str-contains? screen "[Run]"))
+      (assert (str-contains? screen "[Log]")))
+    (let [hits (.value (field w action-hits))
+          (mut edit-row) -1]
+      (for i (range 0 (jv-count hits))
+        (let [hit (jv-nth hits i)]
+          (when (and (= (js hit "kind") "edit")
+                     (= (js (jv-get hit "action") "id") "test"))
+            (set! edit-row (ji hit "row")))))
+      (assert (> (load edit-row) 0))
+      (set! (.offset (.sidebar-sv w)) 4)
+      (app-snapshot d 110 18 0 a)
+      (click! d
+              (+ (.x (.context-r w)) 2)
+              (+ (+ (.y (.context-r w)) 1)
+                 (- (load edit-row) (.offset (.sidebar-sv w)))))
+      (assert (.action-editor w))
+      (assert (= (input-text (index (field w action-fields) 0)) "test")))
+    (dashboard-key! d (Escape))
+    (actions/edit! d false)
+    (set! (.action-field w) 2)
+    (input-clear! (index (field w action-fields) 2))
+    (dashboard-key! d (Char #\/))
+    (assert (not (.commands-open d)))
+    (assert (= (input-text (index (field w action-fields) 2)) "/"))
+    (dashboard-key! d (Escape))
+    (dashboard-key! d (BackTab))
+    (assert-eq (.action-selected w) 0)
+    (actions/edit! d false)
+    (assert (= (js (jv-get (.value (field w action-edit-doc)) "env") "PRESERVE")
+               "yes"))))
+
+(deftest stale-action-hit-does-not-act-on-a-new-project
+  (let [a (malloc-allocator)
+        d (standalone a "action-stale-ui")
+        w (field d workbench)]
+    (fixture! d)
+    (app-snapshot d 110 32 0 a)
+    (input-set-text! (index (field w settings) 0) "/a-different-project")
+    (let [hits (.value (field w action-hits))]
+      (for i (range 0 (jv-count hits))
+        (let [hit (jv-nth hits i)]
+          (when (= (js hit "kind") "run")
+            (click! d
+                    (+ (.x (.context-r w)) 2)
+                    (+ (+ (.y (.context-r w)) 1) (ji hit "row")))))))
+    (assert (= (cast i64 (.action-job w)) 0))
+    (assert (= (.action-pending w) ""))))

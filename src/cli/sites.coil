@@ -56,8 +56,10 @@
            (if up
                (join a
                      [(int-text a (int-field site "running"))
-                      "/"
-                      (int-text a (int-field site "max_runs"))
+                      (if (= (int-field site "max_runs") 0)
+                          " · unlimited"
+                          (join a
+                                ["/" (int-text a (int-field site "max_runs"))]))
                       " running"])
                ""))
     (push! [(slice u8)]

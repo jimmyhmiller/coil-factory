@@ -1,4 +1,6 @@
 (module factory.harness-tools)
+(import "factory.actions" :as actions)
+(import "factory.config" :as config)
 (import "coil.alloc" :use *)
 (import "coil.slice" :use *)
 (import "agent.tool" :use *)
@@ -15,19 +17,39 @@
           (mut finish) false
           (mut gate) false
           (mut ready) ""
+          (mut project) ""
+          (mut action-home) (config/factory-home a)
           (mut i) 2
           (mut registry) (registry-new a)]
       (when (or (= (len root) 0) (not (sidebar/scope? agent)))
         (return-from :serve 1))
       (loop (when (>= (load i) (len args)) (break))
         (let [flag (get args (load i))]
-          (cond (= flag "--finish") (set! finish true)
+          (cond (and (= flag "--home") (< (+ (load i) 1) (len args)))
+                  (do
+                    (set! i (+ (load i) 1))
+                    (set! action-home (get args (load i))))
+                (and (= flag "--project") (< (+ (load i) 1) (len args)))
+                  (do
+                    (set! i (+ (load i) 1))
+                    (set! project (get args (load i))))
+                (= flag "--finish") (set! finish true)
                 (= flag "--gate") (set! gate true)
                 (and (= flag "--ready") (< (+ (load i) 1) (len args)))
                   (do (set! i (+ (load i) 1)) (set! ready (get args (load i))))
                 :else (return-from :serve 1)))
         (set! i (+ (load i) 1)))
       (sidebar/register! a (mut registry) root agent)
+      (when (> (len (load project)) 0)
+        (let [home (load action-home)]
+          (match (config/load-site-config a home)
+            (config/SiteConfigOk [site]
+                                 (actions/register! a
+                                                    (mut registry)
+                                                    home
+                                                    (load project)
+                                                    (.isolation site)))
+            (_ (return-from :serve 1)))))
       (when (load finish)
         (registry-add! (mut registry)
                        (box! a

@@ -1,4 +1,6 @@
 (module factory.ui.network)
+(import "factory.actions" :as actions)
+(import "factory.config" :as config)
 (import "coil.alloc" :use *)
 (import "coil.slice" :use *)
 (import "coil.serde.value" :use *)
@@ -27,8 +29,11 @@
    (address (slice u8))
    (name (slice u8))
    (endpoint (slice u8))
+   (body (slice u8))
    (hub Hub)
    (reply Reply)
+   (references i64)
+   (owner (ptr Job))
    (owns-tunnel bool)
    (tunnel (ptr tunnel/Tunnel))])
 
@@ -36,7 +41,18 @@
   (let [job (cast (ptr Job) arg)
         a (allocator (field job arena))]
     (block :run
-      (when (and (or (= (.kind job) 2) (= (.kind job) 5))
+      (when (= (.kind job) 6)
+        (let [request (match (jv-parse a (.body job)) (Some [v] v) (_ (JNull)))
+              isolation (match (config/load-site-config a (.home job))
+                          (config/SiteConfigOk [site] (.isolation site)) (_ "invalid"))]
+          (if (= isolation "invalid")
+            (set! (.reply job) (ReplyFailed "Invalid site configuration."))
+            (match (actions/dispatch a (.home job) (.address job) isolation request)
+              (Err [why] (set! (.reply job) (ReplyFailed why)))
+              (Ok [v] (set! (.reply job) (ReplyOk 200 v (jv-encode a v)))))))
+        (atomic/store (field job done) 1)
+        (return-from :run 0))
+      (when (and (or (= (.kind job) 2) (= (.kind job) 5) (= (.kind job) 7))
                  (!= (cast i64 (.tunnel job)) 0))
         (match (tunnel/tunnel-ensure! (.tunnel job))
           (tunnel/TunnelReady [port]
@@ -46,6 +62,10 @@
                                (do
                                  (set! (.reply job) (ReplyFailed why))
                                  (return-from :run 0)))))
+      (when (= (.kind job) 7)
+        (set! (.reply job) (hub-call a (.hub job) "POST" (.endpoint job) (.body job) 10000))
+        (atomic/store (field job done) 1)
+        (return-from :run 0))
       (when (or (= (.kind job) 3) (= (.kind job) 4))
         (if (= (.kind job) 3)
             (when (< (spawn-detached a
@@ -158,23 +178,29 @@
     (atomic/store (field job done) 1)
     (cast (ptr i8) 0)))
 
-(defn start-with-tunnel [(a (dyn Allocator))
+(defn start-request [(a (dyn Allocator))
                          (kind i64)
                          (home (slice u8))
                          (hub Hub)
                          (address (slice u8))
                          (name (slice u8))
                          (borrowed-tunnel (ptr tunnel/Tunnel))
-                         (endpoint (slice u8))] (-> (ptr Job))
+                         (endpoint (slice u8))
+                         (body (slice u8))
+                         (owner (ptr Job))] (-> (ptr Job))
   (let [job (box! a Job (zeroed Job))]
     (scratch/ScratchArena::init (field job arena) (malloc-allocator))
     (set! (.tunnel job) borrowed-tunnel)
+    (set! (.references job) 1)
+    (set! (.owner job) owner)
+    (when (!= (cast i64 owner) 0) (set! (.references owner) (+ (.references owner) 1)))
     (let [scratch (allocator (field job arena))]
       (set! (.kind job) kind)
       (set! (.home job) (copy-bytes scratch home))
       (set! (.address job) (copy-bytes scratch address))
       (set! (.name job) (copy-bytes scratch name))
       (set! (.endpoint job) (copy-bytes scratch endpoint))
+      (set! (.body job) (copy-bytes scratch body))
       (set! (.hub job)
             (Hub
               :base-url (copy-bytes scratch (.base-url hub))
@@ -187,6 +213,11 @@
       (set! (.reply job) (ReplyFailed "Could not start the connection worker."))
       (atomic/store (field job done) 1))
     job))
+
+(defn start-with-tunnel [(a (dyn Allocator)) (kind i64) (home (slice u8)) (hub Hub)
+                         (address (slice u8)) (name (slice u8))
+                         (borrowed-tunnel (ptr tunnel/Tunnel)) (endpoint (slice u8))] (-> (ptr Job))
+  (start-request a kind home hub address name borrowed-tunnel endpoint "" (cast (ptr Job) 0)))
 
 (defn start [(a (dyn Allocator))
              (kind i64)
@@ -208,7 +239,7 @@
                (hub Hub)
                (name (slice u8))
                (owner (ptr Job))] (-> (ptr Job))
-  (start-with-tunnel a
+  (start-request a
                      2
                      home
                      hub
@@ -217,7 +248,7 @@
                      (if (= (cast i64 owner) 0)
                          (cast (ptr tunnel/Tunnel) 0)
                          (.tunnel owner))
-                     "/v1/overview"))
+                     "/v1/overview" "" owner))
 
 (defn fetch [(a (dyn Allocator))
              (home (slice u8))
@@ -225,7 +256,7 @@
              (name (slice u8))
              (endpoint (slice u8))
              (owner (ptr Job))] (-> (ptr Job))
-  (start-with-tunnel a
+  (start-request a
                      5
                      home
                      hub
@@ -234,19 +265,24 @@
                      (if (= (cast i64 owner) 0)
                          (cast (ptr tunnel/Tunnel) 0)
                          (.tunnel owner))
-                     endpoint))
+                     endpoint "" owner))
 
 (defn ready? [(job (ptr Job))] (-> bool)
   (and (!= (cast i64 job) 0) (= (atomic/read (field job done)) 1)))
 
 (defn close! [(a (dyn Allocator)) (job (ptr Job))] (-> i64)
+  (block :close
   (when (!= (cast i64 job) 0)
+    (when (> (.references job) 1)
+      (set! (.references job) (- (.references job) 1))
+      (return-from :close 0))
     (join (field job thread))
     (when (and (.owns-tunnel job) (!= (cast i64 (.tunnel job)) 0))
       (tunnel/tunnel-free! (.tunnel job))
       (destroy (malloc-allocator) (.tunnel job))
       0)
+    (when (!= (cast i64 (.owner job)) 0) (close! a (.owner job)))
     (close! (field job arena))
     (destroy a job)
     0)
-  0)
+  0))

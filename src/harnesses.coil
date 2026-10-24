@@ -1,4 +1,5 @@
 (module factory.harnesses)
+(import "factory.actions" :as actions)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.primitive" :as primitive)
@@ -64,6 +65,8 @@
   [(harness (slice u8))
    ;;; "" means the harness's default on this site.
    (model (slice u8))
+   ;;; Codex service tier: empty for standard, priority for Fast.
+   (service-tier (slice u8))
    ;;; Tool groups: `files`, `read`, `shell`, comma-separated; "" for none.
    (tools (slice u8))
    ;;; Whether the agent has the `finish` tool (stations do; reviewers don't).
@@ -103,13 +106,14 @@
       tools
       (cat a
            [tools
-            ". Persistent context: use sidebar_read, sidebar_section and sidebar_item (with the harness's MCP prefix when present) to keep the latest results, todos and important working context visible beside the conversation. Use stable section/item ids and update them in place. The tools save automatically; this board is separate from the transcript."])))
+            ". Persistent context: use sidebar_read, sidebar_section and sidebar_item (with the harness's MCP prefix when present) to keep the latest results, todos and important working context visible beside the conversation. Use stable section/item ids and update them in place. The tools save automatically; this board is separate from the transcript. Project actions: use project_actions_list and project_action_set to add command buttons shared across conversations in the workspace. Adding a button does not run it. Use project_action_start/status/logs/stop to manage supervised applications, which survive a turn ending. Read the token before editing or starting an action."])))
 
 ;;; Persistent harnesses expose the context board and, for stations, finish.
 ;;; A standalone agent's custom server also receives its context scope.
 ;;; Requests without persistent state keep the legacy finish-only server.
 (defn tool-server [(a (dyn Allocator))
                    (request AgentRequest)
+                   (home (slice u8))
                    (ready-file (slice u8))] (-> (ArrayList (slice u8)))
   (let [(mut command) (ArrayList::new [(slice u8)] a)]
     (cond (and (> (len (.run-dir request)) 0)
@@ -119,6 +123,9 @@
               (push! (mut command) "_mcp-harness")
               (push! (mut command) (.run-dir request))
               (push! (mut command) (.station request))
+              (when (actions/shell-enabled? a (.tools request))
+                (for word (iter ["--project" (.workspace request) "--home" home])
+                  (push! (mut command) word)))
               (when (.finish request) (push! (mut command) "--finish") 0)
               (when (> (len (.gate request)) 0)
                 (push! (mut command) "--gate")
@@ -254,6 +261,12 @@
                          (when (.finish request)
                            (registry-add! registry finish)
                            0)
+                         (when (actions/shell-enabled? a (.tools request))
+                           (actions/register! a
+                                              registry
+                                              (.home config)
+                                              (.workspace request)
+                                              (.isolation config)))
                          (sidebar/register! a
                                             registry
                                             (.run-dir request)
@@ -471,6 +484,8 @@
                       (return-from
                         :setup
                           (AgentUnavailable "the opencode harness needs OpenCode on this site: install it (https://opencode.ai) or set \"opencode\" in site.json to its path"))))
+            action-root
+              (actions/runtime-for a (.home config) (.workspace request))
             root (path-join a (.run-dir request) "opencode")
             state-dir
               (path-join a
@@ -487,6 +502,7 @@
             problem
               (ensure-dirs! a
                             [root
+                             action-root
                              state-dir
                              site-root
                              config-home
@@ -499,6 +515,7 @@
                                           config
                                           (.workspace request)
                                           [root
+                                           action-root
                                            site-root
                                            (path-join a
                                                       (.run-dir request)
@@ -514,7 +531,7 @@
               mcp (jv-object a)
               plugins (jv-array a)
               refusals (opencode-refusals a (.tools request))
-              server (tool-server a request ready-file)
+              server (tool-server a request (.home config) ready-file)
               stop (stop-name request)]
           (when (> (len refusals) 0)
             (let [guard-path
@@ -686,6 +703,18 @@
       0)
     (slice out)))
 
+(defn codex-tier-settings [(a (dyn Allocator))
+                           (config (ptr SiteConfig))
+                           (sandbox (slice u8))
+                           (tier (slice u8))]
+  (-> (slice (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
+    (for setting (iter (codex-settings a config sandbox))
+      (push! (mut out) setting))
+    (when (> (len tier) 0)
+      (push! (mut out) (cat a ["service_tier=" (codex/toml-string a tier)])))
+    (slice out)))
+
 (defn codex-agent [(a (dyn Allocator))
                    (config (ptr SiteConfig))
                    (request AgentRequest)
@@ -711,7 +740,7 @@
         (let [model (effective-model config "codex" (.model request))
               ready-file
                 (path-join a root (cat a [(.station request) ".ready"]))
-              (mut command) (tool-server a request ready-file)
+              (mut command) (tool-server a request (.home config) ready-file)
               stop (stop-name request)]
           (let [harness
                   (box! a
@@ -732,7 +761,10 @@
                                                  ready-file
                                                  "")
                                            :settings
-                                             (codex-settings a config sandbox)
+                                             (codex-tier-settings a
+                                                                  config
+                                                                  sandbox
+                                                                  (.service-tier request))
                                            :idle-timeout-ms 1800000)
                                          observer
                                          control))]
@@ -776,9 +808,14 @@
                       (return-from
                         :setup
                           (AgentUnavailable "Install Claude Code on this site, or set claude in site.json to its executable path."))))
+            action-root
+              (actions/runtime-for a (.home config) (.workspace request))
             root (path-join a (.run-dir request) "claude")
             problem
-              (ensure-dirs! a [root (path-join a (.run-dir request) "sidebar")])]
+              (ensure-dirs! a
+                            [root
+                             action-root
+                             (path-join a (.run-dir request) "sidebar")])]
         (when (> (len problem) 0)
           (return-from :setup (AgentUnavailable problem)))
         (let [launcher
@@ -786,6 +823,7 @@
                                           config
                                           (.workspace request)
                                           [root
+                                           action-root
                                            (path-join a
                                                       (.run-dir request)
                                                       "sidebar")
@@ -796,7 +834,7 @@
                   (Err [message]
                        (return-from :setup (AgentUnavailable message))))
               ready (path-join a root (cat a [(.station request) ".ready"]))
-              command (tool-server a request ready)
+              command (tool-server a request (.home config) ready)
               stop (stop-name request)
               mcp (jv-object a)
               servers (jv-object a)

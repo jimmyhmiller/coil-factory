@@ -324,7 +324,8 @@
 ;;; longer than `width` is broken hard. The returned lines borrow `text`; the
 ;;; list itself is allocated from `a`. A `width` below 1 yields no lines, since
 ;;; nothing can be shown.
-(defn wrap-text [(a (dyn Allocator)) (text (slice u8)) (width i64)] (-> (ArrayList (slice u8)))
+(defn wrap-text [(a (dyn Allocator)) (text (slice u8)) (width i64)]
+  (-> (ArrayList (slice u8)))
   (let [(mut out) (ArrayList::new [(slice u8)] a)]
     (when (>= width 1)
       (let [(mut start) 0
@@ -978,12 +979,14 @@
         false
         (do (input--delete-range! input start (.cursor input)) true))))
 
-;;; Ctrl-K: delete from the cursor to the end of the line.
+;;; Ctrl-K: delete to the end of the line, or the newline when already there.
 (defn input-kill-to-end! [(input (ptr TextInput))] (-> bool)
   (let [end (input--line-end input (.cursor input))]
-    (if (= end (.cursor input))
-        false
-        (do (input--delete-range! input (.cursor input) end) true))))
+    (cond (> end (.cursor input))
+            (do (input--delete-range! input (.cursor input) end) true)
+          (< end (len (.text input)))
+            (do (input--delete-range! input end (+ end 1)) true)
+          :else false)))
 
 (defn input--copy [(a (dyn Allocator)) (bytes (slice u8))] (-> (slice u8))
   (let [(mut copy) (ArrayList::new [u8] a)]
@@ -1034,7 +1037,8 @@
 
 ;;; Take the text for sending: push it to history, clear the input, and return
 ;;; a copy allocated from `a`.
-(defn input-submit! [(input (ptr TextInput)) (a (dyn Allocator))] (-> (slice u8))
+(defn input-submit! [(input (ptr TextInput)) (a (dyn Allocator))]
+  (-> (slice u8))
   (let [text (input--copy a (slice (.text input)))]
     (input-history-push! input text)
     (input-clear! input)
@@ -1066,7 +1070,8 @@
 
 ;;; The position `column` display cells into the line starting at `start`
 ;;; (or the line end when it is shorter).
-(defn input--snap-column [(input (ptr TextInput)) (start i64) (column i64)] (-> i64)
+(defn input--snap-column [(input (ptr TextInput)) (start i64) (column i64)]
+  (-> i64)
   (let [(mut it)
           (ClusterIter
             :text (slice (.text input))

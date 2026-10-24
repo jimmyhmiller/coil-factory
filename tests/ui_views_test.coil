@@ -217,33 +217,33 @@
       (assert (= screen
                  " ◆ factory › haiku-4695 › critique   running                                        02:35
 ╭─ critique · conversation ──────────────────────────────────────────────────────────────╮
-│ factory                                                                                │
-│ │ Begin the critique station.                                                          │
-│ │ Look at the workspace.                                                               │
 │ │ Count syllables.                                                                     │
 │ │ … 2 more lines                                                                       │
 │                                                                                        │
-│ critique                                                                               │
-│ ┊ Start by listing files.                                                              │
-│ │ I will look at the workspace first.                                                  │
-│ │ ▤ .  → poem.md                                                                       │
-│ │ ▤ poem.md  → 1│ Cold autumn rainfall                                                 │
-│                                                                                        │
-│ you                                                                                    │
-│ │ count carefully                                                                      │
-│                                                                                        │
-│ critique                                                                               │
-│ │ Counting now: the lines are 5, 7 and 5 syllables, which is exactly what a haiku      │
-│ │ needs.                                                                               │
-│ ┊ Run the tests.                                                                       │
-│ │ $ coil test  ✓ 1.5s                                                                  │
-│                                                                                        │
-│ you · waiting for the agent                                                            │
-│ │ also check the title                                                                 │
-│                                                                                        │
-│ you · sending                                                                          │
-│ │ and the rhythm                                                                       │
-│                                                                                        │
+│ critique                                                                               ┃
+│ ┊ Start by listing files.                                                              ┃
+│ │ I will look at the workspace first.                                                  ┃
+│ │ ▤ .  → poem.md                                                                       ┃
+│ │   poem.md                                                                            ┃
+│ │ ▤ poem.md  → 1│ Cold autumn rainfall                                                 ┃
+│ │   1│ Cold autumn rainfall                                                            ┃
+│ │   2│ drumming on the old tin roof                                                    ┃
+│                                                                                        ┃
+│ you                                                                                    ┃
+│ │ count carefully                                                                      ┃
+│                                                                                        ┃
+│ critique                                                                               ┃
+│ │ Counting now: the lines are 5, 7 and 5 syllables, which is exactly what a haiku      ┃
+│ │ needs.                                                                               ┃
+│ ┊ Run the tests.                                                                       ┃
+│ │ $ coil test  ✓ 1.5s                                                                  ┃
+│ │   ok                                                                                 ┃
+│                                                                                        ┃
+│ you · waiting for the agent                                                            ┃
+│ │ also check the title                                                                 ┃
+│                                                                                        ┃
+│ you · sending                                                                          ┃
+│ │ and the rhythm                                                                       ┃
 │ ⠋ tool  $ coil test                                                                    │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │ ❯ Steer the agent — it reads this at its next turn                                     │
@@ -464,3 +464,22 @@
     (let [screen (app-snapshot d 60 24 0 a)]
       (assert (str-contains? screen "haiku-4695"))
       (assert (str-contains? screen "coil test")))))
+
+(deftest tool-inspector-keeps-old-harness-results-separate-from-reused-call-ids
+  (let [a (malloc-allocator)
+        d (dash-for-test a)
+        saved
+          (doc a
+               "{'history':[{'factory_segment':'claude:0','role':'assistant','tool_calls':[{'id':'same','function':{'name':'Read','arguments':'old file'}}]},{'factory_segment':'claude:0','role':'tool','tool_call_id':'same','content':'old result'}]}")
+        current
+          (doc a
+               "{'harness':'codex','messages':[{'role':'assistant','tool_calls':[{'id':'same','function':{'name':'Read','arguments':'new file'}}]},{'role':'tool','tool_call_id':'same','content':'new result'}]}")]
+    (jv-put! saved "checkpoint" (JStr (jv-encode a current)))
+    (snap-commit! (field (field d workbench) current) saved NOW)
+    (set! (.view d) (ViewPersonal))
+    (let [nodes (inspect/inspection-nodes d a 100)]
+      (assert-eq (len nodes) 6)
+      (assert (= (.id (get nodes 0)) "claude:0/same"))
+      (assert (= (.id (get nodes 3)) "same"))
+      (assert (= (.label (get nodes 2)) "Result: old result"))
+      (assert (= (.label (get nodes 5)) "Result: new result")))))

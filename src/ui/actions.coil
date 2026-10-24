@@ -1,0 +1,407 @@
+(module factory.ui.actions)
+(import "coil.alloc" :use *)
+(import "coil.scratch" :as scratch)
+(import "ssh.tunnel" :as tunnel)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.keys" :use *)
+(import "factory.ui.model" :use *)
+(import "factory.ui.workbench" :as workbench)
+(import "factory.ui.store" :use *)
+(import "factory.ui.network" :as network)
+(import "factory.ui.fmt" :use *)
+(import "factory.client" :use *)
+(import "factory.actions" :as actions)
+
+(defn project [(d (ptr Dash))] (-> (slice u8))
+  (let [w (field d workbench)]
+    (match (.view d)
+      (ViewChat []
+                (concat (allocator (field d io))
+                        [(.base-url (.hub d))
+                         "/"
+                         (.run (.chat d))
+                         "/"
+                         (.agent (.chat d))]))
+      (_ (if (> (len (.session-id w)) 0)
+             (js (.value (field w current)) "workdir")
+             (workbench/value w 0))))))
+
+(defn own! [(d (ptr Dash)) (target (ptr (slice u8))) (value (slice u8))]
+  (-> i64)
+  (let [owned (copy-bytes (.allocator d) value)]
+    (when (> (len (load target)) 0) (free-bytes (.allocator d) (load target) 1))
+    (set! target owned))
+  0)
+
+(defn request! [(d (ptr Dash)) (kind i64) (args JVal)] (-> i64)
+  (block
+    :request
+      (let [w (field d workbench)
+            a (allocator (field d io))]
+        (when (and (!= kind 1) (.actions-unavailable w))
+          (own! d
+                (field w action-error)
+                "Actions are unavailable; wait for a successful refresh.")
+          (return-from :request 0))
+        (when (and (!= kind 1) (not (= (.actions-project w) (project d))))
+          (set! (.actions-polled w) 0)
+          (own! d
+                (field w action-error)
+                "Project changed; wait for the action list to refresh.")
+          (return-from :request 0))
+        (if (!= (cast i64 (.action-job w)) 0)
+            (when (and (!= kind 1)
+                       (not (.action-mutating w))
+                       (= (.action-pending w) ""))
+              (let [doc (jv-object a)]
+                (jv-put! doc "kind" (JInt kind))
+                (jv-put! doc "args" args)
+                (own! d (field w action-pending) (jv-encode a doc))
+                (own! d (field w action-pending-project) (project d))))
+            (let [doc (jv-object a)]
+              (jv-put! doc "kind" (JInt kind))
+              (jv-put! doc "args" args)
+              (jv-put! doc "output_run" (JStr (.action-output w)))
+              (set! (.action-mutating w) (!= kind 1))
+              (let [remote (match (.view d) (ViewChat [] true) (_ false))
+                    owner (.active-connection w)]
+                (set! (.action-job w)
+                      (network/start-request (.allocator d)
+                                             (if remote 7 6)
+                                             (.home w)
+                                             (.hub d)
+                                             (if remote
+                                                 (.base-url (.hub d))
+                                                 (project d))
+                                             (project d)
+                                             (if (or (not remote)
+                                                     (= (cast i64 owner) 0))
+                                                 (cast (ptr tunnel/Tunnel) 0)
+                                                 (.tunnel owner))
+                                             (if remote
+                                                 (concat a
+                                                         ["/v1/runs/"
+                                                          (.run (.chat d))
+                                                          "/agents/"
+                                                          (.agent (.chat d))
+                                                          "/actions"])
+                                                 "")
+                                             (jv-encode a doc)
+                                             (if remote
+                                                 owner
+                                                 (cast (ptr network/Job) 0)))))))
+        0)))
+
+(defn poll! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        job (.action-job w)]
+    (when (not (match (.view d)
+                 (ViewPersonal [] true)
+                 (ViewChat [] true)
+                 (_ false)))
+      (own! d (field w action-pending) ""))
+    (when (network/ready? job)
+      (set! (.action-job w) (cast (ptr network/Job) 0))
+      (set! (.action-mutating w) false)
+      (when (= (.name job) (project d))
+        (if (reply-ok? (.reply job))
+            (let [body (reply-body (.reply job))]
+              (if (= (ji (match (jv-parse (allocator (field d io)) (.body job))
+                           (Some [v] v)
+                           (_ (JNull)))
+                         "kind")
+                     1)
+                  (let [a (snap-spare (field w actions))
+                        old-id (js (selected d) "id")
+                        doc (jv-clone a body)
+                        list (jv-get doc "actions")]
+                    (for i (range 0 (jv-count list))
+                      (when (= (js (jv-nth list i) "id") old-id)
+                        (set! (.action-selected w) i)))
+                    (when (>= (.action-selected w) (jv-count list))
+                      (set! (.action-selected w) 0))
+                    (when (and (.actions-unavailable w) (= (js doc "error") ""))
+                      (own! d (field w action-error) ""))
+                    (set! (.actions-unavailable w) (> (len (js doc "error")) 0))
+                    (snap-commit! (field w actions) doc (.now d)))
+                  (set! (.actions-polled w) 0)))
+            (do
+              (own! d
+                    (field w action-error)
+                    (reply-error (allocator (field d io)) (.reply job)))
+              (let [request
+                      (match (jv-parse (allocator (field d io)) (.body job))
+                        (Some [v] v)
+                        (_ (JNull)))
+                    kind (ji request "kind")]
+                (when (= kind 1) (set! (.actions-unavailable w) true))
+                (when (or (= kind 2) (= kind 3)) (set! (.action-editor w) true))))))
+      (network/close! (.allocator d) job))
+    (when (match (.view d) (ViewPersonal [] true) (ViewChat [] true) (_ false))
+      (when (not (= (.actions-project w) (project d)))
+        (own! d (field w actions-project) (project d))
+        (own! d (field w action-output) "")
+        (own! d (field w action-error) "")
+        (snap-reset! (field w actions))
+        (set! (.actions-unavailable w) true)
+        (set! (.action-editor w) false)
+        (own! d (field w action-pending) "")
+        (set! (.action-selected w) 0)
+        (set! (.actions-polled w) 0))
+      (when (and (= (cast i64 (.action-job w)) 0)
+                 (> (len (.action-pending w)) 0))
+        (let [pending
+                (match (jv-parse (allocator (field d io)) (.action-pending w))
+                  (Some [v] v)
+                  (_ (JNull)))
+              same (= (.action-pending-project w) (project d))]
+          (when same (request! d (ji pending "kind") (jv-get pending "args")))
+          (own! d (field w action-pending) "")))
+      (when (and (> (len (project d)) 0)
+                 (.sidebar-visible w)
+                 (= (cast i64 (.action-job w)) 0)
+                 (>= (- (.now d) (.actions-polled w)) 750))
+        (set! (.actions-polled w) (.now d))
+        (request! d 1 (jv-object (allocator (field d io))))))
+    0))
+
+(defn selected [(d (ptr Dash))] (-> JVal)
+  (let [w (field d workbench)]
+    (jv-nth (jv-get (.value (field w actions)) "actions") (.action-selected w))))
+
+(defn activate! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        a (allocator (field d io))
+        action (selected d)
+        run (jv-get action "run")
+        args (jv-object a)]
+    (when (not (jv-null? action))
+      (own! d (field w action-error) "")
+      (if (actions/active? run)
+          (do (jv-put! args "run_id" (jv-get run "run_id")) (request! d 7 args))
+          (do
+            (jv-put! args "action_id" (jv-get action "id"))
+            (jv-put! args
+                     "expected_revision"
+                     (jv-get (.value (field w actions)) "token"))
+            (request! d 4 args))))
+    0))
+
+(defn output! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        id (js (jv-get (selected d) "run") "run_id")]
+    (own! d (field w action-output) (if (= id (.action-output w)) "" id))
+    (set! (.actions-polled w) 0)
+    0))
+
+(defn edit! [(d (ptr Dash)) (new bool)] (-> i64)
+  (block :edit
+    (when (or (.action-mutating (.workbench d))
+              (> (len (.action-pending (.workbench d))) 0))
+      (return-from :edit 0))
+    (when (or (.actions-unavailable (.workbench d))
+              (= (js (.value (field (field d workbench) actions)) "token") ""))
+      (own! d
+            (field (field d workbench) action-error)
+            "Load a valid actions configuration before editing.")
+      (return-from :edit 0))
+    (let [w (field d workbench)
+          action (if new (JNull) (selected d))]
+      (let [a (snap-spare (field w action-edit-doc))]
+        (snap-commit! (field w action-edit-doc) (jv-clone a action) (.now d)))
+      (own! d (field w action-original) (js action "id"))
+      (own! d (field w action-token) (js (.value (field w actions)) "token"))
+      (for i (range 0 4)
+        (input-set-text! (index (field w action-fields) i)
+                         (js action (get ["id" "label" "command" "cwd"] i))))
+      (set! (.action-field w) 0)
+      (set! (.action-editor w) true)
+      0)))
+
+(defn save-editor! [(d (ptr Dash)) (remove bool)] (-> i64)
+  (let [w (field d workbench)
+        a (allocator (field d io))
+        args (jv-object a)
+        action
+          (jv-clone a
+                    (if (= (.action-original w) "") (jv-object a) (selected d)))
+        id (input-text (index (field w action-fields) 0))]
+    (jv-put! args "expected_revision" (JStr (.action-token w)))
+    (if remove
+        (do
+          (jv-put! args "action_id" (JStr (.action-original w)))
+          (request! d 3 args))
+        (if (and (> (len (.action-original w)) 0)
+                 (not (= id (.action-original w))))
+            (own! d
+                  (field w action-error)
+                  "An existing action's id cannot be changed. Create a new action instead.")
+            (let [saved (jv-object a)]
+              (for key (iter ["description" "env" "order"])
+                (when (not (jv-null? (jv-get action key)))
+                  (jv-put! saved key (jv-get action key))))
+              (for i (range 0 4)
+                (jv-put! saved
+                         (get ["id" "label" "command" "cwd"] i)
+                         (JStr (input-text (index (field w action-fields) i)))))
+              (jv-put! args "action" saved)
+              (request! d 2 args))))
+    (when (or (!= (cast i64 (.action-job w)) 0) (> (len (.action-pending w)) 0))
+      (set! (.action-editor w) false))
+    0))
+
+(defn editor-key! [(d (ptr Dash)) (key Key)] (-> i64)
+  (let [w (field d workbench)]
+    (match key
+      (Escape [] (set! (.action-editor w) false))
+      (Tab [] (set! (.action-field w) (% (+ (.action-field w) 1) 4)))
+      (BackTab [] (set! (.action-field w) (% (+ (.action-field w) 3) 4)))
+      (Enter [] (save-editor! d false))
+      (Ctrl [letter]
+            (if (= letter #\d)
+                (save-editor! d true)
+                (input-handle-key! (index (field w action-fields)
+                                          (.action-field w))
+                                   key)))
+      (_ (input-handle-key! (index (field w action-fields) (.action-field w))
+                            key)))
+    0))
+
+(defn key! [(d (ptr Dash)) (key Key)] (-> bool)
+  (let [w (field d workbench)
+        count (jv-count (jv-get (.value (field w actions)) "actions"))]
+    (match key
+      (Tab []
+           (when (> count 0)
+             (set! (.action-selected w) (% (+ (.action-selected w) 1) count))
+             (reveal! d))
+           true)
+      (BackTab []
+               (when (> count 0)
+                 (set! (.action-selected w)
+                       (% (+ (.action-selected w) (- count 1)) count))
+                 (reveal! d))
+               true)
+      (Enter [] (activate! d) true)
+      (Char [c]
+            (cond (= c #\o) (do (output! d) true)
+                  (= c #\n) (do (edit! d true) true)
+                  (= c #\e) (do (edit! d false) true)
+                  :else false))
+      (_ false))))
+
+(defn draw-editor! [(d (ptr Dash)) (c (ptr Canvas))] (-> i64)
+  (let [w (field d workbench)
+        theme (.theme d)
+        r (rect-center (canvas-rect c) 86 13)
+        (mut opts) (panel-opts theme "Project action" true)]
+    (canvas-hide-cursor! c)
+    (fill! c r 32 (style-default))
+    (set! (.footer opts) "Enter save · Ctrl-D delete · Esc cancel")
+    (let [inner (rect-inset-xy (draw-box! c r opts) 1 1)]
+      (for i (range 0 4)
+        (let [y (+ (.y inner) (* i 2))]
+          (put-text-ellipsis! c
+                              inner
+                              (.x inner)
+                              y
+                              (get ["Id" "Label" "Command" "Directory"] i)
+                              (.muted theme))
+          (draw-input! c
+                       (rect (+ (.x inner) 11) y (- (.w inner) 11) 1)
+                       (index (field w action-fields) i)
+                       (.text theme)
+                       (get ["dev"
+                             "Run application"
+                             "npm run dev"
+                             ". (relative to project)"]
+                            i)
+                       (.subtle theme)
+                       (= (.action-field w) i))))
+      (put-text-ellipsis! c
+                          inner
+                          (.x inner)
+                          (+ (.y inner) 8)
+                          (.action-error w)
+                          (.error theme)))
+    0))
+
+(defn click! [(d (ptr Dash)) (x i64) (y i64)] (-> bool)
+  (let [w (field d workbench)
+        r (rect-inset-xy (.context-r w) 2 1)
+        hits (.value (field w action-hits))
+        row (+ (- y (.y r)) (.offset (.sidebar-sv w)))
+        column (- x (.x r))]
+    (if (not (rect-contains? r x y))
+        false
+        (block :hit
+          (set! (.sidebar-focus w) true)
+          (for i (range 0 (jv-count hits))
+            (let [hit (jv-nth hits i)
+                  start (ji hit "column")
+                  kind (js hit "kind")
+                  action (jv-get hit "action")
+                  args (jv-object (allocator (field d io)))]
+              (when (and (= row (ji hit "row"))
+                         (>= column start)
+                         (< column (+ start (if (= kind "new") 12 6))))
+                (when (not (= (js hit "project") (project d)))
+                  (set! (.actions-polled w) 0)
+                  (return-from :hit true))
+                (let [list (jv-get (.value (field w actions)) "actions")
+                      (mut found) false]
+                  (for n (range 0 (jv-count list))
+                    (when (= (js (jv-nth list n) "id") (js action "id"))
+                      (set! (.action-selected w) n)
+                      (set! found true)))
+                  (when (or (= kind "new") (load found))
+                    (cond (= kind "new") (edit! d true)
+                          (= kind "edit") (edit! d false)
+                          (= kind "output")
+                            (do
+                              (let [id (js (jv-get action "run") "run_id")]
+                                (own! d
+                                      (field w action-output)
+                                      (if (= id (.action-output w)) "" id)))
+                              (set! (.actions-polled w) 0))
+                          :else
+                            (do
+                              (own! d (field w action-error) "")
+                              (if (actions/active? (jv-get action "run"))
+                                  (do
+                                    (jv-put! args
+                                             "run_id"
+                                             (jv-get (jv-get action "run")
+                                                     "run_id"))
+                                    (request! d 7 args))
+                                  (do
+                                    (jv-put! args
+                                             "action_id"
+                                             (jv-get action "id"))
+                                    (jv-put! args
+                                             "expected_revision"
+                                             (jv-get hit "token"))
+                                    (request! d 4 args)))))))
+                (return-from :hit true))))
+          true))))
+
+(defn reveal! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        hits (.value (field w action-hits))
+        id (js (selected d) "id")]
+    (for i (range 0 (jv-count hits))
+      (let [hit (jv-nth hits i)
+            row (ji hit "row")
+            sv (field w sidebar-sv)]
+        (when (and (= (js hit "kind") "run")
+                   (= (js (jv-get hit "action") "id") id))
+          (cond (< row (.offset sv))
+                  (set! (.offset sv) (if (> row 2) (- row 2) 0))
+                (>= row (+ (.offset sv) (.height sv)))
+                  (set! (.offset sv) (+ (- row (.height sv)) 2))
+                :else 0))))
+    0))

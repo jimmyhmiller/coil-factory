@@ -16,6 +16,10 @@
   ;;; The instructions the agent works under. Called before the first run of
   ;;; a new conversation (not after a restore).
   (harness-add-system! [(self (ptr Self)) (text (slice u8))] (-> i64))
+  ;;; Historical context for a new native conversation. External harnesses send
+  ;;; this over stdin before the first user message, without mirroring it as a
+  ;;; new user turn. Checkpoints retain it until the native session exists.
+  (harness-add-context! [(self (ptr Self)) (text (slice u8))] (-> i64))
   ;;; A message from the person's side, delivered at the start of the next run.
   (harness-add-user! [(self (ptr Self)) (text (slice u8))] (-> i64))
   ;;; Work until the agent calls the stop tool, replies without calling any
@@ -31,12 +35,14 @@
 ;;; messages.
 (impl Harness Agent
   (harness-add-system! [(self (ptr Agent)) (text (slice u8))] (-> i64)
-                       (agent-add-system! self text))
+    (agent-add-system! self text))
+  (harness-add-context! [(self (ptr Agent)) (text (slice u8))] (-> i64)
+    (agent-add-system! self text))
   (harness-add-user! [(self (ptr Agent)) (text (slice u8))] (-> i64)
-                     (agent-add-user! self text))
+    (agent-add-user! self text))
   (harness-run! [(self (ptr Agent))] (-> AgentStop)
-                (agent-run! self))
+    (agent-run! self))
   (harness-checkpoint [(self (ptr Agent)) (a (dyn Allocator))] (-> (slice u8))
-                      (agent-transcript-json self a))
+    (agent-transcript-json self a))
   (harness-restore! [(self (ptr Agent)) (checkpoint (slice u8))] (-> bool)
-                    (agent-restore! self checkpoint)))
+    (agent-restore! self checkpoint)))

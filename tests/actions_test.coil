@@ -1,0 +1,41 @@
+(module factory.actions-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "factory.actions" :as actions)
+(import "factory.sidebar" :use [cat text])
+(import "factory.sidebar-test" :use [json ok])
+(import "factory.session-test" :use [fresh-home])
+(import "durable.atomic" :as disk)
+
+(deftest action-storage-and-stale-edits
+  (let [a (malloc-allocator)
+        home (fresh-home a "actions")
+        empty (ok (actions/operate a home home "none" 1 (jv-object a)))
+        args (jv-object a)]
+    (jv-put! args "expected_revision" (jv-get empty "token"))
+    (jv-put! args
+             "action"
+             (json a
+                   "{\"id\":\"dev\",\"label\":\"Run application\",\"command\":\"echo hello\"}"))
+    (let [saved (ok (actions/operate a home home "none" 2 args))]
+      (assert-eq (jv-count (jv-get saved "actions")) 1)
+      (assert (match (actions/operate a home home "none" 2 args)
+                (Err [_] true)
+                (_ false)))
+      (assert-eq (jv-int (jv-get saved "revision")) 1))))
+
+(deftest invalid-actions-and-workspace-escapes
+  (let [a (malloc-allocator)
+        home (fresh-home a "actions-invalid")
+        doc (ok (actions/config a home))]
+    (for raw (iter ["{\"id\":\"../bad\",\"label\":\"x\",\"command\":\"true\"}"
+                    "{\"id\":\"dev\",\"label\":\"x\",\"command\":\"true\",\"cwd\":\"..\"}"
+                    "{\"id\":\"dev\",\"label\":\"x\",\"command\":\"true\",\"env\":{\"BAD;X\":\"x\"}}"])
+      (let [args (jv-object a)]
+        (jv-put! args "expected_revision" (jv-get doc "token"))
+        (jv-put! args "action" (json a raw))
+        (assert (match (actions/operate a home home "none" 2 args)
+                  (Err [_] true)
+                  (_ false)))))))

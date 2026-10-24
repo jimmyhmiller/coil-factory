@@ -57,15 +57,15 @@
    (cell-id (slice u8))
    (markdown (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         Note)
 
 (defstruct Delivery
   [(id (slice u8)) (cell-id (slice u8)) (delivered i64) (principal (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         Delivery)
 
 ;;; A note as the function lists it: with its delivery, or none yet.
@@ -77,14 +77,14 @@
    (markdown (slice u8))
    (delivered (Option Delivery))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         NoteListing)
 
 (defstruct DeliveryUpload [(cell-id (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         DeliveryUpload)
 
 ;;; Every cell id the factory writes starts with this, so it never replaces a
@@ -114,8 +114,8 @@
    (notebooks (ArrayList (slice u8)))
    (state-dir (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         MacConfig)
 
 (defstruct SnapshotRecord [(day (slice u8)) (id (slice u8)) (cells i64)])
@@ -128,8 +128,8 @@
    ;;; The latest thirty.
    (snapshots (ArrayList SnapshotRecord))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         MacState)
 
 ;; ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@
   ;;; false holds new triage and bug runs; runs already going finish.
   [(enabled bool)
    (state-dir (slice u8))
-   ;;; This factory's own native site (`factory daemon` with FACTORY_HOME here).
+   ;;; Shared native factory site; the controller owns only its workflow state.
    (site-home (slice u8))
    (port i64)
    ;;; This program, which the station gates run as `PROGRAM gate ...`.
@@ -174,8 +174,8 @@
    (approvals-url (slice u8))
    (approvals-token-file (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         ServerConfig)
 
 ;;; A native factory run the controller is watching.
@@ -200,8 +200,8 @@
    ;;; Why the controller stopped it, or why it ended badly; "" while fine.
    (failure (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         RunWatch)
 
 (defn new-watch [(tag (slice u8)) (request (slice u8)) (now i64)] (-> RunWatch)
@@ -250,8 +250,8 @@
    (not-a-bug i64)
    (events (ArrayList Event))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         Triage)
 
 ;;; `ScopeReview`: triage judged it out of Coil's scope (SCOPE.md), and Jimmy
@@ -340,8 +340,8 @@
    (scope-comment (slice u8))
    (events (ArrayList Event))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case)
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase))
                      (field other-bugs (default ""))
                      (field scope-rule (default ""))
                      (field scope-reason (default ""))
@@ -389,8 +389,8 @@
    ;;; What the last status note said, so a note is written only on a change.
    (status-summary (slice u8))])
 
-(derive (Serialize (rename-all :snake_case))
-        (Deserialize (rename-all :snake_case))
+(derive (Serialize (rename-all (SnakeCase)))
+        (Deserialize (rename-all (SnakeCase)))
         ServerState)
 
 (defn empty-repro [(a (dyn Allocator))] (-> Repro)

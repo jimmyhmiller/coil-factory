@@ -1,0 +1,112 @@
+;;; Explicit live check (uses installed Claude/Codex logins):
+;;; coil build && coil test tests/live/model_switch_live.coil
+(module factory.model-switch-live)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [trim])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "factory.events" :use *)
+(import "factory.journal" :use *)
+(import "factory.session" :as session)
+(import "factory.model-catalog" :as catalog)
+(import "factory.proc" :as proc)
+(import "factory.session-test" :use [fresh-home])
+
+(defn turn! [(a (dyn Allocator))
+             (home (slice u8))
+             (id (slice u8))
+             (message (slice u8))] (-> JVal)
+  (match (append-record! a
+                         (session/path a home id "inbox.jsonl")
+                         (ev-str! (ev a "message.sent") "text" message))
+    (AppendedAt [_] 0)
+    (_ (assert false)))
+  (let [result
+          (proc/capture a
+                        "./build/release/factory"
+                        ["_session" home id]
+                        ""
+                        180000)
+        state (session/info a home id)]
+    (when (not (.ok result))
+      (println "Worker error: {s}" (session/str state "error"))
+      (println "Worker stderr: {s}" (.error result)))
+    (assert (.ok result))
+    (assert (= (session/str state "status") "idle"))
+    state))
+
+(defn last-reply [(a (dyn Allocator)) (state JVal)] (-> (slice u8))
+  (let [checkpoint
+          (match (jv-parse a (session/str state "checkpoint"))
+            (Some [v] v)
+            (_ (do (assert false) (JNull))))
+        messages (jv-get checkpoint "messages")
+        (mut reply) ""]
+    (for i (range 0 (jv-count messages))
+      (let [message (jv-nth messages i)]
+        (when (= (session/str message "role") "assistant")
+          (set! reply (session/str message "content")))))
+    (trim (load reply))))
+
+(deftest live-switches-between-claude-and-codex-and-retains-the-conversation
+  (let [a (malloc-allocator)
+        home (fresh-home a "live-model-switch")
+        id
+          (match (session/create! a
+                                  home
+                                  "claude"
+                                  "haiku"
+                                  home
+                                  "Live model switching")
+            (Ok [id] id)
+            (_ (do (assert false) "")))
+        first
+          (turn! a
+                 home
+                 id
+                 "Remember the private marker ORCHID-4927. Reply only with that marker. Do not use tools.")]
+    (assert (= (last-reply a first) "ORCHID-4927"))
+    (assert (match (session/select-model! a home id "codex" "")
+              (Ok [_] true)
+              (_ false)))
+    (let [second
+            (turn! a
+                   home
+                   id
+                   "What private marker did I ask you to remember? Reply only with it. Do not use tools.")]
+      (assert (= (session/str second "harness") "codex"))
+      (assert (= (last-reply a second) "ORCHID-4927")))
+    (assert (match (session/select-model! a home id "claude" "sonnet")
+              (Ok [_] true)
+              (_ false)))
+    (let [third
+            (turn! a
+                   home
+                   id
+                   "Repeat the private marker from earlier. Reply only with it. Do not use tools.")]
+      (assert (= (session/str third "harness") "claude"))
+      (assert (= (session/str third "model") "sonnet"))
+      (assert (= (last-reply a third) "ORCHID-4927")))
+    (assert-eq (jv-count (session/list-sessions a home)) 1)))
+
+(deftest live-claude-discovery-reads-versioned-models-from-the-installed-cli
+  (let [a (malloc-allocator)
+        program
+          (match (proc/search-path a "claude")
+            (Some [p] p)
+            (_ (do (assert false) "")))
+        models
+          (match (catalog/discover-claude a program "/private/tmp")
+            (Ok [models] models)
+            (Err [why] (do (println "{s}" why) (assert false) (JNull))))
+        choices (jv-array a)]
+    (catalog/add-claude! a choices models)
+    (assert (> (jv-count choices) 0))
+    (for i (range 0 (jv-count choices))
+      (let [choice (jv-nth choices i)
+            model (session/str choice "model")]
+        (assert (not (= model "opus")))
+        (assert (not (= model "sonnet")))
+        (assert (not (= model "haiku")))
+        (println "{s} · {s}" (session/str choice "label") model)))))

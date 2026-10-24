@@ -22,7 +22,7 @@
 ;;; bracketed paste; its text borrows the reader's (or decoded buffer's) storage
 ;;; and is valid until the next read. `Resize` reports the new size. `NoKey`
 ;;; means the timeout elapsed. `Eof` means standard input closed. `Unknown` is a
-;;; complete escape sequence this decoder does not map (focus, mouse, …).
+;;; complete escape sequence this decoder does not map (focus, clicks, …).
 (defsum Key
   (Char [(rune i64)])
   (Enter)
@@ -49,6 +49,11 @@
   (WordLeft)
   (WordRight)
   (Paste [(text (slice u8))])
+  ;;; One wheel step; rows is -1 up or +1 down, coordinates are zero-based.
+  (Scroll [(rows i64) (x i64) (y i64)])
+  (Click [(x i64) (y i64)])
+  (Drag [(x i64) (y i64)])
+  (Release [(x i64) (y i64)])
   (Resize [(width i64) (height i64)])
   (NoKey)
   (Eof)
@@ -211,11 +216,34 @@
   (and (> modifier 1)
        (!= (& (- modifier 1) 6) 0)))
 
+(defn keys--wheel [(button i64) (x i64) (y i64)] (-> Key)
+  (if (and (>= button 0)
+           (= (& button 192) 64)
+           (< (& button 3) 2)
+           (> x 0)
+           (> y 0))
+      (Scroll (if (= (& button 3) 0) -1 1) (- x 1) (- y 1))
+      (if (and (= (& button 227) 32) (> x 0) (> y 0))
+          (Drag (- x 1) (- y 1))
+          (if (and (= (& button 227) 3) (> x 0) (> y 0))
+              (Release (- x 1) (- y 1))
+              (if (and (= (& button 227) 0) (> x 0) (> y 0))
+                  (Click (- x 1) (- y 1))
+                  (Unknown))))))
+
 (defn keys--csi-key [(csi Csi)] (-> Key)
   (let [f (.final csi)
         p0 (.p0 csi)
         p1 (.p1 csi)]
-    (cond (!= (.private csi) 0) (Unknown)
+    (cond (and (= (.private csi) #\<)
+               (= (.count csi) 3)
+               (= f #\m)
+               (> p1 0)
+               (> (.p2 csi) 0))
+            (Release (- p1 1) (- (.p2 csi) 1))
+          (and (= (.private csi) #\<) (= (.count csi) 3) (= f #\M))
+            (keys--wheel p0 p1 (.p2 csi))
+          (!= (.private csi) 0) (Unknown)
           (= f #\A) (Up)
           (= f #\B) (Down)
           (= f #\C) (if (keys--word-modifier? p1) (WordRight) (Right))
@@ -279,6 +307,13 @@
                   (Decoded (Paste (subslice bytes (len PASTE-START) end))
                            (+ end (len PASTE-END)))))
           (and (not final) (keys--partial-of? bytes PASTE-START)) (Incomplete)
+          (keys--starts-with? bytes 0 "\x1b;[M")
+            (if (< n 6)
+                (if final (Decoded (Unknown) n) (Incomplete))
+                (Decoded (keys--wheel (- (keys--byte bytes 3) 32)
+                                      (- (keys--byte bytes 4) 32)
+                                      (- (keys--byte bytes 5) 32))
+                         6))
           (= (keys--byte bytes 1) #\[)
             (let [csi (keys--parse-csi bytes)]
               (cond (> (.length csi) 0)

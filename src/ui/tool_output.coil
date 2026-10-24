@@ -1,0 +1,128 @@
+(module factory.ui.tool-output)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [StrBuf])
+(import "coil.serde.value" :use *)
+(import "agent.json" :use [jv-parse jv-encode])
+(import "factory.ui.fmt" :use [concat int-text js first-line])
+
+(defstruct Output [(text (slice u8)) (status (slice u8))])
+
+;;; Format parsed JSON, respecting quoted strings and escape sequences.
+(defn pretty [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
+  (let [encoded (jv-encode a value)
+        (mut out) (StrBuf::new a)
+        (mut quoted) false
+        (mut escaped) false
+        (mut indent) 0]
+    (for i (range 0 (len encoded))
+      (let [ch (cast i64 (get encoded i))
+            prev (if (> i 0) (cast i64 (get encoded (- i 1))) 0)
+            next
+              (if (< (+ i 1) (len encoded)) (cast i64 (get encoded (+ i 1))) 0)]
+        (cond (load quoted)
+                (do
+                  (push-str! (mut out) (subslice encoded i (+ i 1)))
+                  (cond (load escaped) (set! escaped false)
+                        (= ch 92) (set! escaped true)
+                        (= ch 34) (set! quoted false)
+                        :else 0))
+              (= ch 34)
+                (do
+                  (push-str! (mut out) (subslice encoded i (+ i 1)))
+                  (set! quoted true))
+              (or (= ch 123) (= ch 91))
+                (do
+                  (push-str! (mut out) (subslice encoded i (+ i 1)))
+                  (set! indent (+ (load indent) 1))
+                  (when (not (or (= next 125) (= next 93)))
+                    (push-str! (mut out) "\n")
+                    (for j (range 0 (* (load indent) 2))
+                      (push-str! (mut out) " "))))
+              (or (= ch 125) (= ch 93))
+                (do
+                  (set! indent (- (load indent) 1))
+                  (when (not (or (= prev 123) (= prev 91)))
+                    (push-str! (mut out) "\n")
+                    (for j (range 0 (* (load indent) 2))
+                      (push-str! (mut out) " ")))
+                  (push-str! (mut out) (subslice encoded i (+ i 1))))
+              (= ch 44)
+                (do
+                  (push-str! (mut out) ",\n")
+                  (for j (range 0 (* (load indent) 2))
+                    (push-str! (mut out) " ")))
+              (= ch 58) (push-str! (mut out) ": ")
+              :else (push-str! (mut out) (subslice encoded i (+ i 1))))))
+    (finish! (mut out))))
+
+(defn content-text [(a (dyn Allocator)) (value JVal)] (-> (slice u8))
+  (match value
+    (JStr [text] text)
+    (_ (pretty a value))))
+
+(defn format-text [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (match (jv-parse a text)
+    (Some [v]
+          (match v (JObj [_] (pretty a v)) (JArr [_] (pretty a v)) (_ text)))
+    (_ text)))
+
+(defn present [(a (dyn Allocator)) (raw (slice u8))] (-> Output)
+  (match (jv-parse a raw)
+    (None [] (Output :text raw :status ""))
+    (Some [v]
+          (let [exit (jv-get v "exit_code")
+                stdout (jv-get v "stdout")
+                stderr (jv-get v "stderr")
+                output (jv-get v "output")
+                content (jv-get v "content")
+                status
+                  (match exit
+                    (JInt [n] (concat a ["exit " (int-text a n)]))
+                    (_ ""))]
+            (cond (and (not (jv-null? exit))
+                       (or (match stdout (JStr [_] true) (_ false))
+                           (match output (JStr [_] true) (_ false))))
+                    (let [body
+                            (if (jv-null? stdout)
+                                (js v "output")
+                                (js v "stdout"))
+                          err (js v "stderr")]
+                      (Output
+                        :text
+                          (concat a
+                                  [(format-text a body)
+                                   (if (> (len err) 0)
+                                       (concat a ["\nstderr:\n" err])
+                                       "")])
+                        :status status))
+                  (match v (JStr [_] true) (_ false))
+                    (Output :text (jv-str v) :status "")
+                  (match content (JArr [_] true) (_ false))
+                    (let [(mut parts) (ArrayList::new [(slice u8)] a)
+                          (mut all-text) true]
+                      (for i (range 0 (jv-len content))
+                        (let [block (jv-nth content i)]
+                          (if (= (js block "type") "text")
+                              (push! (mut parts)
+                                     (format-text a (js block "text")))
+                              (set! all-text false))
+                          (when (< (+ i 1) (jv-len content))
+                            (push! (mut parts) "\n"))))
+                      (Output
+                        :text
+                          (if (load all-text)
+                              (concat a (slice parts))
+                              (pretty a v))
+                        :status
+                          (if (match (jv-get v "isError")
+                                (JBool [b] b)
+                                (_ false))
+                              "error"
+                              "")))
+                  :else (Output :text (pretty a v) :status ""))))))
+
+(defn summary [(a (dyn Allocator)) (raw (slice u8))] (-> (slice u8))
+  (let [out (present a raw)]
+    (if (> (len (.status out)) 0) (.status out) (first-line (.text out)))))

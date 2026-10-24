@@ -1,0 +1,72 @@
+(module factory.site-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "durable.atomic" :as atomic)
+(import "factory.site" :as site)
+(import "factory.config" :use *)
+(import "factory.proc" :as proc)
+(import "factory.session-test" :use [fresh-home])
+(import "agent.loop" :use [sleep-ms])
+
+(defn number [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)] (push-i64! (mut out) n) (finish! (mut out))))
+
+(defn queued-site [(a (dyn Allocator))
+                   (home (slice u8))
+                   (limit i64)
+                   (count i64)]
+  (-> (ptr site/Site))
+  (let [(mut config) (zeroed SiteConfig)
+        program (path-join a home "worker")]
+    (set! (.max-runs config) limit)
+    (match (atomic/write-file-atomic! a
+                                      program
+                                      "#!/bin/sh\ni=0\nwhile [ ! -f \"$0.release\" ] && [ \"$i\" -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n"
+                                      493)
+      (Ok [_] 0)
+      (_ (assert false)))
+    (let [s (site/site-open a home config "" program)]
+      (for i (range 0 count)
+        (let [entry (site/entry-new a (number a i))]
+          (set! (.status (.state entry)) "queued")
+          (push! (mut (.runs s)) entry)))
+      s)))
+
+(defn alive-count [(s (ptr site/Site))] (-> i64)
+  (let [(mut count) 0]
+    (for entry (iter (.runs s))
+      (when (site/entry-alive? s entry) (set! count (+ (load count) 1)) 0))
+    (load count)))
+
+(defn release! [(a (dyn Allocator)) (s (ptr site/Site))] (-> i64)
+  (match (atomic/write-file-atomic! a
+                                    (path-join a (.home s) "worker.release")
+                                    ""
+                                    384)
+    (Ok [_] 0)
+    (_ (assert false)))
+  (let [(mut attempts) 0]
+    (loop (when (or (= (alive-count s) 0) (> (load attempts) 100)) (break))
+      (sleep-ms 10)
+      (set! attempts (+ (load attempts) 1))))
+  (assert-eq (alive-count s) 0)
+  0)
+
+(deftest unlimited-site-starts-64-independent-runs-in-one-supervision-pass
+  (let [a (malloc-allocator)
+        s (queued-site a (fresh-home a "parallel-site") 0 64)]
+    (site/supervise! s)
+    (let [alive (alive-count s)]
+      (release! a s)
+      (assert-eq alive 64))))
+
+(deftest optional-limit-counts-workers-before-their-first-journal-update
+  (let [a (malloc-allocator)
+        s (queued-site a (fresh-home a "limited-site") 2 8)]
+    (site/supervise! s)
+    (site/supervise! s)
+    (let [alive (alive-count s)]
+      (release! a s)
+      (assert-eq alive 2))))

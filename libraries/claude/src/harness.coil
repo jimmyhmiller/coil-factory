@@ -35,6 +35,7 @@
    (control (dyn AgentControl))
    (session (slice u8))
    (system (slice u8))
+   (context (slice u8))
    (pending (ArrayList (slice u8)))
    (inbound (ArrayList Inbound))
    (messages JVal)
@@ -51,6 +52,7 @@
     :control control
     :session ""
     :system ""
+    :context ""
     :pending (ArrayList::new [(slice u8)] a)
     :inbound (ArrayList::new [Inbound] a)
     :messages (jv-array a)
@@ -497,6 +499,9 @@
         (mut arrived) (control-inbox (.control h) a)]
     (for message (iter arrived) (push! (mut (.inbound h)) message))
     (free! (mut arrived))
+    (when (and (= (len (.session h)) 0) (> (len (.context h)) 0))
+      (push-str! (mut prompt) (.context h))
+      (push-str! (mut prompt) "\n\n"))
     (for text (iter (.pending h))
       (push-str! (mut prompt) text)
       (push-str! (mut prompt) "\n\n")
@@ -628,6 +633,7 @@
     (jv-put! root "harness" (JStr "claude"))
     (jv-put! root "session" (JStr (.session h)))
     (jv-put! root "system" (JStr (.system h)))
+    (jv-put! root "context" (JStr (.context h)))
     (jv-put! root "messages" (.messages h))
     (jv-put! root "pending" pending)
     (jv-put! root "inbound" inbound)
@@ -674,6 +680,8 @@
                         (copy-bytes a (jv-string-or (jv-get root "session") "")))
                   (set! (.system h)
                         (copy-bytes a (jv-string-or (jv-get root "system") "")))
+                  (set! (.context h)
+                        (copy-bytes a (jv-string-or (jv-get root "context") "")))
                   (set! (.messages h) (jv-clone a (jv-get root "messages")))
                   (set! (.turns h) (jv-int (jv-get root "turns")))
                   (clear! (mut (.pending h)))
@@ -706,6 +714,9 @@
   (harness-add-system! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> i64)
     (set! (.system self) (copy-bytes (.allocator self) text))
     (mirror-text! self "system" text))
+  (harness-add-context! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> i64)
+    (set! (.context self) (copy-bytes (.allocator self) text))
+    0)
   (harness-add-user! [(self (ptr ClaudeHarness)) (text (slice u8))] (-> i64)
     (push! (mut (.pending self)) (copy-bytes (.allocator self) text))
     0)

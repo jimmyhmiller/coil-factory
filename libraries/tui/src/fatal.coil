@@ -1,6 +1,6 @@
 (module tui.fatal)
-(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
 (import "coil.slice" :use *)
 
 (extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))

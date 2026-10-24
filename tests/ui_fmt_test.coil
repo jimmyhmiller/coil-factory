@@ -52,3 +52,18 @@
     (assert (= (tool-glyph "glob") "\x2315;"))
     (assert (= (first-line "\n  hello  \nworld") "hello"))
     (assert-eq (line-count "a\nb\n") 2)))
+
+(deftest native-tool-calls-render-commands-and-paths-instead-of-json-arguments
+  (let [a (malloc-allocator)]
+    (assert-eq (tool-glyph "Bash") "$")
+    (assert-eq (tool-subject a "Bash" "{\"command\":\"ls -la\"}") "ls -la")
+    (assert-eq (tool-subject a "Read" "{\"file_path\":\"src/main.coil\"}")
+               "src/main.coil")
+    (assert-eq (tool-subject a "exec_command" "{\"cmd\":\"coil test\"}")
+               "coil test")
+    (assert-eq (tool-summary-text a "Bash" "Bash {\"command\":\"ls -la\"}")
+               "ls -la")
+    (assert-eq (tool-summary-text a
+                                  "Read"
+                                  "Read {\"file_path\":\"src/main.coil\"}")
+               "src/main.coil")))

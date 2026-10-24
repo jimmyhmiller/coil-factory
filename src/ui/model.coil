@@ -357,7 +357,7 @@
        [(HelpRow :key "ctrl-p" :what "search commands from any view")
         (HelpRow :key "ctrl-n" :what "new personal conversation")
         (HelpRow :key "ctrl-f" :what "switch conversation / factory activity")
-        (HelpRow :key "ctrl-k" :what "connect local, HTTP or SSH factory")
+        (HelpRow :key "/connect" :what "connect local, HTTP or SSH factory")
         (HelpRow :key "ctrl-g" :what "choose project, harness and model")
         (HelpRow :key "ctrl-b" :what "select a saved conversation")
         (HelpRow :key "ctrl-x" :what "cancel the current personal turn")
@@ -378,7 +378,7 @@
         (HelpRow
           :key "ctrl-o"
           :what "expand checkpointed tool arguments and results (chat)")
-        (HelpRow :key "esc" :what "back")
+        (HelpRow :key "esc" :what "interrupt assistant / close overlay")
         (HelpRow :key "q  ctrl-c" :what "quit")])
 
 (defn draw-help! [(d (ptr Dash)) (c (ptr Canvas))] (-> i64)

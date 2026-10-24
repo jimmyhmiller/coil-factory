@@ -6,6 +6,8 @@
 (import "coil.serde.value" :use *)
 (import "agent.json" :use [copy-bytes])
 (import "tui.canvas" :use *)
+(import "factory.ui.markdown" :as markdown)
+(import "factory.ui.tool-output" :as tool-output)
 (import "tui.width" :use [text-width])
 (import "tui.widgets" :use *)
 (import "factory.ui.fmt" :use *)
@@ -30,7 +32,8 @@
    (text (slice u8))
    (tone Tone)
    (suffix (slice u8))
-   (suffix-tone Tone)])
+   (suffix-tone Tone)
+   (rich (slice markdown/Span))])
 
 (defn line [(gutter (slice u8))
             (gutter-tone Tone)
@@ -42,7 +45,27 @@
     :text text
     :tone tone
     :suffix ""
-    :suffix-tone (ToneMuted)))
+    :suffix-tone (ToneMuted)
+    :rich []))
+
+(defn draw-rich! [(c (ptr Canvas))
+                  (r Rect)
+                  (x i64)
+                  (y i64)
+                  (spans (slice markdown/Span))
+                  (theme Theme)
+                  (tone Tone)] (-> i64)
+  (let [(mut offset) 0]
+    (for span (iter spans)
+      (let [base
+              (cond (.code span)
+                      (with-bg (.accent-alt theme) (.bg (.selection theme)))
+                    (.link span) (.accent theme)
+                    :else (tone-style theme tone))
+            style (with-attrs base (.attrs span))]
+        (put-text! c r (+ x (load offset)) y (.text span) style)
+        (set! offset (+ (load offset) (text-width (.text span))))))
+    (load offset)))
 
 ;;; Draw the visible window of `lines` in `r`, following `sv` (sticky bottom).
 (defn draw-lines! [(c (ptr Canvas))
@@ -70,12 +93,20 @@
                                    (.gutter l)
                                    (tone-style theme (.gutter-tone l)))
                       tw
-                        (put-text-ellipsis! c
-                                            r
-                                            (+ (.x r) gw)
-                                            y
-                                            (.text l)
-                                            (tone-style theme (.tone l)))]
+                        (if (= (len (.rich l)) 0)
+                            (put-text-ellipsis! c
+                                                r
+                                                (+ (.x r) gw)
+                                                y
+                                                (.text l)
+                                                (tone-style theme (.tone l)))
+                            (draw-rich! c
+                                        r
+                                        (+ (.x r) gw)
+                                        y
+                                        (.rich l)
+                                        theme
+                                        (.tone l)))]
                   (when (> (len (.suffix l)) 0)
                     (put-text-ellipsis! c
                                         r
@@ -304,7 +335,8 @@
                                          (concat a
                                                  [(tool-glyph (js record "tool"))
                                                   " "
-                                                  (tool-summary-text (js record
+                                                  (tool-summary-text a
+                                                                     (js record
                                                                          "tool")
                                                                      (js record
                                                                          "summary"))])
@@ -608,7 +640,14 @@
 (defn b--said! [(b (ptr Builder)) (text (slice u8))] (-> i64)
   (when (> (len (trim text)) 0)
     (b--agent! b)
-    (b--body! b text "│ " (ToneAccent) (TonePlain) 0))
+    (for row (iter (markdown/render (.a b) text (- (.width b) 2)))
+      (let [(mut l)
+              (line (concat (.a b) ["│ " (.prefix row)])
+                    (ToneAccent)
+                    (.text row)
+                    (TonePlain))]
+        (set! (.rich l) (.spans row))
+        (b--push! b l))))
   0)
 
 (defn b--tool! [(b (ptr Builder))
@@ -624,9 +663,11 @@
               :text text
               :tone (ToneMuted)
               :suffix result
-              :suffix-tone result-tone))
-  (when (and (.details b) (> (len (trim output)) 0))
-    (b--body! b output "│   " (ToneAccent) (ToneSubtle) 12))
+              :suffix-tone result-tone
+              :rich []))
+  (when (> (len (trim output)) 0)
+    (let [shown (tool-output/present (.a b) output)]
+      (b--body! b (.text shown) "│   " (ToneAccent) (ToneSubtle) 6)))
   0)
 
 (defn b--event! [(b (ptr Builder))
@@ -692,7 +733,8 @@
                                                                            "arguments"))])
                                                 (concat a
                                                         ["→ "
-                                                         (first-line output)])
+                                                         (tool-output/summary a
+                                                                              output)])
                                                 (ToneSubtle)
                                                 output)
                                       (set! k (+ (load k) 1))))))

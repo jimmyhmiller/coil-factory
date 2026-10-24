@@ -1,4 +1,5 @@
 (module factory.ui.dashboard)
+(import "factory.ui.actions" :as project-actions)
 (import "coil.alloc" :use [Allocator free box!])
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -10,8 +11,10 @@
 (import "factory.config" :as config)
 (import "factory.proc" :as proc)
 (import "factory.session" :as session)
+(import "factory.model-catalog" :as catalog)
 (import "factory.client" :as client)
 (import "factory.ui.workbench" :as workbench)
+(import "factory.ui.sidebar-command" :as sidebar-command)
 (import "factory.ui.personal" :as personal)
 (import "factory.ui.network" :as network)
 (import "agent.json"
@@ -214,6 +217,8 @@
 ;;; twice a second).
 (defn poll! [(d (ptr Dash))] (-> i64)
   (poll-network! d)
+  (poll-models! d)
+  (project-actions/poll! d)
   (poll-personal! d)
   (poll-sidebar! d)
   (let [now (.now d)]
@@ -461,7 +466,12 @@
 (defn chat-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (let [chat (field d chat)]
     (match key
-      (Escape [] (do (back! d) (Continue)))
+      (Escape []
+              (do
+                (if (= (js (.value (field d run)) "status") "running")
+                    (post-run! d (.run chat) "pause" "interrupted")
+                    0)
+                (Continue)))
       (PageUp []
               (do
                 (scroll-up! (field chat sv)
@@ -496,12 +506,12 @@
     (ViewOverview [] (default-agent (selected-run d)))))
 
 (defn command-name [(id i64)] (-> (slice u8))
-  (if (and (> id 0) (<= id 24))
+  (if (and (> id 0) (<= id 26))
       (get ["factory"
             "open"
             "agent"
             "pause"
-            "resume"
+            "resume-run"
             "stop"
             "help"
             "quit"
@@ -512,20 +522,22 @@
             "settings"
             "connect"
             "local"
-            "history"
+            "resume"
             "cancel"
             "details"
             "remote"
             "start"
             "confirm"
             "dismiss"
-            "sidebar"
-            "sidebar-hide"]
+            ""
+            ""
+            "model"
+            "sidebars"]
            (- id 1))
       ""))
 
 (defn command-shortcut [(id i64)] (-> (slice u8))
-  (if (and (> id 0) (<= id 24))
+  (if (and (> id 0) (<= id 26))
       (get ["Ctrl-F"
             "Enter"
             "c"
@@ -539,7 +551,7 @@
             "Ctrl-N"
             "Ctrl-F"
             "Ctrl-G"
-            "Ctrl-K"
+            ""
             "Ctrl-L in connections"
             "Ctrl-B"
             "Ctrl-X"
@@ -548,7 +560,9 @@
             "Ctrl-S"
             "y"
             "Esc"
-            "Ctrl-Y"
+            ""
+            ""
+            ""
             ""]
            (- id 1))
       ""))
@@ -653,7 +667,7 @@
                           :enabled true)
                         (Command
                           :id 16
-                          :title "Saved conversations"
+                          :title "Resume conversation"
                           :detail "Choose a conversation"
                           :enabled true)
                         (Command
@@ -691,19 +705,17 @@
                           :detail "Dismiss stop confirmation"
                           :enabled (.confirm-stop d))
                         (Command
-                          :id 23
-                          :title "Focus saved context"
-                          :detail "Sections, results and lists"
+                          :id 25
+                          :title "Choose model"
+                          :detail
+                            "Switch model and harness in this conversation"
                           :enabled
-                            (match (.view d)
-                              (ViewPersonal [] true)
-                              (ViewChat [] true)
-                              (_ false)))
+                            (match (.view d) (ViewPersonal [] true) (_ false)))
                         (Command
-                          :id 24
-                          :title "Hide context sidebar"
-                          :detail "Give the conversation more room"
-                          :enabled (.sidebar-visible (.workbench d)))])
+                          :id 26
+                          :title "Configure sidebars"
+                          :detail "--hide, --show, --toggle left|right|all"
+                          :enabled true)])
       (push! (mut commands)
              (Command
                :id (.id command)
@@ -715,6 +727,12 @@
                           (.title command)])
                :detail (.detail command)
                :enabled (.enabled command))))
+    (push! (mut commands)
+           (Command
+             :id 16
+             :title "/history  Saved conversations"
+             :detail "Choose a conversation"
+             :enabled true))
     (load commands)))
 
 (defn command-selected! [(d (ptr Dash)) (id i64)] (-> AppFlow)
@@ -731,7 +749,8 @@
             (= id 14)
             (= id 16)
             (= id 19)
-            (= id 23))
+            (= id 25)
+            (= id 26))
     (set! (.settings-open (.workbench d)) false)
     (set! (.connections-open (.workbench d)) false)
     (set! (.inspection-open d) false)
@@ -801,12 +820,11 @@
               0)
             (Continue))
         (= id 22) (do (set! (.confirm-stop d) false) (Continue))
-        (= id 23) (do (focus-sidebar! d) (Continue))
-        (= id 24)
+        (= id 25)
           (do
-            (set! (.sidebar-visible (.workbench d)) false)
-            (set! (.sidebar-focus (.workbench d)) false)
+            (open-models! d)
             (Continue))
+        (= id 26) (open-slash! d "sidebars ")
         :else (Continue)))
 
 (defn submit-launch! [(d (ptr Dash))] (-> i64)
@@ -842,7 +860,9 @@
                   (complain! d a reply)))))))
 
 (defn slash-available? [(d (ptr Dash))] (-> bool)
-  (and (not (or (.settings-open (.workbench d))
+  (and (not (or (.models-open (.workbench d))
+                (.settings-open (.workbench d))
+                (.action-editor (.workbench d))
                 (.connections-open (.workbench d))
                 (.inspection-open d)
                 (.launch-open d)
@@ -862,16 +882,281 @@
   (set! (.commands-open d) true)
   (Continue))
 
+(defn sidebars-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)
+        p (field d commands)
+        input (field p input)
+        a (io-allocator d)
+        query (input-text input)
+        items
+          (sidebar-command/suggestions a
+                                       (subslice query 0 (.cursor input))
+                                       (.workspace-visible w)
+                                       (.sidebar-visible w))]
+    (list-set-count! (field p list) (len items))
+    (match key
+      (Escape [] (set! (.commands-open d) false))
+      (Up [] (list-move! (field p list) -1))
+      (Down [] (list-move! (field p list) 1))
+      (PageUp [] (list-move! (field p list) -8))
+      (PageDown [] (list-move! (field p list) 8))
+      (Tab []
+           (when (> (len items) 0)
+             (let [item (get items (.selected (.list p)))
+                   (mut end) (.cursor input)]
+               (loop (when (or (>= (load end) (len query))
+                               (sidebar-command/space? (get query (load end))))
+                       (break))
+                 (set! end (+ (load end) 1)))
+               (let [value (.value item)
+                     tail (trim (subslice query (load end) (len query)))]
+                 (input-set-text! input (concat a [value tail]))
+                 (set! (.cursor input) (len value)))
+               (list-select! (field p list) 0))))
+      (Enter []
+             (let [plan (sidebar-command/parse a query)]
+               (cond (> (len (.error plan)) 0)
+                       (toast! d (.error plan) (ToneError))
+                     (or (.help plan)
+                         (and (= (.left plan) 0) (= (.right plan) 0)))
+                       (do
+                         (input-set-text! input
+                                          (if (.help plan)
+                                              "sidebars --help"
+                                              "sidebars "))
+                         (list-select! (field p list) 0))
+                     :else
+                       (let [old-left (.workspace-visible w)
+                             old-right (.sidebar-visible w)]
+                         (set! (.workspace-visible w)
+                               (sidebar-command/visible old-left (.left plan)))
+                         (set! (.sidebar-visible w)
+                               (sidebar-command/visible old-right (.right plan)))
+                         (if (workbench/save-layout! w a)
+                             (do
+                               (when (not (.workspace-visible w))
+                                 (set! (.history-focus w) false))
+                               (when (not (.sidebar-visible w))
+                                 (set! (.sidebar-focus w) false))
+                               (set! (.dragging w) 0)
+                               (set! (.commands-open d) false)
+                               (toast! d
+                                       (concat a
+                                               ["Left "
+                                                (sidebar-command/state (.workspace-visible w))
+                                                " · Right "
+                                                (sidebar-command/state (.sidebar-visible w))])
+                                       (ToneSuccess)))
+                             (do
+                               (set! (.workspace-visible w) old-left)
+                               (set! (.sidebar-visible w) old-right)
+                               (toast! d
+                                       "Could not save sidebar visibility."
+                                       (ToneError))))))))
+      (_ (do (input-handle-key! input key) (list-select! (field p list) 0))))
+    (Continue)))
+
 (defn slash-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
-  (let [a (io-allocator d)
-        commands (dashboard-commands d a)]
-    (match (palette-key! (field d commands) a (slice commands) key)
-      (PaletteClose [] (do (set! (.commands-open d) false) (Continue)))
-      (PaletteSelected [id] (command-selected! d id))
-      (_ (Continue)))))
+  (block :slash
+    (when (sidebar-command/active? (input-text (field (field d commands) input)))
+      (return-from :slash (sidebars-key! d key)))
+    (let [a (io-allocator d)
+          commands (dashboard-commands d a)]
+      (match (palette-key! (field d commands) a (slice commands) key)
+        (PaletteClose [] (do (set! (.commands-open d) false) (Continue)))
+        (PaletteSelected [id] (command-selected! d id))
+        (_ (Continue))))))
+
+(defn wheel! [(d (ptr Dash)) (rows i64) (x i64) (y i64)] (-> AppFlow)
+  (let [w (field d workbench)
+        amount (* rows 3)
+        r (.context-r w)]
+    (cond (.models-open w) (list-move! (field (field w models) list) amount)
+          (.commands-open d) (list-move! (field (field d commands) list) amount)
+          (or (.settings-open w)
+              (.action-editor w)
+              (.connections-open w)
+              (.inspection-open d)
+              (.launch-open d)
+              (.confirm-stop d)
+              (.help d))
+            0
+          :else
+            (match (.view d)
+              (ViewPersonal []
+                            (if (or (.history-focus w)
+                                    (rect-contains? (.history-r w) x y))
+                                (list-move! (field w history) amount)
+                                (scroll-wheel! (if (and (>= x (.x r))
+                                                        (< x (+ (.x r) (.w r)))
+                                                        (>= y (.y r))
+                                                        (< y (+ (.y r) (.h r))))
+                                                   (field w sidebar-sv)
+                                                   (field (field d personal) sv))
+                                               amount)))
+              (ViewChat []
+                        (scroll-wheel! (if (and (>= x (.x r))
+                                                (< x (+ (.x r) (.w r)))
+                                                (>= y (.y r))
+                                                (< y (+ (.y r) (.h r))))
+                                           (field w sidebar-sv)
+                                           (field (field d chat) sv))
+                                       amount))
+              (ViewOverview [] (list-move! (field d runs-lv) amount))
+              (ViewRun [] (scroll-wheel! (field d feed-sv) amount)))))
+  (Continue))
+
+(defn scroll-wheel! [(sv (ptr ScrollView)) (rows i64)] (-> i64)
+  (if (< rows 0) (scroll-up! sv (- 0 rows)) (scroll-down! sv rows)))
+
+(defn drag! [(d (ptr Dash)) (x i64) (release bool)] (-> AppFlow)
+  (let [w (field d workbench)
+        body (.layout-r w)
+        left (if (> (.w (.workspace-r w)) 0) (+ (.w (.workspace-r w)) 4) 0)]
+    (when (> (.dragging w) 0)
+      (let [want
+              (if (= (.dragging w) 1) (- x (.x body)) (- (rect-right body) x))
+            minimum (if (= (.dragging w) 1) 16 18)
+            maximum
+              (if (= (.dragging w) 1)
+                  (- (- (.w body) (.w (.context-r w))) 40)
+                  (- (- (.w body) left) 40))
+            size
+              (if (< want minimum) minimum (if (> want maximum) maximum want))]
+        (if (= (.dragging w) 1)
+            (set! (.workspace-width w) size)
+            (set! (.context-width w) size)))
+      (when release
+        (set! (.dragging w) 0)
+        (when (not (workbench/save-layout! w (io-allocator d)))
+          (toast! d "Could not save sidebar widths." (ToneError)))))
+    (Continue)))
+
+(defn divider! [(d (ptr Dash)) (x i64) (y i64)] (-> bool)
+  (let [w (field d workbench)
+        body (.layout-r w)
+        left (.workspace-r w)
+        right (.context-r w)]
+    (set! (.dragging w) 0)
+    (when (and (or (match (.view d)
+                     (ViewPersonal [] true)
+                     (ViewChat [] true)
+                     (_ false)))
+               (>= y (.y body))
+               (< y (rect-bottom body))
+               (not (or (.history-focus w)
+                        (.models-open w)
+                        (.commands-open d)
+                        (.settings-open w)
+                        (.action-editor w)
+                        (.connections-open w)
+                        (.inspection-open d)
+                        (.launch-open d)
+                        (.help d)
+                        (.confirm-stop d))))
+      (cond (and (> (.w left) 0)
+                 (>= x (+ (rect-right left) 1))
+                 (<= x (+ (rect-right left) 2)))
+              (set! (.dragging w) 1)
+            (and (> (.w right) 0)
+                 (< (.w right) (.w body))
+                 (>= x (- (.x right) 1))
+                 (<= x (.x right)))
+              (set! (.dragging w) 2)
+            :else 0))
+    (> (.dragging w) 0)))
+
+(defn conversation-typing? [(key Key)] (-> bool)
+  (match key
+    (Char [_] true)
+    (Paste [_] true)
+    (ShiftEnter [] true)
+    (AltEnter [] true)
+    (_ false)))
+
+;;; Re-dispatch the original event so normal composer and slash handling apply.
+(defn conversation-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (set! (.sidebar-focus (.workbench d)) false)
+  (set! (.history-focus (.workbench d)) false)
+  (dashboard-key! d key))
+
+(defn click! [(d (ptr Dash)) (x i64) (y i64)] (-> AppFlow)
+  (block :click
+    (when (and (match (.view d)
+                 (ViewPersonal [] true)
+                 (ViewChat [] true)
+                 (_ false))
+               (not (.action-editor (.workbench d)))
+               (not (or (.models-open (.workbench d))
+                        (.settings-open (.workbench d))
+                        (.connections-open (.workbench d))
+                        (.commands-open d)
+                        (.inspection-open d)
+                        (.launch-open d)
+                        (.help d)
+                        (.confirm-stop d)))
+               (project-actions/click! d x y))
+      (return-from :click (Continue)))
+    (when (divider! d x y) (return-from :click (Continue)))
+    (let [w (field d workbench)]
+      (when (and (match (.view d)
+                   (ViewPersonal [] true)
+                   (ViewChat [] true)
+                   (_ false))
+                 (not (or (.models-open w)
+                          (.commands-open d)
+                          (.settings-open w)
+                          (.action-editor w)
+                          (.connections-open w)
+                          (.inspection-open d)
+                          (.launch-open d)
+                          (.help d)
+                          (.confirm-stop d)))
+                 (rect-contains? (.layout-r w) x y)
+                 (not (rect-contains? (.workspace-r w) x y))
+                 (not (rect-contains? (.context-r w) x y))
+                 (not (and (.history-focus w)
+                           (rect-contains? (.history-r w) x y))))
+        (set! (.sidebar-focus w) false)
+        (set! (.history-focus w) false)
+        (return-from :click (Continue)))
+      (when (and (match (.view d) (ViewPersonal [] true) (_ false))
+                 (not (or (.models-open w)
+                          (.commands-open d)
+                          (.settings-open w)
+                          (.action-editor w)
+                          (.connections-open w)
+                          (.inspection-open d)
+                          (.launch-open d)
+                          (.help d)
+                          (.confirm-stop d))))
+        (cond (rect-contains? (.history-r w) x y)
+                (let [i (+ (.offset (.history w)) (- y (.y (.history-r w))))
+                      sessions (.value (field w sessions))]
+                  (when (and (>= i 0) (< i (jv-len sessions)))
+                    (list-select! (field w history) i)
+                    (open-personal! d (js (jv-nth sessions i) "id"))))
+              (and (not (.history-focus w))
+                   (rect-contains? (.workspace-r w) x y))
+                (let [row (- y (.y (.workspace-r w)))]
+                  (cond (= row 0) (new-personal! d)
+                        (= row 2) (set! (.view d) (ViewOverview))
+                        (= row 5) (set! (.connections-open w) true)
+                        :else 0))
+              :else 0))
+      (Continue))))
 
 (defn dashboard-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (cond (match key (Ctrl [l] (= l #\c)) (_ false)) (Quit)
+        (match key (Scroll [_ _ _] true) (_ false))
+          (match key (Scroll [rows x y] (wheel! d rows x y)) (_ (Continue)))
+        (match key (Drag [_ _] true) (_ false))
+          (match key (Drag [x y] (drag! d x false)) (_ (Continue)))
+        (match key (Release [_ _] true) (_ false))
+          (match key (Release [x y] (drag! d x true)) (_ (Continue)))
+        (match key (Click [_ _] true) (_ false))
+          (match key (Click [x y] (click! d x y)) (_ (Continue)))
+        (.models-open (.workbench d)) (models-key! d key)
         (.commands-open d) (slash-key! d key)
         (match key (Ctrl [l] (= l #\p)) (_ false)) (open-slash! d "")
         (and (slash-available? d) (match key (Char [ch] (= ch #\/)) (_ false)))
@@ -881,6 +1166,8 @@
           (match key
             (Paste [text] (open-slash! d (subslice text 1 (len text))))
             (_ (Continue)))
+        (.action-editor (.workbench d))
+          (do (project-actions/editor-key! d key) (Continue))
         (.settings-open (.workbench d)) (settings-key! d key)
         (.connections-open (.workbench d)) (connections-key! d key)
         (and (match key (Ctrl [ch] (= ch #\y)) (_ false))
@@ -937,8 +1224,6 @@
                     (ViewPersonal [] (ViewOverview))
                     (_ (ViewPersonal))))
             (Continue))
-        (match key (Ctrl [l] (= l #\k)) (_ false))
-          (do (set! (.connections-open (.workbench d)) true) (Continue))
         (match key (Ctrl [l] (= l #\g)) (_ false))
           (do (set! (.settings-open (.workbench d)) true) (Continue))
         (and (match (.view d) (ViewPersonal [] true) (_ false))
@@ -970,24 +1255,35 @@
 ;; ---------------------------------------------------------------------------
 ;; The app
 (defn draw-slash! [(d (ptr Dash)) (frame (ptr Frame))] (-> i64)
-  (let [a (.scratch frame)
-        c (.canvas frame)
-        bounds (canvas-rect c)
-        commands (dashboard-commands d a)
-        p (field d commands)
-        items (palette-items a p (slice commands))
-        bottom (rect 0 (- (.h bounds) 1) (.w bounds) 1)]
-    (draw-palette! p c a bounds (slice commands) (.theme d))
-    (fill! c bottom 32 (style-default))
-    (when (> (len items) 0)
-      (let [selected (get items (.selected (.list p)))]
-        (put-text-ellipsis! c
-                            bottom
-                            1
-                            (.y bottom)
-                            (command-label a (.id selected))
-                            (.muted (.theme d)))))
-    0))
+  (block :draw
+    (when (sidebar-command/active? (input-text (field (field d commands) input)))
+      (return-from
+        :draw
+          (sidebar-command/draw! (field d commands)
+                                 (.canvas frame)
+                                 (.scratch frame)
+                                 (canvas-rect (.canvas frame))
+                                 (.theme d)
+                                 (.workspace-visible (.workbench d))
+                                 (.sidebar-visible (.workbench d)))))
+    (let [a (.scratch frame)
+          c (.canvas frame)
+          bounds (canvas-rect c)
+          commands (dashboard-commands d a)
+          p (field d commands)
+          items (palette-items a p (slice commands))
+          bottom (rect 0 (- (.h bounds) 1) (.w bounds) 1)]
+      (draw-palette! p c a bounds (slice commands) (.theme d))
+      (fill! c bottom 32 (style-default))
+      (when (> (len items) 0)
+        (let [selected (get items (.selected (.list p)))]
+          (put-text-ellipsis! c
+                              bottom
+                              1
+                              (.y bottom)
+                              (command-label a (.id selected))
+                              (.muted (.theme d)))))
+      0)))
 
 (impl App Dash
   (app-draw [(self (ptr Dash)) (frame (ptr Frame))]
@@ -1010,11 +1306,15 @@
       (draw-launch! (field self launch) (.canvas frame) (.theme self)))
     (when (.inspection-open self)
       (draw-inspection! self (.canvas frame) (.scratch frame)))
+    (when (.action-editor (.workbench self))
+      (project-actions/draw-editor! self (.canvas frame)))
     (when (.settings-open (.workbench self))
       (personal/draw-settings! self (.canvas frame)))
     (when (.connections-open (.workbench self))
       (personal/draw-connections! self (.canvas frame) (.scratch frame)))
     (when (.commands-open self) (draw-slash! self frame))
+    (when (.models-open (.workbench self))
+      (personal/draw-models! self (.canvas frame) (.scratch frame)))
     0)
   (app-event [(self (ptr Dash)) (event Event)]
     (-> AppFlow)
@@ -1047,21 +1347,25 @@
             (open-chat! d initial-run initial-agent false)
           (> (len initial-run) 0) (open-run! d initial-run)
           :else 0)
-    (let [result
-            (match (app-run d (app-options-default) a)
-              (Ok [_] 0)
-              (Err [e]
-                   (match e
-                     (NotATerminal []
-                                   (do
-                                     (println "factory: the dashboard needs an interactive terminal (try `factory ps`)")
-                                     1))
-                     (_ (do
-                          (println "factory: could not take over the terminal")
-                          1)))))]
-      (network/close! a (.job (.workbench d)))
-      (network/close! a (.active-connection (.workbench d)))
-      result)))
+    (let [(mut options) (app-options-default)]
+      (set! (.mouse (.term options)) true)
+      (let [result
+              (match (app-run d options a)
+                (Ok [_] 0)
+                (Err [e]
+                     (match e
+                       (NotATerminal []
+                                     (do
+                                       (println "factory: the dashboard needs an interactive terminal (try `factory ps`)")
+                                       1))
+                       (_ (do
+                            (println "factory: could not take over the terminal")
+                            1)))))]
+        (catalog/close! a (.model-job (.workbench d)))
+        (network/close! a (.action-job (.workbench d)))
+        (network/close! a (.job (.workbench d)))
+        (network/close! a (.active-connection (.workbench d)))
+        result))))
 
 ;;; Conversation-first workbench control. Local messages never pass through a
 ;;; factory hub; remote jobs publish results back to this event loop.
@@ -1133,12 +1437,16 @@
       (when (= (len text) 0) (return-from :send 0))
       (let [a (io-allocator d)]
         (when (= (len (.session-id w)) 0)
-          (match (session/create! a
-                                  (.home w)
-                                  (trim (workbench/value w 1))
-                                  (trim (workbench/value w 2))
-                                  (workbench/value w 0)
-                                  (first-line text))
+          (match (session/create-tier! a
+                                       (.home w)
+                                       (trim (workbench/value w 1))
+                                       (trim (workbench/value w 2))
+                                       (workbench/value w 0)
+                                       (first-line text)
+                                       (if (= (trim (workbench/value w 1))
+                                              "codex")
+                                           (.service-tier w)
+                                           ""))
             (Ok [id] (own! d (field w session-id) id))
             (Err [why] (do (toast! d why (ToneError)) (return-from :send 0)))))
         (match (session/send! a (.home w) (.session-id w) text)
@@ -1150,6 +1458,19 @@
                 (set! (.polled w) 0)
                 (poll-personal! d)))
           (Err [why] (toast! d why (ToneError))))))))
+
+(defn interrupt-personal! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        a (io-allocator d)]
+    (when (and (> (len (.session-id w)) 0)
+               (or (= (.status w) "running")
+                   (proc/process-alive? (session/worker-pid a
+                                                            (.home w)
+                                                            (.session-id w)))))
+      (if (session/cancel! a (.home w) (.session-id w))
+          (toast! d "Stopping…" (ToneMuted))
+          (toast! d "Could not interrupt the assistant." (ToneError))))
+    0))
 
 (defn personal-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (let [w (field d workbench)
@@ -1163,8 +1484,11 @@
                    (when (and (>= i 0) (< i (jv-len sessions)))
                      (open-personal! d (js (jv-nth sessions i) "id")))
                    (Continue)))
-          (_ (do (list-handle-key! (field w history) key 8) (Continue))))
+          (_ (if (conversation-typing? key)
+                 (conversation-key! d key)
+                 (do (list-handle-key! (field w history) key 8) (Continue)))))
         (match key
+          (Escape [] (do (interrupt-personal! d) (Continue)))
           (PageUp [] (do (scroll-up! (field chat sv) 10) (Continue)))
           (PageDown [] (do (scroll-down! (field chat sv) 10) (Continue)))
           (Ctrl [letter]
@@ -1327,6 +1651,154 @@
                              (.active-connection w))))
     0))
 
+(defn open-models! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        a (snap-spare (field w model-options))
+        meta
+          (if (> (len (.session-id w)) 0)
+              (session/read-doc a
+                                (session/path a
+                                              (.home w)
+                                              (.session-id w)
+                                              "session.json"))
+              (JNull))
+        harness (if (jv-null? meta) (workbench/value w 1) (js meta "harness"))
+        model (if (jv-null? meta) (workbench/value w 2) (js meta "model"))
+        options (catalog/catalog a (.home w) harness model)]
+    (snap-commit! (field w model-options) options (.now d))
+    (palette-reset! (field w models))
+    (list-set-count! (field (field w models) list) (jv-len options))
+    (for i (range 0 (jv-len options))
+      (let [option (jv-nth options i)]
+        (when (and (= (js option "harness") harness)
+                   (= (js option "model") model)
+                   (= (js option "service_tier")
+                      (if (jv-null? meta)
+                          (.service-tier w)
+                          (js meta "service_tier"))))
+          (list-select! (field (field w models) list) i))))
+    (set! (.models-open w) true)
+    (own! d (field w model-error) "")
+    (when (= (cast i64 (.model-job w)) 0)
+      (set! (.model-job w)
+            (catalog/start-claude (.allocator d)
+                                  (.home w)
+                                  (if (jv-null? meta)
+                                      (workbench/value w 0)
+                                      (js meta "workdir")))))
+    0))
+
+;;; Discovery owns a separate arena. Publish on the UI thread and preserve the
+;;; highlighted model by identity while the person is searching or navigating.
+(defn poll-models! [(d (ptr Dash))] (-> i64)
+  (let [w (field d workbench)
+        job (.model-job w)]
+    (when (catalog/ready? job)
+      (join (field job thread))
+      (own! d (field w model-error) (.error job))
+      (when (and (.models-open w) (not (jv-null? (.models job))))
+        (let [a (io-allocator d)
+              old-commands (personal/model-commands d a)
+              old-items (palette-items a (field w models) (slice old-commands))
+              selected (.selected (.list (.models w)))
+              old-option
+                (if (and (>= selected 0) (< selected (len old-items)))
+                    (jv-nth (.value (field w model-options))
+                            (- (.id (get old-items selected)) 1))
+                    (JNull))
+              old-harness (js old-option "harness")
+              old-model (js old-option "model")
+              old-tier (js old-option "service_tier")
+              pa (snap-spare (field w model-options))
+              meta
+                (if (> (len (.session-id w)) 0)
+                    (session/read-doc pa
+                                      (session/path pa
+                                                    (.home w)
+                                                    (.session-id w)
+                                                    "session.json"))
+                    (JNull))
+              harness
+                (if (jv-null? meta) (workbench/value w 1) (js meta "harness"))
+              model (if (jv-null? meta) (workbench/value w 2) (js meta "model"))
+              options
+                (catalog/catalog-with-claude pa
+                                             (.home w)
+                                             harness
+                                             model
+                                             (.models job))]
+          (snap-commit! (field w model-options) options (.now d))
+          (let [commands (personal/model-commands d a)
+                items (palette-items a (field w models) (slice commands))]
+            (list-set-count! (field (field w models) list) (len items))
+            (list-select! (field (field w models) list) 0)
+            (for i (range 0 (len items))
+              (let [option (jv-nth options (- (.id (get items i)) 1))
+                    previous-model
+                      (if (= old-harness "claude")
+                          (catalog/resolve-claude-id (.models job) old-model)
+                          old-model)]
+                (when (and (= (js option "harness") old-harness)
+                           (= (js option "model") previous-model)
+                           (= (js option "service_tier") old-tier))
+                  (list-select! (field (field w models) list) i)))))
+          0))
+      (catalog/close! (.allocator d) job)
+      (set! (.model-job w) (cast (ptr catalog/Job) 0))
+      0))
+  0)
+
+(defn models-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
+  (let [w (field d workbench)
+        a (io-allocator d)
+        commands (personal/model-commands d a)]
+    (match (palette-key! (field w models) a (slice commands) key)
+      (PaletteClose [] (set! (.models-open w) false))
+      (PaletteSelected [id]
+                       (let [option
+                               (jv-nth (.value (field w model-options))
+                                       (- id 1))
+                             harness (js option "harness")
+                             model (js option "model")
+                             result
+                               (if (= (len (.session-id w)) 0)
+                                   (Ok [i64 (slice u8)] 0)
+                                   (session/select-model-tier! a
+                                                               (.home w)
+                                                               (.session-id w)
+                                                               harness
+                                                               model
+                                                               (js option
+                                                                   "service_tier")))]
+                         (match result
+                           (Err [why] (toast! d why (ToneError)))
+                           (Ok [_]
+                               (do
+                                 (input-set-text! (index (field w settings) 1)
+                                                  harness)
+                                 (input-set-text! (index (field w settings) 2)
+                                                  model)
+                                 (own! d
+                                       (field w service-tier)
+                                       (js option "service_tier"))
+                                 (set! (.models-open w) false)
+                                 (set! (.polled w) 0)
+                                 (poll-personal! d)
+                                 (toast! d
+                                         (concat a
+                                                 [harness
+                                                  " · "
+                                                  (if (= (len model) 0)
+                                                      "CLI default"
+                                                      (js option "label"))
+                                                  (if (= (.status w) "running")
+                                                      " · next turn"
+                                                      "")])
+                                         (ToneSuccess))
+                                 0)))))
+      (_ 0))
+    (Continue)))
+
 (defn settings-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
   (let [w (field d workbench)]
     (match key
@@ -1388,17 +1860,27 @@
     0))
 
 (defn sidebar-key! [(d (ptr Dash)) (key Key)] (-> AppFlow)
-  (let [w (field d workbench)]
-    (match key
-      (Escape [] (set! (.sidebar-focus w) false))
-      (Up [] (scroll-up! (field w sidebar-sv) 1))
-      (Down [] (scroll-down! (field w sidebar-sv) 1))
-      (PageUp [] (scroll-up! (field w sidebar-sv) 10))
-      (PageDown [] (scroll-down! (field w sidebar-sv) 10))
-      (Home [] (scroll-to-top! (field w sidebar-sv)))
-      (End [] (scroll-to-bottom! (field w sidebar-sv)))
-      (_ 0))
-    (Continue)))
+  (block
+    :sidebar
+      (let [w (field d workbench)]
+        (when (and (match (.view d)
+                     (ViewPersonal [] true)
+                     (ViewChat [] true)
+                     (_ false))
+                   (project-actions/key! d key))
+          (return-from :sidebar (Continue)))
+        (when (conversation-typing? key)
+          (return-from :sidebar (conversation-key! d key)))
+        (match key
+          (Escape [] (set! (.sidebar-focus w) false))
+          (Up [] (scroll-up! (field w sidebar-sv) 1))
+          (Down [] (scroll-down! (field w sidebar-sv) 1))
+          (PageUp [] (scroll-up! (field w sidebar-sv) 10))
+          (PageDown [] (scroll-down! (field w sidebar-sv) 10))
+          (Home [] (scroll-to-top! (field w sidebar-sv)))
+          (End [] (scroll-to-bottom! (field w sidebar-sv)))
+          (_ 0))
+        (Continue))))
 
 (defn sidebar-scope [(d (ptr Dash)) (a (dyn Allocator))] (-> (slice u8))
   (concat a [(.run (.chat d)) "/" (.agent (.chat d))]))

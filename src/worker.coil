@@ -262,14 +262,17 @@
                          total (+ (.streamed-chars self) chars)]
                      (if (< (- now (.streamed-ms self)) STREAMING_RECORD_MS)
                          (do (set! (.streamed-chars self) total) 0)
-                         (do (set! (.streamed-ms self) now)
-                             (set! (.streamed-chars self) 0)
-                             (observe-record! self
-                                              (ev-int! (ev-str! (ev-agent a "agent.streaming" name)
-                                                                "part"
-                                                                part)
-                                                       "chars"
-                                                       total))))))
+                         (do
+                           (set! (.streamed-ms self) now)
+                           (set! (.streamed-chars self) 0)
+                           (observe-record! self
+                                            (ev-int! (ev-str! (ev-agent a
+                                                                        "agent.streaming"
+                                                                        name)
+                                                              "part"
+                                                              part)
+                                                     "chars"
+                                                     total))))))
         (Said [text]
               (observe-record! self
                                (ev-text! a
@@ -1553,6 +1556,7 @@
                      (station (ptr StationSpec))
                      (gate (slice u8))] (-> AgentRequest)
   (AgentRequest
+    :service-tier ""
     :harness (harness-for worker station)
     :model (model-for worker station)
     :tools (station-tools (field worker factory) station)

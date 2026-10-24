@@ -268,6 +268,25 @@
                   (None [] false))))
       0)))
 
+(deftest handoff-context-travels-on-stdin-once-and-survives-checkpointing
+  (let [a (malloc-allocator)
+        (mut r) (zeroed Recorder)
+        (mut control) (zeroed ControlScript)
+        (mut h) (fixture a (mut r) (mut control))
+        (mut restored) (fixture a (mut r) (mut control))]
+    (harness-add-system! (mut h) "system")
+    (harness-add-context! (mut h) "PRIOR-HISTORY-MARKER")
+    (assert (harness-restore! (mut restored) (harness-checkpoint (mut h) a)))
+    (harness-add-user! (mut restored) "first question")
+    (assert (starts-with (take-prompt! (mut restored))
+                         "PRIOR-HISTORY-MARKER\n\n"))
+    (assert-eq (jv-count (.messages restored)) 2)
+    (for arg (iter (claude-argv a (mut restored)))
+      (assert (not (= arg "PRIOR-HISTORY-MARKER"))))
+    (set! (.session restored) "native-session")
+    (harness-add-user! (mut restored) "second question")
+    (assert (= (take-prompt! (mut restored)) "second question\n\n"))))
+
 (deftest background-tasks-hold-the-invocation-open-until-they-finish
   (let [a (malloc-allocator)
         (mut r) (zeroed Recorder)

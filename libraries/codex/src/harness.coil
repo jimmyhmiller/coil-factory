@@ -9,6 +9,7 @@
 (import "coil.time" :as time)
 (import "ai.chat" :as chat)
 (import "durable.atomic" :as atomic)
+(import "durable.error" :as durable-error)
 (import "agent.harness" :use *)
 (import "agent.json" :use *)
 (import "agent.loop" :use *)
@@ -37,12 +38,18 @@
 ;;; Codex reads its credentials and its global instructions (AGENTS.md) from
 ;;; CODEX_HOME, which is left alone: Codex rewrites its credentials when it
 ;;; refreshes them, so a private copy would drift from the operator's. Every
-;;; setting comes from `-c` overrides with `--ignore-user-config`, so the
+;;; setting comes from `-c` overrides (the instruction file is referenced by
+;;; path) with `--ignore-user-config`, so the
 ;;; operator's config.toml (model, MCP servers, notifications) is never used,
 ;;; and Codex's own extras that are on without it are turned off
 ;;; (`CLOSED-SETTINGS`).
 ;;;
-;;; The system text is Codex's `developer_instructions`. The stop tool is a
+;;; The system text is Codex's `model_instructions_file`: a private, uniquely
+;;; named file beside the workspace, removed after each child exits. Only the
+;;; path goes in argv, so Linux's per-argument limit cannot bound instructions.
+;;; This supplies the native base instructions; tool and permission instructions
+;;; still come from Codex. CODEX_HOME and credentials are left untouched.
+;;; The stop tool is a
 ;;; tool on an MCP server the caller names (`stop-server`, `stop-tool`), which
 ;;; Codex is told to call without asking; when the agent calls it, the process
 ;;; is stopped at the next item boundary and the run ends with `Finished`.
@@ -98,6 +105,9 @@
    ;;; The Codex thread id, once the first run has started one.
    (session (slice u8))
    (system (slice u8))
+   ;;; Transient transport, never persisted in checkpoints.
+   (instructions-file (slice u8))
+   (context (slice u8))
    ;;; Text for the next run, in order, not yet sent to Codex.
    (pending (ArrayList (slice u8)))
    ;;; Messages from people, not yet sent; each is acknowledged when it is.
@@ -118,6 +128,8 @@
     :control control
     :session ""
     :system ""
+    :instructions-file ""
+    :context ""
     :pending (ArrayList::new [(slice u8)] a)
     :inbound (ArrayList::new [Inbound] a)
     :messages (jv-array a)
@@ -240,7 +252,10 @@
       0)
     (setting! a (mut argv) "sandbox_mode" (toml-string a (.sandbox options)))
     (setting! a (mut argv) "approval_policy" (toml-string a "never"))
-    (setting! a (mut argv) "developer_instructions" (toml-string a (.system h)))
+    (when (> (len (.instructions-file h)) 0)
+      (setting! a (mut argv) "model_instructions_file"
+                (toml-string a (.instructions-file h)))
+      0)
     (for closed (iter CLOSED-SETTINGS)
       (push! (mut argv) "-c")
       (push! (mut argv) closed))
@@ -934,6 +949,9 @@
         (mut first) true]
     (for message (iter arrived) (push! (mut (.inbound h)) message))
     (free! (mut arrived))
+    (when (and (= (len (.session h)) 0) (> (len (.context h)) 0))
+      (push-str! (mut out) (.context h))
+      (set! first false))
     (for text (iter (.pending h))
       (when (not (load first)) (push-str! (mut out) "\n\n") 0)
       (push-str! (mut out) text)
@@ -977,6 +995,26 @@
           (when (> (len (.ready-file options)) 0)
             (atomic/unlink-path a (.ready-file options))
             0)
+          ;; Prepare the child transport; never fall back to argv
+          ;; or launch with missing instructions if the filesystem is unavailable.
+          (when (> (len (trim (.system h))) 0)
+            (match (atomic/atomic-temp-path a
+                     (join a [(.workdir options) "/../codex-instructions"]))
+              (Err [e]
+                (return-from :run (harness-failure a
+                  (join a ["Cannot prepare Codex instructions: "
+                           (durable-error/error-describe a e)]))))
+              (Ok [path]
+                (match (atomic/write-temp a path (.system h) 384)
+                  (Err [e]
+                    (do
+                      (atomic/unlink-path a path)
+                      (free-bytes a path 1)
+                      (return-from :run (harness-failure a
+                        (join a ["Cannot write Codex instructions: "
+                                 (durable-error/error-describe a e)])))))
+                  (Ok [_] (set! (.instructions-file h) path)))))
+            0)
           (let [(mut argv) (codex-argv a h)
                 all (slice argv)
                 arena
@@ -995,6 +1033,20 @@
                                          :stderr-bytes 8192)
                                        turn)]
             (free! (mut argv))
+            (when (> (len (.instructions-file h)) 0)
+              (let [path (.instructions-file h)
+                    removed (atomic/unlink-path a path)]
+                (set! (.instructions-file h) "")
+                (free-bytes a path 1)
+                (match removed
+                  (Err [e]
+                    (do
+                      (close! arena)
+                      (return-from :run (harness-failure a
+                        (join a ["Cannot remove Codex instructions: "
+                                 (durable-error/error-describe a e)])))))
+                  (Ok [_] 0)))
+              0)
             (close! arena)
             (when (and (.started turn) (not (.usage-seen turn)))
               (recover-usage! h)
@@ -1074,6 +1126,7 @@
     (jv-put! root "harness" (JStr "codex"))
     (jv-put! root "session" (JStr (.session h)))
     (jv-put! root "system" (JStr (.system h)))
+    (jv-put! root "context" (JStr (.context h)))
     (jv-put! root "pending" pending)
     (jv-put! root "turns" (JInt (.turns h)))
     (jv-put! root "messages" (.messages h))
@@ -1093,6 +1146,8 @@
                         (copy-bytes a (jv-string-or (jv-get root "session") "")))
                   (set! (.system h)
                         (copy-bytes a (jv-string-or (jv-get root "system") "")))
+                  (set! (.context h)
+                        (copy-bytes a (jv-string-or (jv-get root "context") "")))
                   (set! (.turns h) (jv-int (jv-get root "turns")))
                   (set! (.messages h)
                         (if (jv-null? messages)
@@ -1115,6 +1170,9 @@
     (do
       (set! (.system self) (copy-bytes (.allocator self) text))
       (mirror-text! self "system" text)))
+  (harness-add-context! [(self (ptr CodexHarness)) (text (slice u8))] (-> i64)
+    (set! (.context self) (copy-bytes (.allocator self) text))
+    0)
   (harness-add-user! [(self (ptr CodexHarness)) (text (slice u8))] (-> i64)
     (do (push! (mut (.pending self)) (copy-bytes (.allocator self) text)) 0))
   (harness-run! [(self (ptr CodexHarness))] (-> AgentStop)

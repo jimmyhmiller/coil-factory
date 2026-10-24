@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import hashlib
 import subprocess
 import sys
 
@@ -16,6 +17,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("/srv/paper-factory"))
     parser.add_argument("--signal-executable", type=Path)
     parser.add_argument("--signal-env", type=Path)
+    parser.add_argument("--site-home", type=Path, default=Path.home() / ".factory")
     args = parser.parse_args()
     if not sys.platform.startswith("linux"):
         raise RuntimeError("Linux/systemd installer required")
@@ -23,19 +25,21 @@ def main():
     for name in ("codex", "opencode"):
         if not shutil.which(name):
             raise RuntimeError("Missing executable: " + name)
+    # Application installers attach controllers to the shared service; they
+    # never install or replace a daemon behind another workflow's back.
+    site = args.site_home.resolve()
+    shared_binary = site / "bin/factory"
+    site_settings = read_json(site / "site.json")
+    if not shared_binary.is_file():
+        raise RuntimeError("Install the shared factory.service before installing paper controllers")
+    if hashlib.sha256(args.binary.read_bytes()).digest() != hashlib.sha256(shared_binary.read_bytes()).digest():
+        raise RuntimeError("Update the shared factory binary separately before installing paper controllers")
+    subprocess.run(["systemctl", "--user", "is-active", "--quiet", "factory.service"], check=True)
+    port = site_settings.get("port", 7788)
     root.mkdir(parents=True, exist_ok=True)
-    (root / "bin").mkdir(exist_ok=True)
-    shutil.copy2(args.binary, root / "bin/factory")
-    (root / "bin/factory").chmod(0o755)
-    site = root / "site"
-    site.mkdir(exist_ok=True)
-    # Model probes and research run on their own site, so they never hold up
-    # a paper run.
-    models_site = root / "models-site"
-    models_site.mkdir(exist_ok=True)
     config_path = root / "config.json"
     config = read_json(config_path) if config_path.exists() else {}
-    config.update(state_dir=str(root / "state"), site_home=str(site), port=7799,
+    config.update(state_dir=str(root / "state"), site_home=str(site), port=port,
                   output_dir=str(output), recipe=str(root / "runtime/factories/papers.md"),
                   enabled=False, timezone="America/Indiana/Indianapolis", start_time="09:00",
                   archive_url="https://jimmyhmiller.com/readings",
@@ -46,7 +50,7 @@ def main():
                   public_base_url="https://computer.jimmyhmiller.com/papers",
                   request_dir="/var/lib/paper-requests", request_url="/papers/request")
     config["models"] = {
-        "site_home": str(models_site), "port": 7798, "opencode_home": str(root / "state/models-opencode"),
+        "site_home": str(site), "port": port, "opencode_home": str(root / "state/models-opencode"),
         "opencode": shutil.which("opencode"),
         "probe_recipe": str(root / "runtime/factories/model-probe.md"),
         "research_recipe": str(root / "runtime/factories/model-research.md"),
@@ -65,29 +69,18 @@ def main():
         config["signal"] = {"env_file": str(args.signal_env.resolve())}
     validate_config(config)
     atomic_json(config_path, config)
-    atomic_json(site / "site.json", {"name": "daily-papers-server", "port":7799,
-        "max_runs":1, "isolation":"sandbox", "codex":shutil.which("codex"),
-        "opencode":shutil.which("opencode"), "codex_model":config["paid_model"],
-        "codex_network":True, "overseer":{"policy":"observe"}})
-    atomic_json(models_site / "site.json", {"name": "paper-models", "port": 7798,
-        "max_runs":1, "isolation":"sandbox", "codex":shutil.which("codex"),
-        "opencode":shutil.which("opencode"), "codex_model":config["paid_model"],
-        "codex_network":True, "overseer":{"policy":"observe"}})
     units = Path.home() / ".config/systemd/user"
     units.mkdir(parents=True, exist_ok=True)
     path = ":".join([str(Path.home()/".local/bin"),str(Path.home()/".npm-global/bin"),
                      str(Path.home()/".cargo/bin"),"/usr/local/bin","/usr/bin","/bin"])
     common = 'WorkingDirectory=' + str(root) + '\nEnvironment="PATH=' + path + '"\nEnvironment="PYTHONPATH=' + str(root/"runtime") + '"\nEnvironment="PYTHONDONTWRITEBYTECODE=1"\nEnvironment="FACTORY_HOME=' + str(site) + '"\n'
     definitions = {
-        "paper-factory-site.service": "[Unit]\nDescription=Daily paper native factory site\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\n" + common + "ExecStart=" + str(root/"bin/factory") + " daemon\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-        "paper-factory-daily.service": "[Unit]\nDescription=Daily paper controller heartbeat\nAfter=paper-factory-site.service\nWants=paper-factory-site.service\n\n[Service]\nType=oneshot\n" + common + "ExecStart=/usr/bin/python3 -m paper_factory.controller --config " + str(config_path) + "\nTimeoutStartSec=120\n",
+        "paper-factory-daily.service": "[Unit]\nDescription=Daily paper controller heartbeat\nAfter=factory.service\nWants=factory.service\n\n[Service]\nType=oneshot\n" + common + "ExecStart=/usr/bin/python3 -m paper_factory.controller --config " + str(config_path) + "\nTimeoutStartSec=120\n",
         # A heartbeat takes well under a second; every 5s keeps the library's
         # live status current.
         "paper-factory-daily.timer": "[Unit]\nDescription=Check paper schedule and monitor runs every 5 seconds\n\n[Timer]\nOnBootSec=60\nOnUnitActiveSec=5\nAccuracySec=1\nUnit=paper-factory-daily.service\n\n[Install]\nWantedBy=timers.target\n"
     }
-    models_common = common.replace('FACTORY_HOME=' + str(site), 'FACTORY_HOME=' + str(models_site))
-    definitions["paper-models-site.service"] = "[Unit]\nDescription=Factory site for free-model probes and research\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\n" + models_common + "ExecStart=" + str(root/"bin/factory") + " daemon\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
-    definitions["paper-models.service"] = "[Unit]\nDescription=Free-model registry heartbeat\nAfter=paper-models-site.service\nWants=paper-models-site.service\n\n[Service]\nType=oneshot\n" + models_common + "ExecStart=/usr/bin/python3 -m paper_factory.models --config " + str(config_path) + "\nTimeoutStartSec=300\n"
+    definitions["paper-models.service"] = "[Unit]\nDescription=Free-model registry heartbeat\nAfter=factory.service\nWants=factory.service\n\n[Service]\nType=oneshot\n" + common + "ExecStart=/usr/bin/python3 -m paper_factory.models --config " + str(config_path) + "\nTimeoutStartSec=300\n"
     definitions["paper-models.timer"] = "[Unit]\nDescription=Discover, test and rank free models every minute\n\n[Timer]\nOnBootSec=90\nOnUnitActiveSec=60\nAccuracySec=1\nUnit=paper-models.service\n\n[Install]\nWantedBy=timers.target\n"
     if config.get("request_dir"):
         # Start a heartbeat the moment Gatekeeper commits a request file.
@@ -100,10 +93,9 @@ def main():
     subprocess.run(["systemctl","--user","daemon-reload"],check=True)
     # Scheduler stays disabled until Gatekeeper's route is verified. The daily
     # timer and request path unit are enabled only by the final activation step.
-    subprocess.run(["systemctl","--user","enable","--now","paper-factory-site.service","paper-models-site.service"],check=True)
     if args.signal_executable:
         subprocess.run(["systemctl","--user","enable","--now","paper-factory-signal.service"],check=True)
-    print("Installed server site and Signal socket; daily timer awaits route verification/activation")
+    print("Installed paper controllers using shared factory.service; daily timer awaits route verification/activation")
 
 
 if __name__ == "__main__":

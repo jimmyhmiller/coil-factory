@@ -1,0 +1,50 @@
+(module factory.sidebar-command-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "factory.ui.sidebar-command" :as cmd)
+
+(deftest sidebar-flags-validate-the-whole-plan-and-toggle-each-panel-independently
+  (let [a (malloc-allocator)
+        plan (cmd/parse a "sidebars --hide left --show right")]
+    (assert-eq (.error plan) "")
+    (assert (not (cmd/visible true (.left plan))))
+    (assert (cmd/visible false (.right plan)))
+    (assert (not (cmd/visible false (.left plan))))
+    (assert (cmd/visible true (.right plan))))
+  (let [a (malloc-allocator)
+        plan (cmd/parse a "sidebars --toggle all")]
+    (assert (not (cmd/visible true (.left plan))))
+    (assert (cmd/visible false (.right plan)))))
+
+(deftest sidebar-flags-reject-incomplete-unknown-and-overlapping-actions
+  (let [a (malloc-allocator)]
+    (for query (iter ["sidebars --hide"
+                      "sidebars --hide bottom"
+                      "sidebars --oops left"
+                      "sidebars --hide left --show left"
+                      "sidebars --hide all --show right"
+                      "sidebars --show right --toggle all"
+                      "sidebars --help --hide all"])
+      (assert (> (len (.error (cmd/parse a query))) 0)))
+    (assert (.help (cmd/parse a "sidebars --help")))
+    (let [plan (cmd/parse a "sidebars")]
+      (assert-eq (.left plan) 0)
+      (assert-eq (.right plan) 0)
+      (assert-eq (.error plan) ""))))
+
+(deftest sidebar-completion-distinguishes-flags-targets-and-following-actions
+  (let [a (malloc-allocator)
+        flags (cmd/suggestions a "sidebars " true false)
+        targets (cmd/suggestions a "sidebars --hide " true false)
+        partial (cmd/suggestions a "sidebars --hide r" true false)
+        following (cmd/suggestions a "sidebars --hide left --s" false true)]
+    (assert-eq (len flags) 4)
+    (assert-eq (len targets) 3)
+    (assert-eq (len partial) 1)
+    (assert-eq (.value (get partial 0)) "sidebars --hide right ")
+    (assert-eq (.detail (get targets 0)) "Conversations · shown")
+    (assert-eq (.detail (get targets 1)) "Context · hidden")
+    (assert-eq (len following) 1)
+    (assert-eq (.value (get following 0)) "sidebars --hide left --show ")
+    (assert-eq (len (cmd/suggestions a "" true true)) 0)))

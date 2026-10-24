@@ -153,38 +153,50 @@
 
 ;;; One supervision pass. Call with the site lock held.
 (defn supervise! [(site (ptr Site))] (-> i64)
+  ;; Refresh before counting slots, and count live worker reservations even
+  ;; while their journals still say queued. Otherwise a slow startup lets each
+  ;; supervision pass exceed an explicitly configured limit.
+  (for entry (iter (.runs site)) (entry-refresh! site entry))
   (let [a (.allocator site)
         now (wall-ms)
-        (mut capacity) (- (.max-runs (field site config)) (running-count site))]
+        (mut occupied) 0]
     (for entry (iter (.runs site))
-      (entry-refresh! site entry)
-      (let [st (field entry state)
-            status (.status st)
-            recently-spawned (< (- now (.spawned-t entry)) 5000)
-            alive (entry-alive? site entry)]
-        (cond (and (= status "queued")
-                   (not alive)
-                   (> (load capacity) 0)
-                   (not recently-spawned))
-                (when (spawn-run-process! site entry)
-                  (set! capacity (- (load capacity) 1))
-                  0)
-              (and (active-status? status) (not alive) (not recently-spawned))
-                (do
-                  (append! site
-                           (.id entry)
-                           (ev-str! (ev a "run.lost")
-                                    "reason"
-                                    "the run process is gone; `factory resume` continues from the last checkpoint"))
-                  0)
-              (and (> (len (.pending st)) 0)
-                   (not alive)
-                   (not recently-spawned)
-                   (not (active-status? status))
-                   (not (= status "queued")))
-                (do (spawn-run-process! site entry) 0)
-              :else 0)))
-    0))
+      (when (entry-alive? site entry) (set! occupied (+ (load occupied) 1)) 0))
+    (let [(mut capacity)
+            (if (= (.max-runs (field site config)) 0)
+                (len (.runs site))
+                (- (.max-runs (field site config)) (load occupied)))]
+      (for entry (iter (.runs site))
+        (let [st (field entry state)
+              status (.status st)
+              recently-spawned (< (- now (.spawned-t entry)) 5000)
+              alive (entry-alive? site entry)]
+          (cond (and (= status "queued")
+                     (not alive)
+                     (> (load capacity) 0)
+                     (not recently-spawned))
+                  (when (spawn-run-process! site entry)
+                    (set! capacity (- (load capacity) 1))
+                    0)
+                (and (active-status? status) (not alive) (not recently-spawned))
+                  (do
+                    (append! site
+                             (.id entry)
+                             (ev-str! (ev a "run.lost")
+                                      "reason"
+                                      "the run process is gone; `factory resume` continues from the last checkpoint"))
+                    0)
+                (and (> (len (.pending st)) 0)
+                     (> (load capacity) 0)
+                     (not alive)
+                     (not recently-spawned)
+                     (not (active-status? status))
+                     (not (= status "queued")))
+                  (when (spawn-run-process! site entry)
+                    (set! capacity (- (load capacity) 1))
+                    0)
+                :else 0)))
+      0)))
 
 ;;; Load every run under `runs/` into the site.
 (defn load-runs! [(site (ptr Site))] (-> i64)

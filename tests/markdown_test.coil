@@ -1,0 +1,129 @@
+(module factory.markdown-test)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "tui.canvas" :use *)
+(import "tui.width" :use [text-width])
+(import "factory.ui.markdown" :as md)
+(import "factory.ui.chat" :as chat)
+(import "agent.json" :use [jv-parse])
+(import "coil.serde.value" :use *)
+(import "factory.ui.tool-output" :as output)
+(import "factory.ui-views-test" :use [str-contains?])
+
+(deftest markdown-formats-headings-emphasis-links-lists-and-literal-code
+  (let [a (malloc-allocator)
+        rows
+          (md/render a
+                     "# Heading\nA **bold** and *italic* with `a_b` and [site](https://example.com/a(b)).\n- first\n> quote\n```sh\necho '**literal**'\n```"
+                     120)]
+    (assert-eq (.text (get rows 0)) "Heading")
+    (assert (= (& (.attrs (get (.spans (get rows 0)) 0)) ATTR-BOLD) ATTR-BOLD))
+    (assert-eq (.text (get rows 1))
+               "A bold and italic with a_b and site (https://example.com/a(b)).")
+    (assert-eq (.prefix (get rows 2)) "• ")
+    (assert-eq (.prefix (get rows 3)) "│ ")
+    (assert-eq (.text (get rows 5)) "echo '**literal**'")
+    (assert (.code (get (.spans (get rows 5)) 0)))))
+
+(deftest markdown-wraps-styled-unicode-and-preserves-incomplete-streaming-markup
+  (let [a (malloc-allocator)
+        rows
+          (md/render a
+                     "- **hello 世界 hello 世界**\nunfinished **bold\na_b_c and \\*literal*"
+                     16)]
+    (for row (iter rows)
+      (assert (<= (+ (text-width (.prefix row)) (text-width (.text row))) 16)))
+    (let [literal (md/render a "unfinished **bold\na_b_c and \\*literal*" 80)]
+      (assert-eq (.text (get literal 0)) "unfinished **bold")
+      (assert-eq (.text (get literal 1)) "a_b_c and *literal*"))))
+
+(deftest markdown-tables-draw-aligned-boxed-columns
+  (let [a (malloc-allocator)
+        rows
+          (md/render a
+                     "Before\n| Name | Qty | Note |\n|:-----|----:|:----:|\n| **apple** | 3 | `a\\|b` |\n| kiwi | 12 |\nAfter"
+                     80)]
+    (assert-eq (.text (get rows 0)) "Before")
+    (assert-eq (.text (get rows 1))
+               "┌───────┬─────┬──────┐")
+    (assert-eq (.text (get rows 2)) "│ Name  │ Qty │ Note │")
+    (assert (= (& (.attrs (get (.spans (get rows 2)) 1)) ATTR-BOLD) ATTR-BOLD))
+    (assert-eq (.text (get rows 3))
+               "├───────┼─────┼──────┤")
+    (assert-eq (.text (get rows 4)) "│ apple │   3 │ a|b  │")
+    (assert-eq (.text (get rows 5)) "│ kiwi  │  12 │      │")
+    (assert-eq (.text (get rows 6))
+               "└───────┴─────┴──────┘")
+    (assert-eq (.text (get rows 7)) "After")
+    (let [(mut code) false]
+      (for span (iter (.spans (get rows 4)))
+        (when (and (.code span) (= (.text span) "a|b")) (set! code true)))
+      (assert (load code)))))
+
+(deftest markdown-tables-wrap-cells-to-fit-and-need-a-delimiter-row
+  (let [a (malloc-allocator)
+        rows
+          (md/render a
+                     "| k | description |\n|---|---|\n| a | one two three four five six |\n| b | ok |"
+                     24)]
+    (for row (iter rows) (assert (<= (text-width (.text row)) 24)))
+    (assert-eq (.text (get rows 2))
+               "├───┼──────────────────┤")
+    (assert-eq (.text (get rows 3)) "│ a │ one two three    │")
+    (assert-eq (.text (get rows 4)) "│   │ four five six    │")
+    (assert-eq (.text (get rows 5))
+               "├───┼──────────────────┤")
+    (assert-eq (.text (get rows 6)) "│ b │ ok               │"))
+  (let [a (malloc-allocator)
+        streaming (md/render a "| a | b |\n| still streaming" 80)
+        mismatched (md/render a "| a | b |\n|---|" 80)]
+    (assert-eq (.text (get streaming 0)) "| a | b |")
+    (assert-eq (.text (get mismatched 0)) "| a | b |")))
+
+(deftest tool-output-unpacks-command-envelopes-and-preserves-raw-json-data
+  (let [a (malloc-allocator)
+        command
+          (output/present a
+                          "{\"stdout\":\"hello\\nworld\",\"stderr\":\"warning\",\"exit_code\":2}")
+        json (output/present a "{\"ok\":true,\"items\":[1,2]}")
+        text (output/present a "plain output")
+        blocks
+          (output/present a
+                          "{\"content\":[{\"type\":\"text\",\"text\":\"hello\\nworld\"}]}")]
+    (assert-eq (.text command) "hello\nworld\nstderr:\nwarning")
+    (assert-eq (.status command) "exit 2")
+    (assert (str-contains? (.text json) "\n  \"items\": [\n    1,\n    2\n  ]"))
+    (assert-eq (.text text) "plain output")
+    (assert-eq (.text blocks) "hello\nworld")))
+
+(deftest command-stdout-json-is-formatted-without-losing-its-values
+  (let [a (malloc-allocator)
+        out
+          (output/present a
+                          "{\"stdout\":\"{\\\"answer\\\":42,\\\"nested\\\":{\\\"message\\\":\\\"hello\\\\nworld\\\"}}\",\"exit_code\":0}")]
+    (assert (str-contains? (.text out) "\n  \"answer\": 42"))
+    (assert (str-contains? (.text out) "hello\\nworld"))
+    (assert-eq (.status out) "exit 0")))
+
+(deftest conversation-uses-rich-markdown-and-readable-command-results
+  (let [a (malloc-allocator)
+        (mut c) (zeroed chat/Chat)]
+    (chat/chat-init! (mut c) a)
+    (let [doc
+            (match (jv-parse a
+                             "{\"transcript\":[{\"role\":\"assistant\",\"content\":\"## Result\\n**Ready** with `code`\",\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"{\\\"stdout\\\":\\\"hello\\\\nworld\\\",\\\"exit_code\\\":0}\"}]}")
+              (Some [doc] doc)
+              (_ (do (assert false) (JNull))))]
+      (chat/chat-set-transcript! (mut c) doc 1))
+    (let [lines (chat/chat-lines (mut c) 80)
+          (mut heading) false
+          (mut output) false]
+      (for l (iter lines)
+        (when (= (.text l) "Result")
+          (assert (> (len (.rich l)) 0))
+          (assert (= (& (.attrs (get (.rich l) 0)) ATTR-BOLD) ATTR-BOLD))
+          (set! heading true))
+        (when (= (.text l) "hello") (set! output true)))
+      (assert (load heading))
+      (assert (load output)))))

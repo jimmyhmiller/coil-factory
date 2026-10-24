@@ -6,12 +6,94 @@ Run `factory` in your project and start typing. No daemon, recipe, station, or
 gate is required for a personal conversation. Claude and Codex use their existing
 CLI logins; an empty model uses that CLI's default. The workbench chooses the
 site's configured harness, or an installed Claude/Codex CLI when no API model is
-configured. Use `/settings` to choose the project directory, harness and model.
+configured. Use `/settings` to choose the project directory and defaults.
+`/model` opens a searchable model list and selects the matching harness. It works
+in an existing conversation: changing models keeps the conversation, draft and
+Context board. A running turn finishes with its current model; queued messages
+then go to the new selection. Switching harnesses carries the prior messages and
+tool results into a new native provider session; changing models within the same
+harness resumes its native session.
+
+The list uses Claude Code's native model catalog, showing versioned names and
+selecting exact model IDs. It refreshes in the background and caches the result;
+model discovery does not run an inference turn. Codex uses its local model
+catalog. Models advertising the priority service tier also have a `(Fast)` choice
+in `/model`; selecting it persists fast mode for the conversation. Select the
+ordinary model entry to return to standard speed. Speed changes take effect at
+the next turn, including when resuming a saved conversation.
+OpenCode lists third-party models from connected providers and keyless
+free models; Anthropic and OpenAI models are excluded, including proxy routes.
+Configured and current choices follow the same restrictions.
+Ctrl-K deletes to the end of the input line (or deletes the newline at line end).
+Assistant messages render Markdown headings, emphasis, lists, quotes, links and
+code blocks as styled terminal text. Tool results show readable output previews
+with command status separately; JSON data is indented. `/inspect` retains raw results.
+Drag the vertical sidebar borders to resize them; widths save across restarts.
+`/sidebars` shows current visibility and completes flags and targets. Use
+`/sidebars --hide left`, `/sidebars --show right`, or
+`/sidebars --hide left --show right`. Flags are `--hide`, `--show`, `--toggle`;
+targets are `left` (conversations), `right` (context), and `all`. `--toggle all`
+flips each side independently. Tab completes a suggestion; Enter applies the
+complete command. Overlapping targets are rejected before any changes. Each
+choice saves independently; drafts and panel widths are preserved.
+`/sidebars --help` shows usage and examples.
+The mouse wheel scrolls the conversation or the pane under the pointer, preserving
+your input. Escape interrupts the active assistant; an open menu closes first.
 Type `/` to browse and filter commands. The bottom line shows the selected
 command's keyboard shortcut; shortcuts stay available without persistent hints.
 
+The right sidebar also has **Actions**: command buttons shared by conversations
+in the same project. Ask the AI to add a button, or click **New action**. Each
+button has **Run/Stop**, **Log**, and **Edit** controls. Focus the sidebar with
+Ctrl-Y; Tab selects an action, Enter runs/stops it, `o` toggles its log, `e` edits
+it, and `n` creates one. The editor uses Tab between fields, Enter to save,
+Ctrl-D to delete an inactive action, and Escape to cancel.
+
+Definitions are saved in the project's `.factory/actions.json`, which you can
+edit or commit. For example:
+
+```json
+{
+  "version": 1,
+  "revision": 1,
+  "actions": [
+    {
+      "id": "dev",
+      "label": "Run application",
+      "command": "npm run dev",
+      "cwd": ".",
+      "env": {}
+    }
+  ]
+}
+```
+
+Commands use noninteractive `/bin/sh -c`, inherit the environment, and accept
+string environment overrides. Optional integer `order` sorts buttons ascending,
+with file order breaking ties. The directory is relative to the selected project
+and must stay inside it. Use foreground commands: the supervisor manages their
+process groups. Worktrees have separate runs; a factory conversation runs its
+actions in that factory's workspace, on its owning site.
+
+Adding or editing a button never runs it. Only one run per action can be active;
+editing a running action changes its next run. Applications survive closing the
+UI or cancelling an AI turn. Stop first sends TERM, then KILL if necessary, and
+cleans up descendants. Logs retain the latest 1 MiB; the sidebar shows the latest
+64 KiB, with an omission notice. Lines over 64 KiB are dropped and reported by the
+log tool. Lost supervisor ownership is shown as interrupted and blocks automatic
+start/stop; an unavailable site is shown as unavailable.
+
+The AI uses `project_actions_list`, `project_action_set`, `project_action_remove`,
+`project_action_start`, `project_action_status`, `project_action_logs`, and
+`project_action_stop`. Mutations and starts use the opaque `token` returned by
+listing as `expected_revision`; manual config edits also invalidate that token.
+These tools are offered to agents with shell tools, across builtin, Claude,
+Codex, and OpenCode harnesses.
+
 Conversations live in `~/.factory/sessions/`, separately from factory runs.
-`/history` selects a saved conversation; `/new` starts another. Closing the
+`/resume` opens saved conversations; `/history` is an alias. Click a conversation
+in the left sidebar to reopen it, or scroll that list with the mouse wheel.
+`/new` starts another conversation. Closing the
 UI leaves active work running. Reopen a conversation to see its results and
 continue it. `/cancel` cancels the current personal turn. Personal agents work
 directly in the selected project, with no factory gate or automatic commit.
@@ -26,6 +108,11 @@ starts an installed remote factory over SSH. Saved connections reconnect on
 launch. Connection checks run in the background, so an unavailable factory does
 not prevent a personal conversation. Saved tokens are masked on screen and
 stored in an owner-only `connections.json` under the factory home.
+
+One factory daemon can run independent workflows concurrently. `max_runs` in
+`site.json` defaults to `0` (unlimited); a positive number sets an optional cap.
+Production workflows share `factory.service` on computer.jimmyhmiller.com,
+using `~/.factory` and port 7788.
 
 `/run` opens the run composer. Choose a factory, brief,
 project, site, harness and model. The command's bottom hint shows its submission
@@ -44,8 +131,8 @@ place, or change a todo's status without duplicating its text. Statuses are
 `info`, `todo`, `doing`, and `done`.
 
 Boards save automatically and survive restarts, transcript compaction and model
-turns. `/sidebar` focuses the board for scrolling (or shows it full-width on a
-narrow terminal); `/sidebar-hide` gives the conversation more room. Factory-agent
+turns. Ctrl-Y focuses the board for scrolling (or shows it full-width on a
+narrow terminal); `/sidebars --hide right` gives the conversation more room. Factory-agent
 boards refresh independently through the authenticated API, including remote
 factories (`GET /v1/runs/{run}/agents/{station}/sidebar`). Storage is
 `sidebar/<agent>.json` under the conversation or run

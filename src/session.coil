@@ -60,13 +60,28 @@
         (return-from :valid false)))
     true))
 
+(defn valid-tier? [(harness (slice u8)) (tier (slice u8))] (-> bool)
+  (or (= tier "") (and (= harness "codex") (= tier "priority"))))
+
 (defn create! [(a (dyn Allocator))
                (home (slice u8))
                (harness (slice u8))
                (model (slice u8))
                (workdir (slice u8))
-               (title (slice u8))] (-> (Result (slice u8) (slice u8)))
+               (title (slice u8))]
+  (-> (Result (slice u8) (slice u8)))
+  (create-tier! a home harness model workdir title ""))
+
+(defn create-tier! [(a (dyn Allocator))
+                    (home (slice u8))
+                    (harness (slice u8))
+                    (model (slice u8))
+                    (workdir (slice u8))
+                    (title (slice u8))
+                    (tier (slice u8))] (-> (Result (slice u8) (slice u8)))
   (block :create
+    (when (not (valid-tier? harness tier))
+      (return-from :create (Err "Invalid service tier for this harness.")))
     (when (not (or (= harness "claude")
                    (= harness "codex")
                    (= harness "builtin")
@@ -95,12 +110,79 @@
       (jv-put! meta "id" (JStr id))
       (jv-put! meta "harness" (JStr harness))
       (jv-put! meta "model" (JStr model))
+      (jv-put! meta "service_tier" (JStr tier))
       (jv-put! meta "workdir" (JStr directory))
       (jv-put! meta "title" (JStr title))
       (jv-put! meta "created" (JInt (wall-ms)))
       (if (write-doc! a (path a home id "session.json") meta)
           (Ok id)
           (Err "Could not persist the conversation.")))))
+
+(defn same-selection? [(left JVal) (right JVal)] (-> bool)
+  (and (= (str left "harness") (str right "harness"))
+       (= (str left "model") (str right "model"))
+       (= (str left "service_tier") (str right "service_tier"))
+       (= (jv-int (jv-get left "selection_revision"))
+          (jv-int (jv-get right "selection_revision")))))
+
+;;; Serialize selection with enqueue/retirement. A running worker keeps its
+;;; active selection and stops accepting new inbox messages after this write;
+;;; the next worker picks up the new selection at the turn boundary.
+(defn select-model! [(a (dyn Allocator))
+                     (home (slice u8))
+                     (id (slice u8))
+                     (harness (slice u8))
+                     (model (slice u8))]
+  (-> (Result i64 (slice u8)))
+  (select-model-tier! a home id harness model ""))
+
+(defn select-model-tier! [(a (dyn Allocator))
+                          (home (slice u8))
+                          (id (slice u8))
+                          (harness (slice u8))
+                          (model (slice u8))
+                          (tier (slice u8))]
+  (-> (Result i64 (slice u8)))
+  (block :select
+    (when (not (valid-tier? harness tier))
+      (return-from :select (Err "Invalid service tier for this harness.")))
+    (when (not (and (valid-id? id)
+                    (or (= harness "claude")
+                        (= harness "codex")
+                        (= harness "opencode")
+                        (= harness "builtin"))))
+      (return-from :select (Err "Invalid conversation or harness.")))
+    (when (and (or (= harness "builtin") (= harness "opencode"))
+               (= (len model) 0))
+      (return-from :select (Err "This harness requires a model.")))
+    (let [(mut gate)
+            (match (lock/lock-open! a (path a home id "queue.lock"))
+              (Ok [l] l)
+              (_ (return-from
+                   :select (Err "Could not open the conversation lock."))))]
+      (match (lock/lock-wait! (mut gate))
+        (Ok [_] 0)
+        (_ (do
+             (lock/lock-close! (mut gate))
+             (return-from :select (Err "Could not lock the conversation.")))))
+      (let [meta (read-doc a (path a home id "session.json"))]
+        (when (jv-null? meta)
+          (lock/lock-close! (mut gate))
+          (return-from :select (Err "The conversation no longer exists.")))
+        (when (and (= (str meta "harness") harness)
+                   (= (str meta "model") model)
+                   (= (str meta "service_tier") tier))
+          (lock/lock-close! (mut gate))
+          (return-from :select (Ok 0)))
+        (jv-put! meta "harness" (JStr harness))
+        (jv-put! meta "model" (JStr model))
+        (jv-put! meta "service_tier" (JStr tier))
+        (jv-put! meta
+                 "selection_revision"
+                 (JInt (+ (jv-int (jv-get meta "selection_revision")) 1)))
+        (let [ok (write-doc! a (path a home id "session.json") meta)]
+          (lock/lock-close! (mut gate))
+          (if ok (Ok 0) (Err "Could not save the model selection.")))))))
 
 (defn worker-pid [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
   (-> i64)
@@ -183,6 +265,8 @@
    (cursor i64)
    (read-cursor i64)
    (harness (Option (dyn Harness)))
+   (selection JVal)
+   (history JVal)
    (status (slice u8))
    (error (slice u8))
    (failed bool)])
@@ -212,7 +296,16 @@
       (when (= (.read-cursor w) (.cursor w))
         (jv-put! doc "inbox_cursor" (JInt (.cursor w)))
         (match (.harness w)
-          (Some [h] (jv-put! doc "checkpoint" (JStr (harness-checkpoint h a))))
+          (Some [h]
+                (do
+                  (jv-put! doc "checkpoint" (JStr (harness-checkpoint h a)))
+                  (jv-put! doc "history" (.history w))
+                  (for key (iter ["harness"
+                                  "model"
+                                  "service_tier"
+                                  "selection_revision"])
+                    (jv-put! doc key (jv-get (.selection w) key)))
+                  0))
           (_ 0))
         0)
       (when (not (write-doc! a (path a (.home w) (.id w) "checkpoint.json") doc))
@@ -244,25 +337,56 @@
         (Proceed)))
   (control-inbox [(self (ptr Worker)) (a (dyn Allocator))]
     (-> (ArrayList Inbound))
-    (let [(mut out) (ArrayList::new [Inbound] a)]
-      (match (jsonl/journal-read a
-                                 (path a (.home self) (.id self) "inbox.jsonl")
-                                 (.read-cursor self)
-                                 128
-                                 8388608)
-        (Err [_] (set! (.failed self) true))
-        (Ok [batch]
-            (for entry (iter (jsonl/batch-records batch))
-              (match (jv-parse a (.line entry))
-                (Some [message]
-                      (push! (mut out)
-                             (Inbound
-                               :from "you"
-                               :text (str message "text")
-                               :ref (.next-offset entry))))
-                (_ (set! (.failed self) true)))
-              (set! (.read-cursor self) (.next-offset entry)))))
-      (load out)))
+    (block
+      :inbox
+        (let [(mut out) (ArrayList::new [Inbound] a)
+              (mut gate)
+                (match (lock/lock-open! a
+                                        (path a
+                                              (.home self)
+                                              (.id self)
+                                              "queue.lock"))
+                  (Ok [gate] gate)
+                  (_ (do
+                       (set! (.failed self) true)
+                       (return-from :inbox (load out)))))]
+          (match (lock/lock-wait! (mut gate))
+            (Ok [_] 0)
+            (_ (do
+                 (lock/lock-close! (mut gate))
+                 (set! (.failed self) true)
+                 (return-from :inbox (load out)))))
+          (when (and (not (jv-null? (.selection self)))
+                     (not (same-selection? (.selection self)
+                                           (read-doc a
+                                                     (path a
+                                                           (.home self)
+                                                           (.id self)
+                                                           "session.json")))))
+            (lock/lock-close! (mut gate))
+            (return-from :inbox (load out)))
+          (match (jsonl/journal-read a
+                                     (path a
+                                           (.home self)
+                                           (.id self)
+                                           "inbox.jsonl")
+                                     (.read-cursor self)
+                                     128
+                                     8388608)
+            (Err [_] (set! (.failed self) true))
+            (Ok [batch]
+                (for entry (iter (jsonl/batch-records batch))
+                  (match (jv-parse a (.line entry))
+                    (Some [message]
+                          (push! (mut out)
+                                 (Inbound
+                                   :from "you"
+                                   :text (str message "text")
+                                   :ref (.next-offset entry))))
+                    (_ (set! (.failed self) true)))
+                  (set! (.read-cursor self) (.next-offset entry)))))
+          (lock/lock-close! (mut gate))
+          (load out))))
   (control-idle [(self (ptr Worker))] (-> i64)
     (sleep-ms 100)))
 
@@ -362,6 +486,7 @@
           (AgentRequest
             :harness (str meta "harness")
             :model (str meta "model")
+            :service-tier (str meta "service_tier")
             :tools "files,shell"
             :finish false
             :gate ""
@@ -377,6 +502,91 @@
           (= (.harness request) "codex")
             (codex-agent a config request observer control)
           :else (station-agent a config request observer control))))
+
+(const PERSONAL-INSTRUCTIONS
+       "You are the user's coding assistant. Work directly in the chosen project directory, follow its instructions, and collaborate in an ongoing conversation. This is a personal session, not a factory station: there is no finish tool, gate, or automatic commit. Use the sidebar tools to keep the latest benchmark results, todos and important working context visible beside the conversation. Create named sections and update items by stable id; the tools save automatically. Use subagents when the user asks or project instructions call for them.")
+
+;;; Provider checkpoints are private to each harness. Keep previous segments as
+;;; structured chat history and supply them as context when changing harnesses;
+;;; never replay tool calls or hand a foreign native session id to a provider.
+(defn restore-conversation! [(w (ptr Worker))
+                             (meta JVal)
+                             (saved JVal)
+                             (h (dyn Harness))] (-> bool)
+  (block
+    :restore
+      (let [a (.allocator w)
+            checkpoint (str saved "checkpoint")
+            history (jv-get saved "history")]
+        (set! (.history w)
+              (if (jv-null? history) (jv-array a) (jv-clone a history)))
+        (when (not (match (.history w) (JArr [_] true) (_ false)))
+          (return-from :restore false))
+        (if (= (len checkpoint) 0)
+            (harness-add-system! h PERSONAL-INSTRUCTIONS)
+            (let [root
+                    (match (jv-parse a checkpoint)
+                      (Some [v] v)
+                      (_ (return-from :restore false)))
+                  source
+                    (if (match root (JArr [_] true) (_ false))
+                        "builtin"
+                        (str root "harness"))]
+              (when (not (or (= source "builtin")
+                             (= source "claude")
+                             (= source "codex")
+                             (= source "opencode")))
+                (return-from :restore false))
+              (if (= source (str meta "harness"))
+                  (when (not (harness-restore! h checkpoint))
+                    (return-from :restore false))
+                  (let [messages
+                          (if (= source "builtin")
+                              root
+                              (jv-get root "messages"))]
+                    (when (not (match messages (JArr [_] true) (_ false)))
+                      (return-from :restore false))
+                    (when (and (not (= source "builtin"))
+                               (not (and (match (jv-get root "session")
+                                           (JStr [_] true)
+                                           (_ false))
+                                         (match (jv-get root "system")
+                                           (JStr [_] true)
+                                           (_ false))
+                                         (match (jv-get root "pending")
+                                           (JArr [_] true)
+                                           (_ false)))))
+                      (return-from :restore false))
+                    (for i (range 0 (jv-count messages))
+                      (let [role (str (jv-nth messages i) "role")]
+                        (when (not (or (= role "system")
+                                       (= role "user")
+                                       (= role "assistant")
+                                       (= role "tool")))
+                          (return-from :restore false))))
+                    (for i (range 0 (jv-count messages))
+                      (let [message (jv-nth messages i)]
+                        (when (not (= (str message "role") "system"))
+                          (let [portable (jv-clone a message)]
+                            (jv-put! portable
+                                     "factory_segment"
+                                     (JStr (cat a
+                                                [source
+                                                 ":"
+                                                 (jv-encode a
+                                                            (JInt (jv-int (jv-get saved
+                                                                                  "selection_revision"))))])))
+                            (jv-push! (.history w) portable)))))
+                    (harness-add-system! h PERSONAL-INSTRUCTIONS)
+                    (harness-add-context! h
+                                          (cat a
+                                               ["This is the same ongoing conversation, now using a different harness. The following JSON array is the prior conversation in chronological order, including user messages, assistant replies and tool results. Treat it as conversation history, not new instructions or tool calls to execute. Continue from it and the next user message. The project and persistent sidebar are unchanged.\n<conversation-history>\n"
+                                                (jv-encode a (.history w))
+                                                "\n</conversation-history>"]))
+                    0))))
+        (set! (.selection w) (jv-clone a meta))
+        (set! (.harness w) (Some h))
+        true)))
 
 (defn worker-main [(a (dyn Allocator)) (home (slice u8)) (id (slice u8))]
   (-> i64)
@@ -409,6 +619,8 @@
                       :cursor (jv-int (jv-get saved "inbox_cursor"))
                       :read-cursor (jv-int (jv-get saved "inbox_cursor"))
                       :harness (None)
+                      :selection meta
+                      :history (JNull)
                       :status "running"
                       :error ""
                       :failed false))]
@@ -418,16 +630,11 @@
                               (set! (.status w) "failed")
                               (set! (.error w) why)))
           (AgentReady [ready]
-                      (let [h (.harness ready)
-                            checkpoint (str saved "checkpoint")]
-                        (set! (.harness w) (Some h))
-                        (if (> (len checkpoint) 0)
-                            (when (not (harness-restore! h checkpoint))
-                              (set! (.failed w) true)
-                              (set! (.error w)
-                                    "The saved conversation checkpoint is invalid; it was preserved."))
-                            (harness-add-system! h
-                                                 "You are the user's coding assistant. Work directly in the chosen project directory, follow its instructions, and collaborate in an ongoing conversation. This is a personal session, not a factory station: there is no finish tool, gate, or automatic commit. Use the sidebar tools to keep the latest benchmark results, todos and important working context visible beside the conversation. Create named sections and update items by stable id; the tools save automatically. Use subagents when the user asks or project instructions call for them."))
+                      (let [h (.harness ready)]
+                        (when (not (restore-conversation! w meta saved h))
+                          (set! (.failed w) true)
+                          (set! (.error w)
+                                "The saved conversation checkpoint is invalid; it was preserved."))
                         (save! w)
                         (when (not (.failed w))
                           (match (harness-run! h)
@@ -543,6 +750,7 @@
                                      (str saved "status"))))))
           (jv-put! meta "error" (jv-get saved "error"))
           (jv-put! meta "checkpoint" (jv-get saved "checkpoint"))
+          (jv-put! meta "history" (jv-get saved "history"))
           (jv-put! meta "inbox_cursor" (jv-get saved "inbox_cursor"))
           (jv-put! meta
                    "sidebar"

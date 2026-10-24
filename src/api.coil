@@ -1,4 +1,5 @@
 (module factory.api)
+(import "factory.actions" :as actions)
 (import "factory.sidebar" :as sidebar)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
@@ -48,6 +49,7 @@
   (CancelRun)
   (GetAgent)
   (GetSidebar)
+  (ProjectActions)
   (PostMessage)
   (GetDiff)
   (ListSites)
@@ -895,7 +897,7 @@
                 "text/plain; charset=utf-8"
                 (join a
                       [(guide-text)
-                       "\nGET  /v1/runs/{run}/agents/{station}/sidebar  saved context sections and item lists (version, revision, updated, sections)\n"])))
+                       "\nGET  /v1/runs/{run}/agents/{station}/sidebar  saved context sections and item lists (version, revision, updated, sections)\nPOST /v1/runs/{run}/agents/{station}/actions  {kind: 1..7, args, output_run?} project command buttons and supervised runs; kinds: list, set, remove, start, status, logs, stop\n"])))
 
 (defn guide-text [] (-> (slice u8))
   "FACTORY SITE API\n\nThis is a factory site: it runs software factories (Markdown recipes of agent stations) in isolated git worktrees and records everything they do in a journal per run.\n\nAuthenticate every /v1 request with `Authorization: Bearer <token>`; the token is in ~/.factory/token on this machine. Bodies are JSON. Errors are {\"error\": {\"code\", \"message\"}}. Run ids accept a unique prefix.\n\nGET  /v1/site                              this site: name, capacity, isolation, default model\nGET  /v1/overview                          every run's folded state, newest first\nGET  /v1/factories                         the factory library\nGET  /v1/factories/{name}                  one factory, with its Markdown\nGET  /v1/reviewers                         reviewers a run can name, and what each runs on\nPOST /v1/factories/check  {text}           validate a factory's Markdown\nGET  /v1/runs                              runs, newest first\nPOST /v1/runs  {factory | factory_text, brief, project, base, model, harness, reviewers}\n                                           start a run; project is a repository path on this site;\n                                           reviewers: comma-separated names, or \"none\"\nGET  /v1/runs/{run}                        stations, agents (what each is doing now), findings, pending messages\nGET  /v1/runs/{run}/events?after=&limit=   journal page; ?tail=N for the last N records\nGET  /v1/runs/{run}/events/stream          Server-Sent Events; id is the cursor; Last-Event-ID resumes; ?follow=1 never ends\nPOST /v1/runs/{run}/pause | resume | cancel\nGET  /v1/runs/{run}/agents/{station}       one agent's state and full transcript\nPOST /v1/runs/{run}/agents/{station}/messages  {text}\n                                           talk to an agent: running agents read it at their next turn, blocked\n                                           ones resume with it as the answer, finished ones reply in their workspace\nGET  /v1/runs/{run}/diff                   the run branch's changes\n\nRun status: queued, running, paused, blocked (waiting for a person), succeeded, failed, cancelled, lost.\nJournal records: {t, kind, agent?, ...}; kinds include run.*, station.*, gate.*, agent.turn, agent.streaming, agent.text, agent.thought, agent.usage, tool.started, tool.finished, message.sent, message.received, control, finding, oversight.\n")
@@ -921,6 +923,7 @@
     (CancelRun [] (with-run self a ctx))
     (GetAgent [] (with-run self a ctx))
     (GetSidebar [] (with-run self a ctx))
+    (ProjectActions [] (with-run self a ctx))
     (PostMessage [] (with-run self a ctx))
     (GetDiff [] (with-run self a ctx))
     (ListSites [] (list-sites-reply self a))
@@ -989,6 +992,7 @@
     (route! a router site hub "POST" "/v1/runs/{run}/pause" (PauseRun))
     (route! a router site hub "POST" "/v1/runs/{run}/resume" (ResumeRun))
     (route! a router site hub "POST" "/v1/runs/{run}/cancel" (CancelRun))
+    (route! a router site hub "POST" "/v1/runs/{run}/agents/{agent}/actions" (ProjectActions))
     (route! a router site hub "GET" "/v1/runs/{run}/agents/{agent}" (GetAgent))
     (route! a
             router
@@ -1022,6 +1026,14 @@
     (ResumeRun [] (resume-body self a ctx entry))
     (CancelRun [] (cancel-body self a ctx entry))
     (GetAgent [] (get-agent-body self a ctx entry))
+    (ProjectActions []
+      (if (not (station-known? entry (app/param ctx "agent")))
+        (problem-reply a 404 "agent_not_found" "This run has no such agent.")
+        (match (actions/dispatch a (.home (.site self))
+                  (workspace-path a (.home (.site self)) (.id entry))
+                  (.isolation (.config (.site self))) (json-body a ctx))
+          (Ok [v] (json-reply a 200 v))
+          (Err [why] (problem-reply a 409 "action_failed" why)))))
     (GetSidebar []
                 (if (station-known? entry (app/param ctx "agent"))
                     (json-reply a

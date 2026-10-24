@@ -1,4 +1,5 @@
 (module factory.agentkit)
+(import "factory.actions" :as actions)
 (import "factory.sidebar" :as sidebar)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
@@ -535,6 +536,7 @@
                     (call AgentCall)
                     (harness-name (slice u8))] (-> AgentRequest)
   (AgentRequest
+    :service-tier ""
     :harness harness-name
     :model (if (> (len (.model call)) 0) (.model call) (.model spec))
     :tools (.tools spec)
@@ -678,6 +680,8 @@
                                    (.workdir call)
                                    "--home"
                                    (.home call)
+                                   "--site-home"
+                                   (.home config)
                                    "--isolation"
                                    (.isolation config)])
                     (push! (mut server) word))
@@ -764,6 +768,7 @@
    (error (slice u8))
    (workdir (slice u8))
    (home (slice u8))
+   (site-home (slice u8))
    (isolation (slice u8))
    (ready (slice u8))
    (sidebar-root (slice u8))
@@ -778,6 +783,7 @@
             :error ""
             :workdir ""
             :home ""
+            :site-home ""
             :isolation "none"
             :ready ""
             :sidebar-root ""
@@ -793,6 +799,7 @@
                       (= flag "--error") (set! (.error out) value)
                       (= flag "--workdir") (set! (.workdir out) value)
                       (= flag "--home") (set! (.home out) value)
+                      (= flag "--site-home") (set! (.site-home out) value)
                       (= flag "--isolation") (set! (.isolation out) value)
                       (= flag "--ready") (set! (.ready out) value)
                       (= flag "--sidebar-root") (set! (.sidebar-root out) value)
@@ -888,6 +895,16 @@
                                                              :allocator a
                                                              :path (.ready args)))
                                                    (mut problem) ""]
+                                               (when (actions/shell-enabled? a
+                                                                             (.tools spec))
+                                                 (actions/register! a
+                                                                    (mut registry)
+                                                                    (if (> (len (.site-home args))
+                                                                           0)
+                                                                        (.site-home args)
+                                                                        (factory-home a))
+                                                                    (.workdir args)
+                                                                    (.isolation args)))
                                                (sidebar/register! a
                                                                   (mut registry)
                                                                   (.sidebar-root args)

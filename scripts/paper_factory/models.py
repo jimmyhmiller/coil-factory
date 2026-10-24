@@ -1,7 +1,7 @@
 """The free-model registry: discover, research, test and rank free models.
 
-One bounded heartbeat, like the paper controller, with its own lock, state and
-native factory site, so its runs never hold up a paper run.
+One bounded heartbeat, like the paper controller, with its own lock and state.
+Its native runs share the factory daemon with the other workflows.
 
 - Discovery refreshes OpenCode's catalogue and keeps every model offered at zero
   input and output cost with tool calls and a large enough context. Denied

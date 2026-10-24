@@ -5,7 +5,7 @@
 (import "coil.slice" :use *)
 (import "coil.str"
         :use
-        [StrBuf trim])
+        [StrBuf trim starts-with])
 (import "coil.serde.value" :use *)
 (import "agent.json" :use [jv-parse])
 (import "tui.canvas" :use *)
@@ -264,32 +264,49 @@
 ;;; The glyph for a tool: `$` shell, `✎` writes and edits, `▤` reads and
 ;;; listings, `⌕` search, `⚑` finish. Knows the builtin harness's tool names
 ;;; and OpenCode's (bash, read, edit, write, apply_patch, list, glob, grep).
+(defn tool-kind [(tool (slice u8))] (-> (slice u8))
+  (cond (= tool "Bash") "bash"
+        (= tool "exec_command") "shell"
+        (= tool "Read") "read_file"
+        (= tool "Edit") "edit_file"
+        (= tool "Write") "write_file"
+        (= tool "Glob") "glob"
+        (= tool "Grep") "grep"
+        :else tool))
+
 (defn tool-glyph [(tool (slice u8))] (-> (slice u8))
-  (cond (or (= tool "shell") (= tool "bash")) "$"
-        (or (= tool "edit_file")
-            (= tool "write_file")
-            (= tool "edit")
-            (= tool "write")
-            (= tool "apply_patch"))
-          "✎"
-        (or (= tool "read_file")
-            (= tool "list_dir")
-            (= tool "read")
-            (= tool "list"))
-          "▤"
-        (or (= tool "search") (= tool "grep") (= tool "glob")) "⌕"
-        (= tool "finish") "⚑"
-        :else "⚙"))
+  (let [tool (tool-kind tool)]
+    (cond (or (= tool "shell") (= tool "bash")) "$"
+          (or (= tool "edit_file")
+              (= tool "write_file")
+              (= tool "edit")
+              (= tool "write")
+              (= tool "apply_patch"))
+            "✎"
+          (or (= tool "read_file")
+              (= tool "list_dir")
+              (= tool "read")
+              (= tool "list"))
+            "▤"
+          (or (= tool "search") (= tool "grep") (= tool "glob")) "⌕"
+          (= tool "finish") "⚑"
+          :else "⚙")))
 
 ;;; One human line for a tool call, from its name and JSON arguments:
 ;;; "coil test", "src/x.coil", "\"pattern\"", "done: summary".
 (defn tool-subject [(a (dyn Allocator))
                     (tool (slice u8))
                     (arguments (slice u8))] (-> (slice u8))
-  (let [args (match (jv-parse a arguments) (Some [v] v) (None [] (JNull)))]
-    (cond (or (= tool "shell") (= tool "bash")) (first-line (js args "command"))
+  (let [tool (tool-kind tool)
+        args (match (jv-parse a arguments) (Some [v] v) (None [] (JNull)))]
+    (cond (or (= tool "shell") (= tool "bash"))
+            (first-line (if (> (len (js args "command")) 0)
+                            (js args "command")
+                            (js args "cmd")))
           (or (= tool "edit_file") (= tool "write_file") (= tool "read_file"))
-            (js args "path")
+            (if (> (len (js args "path")) 0)
+                (js args "path")
+                (js args "file_path"))
           (or (= tool "edit") (= tool "write") (= tool "read"))
             (js args "filePath")
           (or (= tool "grep") (= tool "glob"))
@@ -344,12 +361,29 @@
         :else (ToneMuted)))
 
 ;;; A journal tool summary without the glyph it already starts with ("$ ").
-(defn tool-summary-text [(tool (slice u8)) (summary (slice u8))] (-> (slice u8))
-  (if (and (or (= tool "shell") (= tool "bash"))
-           (>= (len summary) 2)
-           (= (subslice summary 0 2) "$ "))
-      (subslice summary 2 (len summary))
-      summary))
+(defn tool-summary-text [(a (dyn Allocator))
+                         (tool (slice u8))
+                         (summary (slice u8))] (-> (slice u8))
+  (block :summary
+    (for i (range 0 (len summary))
+      (when (= (cast i64 (get summary i)) 123)
+        (let [args (subslice summary i (len summary))]
+          (match (jv-parse a args)
+            (Some [v]
+                  (when (not (= (tool-kind tool) tool))
+                    (return-from
+                      :summary
+                        (concat a
+                                [(if (starts-with summary "[subagent ")
+                                     (first-line (subslice summary 0 i))
+                                     "")
+                                 (tool-subject a tool args)]))))
+            (_ 0)))
+        (break)))
+    (if (and (or (= (tool-kind tool) "shell") (= (tool-kind tool) "bash"))
+             (starts-with summary "$ "))
+        (subslice summary 2 (len summary))
+        summary)))
 
 ;;; How long a tool took: "12ms", "1.5s", "2m03s".
 (defn fmt-ms [(a (dyn Allocator)) (ms i64)] (-> (slice u8))

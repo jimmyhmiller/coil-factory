@@ -1,0 +1,789 @@
+(module factory.actions)
+(import "coil.alloc" :use *)
+(import "coil.hashmap" :use [for-entries])
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.scratch" :as scratch)
+(import "agent.json" :use *)
+(import "agent.tool" :use *)
+(import "durable.atomic" :as disk)
+(import "durable.lock" :as lock)
+(import "durable.ids" :as ids)
+(import "factory.sidebar" :use [cat text key?])
+(import "factory.proc" :as proc)
+(import "factory.events" :use [wall-ms])
+(import "factory.toolkit" :as toolkit)
+(import "agent_tools.workspace" :as ws)
+(import "agent_tools.sandbox" :as sandbox)
+(import "agent_tools.stream" :as stream)
+(import "agent_tools.text" :as output-text)
+
+(const LOG-LIMIT 1048576)
+
+;;; Content tokens detect manual edits even when their numeric revision is unchanged.
+(defn read-file [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (disk/read-file-if-exists a path)
+    (Ok [v] (match v (Some [s] s) (_ "")))
+    (_ "")))
+
+(defn document [(a (dyn Allocator)) (path (slice u8))] (-> JVal)
+  (match (jv-parse a (read-file a path)) (Some [v] v) (_ (JNull))))
+
+(defn save! [(a (dyn Allocator)) (path (slice u8)) (v JVal)] (-> bool)
+  (match (disk/write-file-atomic! a path (jv-encode a v) 384)
+    (Ok [_] true)
+    (_ false)))
+
+;;; Reversible, collision-free encoding, with bounded filesystem component sizes.
+(defn runtime [(a (dyn Allocator)) (home (slice u8)) (project (slice u8))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
+        (mut count) 0]
+    (push-str! (mut out) home)
+    (push-str! (mut out) "/actions/")
+    (for b (iter project)
+      (when (= (load count) 60)
+        (push-str! (mut out) "/")
+        (set! count 0))
+      (push! (mut out) (ids/hex-digit (/ (cast i64 b) 16)))
+      (push! (mut out) (ids/hex-digit (% (cast i64 b) 16)))
+      (set! count (+ (load count) 1)))
+    (push-str! (mut out) "/state")
+    (finish! (mut out))))
+
+(defn config-path [(a (dyn Allocator)) (project (slice u8))] (-> (slice u8))
+  (cat a [project "/.factory/actions.json"]))
+
+(defn plain? [(s (slice u8)) (limit i64)] (-> bool)
+  (let [(mut valid) (and (> (len (trim s)) 0) (<= (len s) limit))]
+    (for b (iter s) (when (or (< b 32) (= b 127)) (set! valid false)))
+    (load valid)))
+
+(defn env-key? [(s (slice u8))] (-> bool)
+  (let [(mut valid) (and (> (len s) 0) (<= (len s) 128))]
+    (for i (range 0 (len s))
+      (let [b (get s i)]
+        (when (not (or (and (>= b 65) (<= b 90))
+                       (and (>= b 97) (<= b 122))
+                       (= b 95)
+                       (and (> i 0) (>= b 48) (<= b 57))))
+          (set! valid false))))
+    (load valid)))
+
+(defn no-nul? [(s (slice u8))] (-> bool)
+  (let [(mut valid) true]
+    (for b (iter s) (when (= b 0) (set! valid false)))
+    (load valid)))
+
+(defn action-valid? [(v JVal)] (-> bool)
+  (block :valid
+    (when (not (and (key? (text v "id"))
+                    (plain? (text v "label") 120)
+                    (> (len (trim (text v "command"))) 0)
+                    (<= (len (text v "command")) 16384)
+                    (no-nul? (text v "command"))
+                    (<= (len (text v "description")) 2048)
+                    (<= (len (text v "cwd")) 4096)
+                    (no-nul? (text v "cwd"))))
+      (return-from :valid false))
+    (when (not (match (jv-get v "order")
+                 (JNull [] true)
+                 (JInt [_] true)
+                 (_ false)))
+      (return-from :valid false))
+    (for field (iter ["description" "cwd"])
+      (when (not (match (jv-get v field)
+                   (JNull [] true)
+                   (JStr [_] true)
+                   (_ false)))
+        (return-from :valid false)))
+    (match (jv-get v "env")
+      (JNull [] 0)
+      (JObj [env]
+            (for-entries [k value env]
+                         (when (not (and (env-key? k)
+                                         (match value
+                                           (JStr [s]
+                                                 (and (<= (len s) 16384)
+                                                      (no-nul? s)))
+                                           (_ false))))
+                           (return-from :valid false))))
+      (_ (return-from :valid false)))
+    true))
+
+(defn config [(a (dyn Allocator)) (project (slice u8))]
+  (-> (Result JVal (slice u8)))
+  (block
+    :config
+      (let [(mut missing) false
+            raw
+              (match (disk/read-file-if-exists a (config-path a project))
+                (Ok [v]
+                    (match v (None [] (do (set! missing true) "")) (Some [s] s)))
+                (_ (return-from :config (Err "Cannot read project actions."))))
+            v
+              (if (load missing)
+                  (jv-object a)
+                  (match (jv-parse a raw)
+                    (Some [doc] doc)
+                    (_ (return-from
+                         :config (Err "Invalid actions.json; file preserved.")))))]
+        (when (load missing)
+          (jv-put! v "version" (JInt 1))
+          (jv-put! v "revision" (JInt 0))
+          (jv-put! v "actions" (jv-array a)))
+        (when (or (> (len raw) 1048576)
+                  (!= (jv-int (jv-get v "version")) 1)
+                  (not (match (jv-get v "revision")
+                         (JInt [n] (and (>= n 0) (< n 9000000000000000)))
+                         (_ false)))
+                  (not (match (jv-get v "actions") (JArr [_] true) (_ false)))
+                  (> (jv-count (jv-get v "actions")) 64))
+          (return-from
+            :config (Err "Invalid project actions schema; file preserved.")))
+        (let [actions (jv-get v "actions")]
+          (for i (range 0 (jv-count actions))
+            (when (not (action-valid? (jv-nth actions i)))
+              (return-from
+                :config (Err "Invalid action definition; file preserved.")))
+            (for j (range 0 i)
+              (when (= (text (jv-nth actions i) "id")
+                       (text (jv-nth actions j) "id"))
+                (return-from
+                  :config (Err "Duplicate action id; file preserved."))))))
+        ;; A full canonical document is an exact content identity, with no hash collisions.
+        (jv-put! v "token" (JStr (jv-encode a v)))
+        (Ok v))))
+
+(defn active? [(run JVal)] (-> bool)
+  (let [s (text run "state")]
+    (or (= s "starting") (= s "running") (= s "stopping") (= s "interrupted"))))
+
+(defn run-path [(a (dyn Allocator))
+                (root (slice u8))
+                (id (slice u8))
+                (suffix (slice u8))]
+  (-> (slice u8))
+  (cat a [root "/" id suffix]))
+
+;;; Kernel-owned lifetime locks establish ownership without trusting persisted PIDs.
+(defn owned? [(a (dyn Allocator)) (root (slice u8)) (id (slice u8))] (-> bool)
+  (match (lock/lock-open! a (run-path a root id ".owner"))
+    (Err [_] false)
+    (Ok [opened]
+        (let [(mut gate) opened
+              held
+                (match (lock/lock-try! (mut gate))
+                  (Ok [got] (not got))
+                  (_ false))]
+          (lock/lock-close! (mut gate))
+          held))))
+
+(defn status [(a (dyn Allocator)) (root (slice u8)) (id (slice u8))] (-> JVal)
+  (if (not (key? id))
+      (JNull)
+      (let [v (document a (run-path a root id ".json"))]
+        (when (and (active? v)
+                   (not (owned? a root id))
+                   (or (!= (text v "state") "starting")
+                       (> (- (wall-ms) (jv-int (jv-get v "started"))) 5000)))
+          (jv-put! v "state" (JStr "interrupted"))
+          (jv-put! v
+                   "error"
+                   (JStr "Supervisor ownership lost. Automatic start and stop are disabled; inspect any surviving application processes.")))
+        v)))
+
+(defn latest [(a (dyn Allocator)) (root (slice u8)) (action (slice u8))]
+  (-> JVal)
+  (status a
+          root
+          (text (document a (cat a [root "/latest-" action ".json"])) "run_id")))
+
+(defn list-actions [(a (dyn Allocator)) (home (slice u8)) (project (slice u8))]
+  (-> JVal)
+  (match (config a project)
+    (Err [why] (let [v (jv-object a)] (jv-put! v "error" (JStr why)) v))
+    (Ok [v]
+        (let [actions (jv-get v "actions")
+              root (runtime a home project)
+              ordered (jv-array a)
+              (mut used) (zeroed (array bool 64))]
+          (for ignored (range 0 (jv-count actions))
+            (let [(mut best) -1]
+              (for i (range 0 (jv-count actions))
+                (when (and (not (get used i))
+                           (or (< (load best) 0)
+                               (< (jv-int (jv-get (jv-nth actions i) "order"))
+                                  (jv-int (jv-get (jv-nth actions (load best))
+                                                  "order")))))
+                  (set! best i)))
+              (set! (mut used) (load best) true)
+              (jv-push! ordered (jv-nth actions (load best)))))
+          (jv-put! v "actions" ordered)
+          (for i (range 0 (jv-count actions))
+            (let [action (jv-nth actions i)]
+              (jv-put! action "run" (latest a root (text action "id")))))
+          v))))
+
+(defn acquire [(a (dyn Allocator)) (path (slice u8))]
+  (-> (Result lock/FileLock (slice u8)))
+  (match (lock/lock-open! a path)
+    (Err [_] (Err "Cannot open actions lock."))
+    (Ok [opened]
+        (let [(mut gate) opened]
+          (match (lock/lock-wait! (mut gate))
+            (Ok [_] (Ok (load gate)))
+            (_ (do (lock/lock-close! (mut gate)) (Err "Cannot lock actions."))))))))
+
+(defn shell-quote [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (push-str! (mut out) "'")
+    (for b (iter s)
+      (if (= b 39) (push-str! (mut out) "'\\''") (push! (mut out) b)))
+    (push-str! (mut out) "'")
+    (finish! (mut out))))
+
+(defn command [(a (dyn Allocator)) (action JVal)] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (match (jv-get action "env")
+      (JObj [env]
+            (for-entries [k value env]
+                         (push-str! (mut out) "export ")
+                         (push-str! (mut out) k)
+                         (push-str! (mut out) "=")
+                         (push-str! (mut out)
+                                    (shell-quote a (jv-string-or value "")))
+                         (push-str! (mut out) "; ")))
+      (_ 0))
+    (push-str! (mut out) (text action "command"))
+    (finish! (mut out))))
+
+(defn cwd [(a (dyn Allocator)) (project (slice u8)) (action JVal)]
+  (-> (Result (slice u8) (slice u8)))
+  (match (ws/workspace-open a project)
+    (Err [why] (Err why))
+    (Ok [workspace]
+        (let [relative (text action "cwd")]
+          (if (and (> (len relative) 0) (= (get relative 0) 47))
+              (Err "Action cwd must be relative to the project.")
+              (match (ws/resolve a workspace (if (= relative "") "." relative))
+                (Err [why] (Err why))
+                (Ok [resolved]
+                    (match (ws/workspace-open a (.absolute resolved))
+                      (Err [why] (Err why))
+                      (Ok [dir] (Ok (ws/workspace-root dir)))))))))))
+
+(defn operate-locked [(a (dyn Allocator))
+                      (home (slice u8))
+                      (project (slice u8))
+                      (root (slice u8))
+                      (isolation (slice u8))
+                      (kind i64)
+                      (args JVal)]
+  (-> (Result JVal (slice u8)))
+  (block :op
+    (when (>= kind 5)
+      (when (and (= kind 6)
+                 (or (not (match (jv-get args "cursor")
+                            (JNull [] true)
+                            (JInt [n] (>= n 0))
+                            (_ false)))
+                     (not (match (jv-get args "limit")
+                            (JNull [] true)
+                            (JInt [n] (and (> n 0) (<= n 65536)))
+                            (_ false)))))
+        (return-from
+          :op
+            (Err "Log cursor must be nonnegative; limit must be 1–65536 bytes.")))
+      (let [id (text args "run_id")
+            run (status a root id)]
+        (when (jv-null? run)
+          (return-from :op (Err "Unknown project action run.")))
+        (when (= kind 7)
+          (when (= (text run "state") "interrupted")
+            (return-from :op (Err (text run "error"))))
+          (when (active? run)
+            (when (not (save! a (run-path a root id ".stop") (jv-object a)))
+              (return-from :op (Err "Cannot request stop.")))
+            (jv-put! run "state" (JStr "stopping"))))
+        (when (= kind 6)
+          (let [log (document a (run-path a root id ".log.json"))
+                output (text log "output")
+                cursor (jv-int (jv-get args "cursor"))
+                total (jv-int (jv-get log "total"))
+                base (- total (len output))
+                start
+                  (+ base
+                     (utf8-start output
+                                 (- (if (< cursor base)
+                                        base
+                                        (if (> cursor total) total cursor))
+                                    base)))
+                requested (jv-int (jv-get args "limit"))
+                limit
+                  (if (and (> requested 0) (<= requested 65536))
+                      requested
+                      65536)
+                remaining (subslice output (- start base) (len output))
+                prefix (output-text/utf8-prefix remaining limit)
+                end
+                  (+ start
+                     (if (and (= (len prefix) 0) (> (len remaining) 0))
+                         (output-text/utf8-sequence-length remaining 0)
+                         (len prefix)))]
+            (jv-put! run
+                     "output"
+                     (JStr (subslice output (- start base) (- end base))))
+            (jv-put! run "next_cursor" (JInt end))
+            (jv-put! run "total_bytes" (JInt total))
+            (jv-put! run
+                     "truncated"
+                     (JBool (or (< cursor base)
+                                (> (jv-int (jv-get log "dropped_lines")) 0))))))
+        (return-from :op (Ok run))))
+    (let [doc
+            (match (config a project)
+              (Ok [v] v)
+              (Err [why] (return-from :op (Err why))))
+          actions (jv-get doc "actions")
+          id
+            (if (= kind 2)
+                (text (jv-get args "action") "id")
+                (text args "action_id"))
+          (mut chosen) (JNull)]
+      (when (not (= (text args "expected_revision") (text doc "token")))
+        (return-from
+          :op
+            (Err "Project actions changed. List actions again before writing or starting.")))
+      (when (not (key? id)) (return-from :op (Err "Invalid action id.")))
+      (for i (range 0 (jv-count actions))
+        (when (= id (text (jv-nth actions i) "id"))
+          (set! chosen (jv-nth actions i))))
+      (when (or (= kind 2) (= kind 3))
+        (when (and (= kind 3) (active? (latest a root id)))
+          (return-from :op (Err "Stop the active action before removing it.")))
+        (let [out (jv-array a)
+              replacement (jv-get args "action")
+              (mut replaced) false]
+          (when (and (= kind 2) (not (action-valid? replacement)))
+            (return-from
+              :op
+                (Err "Invalid action. Supply id, label, command and optional relative cwd, env, description.")))
+          (when (= kind 2)
+            (match (cwd a project replacement)
+              (Err [why] (return-from :op (Err why)))
+              (_ 0)))
+          (for i (range 0 (jv-count actions))
+            (let [old (jv-nth actions i)]
+              (if (= (text old "id") id)
+                  (when (= kind 2)
+                    (jv-push! out replacement)
+                    (set! replaced true))
+                  (jv-push! out old))))
+          (when (and (= kind 2) (not (load replaced)))
+            (jv-push! out replacement))
+          (when (> (jv-count out) 64)
+            (return-from :op (Err "At most 64 project actions.")))
+          (let [saved (jv-object a)]
+            (jv-put! saved "version" (JInt 1))
+            (jv-put! saved
+                     "revision"
+                     (JInt (+ (jv-int (jv-get doc "revision")) 1)))
+            (jv-put! saved "actions" out)
+            (when (or (> (len (jv-encode a saved)) 1048576)
+                      (not (save! a (config-path a project) saved)))
+              (return-from :op (Err "Cannot save project actions."))))
+          (return-from :op (config a project))))
+      (when (jv-null? (load chosen))
+        (return-from :op (Err "Unknown project action.")))
+      (let [previous (latest a root id)]
+        (when (active? previous) (return-from :op (Ok previous))))
+      (let [directory
+              (match (cwd a project (load chosen))
+                (Ok [dir] dir)
+                (Err [why] (return-from :op (Err why))))
+            run-id
+              (match (ids/random-hex a 12)
+                (Ok [v] v)
+                (_ (return-from :op (Err "Cannot create run id."))))
+            run (jv-object a)]
+        (jv-put! run "run_id" (JStr run-id))
+        (jv-put! run "action_id" (JStr id))
+        (jv-put! run "action" (load chosen))
+        (jv-put! run "cwd" (JStr directory))
+        (jv-put! run "isolation" (JStr isolation))
+        (jv-put! run "project" (JStr project))
+        (jv-put! run "started" (JInt (wall-ms)))
+        (jv-put! run "state" (JStr "starting"))
+        (when (not (save! a (run-path a root run-id ".json") run))
+          (return-from :op (Err "Cannot save action run.")))
+        (let [pointer (jv-object a)]
+          (jv-put! pointer "run_id" (JStr run-id))
+          (when (not (save! a (cat a [root "/latest-" id ".json"]) pointer))
+            (return-from :op (Err "Cannot save latest action run."))))
+        ;; Reap the short-lived launcher; its child is reparented before running.
+        ;; This keeps harness cancellation's descendant cleanup away from applications.
+        (when (not (.ok (proc/capture-limited a
+                                              (proc/self-executable a)
+                                              ["_action" home project run-id]
+                                              ""
+                                              5000
+                                              8192)))
+          (jv-put! run "state" (JStr "failed"))
+          (jv-put! run "error" (JStr "Could not spawn action supervisor."))
+          (save! a (run-path a root run-id ".json") run))
+        (Ok run)))))
+
+(defn operate [(a (dyn Allocator))
+               (home (slice u8))
+               (project-path (slice u8))
+               (isolation (slice u8))
+               (kind i64)
+               (args JVal)]
+  (-> (Result JVal (slice u8)))
+  (block
+    :op
+      (let [project
+              (match (ws/workspace-open a project-path)
+                (Ok [v] (ws/workspace-root v))
+                (Err [why] (return-from :op (Err why))))
+            root (runtime a home project)]
+        (when (= kind 1) (return-from :op (Ok (list-actions a home project))))
+        (match (disk/ensure-dir! a root 448) (_ 0))
+        (when (and (>= kind 2) (<= kind 4))
+          (match (disk/ensure-dir! a (cat a [project "/.factory"]) 448) (_ 0)))
+        (let [(mut gate)
+                (match (acquire a (cat a [root "/operations.lock"]))
+                  (Ok [v] v)
+                  (Err [why] (return-from :op (Err why))))
+              result
+                (if (and (>= kind 2) (<= kind 4))
+                    (match (acquire a
+                                    (cat a [project "/.factory/actions.lock"]))
+                      (Err [why] (Err why))
+                      (Ok [opened]
+                          (let [(mut config-lock) opened
+                                result
+                                  (operate-locked a
+                                                  home
+                                                  project
+                                                  root
+                                                  isolation
+                                                  kind
+                                                  args)]
+                            (lock/lock-close! (mut config-lock))
+                            result)))
+                    (operate-locked a home project root isolation kind args))]
+          (lock/lock-close! (mut gate))
+          result))))
+
+;;; One detached worker per active action. Its lock remains held throughout cleanup.
+(defstruct ActionSink
+  [(root (slice u8))
+   (id (slice u8))
+   (output StrBuf)
+   (total i64)
+   (dirty bool)
+   (last-flush i64)
+   (dropped i64)
+   (run JVal)])
+
+(defn append-output! [(sink (ptr ActionSink)) (raw (slice u8))] (-> i64)
+  (let [line (output-text/sanitize-utf8 (malloc-allocator) raw)]
+    (push-str! (field sink output) line)
+    (push-str! (field sink output) "\n")
+    (set! (.total sink) (+ (.total sink) (len line) 1))
+    (when (> (len (str (.output sink))) (* LOG-LIMIT 2))
+      (let [old (str (.output sink))
+            tail (copy-bytes (malloc-allocator) (utf8-tail old LOG-LIMIT))]
+        (clear! (field (field sink output) bytes))
+        (push-str! (field sink output) tail)
+        (free-bytes (malloc-allocator) tail 1)))
+    (set! (.dirty sink) true)
+    (when (not (= (data line) (data raw)))
+      (free-bytes (malloc-allocator) line 1))
+    0))
+
+(defn flush! [(sink (ptr ActionSink))] (-> i64)
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/ScratchArena::init (mut arena) (malloc-allocator))
+    (let [a (allocator (mut arena))
+          doc (jv-object a)]
+      (let [output (str (.output sink))
+            n (len output)]
+        (jv-put! doc
+                 "output"
+                 (JStr (if (> n LOG-LIMIT) (utf8-tail output LOG-LIMIT) output))))
+      (jv-put! doc "total" (JInt (.total sink)))
+      (jv-put! doc "dropped_lines" (JInt (.dropped sink)))
+      (when (save! a (run-path a (.root sink) (.id sink) ".log.json") doc)
+        (set! (.dirty sink) false)))
+    (close! (mut arena)))
+  (set! (.last-flush sink) (wall-ms))
+  0)
+
+(impl stream/LineSink ActionSink
+  (on-line [(self (ptr ActionSink)) (line (slice u8))] (-> bool)
+    (append-output! self line)
+    true)
+  (on-tick [(self (ptr ActionSink))] (-> bool)
+    (when (and (.dirty self) (>= (- (wall-ms) (.last-flush self)) 250))
+      (flush! self))
+    (let [(mut arena) (zeroed scratch/ScratchArena)]
+      (scratch/ScratchArena::init (mut arena) (malloc-allocator))
+      (let [a (allocator (mut arena))
+            stop
+              (match (disk/file-exists? a
+                                        (run-path a
+                                                  (.root self)
+                                                  (.id self)
+                                                  ".stop"))
+                (Ok [v] v)
+                (_ false))]
+        (when (not (= (text (.run self) "state") (if stop "stopping" "running")))
+          (jv-put! (.run self) "state" (JStr (if stop "stopping" "running")))
+          (save! a (run-path a (.root self) (.id self) ".json") (.run self)))
+        (close! (mut arena))
+        (not stop)))))
+
+(defn worker-main [(a (dyn Allocator))
+                   (home (slice u8))
+                   (project (slice u8))
+                   (id (slice u8))]
+  (-> i64)
+  (block :worker
+    (when (not (key? id)) (return-from :worker 1))
+    (let [root (runtime a home project)
+          (mut owner)
+            (match (lock/lock-open! a (run-path a root id ".owner"))
+              (Ok [v] v)
+              (_ (return-from :worker 1)))]
+      (when (not (match (lock/lock-try! (mut owner)) (Ok [got] got) (_ false)))
+        (lock/lock-close! (mut owner))
+        (return-from :worker 1))
+      (let [run (document a (run-path a root id ".json"))
+            sink
+              (box! a
+                    ActionSink
+                    (ActionSink
+                      :root root
+                      :id id
+                      :output (StrBuf::new a)
+                      :total 0
+                      :dirty false
+                      :last-flush 0
+                      :dropped 0
+                      :run run))]
+        (when (not (= (text run "state") "starting"))
+          (lock/lock-close! (mut owner))
+          (return-from :worker 1))
+        (jv-put! run "supervisor_pid" (JInt (proc/pid)))
+        (save! a (run-path a root id ".json") run)
+        (when (match (disk/file-exists? a (run-path a root id ".stop"))
+                (Ok [v] v)
+                (_ false))
+          (jv-put! run "state" (JStr "stopped"))
+          (jv-put! run "ended" (JInt (wall-ms)))
+          (save! a (run-path a root id ".json") run)
+          (lock/lock-close! (mut owner))
+          (return-from :worker 0))
+        (let [result
+                (match (ws/workspace-open a project)
+                  (Err [why] (Err [stream/StreamEnd (slice u8)] why))
+                  (Ok [workspace]
+                      (match (toolkit/policy-for a
+                                                 workspace
+                                                 (text run "isolation"))
+                        (toolkit/PolicyBad [why]
+                                           (Err [stream/StreamEnd (slice u8)]
+                                                why))
+                        (toolkit/PolicyOk [policy]
+                                          (let [argv
+                                                  (sandbox/sandbox-argv a
+                                                                        policy
+                                                                        project
+                                                                        (cat a
+                                                                             ["exec 2>&1; "
+                                                                              (command a
+                                                                                       (jv-get run
+                                                                                               "action"))]))]
+                                            (stream/stream-lines a
+                                                                 (stream/StreamSpec
+                                                                   :program
+                                                                     (get argv
+                                                                          0)
+                                                                   :args
+                                                                     (subslice (slice argv)
+                                                                               1
+                                                                               (len argv))
+                                                                   :cwd
+                                                                     (text run
+                                                                           "cwd")
+                                                                   :input ""
+                                                                   :timeout-ms 0
+                                                                   :max-line-bytes
+                                                                     65536
+                                                                   :stderr-bytes
+                                                                     8192)
+                                                                 sink))))))]
+          (match result
+            (Err [why]
+                 (jv-put! run "state" (JStr "failed"))
+                 (jv-put! run "error" (JStr why)))
+            (Ok [ended]
+                (set! (.dropped sink) (.dropped-lines ended))
+                (when (> (len (.errors ended)) 0)
+                  (append-output! sink (.errors ended)))
+                (jv-put! run "exit_code" (JInt (.exit-code ended)))
+                (jv-put! run "signal" (JInt (.signal ended)))
+                (jv-put! run
+                         "state"
+                         (JStr (cond (.stopped ended) "stopped"
+                                     (= (.exit-code ended) 0) "exited"
+                                     :else "failed")))))
+          (flush! sink)
+          (jv-put! run "ended" (JInt (wall-ms)))
+          (save! a (run-path a root id ".json") run)))
+      (lock/lock-close! (mut owner))
+      0)))
+
+(defstruct ActionTool
+  [(home (slice u8)) (project (slice u8)) (isolation (slice u8)) (kind i64)])
+
+(impl Tool ActionTool
+  (tool-spec [(self (ptr ActionTool))] (-> ToolSpec)
+    (ToolSpec
+      :name
+        (get ["project_actions_list"
+              "project_action_set"
+              "project_action_remove"
+              "project_action_start"
+              "project_action_status"
+              "project_action_logs"
+              "project_action_stop"]
+             (- (.kind self) 1))
+      :description
+        (get ["List project sidebar actions, configuration token and live/latest runs."
+              "Create or replace a project sidebar command button. Saves only; does not run. Use expected_revision token from list."
+              "Remove an inactive project action. Use expected_revision token from list."
+              "Start a project action, or return its existing active run. Use expected_revision token from list."
+              "Inspect a project action run's lifecycle and exit result."
+              "Read bounded action output with cursor pagination; reports truncation."
+              "Stop a specific project action run and its descendants. Returns stopping until cleanup completes."]
+             (- (.kind self) 1))
+      :parameters (get SCHEMAS (- (.kind self) 1))
+      :self-checked false))
+  (tool-summary [(self (ptr ActionTool)) (a (dyn Allocator)) (call ToolCall)]
+    (-> (slice u8))
+    (cat a
+         ["project action "
+          (call-string call "action_id")
+          (call-string call "run_id")]))
+  (tool-run [(self (ptr ActionTool))
+             (a (dyn Allocator))
+             (call ToolCall)
+             (context (dyn ToolContext))]
+    (-> ToolOutcome)
+    (match (operate a
+                    (.home self)
+                    (.project self)
+                    (.isolation self)
+                    (.kind self)
+                    (.arguments call))
+      (Ok [v] (ToolOk (jv-encode a v)))
+      (Err [why] (ToolFailed why)))))
+
+(defn register! [(a (dyn Allocator))
+                 (registry (ptr ToolRegistry))
+                 (home (slice u8))
+                 (project (slice u8))
+                 (isolation (slice u8))] (-> i64)
+  (when (> (len project) 0)
+    (for kind (range 1 8)
+      (registry-add! registry
+                     (box! a
+                           ActionTool
+                           (ActionTool
+                             :home home
+                             :project project
+                             :isolation isolation
+                             :kind kind)))))
+  0)
+
+(const SCHEMAS
+       ["{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false,\"required\":[]}"
+        "{\"type\":\"object\",\"properties\":{\"expected_revision\":{\"type\":\"string\",\"description\":\"Exact token from project_actions_list.token\"},\"action\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"label\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"env\":{\"type\":\"object\",\"additionalProperties\":true,\"description\":\"Environment overrides. Every value must be a string.\"},\"order\":{\"type\":\"integer\",\"description\":\"Sidebar order, ascending; ties preserve file order. Default 0.\"}},\"required\":[\"id\",\"label\",\"command\"],\"additionalProperties\":false}},\"additionalProperties\":false,\"required\":[\"expected_revision\",\"action\"]}"
+        "{\"type\":\"object\",\"properties\":{\"expected_revision\":{\"type\":\"string\",\"description\":\"Exact token from project_actions_list.token\"},\"action_id\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"expected_revision\",\"action_id\"]}"
+        "{\"type\":\"object\",\"properties\":{\"expected_revision\":{\"type\":\"string\",\"description\":\"Exact token from project_actions_list.token\"},\"action_id\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"expected_revision\",\"action_id\"]}"
+        "{\"type\":\"object\",\"properties\":{\"run_id\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"run_id\"]}"
+        "{\"type\":\"object\",\"properties\":{\"run_id\":{\"type\":\"string\"},\"cursor\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},\"additionalProperties\":false,\"required\":[\"run_id\"]}"
+        "{\"type\":\"object\",\"properties\":{\"run_id\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"run_id\"]}"])
+
+;;; Shared request envelope for asynchronous UI and authenticated site API.
+(defn dispatch [(a (dyn Allocator))
+                (home (slice u8))
+                (project (slice u8))
+                (isolation (slice u8))
+                (request JVal)] (-> (Result JVal (slice u8)))
+  (let [kind (jv-int (jv-get request "kind"))]
+    (if (or (< kind 1) (> kind 7))
+        (Err "Unknown project action operation.")
+        (match (operate a home project isolation kind (jv-get request "args"))
+          (Err [why] (Err why))
+          (Ok [v]
+              (let [output-id (text request "output_run")]
+                (when (and (= kind 1) (> (len output-id) 0))
+                  (let [args (jv-object a)]
+                    (jv-put! args "run_id" (JStr output-id))
+                    (match (operate a home project isolation 6 args)
+                      (Ok [log]
+                          (if (> (jv-int (jv-get log "total_bytes")) 65536)
+                              (do
+                                (jv-put! args
+                                         "cursor"
+                                         (JInt (- (jv-int (jv-get log
+                                                                  "total_bytes"))
+                                                  65536)))
+                                (match (operate a home project isolation 6 args)
+                                  (Ok [tail]
+                                      (jv-put! tail "truncated" (JBool true))
+                                      (jv-put! v "output_run" tail))
+                                  (_ (jv-put! v "output_run" log))))
+                              (jv-put! v "output_run" log)))
+                      (_ 0))))
+                (Ok v)))))))
+
+(defn shell-enabled? [(a (dyn Allocator)) (groups (slice u8))] (-> bool)
+  (let [(mut enabled) false]
+    (for group (iter (split a groups ","))
+      (when (= (trim group) "shell") (set! enabled true)))
+    (load enabled)))
+
+;;; Advance a byte offset to the next UTF-8 boundary (the buffer is sanitized).
+(defn utf8-start [(s (slice u8)) (offset i64)] (-> i64)
+  (let [(mut i) offset]
+    (loop (if (and (< (load i) (len s))
+                   (let [b (get s (load i))] (and (>= b 128) (<= b 191))))
+              (set! i (+ (load i) 1))
+              (break)))
+    (load i)))
+
+(defn utf8-tail [(s (slice u8)) (limit i64)] (-> (slice u8))
+  (subslice s (utf8-start s (if (> (len s) limit) (- (len s) limit) 0)) (len s)))
+
+(defn definition-changed? [(a (dyn Allocator)) (current JVal) (snapshot JVal)]
+  (-> bool)
+  (let [(mut changed) false]
+    (for key (iter ["id" "label" "description" "command" "cwd" "env"])
+      (when (not (= (jv-encode a (jv-get current key))
+                    (jv-encode a (jv-get snapshot key))))
+        (set! changed true)))
+    (load changed)))
+
+(defn runtime-for [(a (dyn Allocator)) (home (slice u8)) (project (slice u8))]
+  (-> (slice u8))
+  (runtime a
+           home
+           (match (proc/real-path a project) (Some [root] root) (_ project))))

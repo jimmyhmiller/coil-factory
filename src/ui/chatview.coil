@@ -132,6 +132,10 @@
             (panel-opts theme
                         (concat a [(.agent chat) " · conversation"])
                         (not (.sidebar-focus (.workbench d))))]
+      (set! (.layout-r (.workbench d)) body)
+      (set! (.workspace-r (.workbench d)) (rect 0 0 0 0))
+      (set! (.context-r (.workbench d))
+            (rect (- (rect-right body) width) (.y body) width (.h body)))
       (when (> width 0)
         (context/draw! d
                        c

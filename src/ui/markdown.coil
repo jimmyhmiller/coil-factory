@@ -1,0 +1,582 @@
+(module factory.ui.markdown)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [trim starts-with])
+(import "mddoc.doc" :as md)
+(import "tui.widgets" :use [wrap-text])
+(import "factory.ui.fmt" :use [concat])
+(import "tui.width" :use [text-width])
+(import "tui.canvas" :use [ATTR-BOLD ATTR-DIM ATTR-ITALIC ATTR-UNDERLINE])
+
+;;; Parsed display spans never contain terminal escape sequences. The canvas
+;;; applies styles, and remains responsible for control-character sanitization.
+(defstruct Span [(text (slice u8)) (attrs i64) (code bool) (link bool)])
+
+(defstruct Row [(prefix (slice u8)) (text (slice u8)) (spans (slice Span))])
+
+(defn emit! [(out (ptr (ArrayList Span)))
+             (text (slice u8))
+             (attrs i64)
+             (code bool)
+             (link bool)] (-> i64)
+  (when (> (len text) 0)
+    (push! out
+           (Span
+             :text text
+             :attrs attrs
+             :code code
+             :link link)))
+  0)
+
+(defn at [(s (slice u8)) (i i64)] (-> i64)
+  (if (and (>= i 0) (< i (len s))) (cast i64 (get s i)) -1))
+
+(defn locate [(s (slice u8)) (needle (slice u8)) (start i64)] (-> i64)
+  (block :find
+    (let [(mut i) start]
+      (loop (when (> (+ (load i) (len needle)) (len s)) (break))
+        (when (= (subslice s (load i) (+ (load i) (len needle))) needle)
+          (return-from :find (load i)))
+        (set! i (+ (load i) 1))))
+    -1))
+
+;;; A delimiter closes only when it is not escaped. Unfinished streaming markup
+;;; remains literal until its matching delimiter arrives.
+(defn closing [(s (slice u8)) (delimiter (slice u8)) (start i64)] (-> i64)
+  (block
+    :close
+      (let [(mut pos) start]
+        (loop (let [found (locate s delimiter (load pos))]
+                (when (< found 0) (return-from :close -1))
+                (let [(mut before) found]
+                  (loop (if (= (at s (- (load before) 1)) 92)
+                            (set! before (- (load before) 1))
+                            (break)))
+                  (when (= (% (- found (load before)) 2) 0)
+                    (return-from :close found)))
+                (set! pos (+ found 1)))))))
+
+(defn inline! [(out (ptr (ArrayList Span)))
+               (s (slice u8))
+               (attrs i64)
+               (link bool)
+               (depth i64)] (-> i64)
+  (block :inline
+    (when (> depth 24) (emit! out s attrs false link) (return-from :inline 0))
+    (let [(mut cursor) 0
+          (mut plain) 0]
+      (loop (when (>= (load cursor) (len s)) (break))
+        (let [i (load cursor)
+              ch (at s i)
+              delimiter
+                (cond (starts-with (subslice s i (len s)) "**") "**"
+                      (starts-with (subslice s i (len s)) "__") "__"
+                      (= ch 42) "*"
+                      (= ch 95) "_"
+                      :else "")
+              (mut end) -1
+              (mut next) (+ i 1)]
+          (cond (and (= ch 92)
+                     (>= (at s (+ i 1)) 33)
+                     (<= (at s (+ i 1)) 126)
+                     (or (< (at s (+ i 1)) 48)
+                         (and (> (at s (+ i 1)) 57) (< (at s (+ i 1)) 65))
+                         (and (> (at s (+ i 1)) 90) (< (at s (+ i 1)) 97))
+                         (> (at s (+ i 1)) 122)))
+                  (do
+                    (emit! out (subslice s (load plain) i) attrs false link)
+                    (emit! out (subslice s (+ i 1) (+ i 2)) attrs false link)
+                    (set! next (+ i 2))
+                    (set! end (load next)))
+                (= ch 96)
+                  (let [(mut count) 1]
+                    (loop (if (= (at s (+ i (load count))) 96)
+                              (set! count (+ (load count) 1))
+                              (break)))
+                    (let [marker (subslice s i (+ i (load count)))
+                          close (closing s marker (+ i (load count)))]
+                      (when (>= close 0)
+                        (emit! out (subslice s (load plain) i) attrs false link)
+                        (emit! out
+                               (subslice s (+ i (load count)) close)
+                               attrs
+                               true
+                               link)
+                        (set! next (+ close (load count)))
+                        (set! end (load next)))))
+                (= ch 91)
+                  (let [label-end (closing s "](" (+ i 1))]
+                    (when (>= label-end 0)
+                      (let [(mut p) (+ label-end 2)
+                            (mut nesting) 1]
+                        (loop (when (or (>= (load p) (len s))
+                                        (= (load nesting) 0))
+                                (break))
+                          (cond (= (at s (load p)) 92) (set! p (+ (load p) 1))
+                                (= (at s (load p)) 40)
+                                  (set! nesting (+ (load nesting) 1))
+                                (= (at s (load p)) 41)
+                                  (set! nesting (- (load nesting) 1))
+                                :else 0)
+                          (set! p (+ (load p) 1)))
+                        (when (= (load nesting) 0)
+                          (emit! out
+                                 (subslice s (load plain) i)
+                                 attrs
+                                 false
+                                 link)
+                          (inline! out
+                                   (subslice s (+ i 1) label-end)
+                                   (| attrs ATTR-UNDERLINE)
+                                   true
+                                   (+ depth 1))
+                          (emit! out " (" attrs false false)
+                          (emit! out
+                                 (subslice s (+ label-end 2) (- (load p) 1))
+                                 0
+                                 false
+                                 true)
+                          (emit! out ")" attrs false false)
+                          (set! next (load p))
+                          (set! end (load next))))))
+                (and (> (len delimiter) 0)
+                     ;; Underscores inside identifiers are literal.
+                     (not (and (= ch 95) (> (at s (- i 1)) 32) (> i 0)))
+                     (> (at s (+ i (len delimiter))) 32))
+                  (let [close (closing s delimiter (+ i (len delimiter)))]
+                    (when (> close (+ i (len delimiter)))
+                      (emit! out (subslice s (load plain) i) attrs false link)
+                      (inline! out
+                               (subslice s (+ i (len delimiter)) close)
+                               (| attrs
+                                  (cond (= (len delimiter) 2) ATTR-BOLD
+                                        :else ATTR-ITALIC))
+                               link
+                               (+ depth 1))
+                      (set! next (+ close (len delimiter)))
+                      (set! end (load next))))
+                :else 0)
+          (when (>= (load end) 0) (set! plain (load end)))
+          (set! cursor (load next))))
+      (emit! out (subslice s (load plain) (len s)) attrs false link))
+    0))
+
+(defn plain-text [(a (dyn Allocator)) (spans (slice Span))] (-> (slice u8))
+  (let [(mut parts) (ArrayList::new [(slice u8)] a)]
+    (for span (iter spans) (push! (mut parts) (.text span)))
+    (concat a (slice parts))))
+
+;;; Word-wrap styled spans to `width` cells. Each row's spans cover exactly its
+;;; text; prefixes are left empty for the caller.
+(defn wrap-spans [(a (dyn Allocator)) (spans (slice Span)) (width i64)]
+  (-> (ArrayList Row))
+  (let [(mut out) (ArrayList::new [Row] a)
+        plain (plain-text a spans)
+        wrapped (wrap-text a plain width)
+        (mut cursor) 0]
+    (for text (iter wrapped)
+      (let [start
+              (if (= (len text) 0)
+                  (load cursor)
+                  (locate plain text (load cursor)))
+            finish (+ start (len text))
+            (mut offset) 0
+            (mut row-spans) (ArrayList::new [Span] a)]
+        (for span (iter spans)
+          (let [end (+ (load offset) (len (.text span)))
+                lo (if (> start (load offset)) start (load offset))
+                hi (if (< finish end) finish end)]
+            (when (> hi lo)
+              (emit! (mut row-spans)
+                     (subslice (.text span)
+                               (- lo (load offset))
+                               (- hi (load offset)))
+                     (.attrs span)
+                     (.code span)
+                     (.link span)))
+            (set! offset end)))
+        (push! (mut out)
+               (Row
+                 :prefix ""
+                 :text text
+                 :spans (slice row-spans)))
+        (set! cursor finish)))
+    (load out)))
+
+(defn rows! [(a (dyn Allocator))
+             (out (ptr (ArrayList Row)))
+             (s (slice u8))
+             (prefix (slice u8))
+             (continuation (slice u8))
+             (width i64)
+             (attrs i64)
+             (code bool)] (-> i64)
+  (let [(mut spans) (ArrayList::new [Span] a)
+        (mut first) true]
+    (if code
+        (emit! (mut spans) s attrs true false)
+        (inline! (mut spans) s attrs false 0))
+    (for row (iter (wrap-spans a (slice spans) (- width (text-width prefix))))
+      (push! out
+             (Row
+               :prefix (if (load first) prefix continuation)
+               :text (.text row)
+               :spans (.spans row)))
+      (set! first false)))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; Tables (GitHub-flavored)
+
+(defsum Align
+  (AlignLeft)
+  (AlignCenter)
+  (AlignRight))
+
+;;; A line can belong to a table only when it has an unescaped pipe.
+(defn piped? [(s (slice u8))] (-> bool)
+  (>= (closing s "|" 0) 0))
+
+;;; The cells of a table row: split at unescaped pipes, dropping one optional
+;;; leading and one trailing pipe. `\|` is a literal pipe anywhere in a cell,
+;;; code spans included, so it is unescaped before inline parsing.
+(defn cells [(a (dyn Allocator)) (line (slice u8))] (-> (ArrayList (slice u8)))
+  (let [s (trim line)
+        (mut out) (ArrayList::new [(slice u8)] a)
+        (mut cell) (ArrayList::new [u8] a)
+        (mut i) (if (= (at s 0) 124) 1 0)
+        (mut ended) false]
+    (loop (when (>= (load i) (len s)) (break))
+      (let [ch (at s (load i))]
+        (cond (and (= ch 92) (= (at s (+ (load i) 1)) 124))
+                (do
+                  (push! (mut cell) (: 124 u8))
+                  (set! ended false)
+                  (set! i (+ (load i) 2)))
+              (= ch 124)
+                (do
+                  (push! (mut out) (trim (slice cell)))
+                  (set! cell (ArrayList::new [u8] a))
+                  (set! ended true)
+                  (set! i (+ (load i) 1)))
+              :else
+                (do
+                  (push! (mut cell) (get s (load i)))
+                  (set! ended false)
+                  (set! i (+ (load i) 1))))))
+    (when (not (load ended)) (push! (mut out) (trim (slice cell))))
+    (load out)))
+
+;;; Column alignments from a delimiter row such as `| :-- | :-: | --: |`, or
+;;; None when the line is not a delimiter row.
+(defn alignments [(a (dyn Allocator)) (line (slice u8))]
+  (-> (Option (ArrayList Align)))
+  (block :parse
+    (when (not (piped? line)) (return-from :parse (None)))
+    (let [(mut out) (ArrayList::new [Align] a)]
+      (for cell (iter (cells a line))
+        (let [n (len cell)
+              left (= (at cell 0) 58)
+              right (and (> n 1) (= (at cell (- n 1)) 58))
+              lo (if left 1 0)
+              hi (if right (- n 1) n)]
+          (when (<= hi lo) (return-from :parse (None)))
+          (for i (range lo hi)
+            (when (not (= (at cell i) 45)) (return-from :parse (None))))
+          (push! (mut out)
+                 (cond (and left right) (AlignCenter)
+                       right (AlignRight)
+                       :else (AlignLeft)))))
+      (if (= (len out) 0) (None) (Some (load out))))))
+
+(defn spaces [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (let [(mut out) (ArrayList::new [u8] a)]
+    (for i (range 0 n) (push! (mut out) (: 32 u8)))
+    (slice out)))
+
+(defn repeat-text [(a (dyn Allocator)) (s (slice u8)) (n i64)] (-> (slice u8))
+  (let [(mut parts) (ArrayList::new [(slice u8)] a)]
+    (for i (range 0 n) (push! (mut parts) s))
+    (concat a (slice parts))))
+
+;;; A full-width row made of spans; its text is their concatenation.
+(defn push-spans! [(a (dyn Allocator))
+                   (out (ptr (ArrayList Row)))
+                   (spans (slice Span))] (-> i64)
+  (push! out
+         (Row
+           :prefix ""
+           :text (plain-text a spans)
+           :spans spans))
+  0)
+
+;;; A horizontal border such as `├──┼──┤` over columns of `widths` cells.
+(defn rule! [(a (dyn Allocator))
+             (out (ptr (ArrayList Row)))
+             (widths (slice i64))
+             (left (slice u8))
+             (mid (slice u8))
+             (right (slice u8))] (-> i64)
+  (let [(mut parts) (ArrayList::new [(slice u8)] a)
+        (mut spans) (ArrayList::new [Span] a)]
+    (push! (mut parts) left)
+    (for j (range 0 (len widths))
+      (when (> j 0) (push! (mut parts) mid))
+      (push! (mut parts) (repeat-text a "─" (+ (get widths j) 2))))
+    (push! (mut parts) right)
+    (emit! (mut spans) (concat a (slice parts)) ATTR-DIM false false)
+    (push-spans! a out (slice spans))))
+
+;;; Column widths that fit `avail` cells. Columns narrower than an even share
+;;; keep their natural width; the rest split what remains.
+(defn fit-columns [(a (dyn Allocator)) (natural (slice i64)) (avail i64)]
+  (-> (slice i64))
+  (let [n (len natural)
+        (mut widths) (ArrayList::new [i64] a)
+        (mut settled) (ArrayList::new [bool] a)
+        (mut total) 0
+        (mut remaining) avail
+        (mut open) n]
+    (for w (iter natural)
+      (push! (mut widths) w)
+      (push! (mut settled) false)
+      (set! total (+ (load total) w)))
+    (when (> (load total) avail)
+      (loop (let [fair (/ (load remaining) (load open))
+                  (mut changed) false]
+              (for j (range 0 n)
+                (when (and (not (get settled j)) (<= (get natural j) fair))
+                  (set! (mut settled) j true)
+                  (set! remaining (- (load remaining) (get natural j)))
+                  (set! open (- (load open) 1))
+                  (set! changed true)))
+              (when (or (not (load changed)) (= (load open) 0)) (break))))
+      (when (> (load open) 0)
+        (let [share (/ (load remaining) (load open))
+              (mut extra) (- (load remaining) (* share (load open)))]
+          (for j (range 0 n)
+            (when (not (get settled j))
+              (set! (mut widths)
+                    j
+                    (cond (< share 1) 1
+                          (> (load extra) 0) (+ share 1)
+                          :else share))
+              (set! extra (- (load extra) 1)))))))
+    (slice widths)))
+
+;;; Render one table row: every cell wrapped to its column and aligned, the
+;;; row as tall as its tallest cell. Returns that height.
+(defn table-row! [(a (dyn Allocator))
+                  (out (ptr (ArrayList Row)))
+                  (row (slice (slice Span)))
+                  (widths (slice i64))
+                  (aligns (slice Align))] (-> i64)
+  (let [(mut wrapped) (ArrayList::new [(ArrayList Row)] a)
+        (mut height) 1]
+    (for j (range 0 (len widths))
+      (let [lines (wrap-spans a (get row j) (get widths j))]
+        (when (> (len lines) (load height)) (set! height (len lines)))
+        (push! (mut wrapped) lines)))
+    (for k (range 0 (load height))
+      (let [(mut spans) (ArrayList::new [Span] a)]
+        (emit! (mut spans) "│ " ATTR-DIM false false)
+        (for j (range 0 (len widths))
+          (let [lines (get wrapped j)
+                (mut used) 0]
+            (when (> j 0) (emit! (mut spans) " │ " ATTR-DIM false false))
+            (when (< k (len lines))
+              (set! used (text-width (.text (get lines k)))))
+            (let [pad (- (get widths j) (load used))
+                  before
+                    (match (get aligns j)
+                      (AlignLeft [] 0)
+                      (AlignCenter [] (/ pad 2))
+                      (AlignRight [] pad))]
+              (emit! (mut spans) (spaces a before) 0 false false)
+              (when (< k (len lines))
+                (for span (iter (.spans (get lines k)))
+                  (push! (mut spans) span)))
+              (emit! (mut spans) (spaces a (- pad before)) 0 false false))))
+        (emit! (mut spans) " │" ATTR-DIM false false)
+        (push-spans! a out (slice spans))))
+    (load height)))
+
+;;; Draw a table in box characters, `width` cells wide at most. Cells wider
+;;; than their share wrap inside their column; when any body row wraps, body
+;;; rows are ruled apart so their lines stay attributable.
+(defn table! [(a (dyn Allocator))
+              (out (ptr (ArrayList Row)))
+              (header (slice (slice u8)))
+              (aligns (slice Align))
+              (body (slice (ArrayList (slice u8))))
+              (width i64)] (-> i64)
+  (let [n (len aligns)
+        (mut grid) (ArrayList::new [(slice (slice Span))] a)
+        (mut natural) (ArrayList::new [i64] a)]
+    (for j (range 0 n) (push! (mut natural) 1))
+    (for r (range 0 (+ (len body) 1))
+      (let [texts (if (= r 0) header (slice (get body (- r 1))))
+            (mut row) (ArrayList::new [(slice Span)] a)]
+        (for j (range 0 n)
+          (let [(mut spans) (ArrayList::new [Span] a)]
+            (when (< j (len texts))
+              (inline! (mut spans)
+                       (get texts j)
+                       (if (= r 0) ATTR-BOLD 0)
+                       false
+                       0))
+            (let [w (text-width (plain-text a (slice spans)))]
+              (when (> w (get natural j)) (set! (mut natural) j w)))
+            (push! (mut row) (slice spans))))
+        (push! (mut grid) (slice row))))
+    (let [widths (fit-columns a (slice natural) (- width (+ (* 3 n) 1)))
+          (mut parts) (ArrayList::new [(ArrayList Row)] a)
+          (mut tall) false]
+      (rule! a out widths "┌" "┬" "┐")
+      (table-row! a out (get grid 0) widths aligns)
+      (rule! a out widths "├" "┼" "┤")
+      (for r (range 1 (len grid))
+        (let [(mut part) (ArrayList::new [Row] a)]
+          (when (> (table-row! a (mut part) (get grid r) widths aligns) 1)
+            (set! tall true))
+          (push! (mut parts) (load part))))
+      (for i (range 0 (len parts))
+        (when (and (load tall) (> i 0)) (rule! a out widths "├" "┼" "┤"))
+        (for row (iter (get parts i)) (push! out row)))
+      (rule! a out widths "└" "┴" "┘")))
+  0)
+
+(defn render [(a (dyn Allocator)) (text (slice u8)) (width i64)]
+  (-> (ArrayList Row))
+  (let [(mut out) (ArrayList::new [Row] a)
+        (mut pos) 0
+        (mut fenced) false
+        (mut fence) (zeroed md/Fence)]
+    (loop (when (>= (load pos) (len text)) (break))
+      (let [l (md/line-at text (load pos))
+            raw (md/line-text text l)
+            s (trim raw)
+            (mut next) (.next l)
+            aligns
+              (if (and (not (load fenced))
+                       (piped? raw)
+                       (< (.next l) (len text)))
+                  (alignments a
+                              (md/line-text text (md/line-at text (.next l))))
+                  (None [(ArrayList Align)]))
+            table
+              (match aligns
+                (Some [cols] (= (len cols) (len (cells a raw))))
+                (None [] false))]
+        (cond (load fenced)
+                (if (md/fence-closes? raw (load fence))
+                    (do
+                      (set! fenced false)
+                      (rows! a (mut out) "" "└ " "  " width 0 true))
+                    (rows! a (mut out) raw "  " "  " width 0 true))
+              table
+                (let [(mut body) (ArrayList::new [(ArrayList (slice u8))] a)]
+                  ;; The table runs until a blank line or a line without a pipe.
+                  (set! next (.next (md/line-at text (.next l))))
+                  (loop (when (>= (load next) (len text)) (break))
+                    (let [row (md/line-at text (load next))
+                          row-text (md/line-text text row)]
+                      (when (or (= (len (trim row-text)) 0)
+                                (not (piped? row-text)))
+                        (break))
+                      (push! (mut body) (cells a row-text))
+                      (set! next (.next row))))
+                  (match aligns
+                    (Some [cols]
+                          (table! a
+                                  (mut out)
+                                  (slice (cells a raw))
+                                  (slice cols)
+                                  (slice body)
+                                  width))
+                    (None [] (unreachable))))
+              :else
+                (match (md/fence-open raw)
+                  (Some [f]
+                        (do
+                          (set! fence f)
+                          (set! fenced true)
+                          (let [info (trim (subslice s (.count f) (len s)))]
+                            (rows! a (mut out) info "┌ " "  " width 0 true))))
+                  (_ (match (md/atx-heading raw)
+                       (Some [h]
+                             (rows! a
+                                    (mut out)
+                                    (.title h)
+                                    ""
+                                    ""
+                                    width
+                                    ATTR-BOLD
+                                    false))
+                       (_ (let [indent (md/leading-spaces raw)
+                                bullet
+                                  (or (starts-with s "- ")
+                                      (starts-with s "* ")
+                                      (starts-with s "+ "))
+                                quote (starts-with s ">")
+                                (mut digits) 0]
+                            (loop (if (md/digit? (at s (load digits)))
+                                      (set! digits (+ (load digits) 1))
+                                      (break)))
+                            (let [ordered
+                                    (and (> (load digits) 0)
+                                         (or (= (at s (load digits)) 46)
+                                             (= (at s (load digits)) 41))
+                                         (= (at s (+ (load digits) 1)) 32))
+                                  task
+                                    (and bullet
+                                         (or (starts-with s "- [ ] ")
+                                             (starts-with s "* [ ] ")
+                                             (starts-with s "+ [ ] ")
+                                             (starts-with s "- [x] ")
+                                             (starts-with s "* [x] ")
+                                             (starts-with s "+ [x] ")
+                                             (starts-with s "- [X] ")
+                                             (starts-with s "* [X] ")
+                                             (starts-with s "+ [X] ")))
+                                  prefix
+                                    (cond task
+                                            (concat a
+                                                    [(subslice raw 0 indent)
+                                                     (if (= (at s 3) 32)
+                                                         "☐ "
+                                                         "☑ ")])
+                                          bullet
+                                            (concat a
+                                                    [(subslice raw 0 indent)
+                                                     "• "])
+                                          quote "│ "
+                                          ordered
+                                            (subslice raw
+                                                      0
+                                                      (+ indent
+                                                         (+ (load digits) 2)))
+                                          :else "")
+                                  body
+                                    (cond task (subslice s 6 (len s))
+                                          bullet (subslice s 2 (len s))
+                                          quote (trim (subslice s 1 (len s)))
+                                          ordered
+                                            (subslice s
+                                                      (+ (load digits) 2)
+                                                      (len s))
+                                          :else raw)
+                                  (mut pad) (ArrayList::new [u8] a)]
+                              (for i (range 0 (text-width prefix))
+                                (push! (mut pad) (cast u8 32)))
+                              (rows! a
+                                     (mut out)
+                                     body
+                                     prefix
+                                     (if quote "│ " (slice pad))
+                                     width
+                                     0
+                                     false))))))))
+        (set! pos (load next))))
+    (load out)))

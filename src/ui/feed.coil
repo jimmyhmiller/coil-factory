@@ -134,7 +134,9 @@
                    record
                    (tool-glyph (js record "tool"))
                    (ToneAccent)
-                   (tool-summary-text (js record "tool") (js record "summary"))
+                   (tool-summary-text a
+                                      (js record "tool")
+                                      (js record "summary"))
                    (ToneMuted))
       (set! found (- (len (.items feed)) 1)))
     (let [item (feed-item feed (load found))]
@@ -179,7 +181,8 @@
                            record
                            (tool-glyph (js record "tool"))
                            (ToneAccent)
-                           (tool-summary-text (js record "tool")
+                           (tool-summary-text a
+                                              (js record "tool")
                                               (js record "summary"))
                            (TonePlain))
               (set! (.call (feed--last feed)) (copy-bytes a (js record "call")))

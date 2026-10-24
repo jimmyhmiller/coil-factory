@@ -97,6 +97,7 @@
               (.default-harness config))
         request
           (AgentRequest
+            :service-tier ""
             :harness harness-name
             :model (.model role)
             :tools (.tools role)

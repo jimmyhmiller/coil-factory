@@ -81,14 +81,16 @@
 (defstruct TermOptions
   [(alt-screen bool)
    (hide-cursor bool)
-   (bracketed-paste bool)])
+   (bracketed-paste bool)
+   (mouse bool)])
 
 ;;; Alternate screen, hidden cursor and bracketed paste: the full-screen setup.
 (defn term-options-default [] (-> TermOptions)
   (TermOptions
     :alt-screen true
     :hide-cursor true
-    :bracketed-paste true))
+    :bracketed-paste true
+    :mouse false))
 
 ;;; Terminal size in cells.
 (defstruct TermSize [(width i64) (height i64)])
@@ -238,11 +240,13 @@
   (when (.alt-screen options) (term--raw-write "\x1b;[?1049h"))
   (when (.hide-cursor options) (term--raw-write "\x1b;[?25l"))
   (when (.bracketed-paste options) (term--raw-write "\x1b;[?2004h"))
+  (when (.mouse options) (term--raw-write "\x1b;[?1002h\x1b;[?1006h"))
   (term--raw-write "\x1b;[?7l\x1b;[0m\x1b;[H\x1b;[2J")
   0)
 
 (defn term--emit-leave [(options TermOptions)] (-> i64)
   (term--raw-write "\x1b;[0m\x1b;[?7h")
+  (when (.mouse options) (term--raw-write "\x1b;[?1006l\x1b;[?1002l"))
   (when (.bracketed-paste options) (term--raw-write "\x1b;[?2004l"))
   (term--raw-write "\x1b;[?25h")
   (when (.alt-screen options) (term--raw-write "\x1b;[?1049l"))

@@ -1,0 +1,430 @@
+(module factory.model-catalog)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.thread" :as thread)
+(import "coil.atomic" :as atomic)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "factory.config" :as config)
+(import "factory.proc" :as proc)
+(import "factory.session" :as session)
+(import "agent_tools.stream" :as stream)
+(import "durable.atomic" :as disk)
+
+(defn contains? [(text (slice u8)) (part (slice u8))] (-> bool)
+  (match (find text part) (Some [_] true) (_ false)))
+
+;;; Filter the model's origin, including versions sold through proxy providers.
+(defn native-vendor? [(a (dyn Allocator)) (name (slice u8))] (-> bool)
+  (let [(mut lowered) (StrBuf::new a)]
+    (for b (iter name)
+      (push! (mut lowered) (if (and (>= b 65) (<= b 90)) (+ b 32) b)))
+    (let [identity (finish! (mut lowered))]
+      (or (contains? identity "anthropic")
+          (contains? identity "openai")
+          (contains? identity "claude")
+          (starts-with identity "gpt")
+          (contains? identity "/gpt")
+          (contains? identity "chatgpt")
+          (contains? identity "codex")
+          (contains? identity "opus")
+          (contains? identity "sonnet")
+          (contains? identity "haiku")
+          (contains? identity "fable")
+          (starts-with identity "o1")
+          (starts-with identity "o3")
+          (starts-with identity "o4")
+          (contains? identity "/o1")
+          (contains? identity "/o3")
+          (contains? identity "/o4")))))
+
+(defn add-claude! [(a (dyn Allocator)) (out JVal) (models JVal)] (-> i64)
+  (for i (range 0 (jv-count models))
+    (let [entry (jv-nth models i)
+          value (session/str entry "value")
+          resolved (session/str entry "resolvedModel")
+          id (if (> (len resolved) 0) resolved value)]
+      (when (and (> (len id) 0) (not (= value "default")))
+        (add! a out "claude" id (jv-string-or (jv-get entry "displayName") id)))))
+  0)
+
+(defn resolve-claude-id [(models JVal) (model (slice u8))] (-> (slice u8))
+  (block :resolve
+    (for i (range 0 (jv-count models))
+      (let [entry (jv-nth models i)
+            resolved (session/str entry "resolvedModel")]
+        (when (and (= (session/str entry "value") model) (> (len resolved) 0))
+          (return-from :resolve resolved))))
+    model))
+
+(defn allowed-opencode? [(a (dyn Allocator)) (cache JVal) (model (slice u8))]
+  (-> bool)
+  (and (not (native-vendor? a model))
+       (match (find model "/")
+         (Some [slash]
+               (let [provider (subslice model 0 slash)
+                     id (subslice model (+ slash 1) (len model))
+                     entry (jv-get (jv-get (jv-get cache provider) "models") id)]
+                 (and (not (native-vendor? a provider))
+                      (not (native-vendor? a
+                                           (session/str entry
+                                                        "canonical_model_id")))
+                      (not (native-vendor? a (session/str entry "family"))))))
+         (_ true))))
+
+(defn add-configured! [(a (dyn Allocator))
+                       (out JVal)
+                       (harness (slice u8))
+                       (model (slice u8))
+                       (models JVal)
+                       (opencode-cache JVal)] (-> i64)
+  (block :add
+    (when (and (= harness "opencode")
+               (not (allowed-opencode? a opencode-cache model)))
+      (return-from :add 0))
+    (when (= harness "claude")
+      (for i (range 0 (jv-count models))
+        (let [entry (jv-nth models i)
+              resolved (session/str entry "resolvedModel")]
+          (when (and (= (session/str entry "value") model) (> (len resolved) 0))
+            (add! a out harness resolved (session/str entry "displayName"))
+            (return-from :add 0)))))
+    (add! a out harness model (if (= (len model) 0) "CLI default" model))))
+
+;;; Model identities always include their harness: a provider/model offered by
+;;; OpenCode is distinct from the same API model run by the builtin agent.
+(defn add! [(a (dyn Allocator))
+            (out JVal)
+            (harness (slice u8))
+            (model (slice u8))
+            (label (slice u8))] (-> i64)
+  (add-tier! a out harness model label ""))
+
+(defn add-tier! [(a (dyn Allocator))
+                 (out JVal)
+                 (harness (slice u8))
+                 (model (slice u8))
+                 (label (slice u8))
+                 (tier (slice u8))] (-> i64)
+  (block :add
+    (when (and (= harness "opencode") (native-vendor? a model))
+      (return-from :add 0))
+    (for i (range 0 (jv-count out))
+      (let [entry (jv-nth out i)]
+        (when (and (= (session/str entry "harness") harness)
+                   (= (session/str entry "model") model)
+                   (= (session/str entry "service_tier") tier))
+          (return-from :add 0))))
+    (let [entry (jv-object a)]
+      (jv-put! entry "harness" (JStr (copy-bytes a harness)))
+      (jv-put! entry "model" (JStr (copy-bytes a model)))
+      (jv-put! entry "service_tier" (JStr (copy-bytes a tier)))
+      (jv-put! entry "label" (JStr (copy-bytes a label)))
+      (jv-push! out entry))
+    0))
+
+(defn add-codex! [(a (dyn Allocator)) (out JVal) (cache JVal)] (-> i64)
+  (let [models (jv-get cache "models")]
+    (for i (range 0 (jv-count models))
+      (let [model (jv-nth models i)
+            slug (session/str model "slug")]
+        (when (and (> (len slug) 0)
+                   (= (session/str model "visibility") "list"))
+          (add! a
+                out
+                "codex"
+                slug
+                (jv-string-or (jv-get model "display_name") slug))
+          (let [tiers (jv-get model "service_tiers")]
+            (for j (range 0 (jv-count tiers))
+              (when (= (session/str (jv-nth tiers j) "id") "priority")
+                (add-tier! a
+                           out
+                           "codex"
+                           slug
+                           (session/cat a
+                                        [(jv-string-or (jv-get model
+                                                               "display_name")
+                                                       slug)
+                                         " (Fast)"])
+                           "priority"))))))))
+  0)
+
+;;; The models.dev cache includes every provider, including ones not configured
+;;; locally. Show authenticated providers and OpenCode's keyless free models.
+(defn add-opencode! [(a (dyn Allocator)) (out JVal) (cache JVal) (auth JVal)]
+  (-> i64)
+  (match cache
+    (JObj [providers]
+          (for-entries [provider data providers]
+                       (match (jv-get data "models")
+                         (JObj [models]
+                               (for-entries [id model models]
+                                            (when (and (not (native-vendor? a
+                                                                            provider))
+                                                       (not (native-vendor? a
+                                                                            id))
+                                                       (not (native-vendor? a
+                                                                            (session/str model
+                                                                                         "canonical_model_id")))
+                                                       (not (native-vendor? a
+                                                                            (session/str model
+                                                                                         "family")))
+                                                       (match (jv-get model
+                                                                      "tool_call")
+                                                         (JBool [b] b)
+                                                         (_ false))
+                                                       (or (not (jv-null? (jv-get auth
+                                                                                  provider)))
+                                                           (and (= provider
+                                                                   "opencode")
+                                                                (match (jv-get (jv-get model
+                                                                                       "cost")
+                                                                               "input")
+                                                                  (JInt [cost]
+                                                                        (= cost
+                                                                           0))
+                                                                  (JFloat [cost]
+                                                                          (= cost
+                                                                             0.0))
+                                                                  (_ false)))))
+                                              (add! a
+                                                    out
+                                                    "opencode"
+                                                    (session/cat a
+                                                                 [provider
+                                                                  "/"
+                                                                  id])
+                                                    (jv-string-or (jv-get model
+                                                                          "name")
+                                                                  id)))))
+                         (_ 0))))
+    (_ 0))
+  0)
+
+(defn installed? [(a (dyn Allocator)) (configured (slice u8)) (name (slice u8))]
+  (-> bool)
+  (or (> (len configured) 0)
+      (match (proc/search-path a name) (Some [_] true) (_ false))))
+
+;;; Build the immediate list from local catalogs. Claude's native initialization
+;;; metadata refreshes separately in a worker, without running a model turn.
+;;; Configured/current choices follow the same provider restrictions.
+(defn catalog-with-claude [(a (dyn Allocator))
+                           (home (slice u8))
+                           (current-harness (slice u8))
+                           (current-model (slice u8))
+                           (claude-models JVal)] (-> JVal)
+  (let [out (jv-array a)
+        c
+          (match (config/load-site-config a home)
+            (config/SiteConfigOk [c] c)
+            (_ (zeroed config/SiteConfig)))
+        user-home (proc/env-or a "HOME" "")
+        codex-home
+          (proc/env-or a "CODEX_HOME" (session/cat a [user-home "/.codex"]))
+        cache-home
+          (proc/env-or a "XDG_CACHE_HOME" (session/cat a [user-home "/.cache"]))
+        data-home
+          (proc/env-or a
+                       "XDG_DATA_HOME"
+                       (session/cat a [user-home "/.local/share"]))
+        opencode-cache
+          (session/read-doc a
+                            (session/cat a [cache-home "/opencode/models.json"]))]
+    (when (installed? a (.claude c) "claude")
+      (add-claude! a out claude-models))
+    (when (installed? a (.codex c) "codex")
+      (add-codex! a
+                  out
+                  (session/read-doc a
+                                    (session/cat a
+                                                 [codex-home
+                                                  "/models_cache.json"])))
+      (add! a out "codex" "" "Codex default"))
+    (when (installed? a (.opencode c) "opencode")
+      (add-opencode! a
+                     out
+                     opencode-cache
+                     (session/read-doc a
+                                       (session/cat a
+                                                    [data-home
+                                                     "/opencode/auth.json"]))))
+    (for i (range 0 4)
+      (let [harness (get ["claude" "codex" "opencode" "builtin"] i)
+            model
+              (cond (= i 0) (.claude-model c)
+                    (= i 1) (.codex-model c)
+                    (= i 2) (.opencode-model c)
+                    :else (.default-model c))]
+        (when (> (len model) 0)
+          (add-configured! a out harness model claude-models opencode-cache))))
+    (when (> (len current-harness) 0)
+      (add-configured! a
+                       out
+                       current-harness
+                       current-model
+                       claude-models
+                       opencode-cache))
+    out))
+
+(defn catalog [(a (dyn Allocator))
+               (home (slice u8))
+               (current-harness (slice u8))
+               (current-model (slice u8))] (-> JVal)
+  (catalog-with-claude a
+                       home
+                       current-harness
+                       current-model
+                       (jv-get (session/read-doc a
+                                                 (session/cat a
+                                                              [home
+                                                               "/claude-models.json"]))
+                               "models")))
+
+;;; Ask only for SDK initialization metadata. No user prompt is sent, so no
+;;; model turn is run. Keep only the models, never account/command metadata.
+(defn parse-claude-models [(a (dyn Allocator)) (output (slice u8))]
+  (-> (Result JVal (slice u8)))
+  (block :parse
+    (for line (iter (split a output "\n"))
+      (match (jv-parse a line)
+        (Some [doc]
+              (let [response (jv-get doc "response")
+                    models (jv-get (jv-get response "response") "models")]
+                (when (and (= (session/str doc "type") "control_response")
+                           (= (session/str response "request_id")
+                              "factory-models")
+                           (= (session/str response "subtype") "success")
+                           (match models
+                             (JArr [_] (> (jv-count models) 0))
+                             (_ false)))
+                  (return-from :parse (Ok models)))))
+        (_ 0)))
+    (Err "Claude Code did not return its model list.")))
+
+(defstruct ModelSink [(allocator (dyn Allocator)) (models JVal)])
+
+(impl stream/LineSink ModelSink
+  (on-line [(self (ptr ModelSink)) (line (slice u8))] (-> bool)
+    (match (parse-claude-models (.allocator self) line)
+      (Ok [models] (do (set! (.models self) models) false))
+      (_ true)))
+  (on-tick [(self (ptr ModelSink))] (-> bool)
+    true))
+
+(defn discover-claude [(a (dyn Allocator))
+                       (program (slice u8))
+                       (cwd (slice u8))]
+  (-> (Result JVal (slice u8)))
+  (let [(mut sink) (ModelSink :allocator a :models (JNull))
+        result
+          (stream/stream-lines a
+                               (stream/StreamSpec
+                                 :program program
+                                 :args
+                                   ["--print"
+                                    "--input-format"
+                                    "stream-json"
+                                    "--output-format"
+                                    "stream-json"
+                                    "--verbose"
+                                    "--safe-mode"
+                                    "--no-session-persistence"
+                                    "--setting-sources"
+                                    ""
+                                    "--strict-mcp-config"
+                                    "--mcp-config"
+                                    "{\"mcpServers\":{}}"
+                                    "--tools"
+                                    ""]
+                                 :cwd cwd
+                                 :input
+                                   "{\"type\":\"control_request\",\"request_id\":\"factory-models\",\"request\":{\"subtype\":\"initialize\"}}\n"
+                                 :timeout-ms 10000
+                                 :max-line-bytes 1048576
+                                 :stderr-bytes 2048)
+                               (mut sink))]
+    (if (not (jv-null? (.models sink)))
+        (Ok (.models sink))
+        (Err "Could not read Claude Code's model list."))))
+
+(defstruct Job
+  [(arena scratch/ScratchArena)
+   (thread thread/Thread)
+   (done i64)
+   (home (slice u8))
+   (program (slice u8))
+   (cwd (slice u8))
+   (models JVal)
+   (error (slice u8))])
+
+(defn run-discovery [(arg (ptr i8))] (-> (ptr i8))
+  (let [job (cast (ptr Job) arg)
+        a (allocator (field job arena))]
+    (match (discover-claude a (.program job) (.cwd job))
+      (Ok [models]
+          (do
+            (set! (.models job) models)
+            (let [cache (jv-object a)]
+              (jv-put! cache "models" models)
+              (match (disk/ensure-dir! a (.home job) 448)
+                (Ok [_]
+                    (when (not (session/write-doc! a
+                                                   (session/cat a
+                                                                [(.home job)
+                                                                 "/claude-models.json"])
+                                                   cache))
+                      (set! (.error job)
+                            "Models loaded; could not save the model cache.")))
+                (_ (set! (.error job)
+                         "Models loaded; could not save the model cache."))))
+            0))
+      (Err [why] (set! (.error job) why)))
+    (atomic/store (field job done) 1)
+    (cast (ptr i8) 0)))
+
+(defn start-claude [(a (dyn Allocator)) (home (slice u8)) (cwd (slice u8))]
+  (-> (ptr Job))
+  (block
+    :start
+      (let [c
+              (match (config/load-site-config a home)
+                (config/SiteConfigOk [c] c)
+                (_ (zeroed config/SiteConfig)))
+            program
+              (if (> (len (.claude c)) 0)
+                  (.claude c)
+                  (match (proc/search-path a "claude")
+                    (Some [p] p)
+                    (_ (return-from :start (cast (ptr Job) 0)))))
+            job (box! a Job (zeroed Job))]
+        (scratch/ScratchArena::init (field job arena) (malloc-allocator))
+        (let [scratch (allocator (field job arena))]
+          (set! (.home job) (copy-bytes scratch home))
+          (set! (.cwd job) (copy-bytes scratch cwd))
+          (set! (.program job) (copy-bytes scratch program))
+          (set! (.models job) (JNull))
+          (set! (.error job) ""))
+        (when (!= (thread/Thread::spawn (field job thread)
+                                        (fnptr-of run-discovery)
+                                        (cast (ptr i8) job))
+                  (cast i32 0))
+          (set! (.error job) "Could not start model discovery.")
+          (atomic/store (field job done) 1))
+        job)))
+
+(defn ready? [(job (ptr Job))] (-> bool)
+  (and (!= (cast i64 job) 0) (= (atomic/read (field job done)) 1)))
+
+(defn close! [(a (dyn Allocator)) (job (ptr Job))] (-> i64)
+  (when (!= (cast i64 job) 0)
+    (join (field job thread))
+    (close! (field job arena))
+    (destroy a job)
+    0)
+  0)

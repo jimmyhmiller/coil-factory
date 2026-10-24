@@ -16,6 +16,7 @@
 (import "agent.tool" :use *)
 (import "agent_tools.sys" :as sys)
 (import "codex.harness" :use *)
+(import "durable.atomic" :as atomic)
 
 ;; ---------------------------------------------------------------------------
 ;; Test doubles
@@ -114,7 +115,7 @@
 
 (defn fresh-dir [(a (dyn Allocator)) (label (slice u8))] (-> (slice u8))
   (let [(mut b) (StrBuf::new a)]
-    (push-str! (mut b) "/private/tmp/codex-test-")
+    (push-str! (mut b) "/tmp/codex-test-")
     (push-i64! (mut b) (process/id))
     (push-str! (mut b) "-")
     (push-str! (mut b) label)
@@ -140,7 +141,7 @@
 dir=\"$(dirname \"$0\")\"
 n=$(cat \"$dir/count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$dir/count\"
 printf '%s\\n' \"$@\" > \"$dir/argv.$n\"
-cat > \"$dir/stdin.$n\"
+for arg in \"$@\"; do\n  case \"$arg\" in\n    model_instructions_file=*)\n      python3 -c 'import pathlib,sys,tomllib; p=tomllib.loads(sys.argv[1])[\"model_instructions_file\"]; pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(p).read_bytes()); pathlib.Path(sys.argv[3]).write_text(p)' \"$arg\" \"$dir/instructions.$n\" \"$dir/instructions-path.$n\" || exit 91\n      ;;\n  esac\ndone\ncat > \"$dir/stdin.$n\"
 pwd > \"$dir/pwd.$n\"
 . \"$dir/reply.$n\"
 ")
@@ -345,8 +346,11 @@ pwd > \"$dir/pwd.$n\"
       (assert (contains? argv "-m\ngpt-6.1-sol\n"))
       (assert (contains? argv "-c\nsandbox_mode=\"workspace-write\"\n"))
       (assert (contains? argv "-c\napproval_policy=\"never\"\n"))
-      (assert (contains? argv
-                         "-c\ndeveloper_instructions=\"You are a \\\"station\\\".\"\n"))
+      (assert (contains? argv "-c\nmodel_instructions_file="))
+      (assert (not (contains? argv "developer_instructions=")))
+      (assert (= (read a (cat a [(.dir f) "/instructions.1"]))
+                 "You are a \"station\"."))
+      (assert (= (read a (read a (cat a [(.dir f) "/instructions-path.1"]))) ""))
       (assert (contains? argv
                          "-c\nmcp_servers.factory.command=\"/usr/local/bin/factory\"\n"))
       (assert (contains? argv
@@ -577,7 +581,12 @@ pwd > \"$dir/pwd.$n\"
     (harness-add-system! h "sys")
     (harness-add-user! h "Begin.")
     (match (harness-run! h) (Cancelled [] 0) (_ (assert false)))
-    (assert (< (- (sys/monotonic-ms) started) 8000))))
+    (assert (< (- (sys/monotonic-ms) started) 8000))
+    (let [path (read a (cat a [(.dir f) "/instructions-path.1"]))]
+      (assert (> (len path) 0))
+      (match (atomic/file-exists? a path)
+        (Ok [exists] (assert (not exists)))
+        (_ (assert false))))))
 
 (deftest errors-and-failed-exits-are-failures
   (let [a (malloc-allocator)
@@ -662,3 +671,93 @@ pwd > \"$dir/pwd.$n\"
                           "{\"type\":\"item.completed\",\"item\":{\"id\":\"child-task\",\"type\":\"collab_agent_tool_call\",\"tool\":\"spawn_agent\",\"prompt\":\"Review the parser\",\"status\":\"completed\",\"receiver_thread_ids\":[\"child\"],\"agents_states\":{\"child\":{\"status\":\"completed\",\"message\":\"No defects\"}}}}"))
     (assert-eq (len (.open turn)) 0)
     (assert (contains? (harness-checkpoint h a) "No defects"))))
+
+(deftest handoff-context-travels-on-stdin-once-and-is-not-a-new-user-message
+  (let [a (malloc-allocator)
+        reply
+          (cat a
+               [(thread-started a)
+                (turn-started a)
+                (message-event a "ok")
+                (turn-completed a)])
+        f (fixture a "handoff-context" [reply reply] (script a))
+        h (.harness f)]
+    (harness-add-system! h "system")
+    (harness-add-context! h "PRIOR-HISTORY-MARKER")
+    (harness-add-user! h "first question")
+    (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+    (assert (harness-restore! h (harness-checkpoint h a)))
+    (harness-add-user! h "second question")
+    (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+    (assert (contains? (read a (cat a [(.dir f) "/stdin.1"]))
+                       "PRIOR-HISTORY-MARKER"))
+    (assert (not (contains? (read a (cat a [(.dir f) "/argv.1"]))
+                            "PRIOR-HISTORY-MARKER")))
+    (assert (not (contains? (read a (cat a [(.dir f) "/stdin.2"]))
+                            "PRIOR-HISTORY-MARKER")))
+    (assert (contains? (read a (cat a [(.dir f) "/stdin.2"])) "second question"))
+    (for i (range 0 (jv-count (.messages h)))
+      (assert (not (= (jv-string-or (jv-get (jv-nth (.messages h) i) "content")
+                                    "")
+                      "PRIOR-HISTORY-MARKER"))))))
+
+
+;;; Real subprocess boundary regression: the payload exceeds Linux MAX_ARG_STRLEN,
+;;; includes Unicode and TOML-sensitive bytes, and survives a checkpoint/resume.
+(deftest large-system-instructions-use-file-on-start-and-resume
+  (let [a (malloc-allocator)
+        (mut control) (zeroed Script)
+        reply (cat a [(thread-started a) (turn-started a) (turn-completed a)])
+        f (fixture a "large-instructions" (kept a [reply reply]) (mut control))
+        h (.harness f)
+        (mut text) (StrBuf::new a)]
+    (for i (range 0 16000)
+      (push-str! (mut text) "Unicode λ, quotes \" and slash \\ and newline\n"))
+    (let [system (finish! (mut text))]
+      (assert (> (len system) 131072))
+      (harness-add-system! h system)
+      (harness-add-user! h "Begin.")
+      (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+      (let [saved (harness-checkpoint h a)]
+        (assert (harness-restore! h saved)))
+      (harness-add-user! h "Continue.")
+      (match (harness-run! h) (Replied [_] 0) (_ (assert false)))
+      (for n (iter ["1" "2"])
+        (assert (= (read a (cat a [(.dir f) "/instructions." n])) system))
+        (let [path (read a (cat a [(.dir f) "/instructions-path." n]))
+              argv (read a (cat a [(.dir f) "/argv." n]))]
+          (assert (> (len path) 0))
+          (match (atomic/file-exists? a path)
+            (Ok [exists] (assert (not exists)))
+            (_ (assert false)))
+          (assert (< (len argv) 8192))
+          (assert (not (contains? argv "Unicode")))))
+      (assert (not (= (read a (cat a [(.dir f) "/instructions-path.1"]))
+                     (read a (cat a [(.dir f) "/instructions-path.2"]))))))
+    (assert (= (read a (cat a [(.dir f) "/stdin.1"])) "Begin."))
+    (assert (= (read a (cat a [(.dir f) "/stdin.2"])) "Continue."))))
+
+
+(deftest instruction-write-failure-does-not-start-codex
+  (let [a (malloc-allocator)
+        f (fixture a "instructions-write-error" ["exit 0\n"] (script a))
+        h (.harness f)]
+    (harness-add-system! h "must not be lost")
+    (harness-add-user! h "Begin.")
+    (set! (.workdir (field h options))
+          (cat a [(.dir f) "/missing/workspace"]))
+    (match (harness-run! h)
+      (Failed [e] (assert (contains? (.message e) "Cannot write Codex instructions:")))
+      (_ (assert false)))
+    (assert (= (read a (cat a [(.dir f) "/count"])) ""))
+    (assert (= (.instructions-file h) ""))))
+
+(deftest spawn-failure-removes-instruction-file
+  (let [a (malloc-allocator)
+        f (fixture a "instructions-spawn-error" ["exit 0\n"] (script a))
+        h (.harness f)]
+    (harness-add-system! h "must not be lost")
+    (harness-add-user! h "Begin.")
+    (set! (.program (field h options)) "/no-such-factory-codex")
+    (match (harness-run! h) (Failed [_] 0) (_ (assert false)))
+    (assert (= (.instructions-file h) ""))))

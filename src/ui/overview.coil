@@ -95,8 +95,12 @@
                              (+ (load x) 1)
                              (concat a
                                      [(int-text a (ji s "running"))
-                                      "/"
-                                      (int-text a (ji s "max_runs"))
+                                      (if (= (ji s "max_runs") 0)
+                                          " · unlimited"
+                                          (concat a
+                                                  ["/"
+                                                   (int-text a
+                                                             (ji s "max_runs"))]))
                                       " running"])
                              (.muted theme)))
                 (when (not (= status "up"))
@@ -349,7 +353,8 @@
                                          :tone (TonePlain)
                                          :suffix
                                            (concat a ["[" (js f "code") "]"])
-                                         :suffix-tone (ToneSubtle))))
+                                         :suffix-tone (ToneSubtle)
+                                         :rich [])))
                             (set! k (+ (load k) 1)))))
                 (let [(mut k) 0]
                   (loop (if (or (>= (load k) (jv-len reviewers))
@@ -396,7 +401,8 @@
                                                                               "reason")))])
                                                :tone (TonePlain)
                                                :suffix ""
-                                               :suffix-tone (ToneSubtle))))
+                                               :suffix-tone (ToneSubtle)
+                                               :rich [])))
                                   0)
                                 0)
                               (set! k (+ (load k) 1))))))

@@ -89,6 +89,7 @@
   [(home (slice u8))
    (name (slice u8))
    (port i64)
+   ;;; 0 means no site-wide concurrency cap; positive values are optional limits.
    (max-runs i64)
    ;;; none | sandbox
    (isolation (slice u8))
@@ -189,7 +190,7 @@
               (do
                 (set! (.name config) (json-str-or object "name" (hostname a)))
                 (set! (.port config) (json-int-or object "port" 7788))
-                (set! (.max-runs config) (json-int-or object "max_runs" 4))
+                (set! (.max-runs config) (json-int-or object "max_runs" 0))
                 (set! (.isolation config)
                       (json-str-or object "isolation" "none"))
                 (set! (.default-model config)
@@ -203,7 +204,8 @@
                 (set! (.codex-model config)
                       (json-str-or object "codex_model" ""))
                 (set! (.claude config) (json-str-or object "claude" ""))
-                (set! (.claude-model config) (json-str-or object "claude_model" ""))
+                (set! (.claude-model config)
+                      (json-str-or object "claude_model" ""))
                 (set! (.codex-writable config)
                       (names-text a (jv-get object "codex_writable")))
                 (set! (.codex-network config)
@@ -256,8 +258,8 @@
                                (= (.default-harness config) "codex")
                                (= (.default-harness config) "claude")))
                         (SiteConfigBad "site.json: default_harness must be builtin, opencode, codex, or claude")
-                      (< (.max-runs config) 1)
-                        (SiteConfigBad "site.json: max_runs must be at least 1")
+                      (< (.max-runs config) 0)
+                        (SiteConfigBad "site.json: max_runs must be nonnegative (0 means unlimited)")
                       :else (SiteConfigOk (load config)))))))))
 
 ;;; A secret by name: the environment first, then `secrets.env` in the site

@@ -5,7 +5,7 @@
 (import "durable.atomic" :as atomic)
 (import "factory.config" :use *)
 (import "factory.proc" :use *)
-(import "factory.harnesses" :use [codex-settings])
+(import "factory.harnesses" :use [codex-settings codex-tier-settings])
 
 (defn home-with [(a (dyn Allocator)) (site-json (slice u8))] (-> (slice u8))
   (let [(mut path) (StrBuf::new a)]
@@ -25,7 +25,9 @@
     (match (load-site-config a (home-with a "{}"))
       (SiteConfigOk [config] (assert (= (.reviewers config) "")))
       (SiteConfigBad [message] (assert false)))
-    (match (load-site-config a (home-with a "{\"reviewers\": [\"judge\", \"security\"]}"))
+    (match (load-site-config a
+                             (home-with a
+                                        "{\"reviewers\": [\"judge\", \"security\"]}"))
       (SiteConfigOk [config] (assert (= (.reviewers config) "judge, security")))
       (SiteConfigBad [message] (assert false)))
     (match (load-site-config a (home-with a "{\"reviewers\": \"judge\"}"))
@@ -34,55 +36,85 @@
 
 (deftest the-old-overseer-model-is-refused-not-ignored
   (let [a (malloc-allocator)]
-    (match (load-site-config a (home-with a "{\"overseer\": {\"model\": \"deepseek/deepseek-v4-pro\"}}"))
+    (match (load-site-config a
+                             (home-with a
+                                        "{\"overseer\": {\"model\": \"deepseek/deepseek-v4-pro\"}}"))
       (SiteConfigOk [config] (assert false))
-      (SiteConfigBad [message] (assert (contains? message "overseer.model is gone"))))))
+      (SiteConfigBad [message]
+                     (assert (contains? message "overseer.model is gone"))))))
 
 (deftest codex-network-is-opt-in-and-does-not-enable-read-only-reviewers
-         (let [a (malloc-allocator)]
-           (match (load-site-config a (home-with a "{}"))
-             (SiteConfigOk [loaded]
-                           (let [(mut config) loaded]
-                             (assert (not (.codex-network config)))
-                             (assert (= (len (codex-settings a
-                                                             (mut config)
-                                                             "workspace-write"))
-                                        2))))
-             (SiteConfigBad [message] (assert false)))
-           (match (load-site-config a (home-with a "{\"codex_network\":true}"))
-             (SiteConfigOk [loaded]
-                           (let [(mut config) loaded]
-                             (assert (.codex-network config))
-                             (let [settings
-                                     (codex-settings a
-                                                     (mut config)
-                                                     "workspace-write")]
-                               (assert (= (len settings) 3))
-                               (assert (= (get settings 0) "features.multi_agent=true"))
-                               (assert (= (get settings 2)
-                                          "sandbox_workspace_write.network_access=true")))
-                             (let [readonly (codex-settings a (mut config) "read-only")]
-                               (assert-eq (len readonly) 2)
-                               (assert (= (get readonly 0) "features.multi_agent=false")))))
-             (SiteConfigBad [message] (assert false)))
-           (match (load-site-config a (home-with a "{\"codex_network\":false}"))
-             (SiteConfigOk [config] (assert (not (.codex-network config))))
-             (SiteConfigBad [message] (assert false)))))
+  (let [a (malloc-allocator)]
+    (match (load-site-config a (home-with a "{}"))
+      (SiteConfigOk [loaded]
+                    (let [(mut config) loaded]
+                      (assert (not (.codex-network config)))
+                      (assert (= (len (codex-settings a
+                                                      (mut config)
+                                                      "workspace-write"))
+                                 2))))
+      (SiteConfigBad [message] (assert false)))
+    (match (load-site-config a (home-with a "{\"codex_network\":true}"))
+      (SiteConfigOk [loaded]
+                    (let [(mut config) loaded]
+                      (assert (.codex-network config))
+                      (let [settings
+                              (codex-settings a
+                                              (mut config)
+                                              "workspace-write")]
+                        (assert (= (len settings) 3))
+                        (assert (= (get settings 0) "features.multi_agent=true"))
+                        (assert (= (get settings 2)
+                                   "sandbox_workspace_write.network_access=true")))
+                      (let [readonly (codex-settings a (mut config) "read-only")]
+                        (assert-eq (len readonly) 2)
+                        (assert (= (get readonly 0)
+                                   "features.multi_agent=false")))))
+      (SiteConfigBad [message] (assert false)))
+    (match (load-site-config a (home-with a "{\"codex_network\":false}"))
+      (SiteConfigOk [config] (assert (not (.codex-network config))))
+      (SiteConfigBad [message] (assert false)))))
 
 (deftest codex-network-refuses-an-invalid-value
-         (let [a (malloc-allocator)]
-           (match (load-site-config a
-                                    (home-with a "{\"codex_network\":\"true\"}"))
-             (SiteConfigOk [config] (assert false))
-             (SiteConfigBad [message]
-                            (assert (contains? message
-                                               "codex_network must be a boolean"))))))
+  (let [a (malloc-allocator)]
+    (match (load-site-config a
+                             (home-with a "{\"codex_network\":\"true\"}"))
+      (SiteConfigOk [config] (assert false))
+      (SiteConfigBad [message]
+                     (assert (contains? message
+                                        "codex_network must be a boolean"))))))
 
 (deftest claude-can-be-the-site-default-with-its-own-model-and-program
   (let [a (malloc-allocator)]
-    (match (load-site-config a (home-with a "{\"default_harness\":\"claude\",\"claude_model\":\"haiku\",\"claude\":\"/opt/claude\"}"))
+    (match (load-site-config a
+                             (home-with a
+                                        "{\"default_harness\":\"claude\",\"claude_model\":\"haiku\",\"claude\":\"/opt/claude\"}"))
       (SiteConfigOk [config]
-        (do (assert (= (.default-harness config) "claude"))
-            (assert (= (.claude-model config) "haiku"))
-            (assert (= (.claude config) "/opt/claude"))))
+                    (do
+                      (assert (= (.default-harness config) "claude"))
+                      (assert (= (.claude-model config) "haiku"))
+                      (assert (= (.claude config) "/opt/claude"))))
       (SiteConfigBad [message] (do (println "{s}" message) (assert false))))))
+
+(deftest concurrency-is-unlimited-by-default-and-can-be-explicitly-limited
+  (let [a (malloc-allocator)]
+    (for settings (iter ["{}" "{\"max_runs\":0}" "{\"max_runs\":128}"])
+      (match (load-site-config a (home-with a settings))
+        (SiteConfigOk [config] (assert (>= (.max-runs config) 0)))
+        (_ (assert false))))
+    (match (load-site-config a (home-with a "{}"))
+      (SiteConfigOk [config] (assert-eq (.max-runs config) 0))
+      (_ (assert false)))
+    (assert (match (load-site-config a (home-with a "{\"max_runs\":-1}"))
+              (SiteConfigBad [_] true)
+              (_ false)))))
+
+(deftest codex-fast-settings-preserve-sandbox-and-set-priority
+  (let [a (malloc-allocator)
+        (mut config) (zeroed SiteConfig)
+        standard (codex-tier-settings a (mut config) "read-only" "")
+        fast (codex-tier-settings a (mut config) "read-only" "priority")]
+    (assert-eq (len fast) (+ (len standard) 1))
+    (for i (range 0 (len standard))
+      (assert (= (get fast i) (get standard i))))
+    (assert (= (get fast (- (len fast) 1)) "service_tier=\"priority\""))))

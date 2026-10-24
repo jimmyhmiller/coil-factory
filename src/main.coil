@@ -1,4 +1,7 @@
 (module factory.main)
+(import "factory.actions" :as actions)
+(import "factory.sidebar" :as sidebar)
+(import "coil.os" :as os)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -182,6 +185,17 @@
         home (factory-home a)]
     (remember-argv0! (arg argv 0))
     (cond ;; Internal entry points, started by the daemon and by `factory up`.
+          (and (= argc 5) (= (arg argv 1) "_action"))
+            (let [action-home (arg argv 2) project (arg argv 3) id (arg argv 4)]
+              ;; Fresh single-threaded launcher: the caller reaps this parent.
+              ;; The supervisor is adopted by init and outlives harness cleanup.
+              (if (not (sidebar/key? id)) 1
+                (let [child (os/fork)]
+                  (cond (< child 0) 1
+                        (> child 0) 0
+                        :else
+                          (if (become-detached! a (actions/run-path a (actions/runtime a action-home project) id ".process.log"))
+                            (actions/worker-main a action-home project id) 1)))))
           (and (>= argc 4) (= (arg argv 1) "_session"))
             (let [session-home (arg argv 2)
                   id (arg argv 3)]

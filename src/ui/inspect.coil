@@ -3,7 +3,7 @@
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
 (import "coil.str" :use [keyops-borrowed])
-(import "agent.json" :use [jv-parse])
+(import "agent.json" :use [jv-parse jv-array jv-push!])
 (import "coil.slice" :use *)
 (import "coil.serde.value" :use *)
 (import "tui.canvas" :use *)
@@ -39,21 +39,33 @@
                :style style)))
     0))
 
+(defn scoped-call-id [(a (dyn Allocator)) (message JVal) (id (slice u8))]
+  (-> (slice u8))
+  (let [segment (js message "factory_segment")]
+    (if (or (= (len segment) 0) (= (len id) 0))
+        id
+        (concat a [segment "/" id]))))
+
 (defn inspection-nodes [(d (ptr Dash)) (a (dyn Allocator)) (width i64)]
   (-> (ArrayList TreeNode))
   (let [messages
           (match (.view d)
             (ViewPersonal []
-                          (match (jv-parse a
-                                           (js (.value (field (field d
-                                                                     workbench)
-                                                              current))
-                                               "checkpoint"))
-                            (Some [checkpoint]
-                                  (match checkpoint
-                                    (JArr [_] checkpoint)
-                                    (_ (jv-get checkpoint "messages"))))
-                            (_ (JNull))))
+                          (let [doc (.value (.current (.workbench d)))
+                                all (jv-array a)
+                                history (jv-get doc "history")
+                                current
+                                  (match (jv-parse a (js doc "checkpoint"))
+                                    (Some [checkpoint]
+                                          (match checkpoint
+                                            (JArr [_] checkpoint)
+                                            (_ (jv-get checkpoint "messages"))))
+                                    (_ (JNull)))]
+                            (for i (range 0 (jv-len history))
+                              (jv-push! all (jv-nth history i)))
+                            (for i (range 0 (jv-len current))
+                              (jv-push! all (jv-nth current i)))
+                            all))
             (_ (jv-get (.value (field (field d chat) transcript)) "transcript")))
         (mut nodes) (ArrayList::new [TreeNode] a)
         (mut results) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed))
@@ -62,7 +74,7 @@
       (let [message (jv-nth messages i)]
         (when (= (js message "role") "tool")
           (set! (mut results)
-                (js message "tool_call_id")
+                (scoped-call-id a message (js message "tool_call_id"))
                 (js message "content"))
           0)))
     (for i (range 0 (jv-len messages))
@@ -71,9 +83,10 @@
         (for j (range 0 (jv-len calls))
           (let [call (jv-nth calls j)
                 function (jv-get call "function")
-                id (js call "id")
+                id (scoped-call-id a message (js call "id"))
                 name (js function "name")
-                parent (js message "parent_tool_use_id")]
+                parent
+                  (scoped-call-id a message (js message "parent_tool_use_id"))]
             (push! (mut nodes)
                    (TreeNode
                      :id id

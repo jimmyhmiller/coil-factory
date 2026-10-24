@@ -1,0 +1,221 @@
+(module factory.ui.sidebar-command)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [trim starts-with])
+(import "factory.ui.fmt" :use [concat])
+(import "tui.canvas" :use *)
+(import "tui.widgets" :use *)
+(import "tui.palette" :use [Palette])
+
+;;; Actions are validated together before any state changes: 0 unchanged,
+;;; 1 hide, 2 show, 3 toggle. An overlap, even through 'all', is rejected.
+(defstruct Plan [(left i64) (right i64) (error (slice u8)) (help bool)])
+
+(defstruct Suggestion
+  [(value (slice u8)) (label (slice u8)) (detail (slice u8))])
+
+(defn space? [(b u8)] (-> bool)
+  (or (= b 32) (= b 9) (= b 10) (= b 13)))
+
+(defn words [(a (dyn Allocator)) (s (slice u8))] (-> (ArrayList (slice u8)))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
+        (mut i) 0]
+    (loop (when (>= (load i) (len s)) (break))
+      (if (space? (get s (load i)))
+          (set! i (+ (load i) 1))
+          (let [start (load i)]
+            (loop (when (or (>= (load i) (len s)) (space? (get s (load i))))
+                    (break))
+              (set! i (+ (load i) 1)))
+            (push! (mut out) (subslice s start (load i))))))
+    (load out)))
+
+(defn active? [(s (slice u8))] (-> bool)
+  (let [s (trim s)]
+    (or (= s "sidebars")
+        (starts-with s "sidebars ")
+        (starts-with s "sidebars\t"))))
+
+(defn action [(s (slice u8))] (-> i64)
+  (cond (= s "--hide") 1 (= s "--show") 2 (= s "--toggle") 3 :else 0))
+
+(defn parse [(a (dyn Allocator)) (s (slice u8))] (-> Plan)
+  (block
+    :parse
+      (let [tokens (words a s)
+            (mut plan) (zeroed Plan)
+            (mut i) 1]
+        (when (or (= (len tokens) 0) (not (= (get tokens 0) "sidebars")))
+          (set! (.error plan)
+                "Use /sidebars --hide|--show|--toggle left|right|all.")
+          (return-from :parse (load plan)))
+        (when (= (len tokens) 1) (return-from :parse (load plan)))
+        (when (= (get tokens 1) "--help")
+          (if (= (len tokens) 2)
+              (set! (.help plan) true)
+              (set! (.error plan) "Use --help on its own."))
+          (return-from :parse (load plan)))
+        (loop (when (>= (load i) (len tokens)) (break))
+          (let [flag (get tokens (load i))
+                code (action flag)]
+            (when (= code 0)
+              (set! (.error plan)
+                    (concat a
+                            ["Unknown option “"
+                             flag
+                             "”. Use --hide, --show, --toggle, or --help."]))
+              (return-from :parse (load plan)))
+            (when (>= (+ (load i) 1) (len tokens))
+              (set! (.error plan) "Choose a target: left, right, or all.")
+              (return-from :parse (load plan)))
+            (let [target (get tokens (+ (load i) 1))
+                  left (or (= target "left") (= target "all"))
+                  right (or (= target "right") (= target "all"))]
+              (when (not (or left right))
+                (set! (.error plan)
+                      (concat a
+                              ["Unknown sidebar “"
+                               target
+                               "”. Choose left, right, or all."]))
+                (return-from :parse (load plan)))
+              (when (or (and left (> (.left plan) 0))
+                        (and right (> (.right plan) 0)))
+                (set! (.error plan)
+                      (concat a
+                              ["Conflicting actions for “"
+                               (if (and left (> (.left plan) 0)) "left" "right")
+                               "”."]))
+                (return-from :parse (load plan)))
+              (when left (set! (.left plan) code))
+              (when right (set! (.right plan) code)))
+            (set! i (+ (load i) 2))))
+        (load plan))))
+
+(defn visible [(current bool) (action i64)] (-> bool)
+  (cond (= action 1) false
+        (= action 2) true
+        (= action 3) (not current)
+        :else current))
+
+(defn state [(shown bool)] (-> (slice u8))
+  (if shown "shown" "hidden"))
+
+(defn suggestions [(a (dyn Allocator))
+                   (query (slice u8))
+                   (left bool)
+                   (right bool)] (-> (ArrayList Suggestion))
+  (block :suggest
+    (when (= (len (trim query)) 0)
+      (return-from :suggest (ArrayList::new [Suggestion] a)))
+    (let [tokens (words a query)
+          (mut out) (ArrayList::new [Suggestion] a)
+          trailing
+            (and (> (len query) 0) (space? (get query (- (len query) 1))))
+          count (if trailing (len tokens) (- (len tokens) 1))
+          partial
+            (if (or trailing (= (len tokens) 1))
+                ""
+                (get tokens (- (len tokens) 1)))
+          (mut prefix-parts) (ArrayList::new [(slice u8)] a)]
+      (for i (range 0 count)
+        (push! (mut prefix-parts) (get tokens i))
+        (push! (mut prefix-parts) " "))
+      (let [prefix
+              (if (= (len tokens) 1)
+                  "sidebars "
+                  (concat a (slice prefix-parts)))
+            flag-position (= (% count 2) 1)]
+        (when (or (= (len tokens) 1) flag-position)
+          (for flag (iter ["--hide" "--show" "--toggle" "--help"])
+            (when (and (starts-with flag partial)
+                       (or (not (= flag "--help")) (<= count 1)))
+              (push! (mut out)
+                     (Suggestion
+                       :value (concat a [prefix flag " "])
+                       :label flag
+                       :detail
+                         (cond (= flag "--hide") "Hide a sidebar"
+                               (= flag "--show") "Show a sidebar"
+                               (= flag "--toggle") "Toggle visibility"
+                               :else "Show usage and examples"))))))
+        (when (and (not flag-position)
+                   (> count 1)
+                   (> (action (get tokens (- count 1))) 0))
+          (for target (iter ["left" "right" "all"])
+            (when (starts-with target partial)
+              (push! (mut out)
+                     (Suggestion
+                       :value (concat a [prefix target " "])
+                       :label target
+                       :detail
+                         (cond (= target "left")
+                                 (concat a ["Conversations · " (state left)])
+                               (= target "right")
+                                 (concat a ["Context · " (state right)])
+                               :else "Both sidebars")))))))
+      (load out))))
+
+(defn draw! [(p (ptr Palette))
+             (c (ptr Canvas))
+             (a (dyn Allocator))
+             (bounds Rect)
+             (theme Theme)
+             (left bool)
+             (right bool)] (-> i64)
+  (let [r (rect-center bounds 86 18)
+        (mut opts) (panel-opts theme "Sidebars" true)
+        query (input-text (field p input))
+        items (suggestions a (subslice query 0 (.cursor (.input p))) left right)
+        help (= (trim query) "sidebars --help")
+        (mut labels) (ArrayList::new [(slice u8)] a)]
+    (set! (.footer opts) "Tab completes · Enter applies · Esc closes")
+    (fill! c r 32 (style-default))
+    (let [inner (draw-box! c r opts)]
+      (draw-input! c
+                   (rect (.x inner) (.y inner) (.w inner) 1)
+                   (field p input)
+                   (.text theme)
+                   "sidebars"
+                   (.muted theme)
+                   true)
+      (put-text-ellipsis! c
+                          inner
+                          (.x inner)
+                          (+ (.y inner) 2)
+                          (concat a
+                                  ["Left · Conversations · "
+                                   (state left)
+                                   "    Right · Context · "
+                                   (state right)])
+                          (.muted theme))
+      (if help
+          (do
+            (push! (mut labels)
+                   "/sidebars --hide|--show|--toggle left|right|all")
+            (push! (mut labels) "")
+            (push! (mut labels) "/sidebars --hide left --show right")
+            (push! (mut labels) "/sidebars --hide all")
+            (push! (mut labels) "/sidebars --toggle all")
+            (push! (mut labels) "")
+            (push! (mut labels) "Toggle flips each sidebar independently.")
+            (push! (mut labels)
+                   "Targets cannot overlap. Changes save across restarts."))
+          (for item (iter items)
+            (push! (mut labels)
+                   (concat a [(.label item) "    " (.detail item)]))))
+      (if help
+          (for i (range 0 (len labels))
+            (put-text-ellipsis! c
+                                inner
+                                (.x inner)
+                                (+ (+ (.y inner) 4) i)
+                                (get labels i)
+                                (.text theme)))
+          (draw-list! c
+                      (rect-drop-top inner 4)
+                      (field p list)
+                      (slice labels)
+                      theme
+                      true)))
+    0))

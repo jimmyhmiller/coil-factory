@@ -1,0 +1,112 @@
+(module factory.model-catalog-test)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.serde.value" :use *)
+(import "agent.json" :use *)
+(import "factory.model-catalog" :as catalog)
+(import "factory.session" :as session)
+
+(defn parsed [(a (dyn Allocator)) (text (slice u8))] (-> JVal)
+  (match (jv-parse a text) (Some [v] v) (_ (do (assert false) (JNull)))))
+
+(deftest model-catalog-preserves-harness-identity-and-filters-hidden-codex-models
+  (let [a (malloc-allocator)
+        out (jv-array a)]
+    (catalog/add-codex! a
+                        out
+                        (parsed a
+                                "{\"models\":[{\"slug\":\"visible\",\"display_name\":\"Visible\",\"visibility\":\"list\"},{\"slug\":\"hidden\",\"visibility\":\"hide\"}]}"))
+    (catalog/add! a out "codex" "visible" "duplicate")
+    (catalog/add! a out "builtin" "visible" "API model")
+    (assert-eq (jv-count out) 2)
+    (assert (= (session/str (jv-nth out 0) "harness") "codex"))
+    (assert (= (session/str (jv-nth out 0) "model") "visible"))
+    (assert (= (session/str (jv-nth out 1) "harness") "builtin"))))
+
+(deftest opencode-catalog-shows-connected-providers-and-keyless-tool-models
+  (let [a (malloc-allocator)
+        out (jv-array a)
+        cache
+          (parsed a
+                  "{\"opencode\":{\"models\":{\"free\":{\"name\":\"Free\",\"tool_call\":true,\"cost\":{\"input\":0}},\"paid\":{\"tool_call\":true,\"cost\":{\"input\":1}},\"no-tools\":{\"tool_call\":false,\"cost\":{\"input\":0}}}},\"connected\":{\"models\":{\"model\":{\"tool_call\":true}}},\"disconnected\":{\"models\":{\"other\":{\"tool_call\":true}}}}")
+        auth (parsed a "{\"connected\":{\"type\":\"oauth\"}}")]
+    (catalog/add-opencode! a out cache auth)
+    (assert-eq (jv-count out) 2)
+    (for i (range 0 (jv-count out))
+      (let [entry (jv-nth out i)]
+        (assert (= (session/str entry "harness") "opencode"))
+        (assert (or (= (session/str entry "model") "opencode/free")
+                    (= (session/str entry "model") "connected/model")))))))
+
+(deftest claude-catalog-uses-native-versioned-names-and-resolved-model-ids
+  (let [a (malloc-allocator)
+        out (jv-array a)
+        models
+          (parsed a
+                  "[{\"value\":\"default\",\"resolvedModel\":\"claude-opus-5-5\",\"displayName\":\"Default\"},{\"value\":\"opus\",\"resolvedModel\":\"claude-opus-5-5\",\"displayName\":\"Opus 5.5\"},{\"value\":\"fable\",\"resolvedModel\":\"claude-fable-5-1\",\"displayName\":\"Fable 5.1\"},{\"value\":\"claude-opus-4-6\",\"displayName\":\"Opus 4.6\"}]")]
+    (catalog/add-claude! a out models)
+    (catalog/add-configured! a out "claude" "opus" models (JNull))
+    (assert-eq (jv-count out) 3)
+    (assert (= (session/str (jv-nth out 0) "model") "claude-opus-5-5"))
+    (assert (= (session/str (jv-nth out 0) "label") "Opus 5.5"))
+    (assert (= (session/str (jv-nth out 1) "model") "claude-fable-5-1"))
+    (assert (= (session/str (jv-nth out 2) "label") "Opus 4.6"))
+    (assert (= (catalog/resolve-claude-id models "opus") "claude-opus-5-5"))))
+
+(deftest opencode-excludes-anthropic-and-openai-even-behind-proxies-or-configured-models
+  (let [a (malloc-allocator)
+        out (jv-array a)
+        cache
+          (parsed a
+                  "{\"anthropic\":{\"models\":{\"native\":{\"tool_call\":true}}},\"openai\":{\"models\":{\"native\":{\"tool_call\":true}}},\"openrouter\":{\"models\":{\"anthropic/claude-opus-5\":{\"tool_call\":true},\"openai/gpt-6-sol\":{\"tool_call\":true},\"renamed\":{\"tool_call\":true,\"canonical_model_id\":\"anthropic/claude-sonnet-5\"},\"allowed\":{\"tool_call\":true,\"canonical_model_id\":\"deepseek/deepseek-v4\"}}},\"opencode\":{\"models\":{\"gpt-6-sol-free\":{\"tool_call\":true,\"cost\":{\"input\":0}},\"claude-haiku-free\":{\"tool_call\":true,\"cost\":{\"input\":0}}}}}")
+        auth (parsed a "{\"anthropic\":{},\"openai\":{},\"openrouter\":{}}")]
+    (catalog/add-opencode! a out cache auth)
+    (catalog/add! a out "opencode" "openai/gpt-6-sol" "configured OpenAI")
+    (catalog/add-configured! a
+                             out
+                             "opencode"
+                             "anthropic/claude-opus-5"
+                             (JNull)
+                             cache)
+    (catalog/add-configured! a
+                             out
+                             "opencode"
+                             "openrouter/renamed"
+                             (JNull)
+                             cache)
+    (catalog/add! a out "opencode" "OpenAI/GPT-6-Sol" "case variation")
+    (assert-eq (jv-count out) 1)
+    (assert (= (session/str (jv-nth out 0) "model") "openrouter/allowed"))))
+
+(deftest claude-discovery-parses-only-the-matching-native-initialization-response
+  (let [a (malloc-allocator)]
+    (match (catalog/parse-claude-models a
+                                        "{\"type\":\"system\",\"models\":[{}]}\n{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"factory-models\",\"response\":{\"models\":[{\"value\":\"opus\",\"resolvedModel\":\"claude-opus-5-5\",\"displayName\":\"Opus 5.5\"}],\"account\":{\"private\":true}}}}\n")
+      (Ok [models] (assert-eq (jv-count models) 1))
+      (_ (assert false)))
+    (assert (match (catalog/parse-claude-models a "{\"models\":[{}]}")
+              (Err [_] true)
+              (_ false)))))
+
+(deftest model-options-own-identities-and-labels-after-discovery-storage-is-released
+  (let [a (malloc-allocator)
+        out (jv-array a)
+        source (copy-bytes a "claude-opus-5-5")]
+    (catalog/add! a out "claude" source source)
+    (store! (data source) (cast u8 88))
+    (assert (= (session/str (jv-nth out 0) "model") "claude-opus-5-5"))
+    (assert (= (session/str (jv-nth out 0) "label") "claude-opus-5-5"))))
+
+(deftest codex-speed-choices-use-advertised-service-tiers-with-distinct-identities
+  (let [a (malloc-allocator)
+        out (jv-array a)]
+    (catalog/add-codex! a
+                        out
+                        (parsed a
+                                "{\"models\":[{\"slug\":\"gpt-6-sol\",\"display_name\":\"Sol\",\"visibility\":\"list\",\"service_tiers\":[{\"id\":\"priority\"},{\"id\":\"priority\"}]},{\"slug\":\"standard-only\",\"visibility\":\"list\"},{\"slug\":\"hidden\",\"visibility\":\"hide\",\"service_tiers\":[{\"id\":\"priority\"}]}]}"))
+    (catalog/add! a out "codex" "gpt-6-sol" "configured")
+    (assert-eq (jv-count out) 3)
+    (assert (= (session/str (jv-nth out 0) "service_tier") ""))
+    (assert (= (session/str (jv-nth out 1) "model") "gpt-6-sol"))
+    (assert (= (session/str (jv-nth out 1) "service_tier") "priority"))
+    (assert (= (session/str (jv-nth out 1) "label") "Sol (Fast)"))))

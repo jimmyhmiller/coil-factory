@@ -5,6 +5,7 @@
 (import "coil.serde.value" :use *)
 (import "tui.canvas" :use *)
 (import "tui.widgets" :use *)
+(import "tui.palette" :use *)
 (import "tui.app" :use [Frame])
 (import "factory.ui.model" :use *)
 (import "factory.ui.fmt" :use *)
@@ -48,6 +49,8 @@
                          0)
         sessions (.value (field w sessions))
         (mut labels) (ArrayList::new [(slice u8)] a)]
+    (set! (.workspace-r w) inner)
+    (set! (.history-r w) (rect-drop-top inner 9))
     (put-text-ellipsis! c
                         inner
                         (.x inner)
@@ -118,13 +121,16 @@
         w (field d workbench)
         current (.value (field w current))
         existing (> (len (.session-id w)) 0)
-        provider (if existing (js current "harness") (workbench/value w 1))
-        model (if existing (js current "model") (workbench/value w 2))
         chat (field d personal)
         full (canvas-rect c)
         context-width (context/panel-width d (.w full))
-        sidebar (if (>= (.w full) 120) 23 0)
-        body (rect-drop-top (rect-drop-bottom full 1) 2)
+        sidebar
+          (if (and (.workspace-visible w) (>= (.w full) 120))
+              (if (< (.workspace-width w) (- (- (.w full) context-width) 40))
+                  (.workspace-width w)
+                  (- (- (.w full) context-width) 40))
+              0)
+        body (rect-drop-top (rect-drop-bottom full 1) 1)
         left (rect (.x body) (.y body) sidebar (.h body))
         right (rect-drop-right (rect-drop-left body sidebar) context-width)
         context-r
@@ -156,51 +162,21 @@
                 (.w inner)
                 (if (> status-y (.y inner)) (- status-y (.y inner)) 0))
         lines (chat-lines chat (.w messages-r))]
-    (put-text! c full 1 0 "◆ factory" (bold (.accent theme)))
     (put-text-ellipsis! c
-                        (rect 13 0 (- (.w full) 13) 1)
-                        13
+                        (rect 1 0 (- (.w full) 2) 1)
+                        1
                         0
-                        (concat a
-                                [provider
-                                 " · "
-                                 (if (= (len model) 0)
-                                     "CLI default model"
-                                     model)
-                                 " · "
-                                 (.status w)])
-                        (.muted theme))
-    (put-text-ellipsis! c
-                        (rect 1 1 (- (.w full) 2) 1)
-                        1
-                        1
                         (if existing
                             (js current "workdir")
                             (workbench/value w 0))
                         (.subtle theme))
+    (set! (.layout-r w) body)
+    (set! (.workspace-r w) (rect 0 0 0 0))
+    (set! (.history-r w) (rect 0 0 0 0))
+    (set! (.context-r w) context-r)
     (when (> sidebar 0) (draw-sidebar! d c a left))
     (when (> context-width 0) (context/draw! d c a context-r))
-    (if (= (len lines) 0)
-        (do
-          (put-text-ellipsis! c
-                              messages-r
-                              (+ (.x messages-r) 2)
-                              (+ (.y messages-r) 2)
-                              "What would you like to work on?"
-                              (bold (.text theme)))
-          (put-text-ellipsis! c
-                              messages-r
-                              (+ (.x messages-r) 2)
-                              (+ (.y messages-r) 4)
-                              "Start typing. Your conversation works without a factory connection."
-                              (.muted theme))
-          (put-text-ellipsis! c
-                              messages-r
-                              (+ (.x messages-r) 2)
-                              (+ (.y messages-r) 6)
-                              "Type / to explore commands."
-                              (.subtle theme)))
-        (draw-lines! c messages-r (field chat sv) lines theme))
+    (draw-lines! c messages-r (field chat sv) lines theme)
     (put-text-ellipsis! c
                         inner
                         (.x inner)
@@ -213,8 +189,7 @@
                                 "Stopped · send a message to continue"
                               (= (.status w) "interrupted")
                                 "Interrupted · send a message to resume the saved session"
-                              :else
-                                "Your project · no factory recipe or gate required")
+                              :else "")
                         (if (= (.status w) "failed")
                             (.error theme)
                             (.muted theme)))
@@ -231,7 +206,9 @@
                  "Ask anything…"
                  (.subtle theme)
                  (not (or (.history-focus w)
+                          (.models-open w)
                           (.settings-open w)
+                          (.action-editor w)
                           (.connections-open w)
                           (.commands-open d))))
     (draw-footer! d
@@ -356,6 +333,7 @@
                                       (panel-opts theme "Conversations" true))
                            1
                            0)]
+      (set! (.history-r w) inner)
       (for i (range 0 (jv-len sessions))
         (let [item (jv-nth sessions i)]
           (push! (mut labels)
@@ -375,3 +353,72 @@
                               (.muted theme))
           (draw-list! c inner (field w history) (slice labels) theme true)))
     0))
+
+(defn model-commands [(d (ptr Dash)) (a (dyn Allocator))]
+  (-> (ArrayList Command))
+  (let [options (.value (.model-options (.workbench d)))
+        (mut commands) (ArrayList::new [Command] a)]
+    (for i (range 0 (jv-len options))
+      (let [option (jv-nth options i)]
+        (push! (mut commands)
+               (Command
+                 :id (+ i 1)
+                 :title
+                   (concat a [(js option "label") "  " (js option "model")])
+                 :detail (js option "harness")
+                 :enabled true))))
+    (load commands)))
+
+(defn draw-models! [(d (ptr Dash)) (c (ptr Canvas)) (a (dyn Allocator))]
+  (-> i64)
+  (let [w (field d workbench)
+        p (field w models)
+        theme (.theme d)
+        r (rect-center (canvas-rect c) 86 18)
+        (mut opts) (panel-opts theme "Model" true)
+        commands (model-commands d a)
+        items (palette-items a p (slice commands))
+        (mut cells) (ArrayList::new [TableCell] a)]
+    (canvas-hide-cursor! c)
+    (fill! c r 32 (style-default))
+    (set! (.footer opts)
+          (cond (!= (cast i64 (.model-job w)) 0) "Loading Claude Code models…"
+                (> (len (.model-error w)) 0) (.model-error w)
+                :else "Enter selects · Esc cancels"))
+    (let [inner (draw-box! c r opts)
+          query-r (rect (.x inner) (.y inner) (.w inner) 1)
+          results-r (rect-drop-top inner 2)]
+      (draw-input! c
+                   query-r
+                   (field p input)
+                   (.text theme)
+                   "Search models…"
+                   (.muted theme)
+                   true)
+      (for command (iter items)
+        (push! (mut cells) (table-cell (.title command) (.text theme)))
+        (push! (mut cells) (table-cell (.detail command) (.muted theme))))
+      (list-set-count! (field p list) (len items))
+      (if (= (len items) 0)
+          (put-text-ellipsis! c
+                              results-r
+                              (.x results-r)
+                              (.y results-r)
+                              "No matching models"
+                              (.muted theme))
+          (draw-table! c
+                       results-r
+                       [(Column
+                          :title "MODEL"
+                          :width (Fill 4)
+                          :align (AlignLeft))
+                        (Column
+                          :title "HARNESS"
+                          :width (Fill 1)
+                          :align (AlignLeft))]
+                       (slice cells)
+                       (field p list)
+                       1
+                       theme
+                       false))
+      0)))
